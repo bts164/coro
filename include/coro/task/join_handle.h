@@ -1,9 +1,10 @@
 #pragma once
 
-#include <coro/context.h>
+#include <coro/detail/context.h>
 #include <coro/future.h>
-#include <coro/poll_result.h>
-#include <coro/task_state.h>
+#include <coro/detail/poll_result.h>
+#include <coro/detail/task_state.h>
+#include <coro/detail/coro_scope.h>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -33,9 +34,21 @@ public:
     JoinHandle& operator=(JoinHandle&&) noexcept = default;
 
     // Cancels the task if not yet completed.
+    // If destroyed inside a coroutine poll() call, registers with the enclosing
+    // CoroutineScope so the parent waits for this child to finish before completing.
     ~JoinHandle() {
-        if (m_state)
-            m_state->cancelled.store(true, std::memory_order_relaxed);
+        if (!m_state) return;  // detached via detach()
+        m_state->cancelled.store(true, std::memory_order_relaxed);
+        if (detail::t_current_coro) {
+            auto state = m_state;  // capture shared_ptr by value
+            detail::t_current_coro->add_child(
+                [state]() { return state->is_complete(); },
+                [state](std::shared_ptr<detail::Waker> w) {
+                    std::lock_guard lock(state->mutex);
+                    state->scope_waker = std::move(w);
+                }
+            );
+        }
     }
 
     // Detaches without cancelling. The task runs to completion; the result is discarded.
@@ -44,7 +57,7 @@ public:
         m_state.reset();
     }
 
-    PollResult<T> poll(Context& ctx) {
+    PollResult<T> poll(detail::Context& ctx) {
         std::lock_guard lock(m_state->mutex);
         if (m_state->exception)
             return PollError(m_state->exception);
@@ -76,15 +89,43 @@ public:
     JoinHandle& operator=(JoinHandle&&) noexcept = default;
 
     ~JoinHandle() {
-        if (m_state)
+        if (!m_state) return;  // detached via detach()
+        if (m_cancelOnDestroy) {
             m_state->cancelled.store(true, std::memory_order_relaxed);
+        }
+        if (detail::t_current_coro) {
+            auto state = m_state;  // capture shared_ptr by value
+            detail::t_current_coro->add_child(
+                [state]() { return state->is_complete(); },
+                [state](std::shared_ptr<detail::Waker> w) {
+                    std::lock_guard lock(state->mutex);
+                    state->scope_waker = std::move(w);
+                }
+            );
+        }
     }
 
-    void detach() && {
+    JoinHandle& cancelOnDestroy(bool b = true) &{
+        m_cancelOnDestroy = b;
+        return *this;
+    }
+
+    JoinHandle&& cancelOnDestroy(bool b = true) && {
+        m_cancelOnDestroy = b;
+        return std::forward<JoinHandle>(*this);
+    }
+
+    JoinHandle& detach() & {
         m_state.reset();
+        return *this;
     }
 
-    PollResult<void> poll(Context& ctx) {
+    JoinHandle&& detach() && {
+        m_state.reset();
+        return std::forward<JoinHandle>(*this);
+    }
+
+    PollResult<void> poll(detail::Context& ctx) {
         std::lock_guard lock(m_state->mutex);
         if (m_state->exception)
             return PollError(m_state->exception);
@@ -95,6 +136,7 @@ public:
     }
 
 private:
+    bool m_cancelOnDestroy = true;
     std::shared_ptr<detail::TaskState<void>> m_state;
 };
 

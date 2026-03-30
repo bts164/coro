@@ -1,4 +1,4 @@
-#include <coro/cancellation_token.h>
+#include <coro/sync/cancellation_token.h>
 
 namespace coro {
 

@@ -265,6 +265,7 @@ Coro::poll(ctx):
 ```
 
 Key properties of this design:
+
 - **No spurious resumes.** The coroutine is only resumed when the inner future is confirmed
   non-Pending. `await_resume()` can always call `.value()` safely.
 - **Waker re-registration.** Each call to `m_poll_current()` passes the fresh `Context`,

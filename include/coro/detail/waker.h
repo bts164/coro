@@ -2,7 +2,7 @@
 
 #include <memory>
 
-namespace coro {
+namespace coro::detail {
 
 class Waker {
 public:

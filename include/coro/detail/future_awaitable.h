@@ -1,8 +1,8 @@
 #pragma once
 
-#include <coro/context.h>
+#include <coro/detail/context.h>
 #include <coro/future.h>
-#include <coro/poll_result.h>
+#include <coro/detail/poll_result.h>
 #include <coroutine>
 #include <functional>
 #include <type_traits>
@@ -26,7 +26,7 @@ namespace coro {
 template<Future F>
 class FutureAwaitable {
 public:
-    explicit FutureAwaitable(F future, Context** ctx_ptr, std::function<bool()>* poll_hook)
+    explicit FutureAwaitable(F future, detail::Context** ctx_ptr, std::function<bool()>* poll_hook)
         : m_future(std::move(future)), m_ctx_ptr(ctx_ptr), m_poll_hook(poll_hook) {}
 
     // Poll once eagerly. If the future completes synchronously, skip suspension entirely.
@@ -57,7 +57,7 @@ public:
 
 private:
     F                                   m_future;
-    Context**                           m_ctx_ptr;
+    detail::Context**                   m_ctx_ptr;
     std::function<bool()>*              m_poll_hook;
     PollResult<typename F::OutputType>  m_result{PollPending};
 };

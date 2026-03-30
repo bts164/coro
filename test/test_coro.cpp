@@ -7,10 +7,10 @@
 
 using namespace coro;
 
-class MockWaker : public Waker {
+class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
+    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
 };
 
 // --- Helper coroutines ---
@@ -27,7 +27,7 @@ Coro<int> awaits_immediate(int value) {
     struct ImmediateFuture {
         using OutputType = int;
         int m_value;
-        PollResult<int> poll(Context&) { return m_value; }
+        PollResult<int> poll(detail::Context&) { return m_value; }
     };
     co_return co_await ImmediateFuture{value};
 }
@@ -35,7 +35,7 @@ Coro<int> awaits_immediate(int value) {
 Coro<void> awaits_immediate_void() {
     struct ImmediateFutureVoid {
         using OutputType = void;
-        PollResult<void> poll(Context&) { return PollReady; }
+        PollResult<void> poll(detail::Context&) { return PollReady; }
     };
     co_await ImmediateFutureVoid{};
 }
@@ -48,7 +48,7 @@ Coro<int> throws_immediately() {
 Coro<int> awaits_throwing() {
     struct ThrowingFuture {
         using OutputType = int;
-        PollResult<int> poll(Context&) {
+        PollResult<int> poll(detail::Context&) {
             return PollError(std::make_exception_ptr(std::runtime_error("inner boom")));
         }
     };
@@ -58,7 +58,7 @@ Coro<int> awaits_throwing() {
 Coro<std::string> chain_two() {
     struct StringFuture {
         using OutputType = std::string;
-        PollResult<std::string> poll(Context&) { return std::string("hello"); }
+        PollResult<std::string> poll(detail::Context&) { return std::string("hello"); }
     };
     auto s = co_await StringFuture{};
     co_return s + " world";
@@ -98,7 +98,7 @@ TEST(CoroTest, VoidCoroIsMovable) {
 
 TEST(CoroTest, IntPollReturnsReady) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto c = returns_int();
     auto result = c.poll(ctx);
     EXPECT_TRUE(result.isReady());
@@ -107,7 +107,7 @@ TEST(CoroTest, IntPollReturnsReady) {
 
 TEST(CoroTest, VoidPollReturnsReady) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto c = returns_void();
     EXPECT_TRUE(c.poll(ctx).isReady());
 }
@@ -116,7 +116,7 @@ TEST(CoroTest, VoidPollReturnsReady) {
 
 TEST(CoroTest, AwaitsImmediateFuture) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto c = awaits_immediate(99);
     auto result = c.poll(ctx);
     EXPECT_TRUE(result.isReady());
@@ -125,14 +125,14 @@ TEST(CoroTest, AwaitsImmediateFuture) {
 
 TEST(CoroTest, AwaitsImmediateVoidFuture) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto c = awaits_immediate_void();
     EXPECT_TRUE(c.poll(ctx).isReady());
 }
 
 TEST(CoroTest, ChainsStringFutures) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto c = chain_two();
     auto result = c.poll(ctx);
     EXPECT_TRUE(result.isReady());
@@ -143,7 +143,7 @@ TEST(CoroTest, ChainsStringFutures) {
 
 TEST(CoroTest, ThrowInBodyStoredAsError) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto c = throws_immediately();
     auto result = c.poll(ctx);
     EXPECT_TRUE(result.isError());
@@ -152,7 +152,7 @@ TEST(CoroTest, ThrowInBodyStoredAsError) {
 
 TEST(CoroTest, InnerFutureErrorRethrown) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto c = awaits_throwing();
     auto result = c.poll(ctx);
     EXPECT_TRUE(result.isError());
@@ -167,7 +167,7 @@ public:
     using OutputType = int;
     explicit TwoPollFuture(int value) : m_value(value) {}
 
-    PollResult<int> poll(Context& ctx) {
+    PollResult<int> poll(detail::Context& ctx) {
         if (!m_polled_once) {
             m_polled_once = true;
             m_waker = ctx.getWaker();
@@ -176,12 +176,12 @@ public:
         return m_value;
     }
 
-    std::shared_ptr<Waker> storedWaker() const { return m_waker; }
+    std::shared_ptr<detail::Waker> storedWaker() const { return m_waker; }
 
 private:
     int                    m_value;
     bool                   m_polled_once = false;
-    std::shared_ptr<Waker> m_waker;
+    std::shared_ptr<detail::Waker> m_waker;
 };
 
 Coro<int> awaits_two_poll(TwoPollFuture f) {
@@ -191,7 +191,7 @@ Coro<int> awaits_two_poll(TwoPollFuture f) {
 TEST(CoroTest, SuspendsOnPendingInnerFuture) {
     auto waker = std::make_shared<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(0);  // waker not called by the test
-    Context ctx(waker);
+    detail::Context ctx(waker);
 
     TwoPollFuture f(7);
     auto c = awaits_two_poll(std::move(f));
@@ -204,7 +204,7 @@ TEST(CoroTest, SuspendsOnPendingInnerFuture) {
 TEST(CoroTest, ResumesAfterInnerFutureBecomesReady) {
     auto waker = std::make_shared<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(::testing::AnyNumber());
-    Context ctx(waker);
+    detail::Context ctx(waker);
 
     TwoPollFuture f(7);
     auto c = awaits_two_poll(std::move(f));
@@ -228,7 +228,7 @@ public:
     explicit SpuriousWakeFuture(int value, int pending_polls)
         : m_value(value), m_remaining(pending_polls) {}
 
-    PollResult<int> poll(Context& ctx) {
+    PollResult<int> poll(detail::Context& ctx) {
         if (m_remaining > 0) {
             --m_remaining;
             m_waker = ctx.getWaker();  // re-register waker each time
@@ -240,7 +240,7 @@ public:
 private:
     int                    m_value;
     int                    m_remaining;
-    std::shared_ptr<Waker> m_waker;
+    std::shared_ptr<detail::Waker> m_waker;
 };
 
 Coro<int> awaits_spurious(SpuriousWakeFuture f) {
@@ -252,7 +252,7 @@ Coro<int> awaits_spurious(SpuriousWakeFuture f) {
 TEST(CoroTest, SpuriousWakeDoesNotResumeCoroutine) {
     auto waker = std::make_shared<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(::testing::AnyNumber());
-    Context ctx(waker);
+    detail::Context ctx(waker);
 
     // Inner future is pending for 2 polls before becoming ready.
     auto c = awaits_spurious(SpuriousWakeFuture{55, 2});

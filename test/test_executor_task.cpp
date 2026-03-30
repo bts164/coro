@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
-#include <coro/single_threaded_executor.h>
-#include <coro/task.h>
-#include <coro/task_state.h>
+#include <coro/runtime/single_threaded_executor.h>
+#include <coro/detail/task.h>
+#include <coro/detail/task_state.h>
 
 using namespace coro;
 using namespace coro::detail;

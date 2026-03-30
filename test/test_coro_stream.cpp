@@ -7,15 +7,15 @@
 
 using namespace coro;
 
-class MockWaker : public Waker {
+class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
+    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
 };
 
 // Helper: drain a CoroStream synchronously into a vector, asserting no errors.
 template<typename T, bool HFV>
-std::vector<T> drain(CoroStream<T, HFV>& s, Context& ctx) {
+std::vector<T> drain(CoroStream<T, HFV>& s, detail::Context& ctx) {
     std::vector<T> out;
     while (true) {
         auto r = s.poll_next(ctx);
@@ -62,7 +62,7 @@ CoroStream<int> awaiting_stream() {
     struct ImmediateFuture {
         using OutputType = int;
         int m_value;
-        PollResult<int> poll(Context&) { return m_value; }
+        PollResult<int> poll(detail::Context&) { return m_value; }
     };
     int a = co_await ImmediateFuture{10};
     co_yield a;
@@ -101,7 +101,7 @@ TEST(CoroStreamTest, IsMovable) {
 
 TEST(CoroStreamTest, EmptyStreamReturnsNullopt) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = empty_stream();
     auto r = s.poll_next(ctx);
     EXPECT_TRUE(r.isReady());
@@ -110,7 +110,7 @@ TEST(CoroStreamTest, EmptyStreamReturnsNullopt) {
 
 TEST(CoroStreamTest, ExhaustedStreamKeepsReturningNullopt) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = empty_stream();
     s.poll_next(ctx);  // exhaust
     auto r = s.poll_next(ctx);
@@ -122,7 +122,7 @@ TEST(CoroStreamTest, ExhaustedStreamKeepsReturningNullopt) {
 
 TEST(CoroStreamTest, RangeYieldsExpectedValues) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = range(0, 4);
     auto items = drain(s, ctx);
     EXPECT_THAT(items, ::testing::ElementsAre(0, 1, 2, 3));
@@ -130,7 +130,7 @@ TEST(CoroStreamTest, RangeYieldsExpectedValues) {
 
 TEST(CoroStreamTest, ExhaustionAfterLastItem) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = range(0, 2);
     drain(s, ctx);
     auto r = s.poll_next(ctx);  // one more after exhaustion
@@ -142,7 +142,7 @@ TEST(CoroStreamTest, ExhaustionAfterLastItem) {
 
 TEST(CoroStreamTest, FinalValueEmittedAsLastItem) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = range_with_sum(1, 4);  // yields 1, 2, 3 then co_return 6
     auto items = drain(s, ctx);
     // yields: 1, 2, 3; final value: 6 (1+2+3)
@@ -151,7 +151,7 @@ TEST(CoroStreamTest, FinalValueEmittedAsLastItem) {
 
 TEST(CoroStreamTest, FinalValueFollowedByNullopt) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = range_with_sum(0, 1);  // co_yield 0, then co_return 0 (sum)
     s.poll_next(ctx);               // item: 0
     s.poll_next(ctx);               // final value: 0 (the sum)
@@ -164,7 +164,7 @@ TEST(CoroStreamTest, FinalValueFollowedByNullopt) {
 
 TEST(CoroStreamTest, ExceptionBeforeYieldStoredAsError) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = throws_on_first_yield();
     auto r = s.poll_next(ctx);
     EXPECT_TRUE(r.isError());
@@ -173,7 +173,7 @@ TEST(CoroStreamTest, ExceptionBeforeYieldStoredAsError) {
 
 TEST(CoroStreamTest, ExceptionAfterYieldStoredAsError) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = throws_after_one_yield();
 
     auto r1 = s.poll_next(ctx);
@@ -189,7 +189,7 @@ TEST(CoroStreamTest, ExceptionAfterYieldStoredAsError) {
 
 TEST(CoroStreamTest, AwaitingStreamYieldsCorrectValues) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto s = awaiting_stream();
     auto items = drain(s, ctx);
     EXPECT_THAT(items, ::testing::ElementsAre(10, 20));

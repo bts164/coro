@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
-#include <coro/runtime.h>
+#include <coro/runtime/runtime.h>
 #include <coro/coro.h>
 #include <stdexcept>
 
@@ -11,17 +11,17 @@ using namespace coro;
 struct ImmediateIntFuture {
     using OutputType = int;
     int m_value;
-    PollResult<int> poll(Context&) { return m_value; }
+    PollResult<int> poll(detail::Context&) { return m_value; }
 };
 
 struct ImmediateVoidFuture {
     using OutputType = void;
-    PollResult<void> poll(Context&) { return PollReady; }
+    PollResult<void> poll(detail::Context&) { return PollReady; }
 };
 
 struct ThrowingFuture {
     using OutputType = int;
-    PollResult<int> poll(Context&) {
+    PollResult<int> poll(detail::Context&) {
         return PollError(std::make_exception_ptr(std::runtime_error("boom")));
     }
 };
@@ -31,7 +31,7 @@ struct SelfWakingFuture {
     using OutputType = int;
     int  m_value;
     bool m_polled_once = false;
-    PollResult<int> poll(Context& ctx) {
+    PollResult<int> poll(detail::Context& ctx) {
         if (!m_polled_once) {
             m_polled_once = true;
             ctx.getWaker()->wake();
@@ -44,7 +44,7 @@ struct SelfWakingFuture {
 // Stream for testing StreamSpawnBuilder
 struct IntStream {
     using ItemType = int;
-    PollResult<std::optional<int>> poll_next(Context&) { return PollPending; }
+    PollResult<std::optional<int>> poll_next(detail::Context&) { return PollPending; }
 };
 
 static_assert(Future<ImmediateIntFuture>);

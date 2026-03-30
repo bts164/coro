@@ -1,7 +1,7 @@
 #pragma once
 
-#include <coro/context.h>
-#include <coro/poll_result.h>
+#include <coro/detail/context.h>
+#include <coro/detail/poll_result.h>
 
 namespace coro {
 
@@ -12,7 +12,7 @@ namespace coro {
 // Mirrors Rust's Future trait. poll() should never be called after it
 // returns a Ready or Error result.
 template<typename F>
-concept Future = requires(F& f, Context& ctx) {
+concept Future = requires(F& f, detail::Context& ctx) {
     typename F::OutputType;
     { F(std::move(f)) };
     { f.poll(ctx) } -> std::same_as<PollResult<typename F::OutputType>>;

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <coro/task.h>
+#include <coro/detail/task.h>
 #include <memory>
 
 namespace coro {

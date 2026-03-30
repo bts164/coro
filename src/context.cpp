@@ -1,6 +1,6 @@
-#include <coro/context.h>
+#include <coro/detail/context.h>
 
-namespace coro {
+namespace coro::detail {
 
 Context::Context(std::shared_ptr<Waker> waker,
                  std::shared_ptr<CancellationToken> token)

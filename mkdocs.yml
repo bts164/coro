@@ -1,0 +1,11 @@
+site_name: C++ Coro Library
+docs_dir: doc
+theme:
+  name: readthedocs
+nav:
+  - Home: index.md
+  - Futures and Streams: future_and_stream.md
+  - Tasks, Executors, and Runtime: task_and_executor.md
+  - Waker & Context In-depth: waker_and_context_propagation.md
+  - Select: select.md
+  - Module Structure: module_structure.md

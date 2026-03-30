@@ -83,6 +83,7 @@ Coro<void> my_async_main()
 ```
 
 When the executor calls `coro.poll(ctx)`:
+
 1. The `Context` is stored in the `promise_type` so it is accessible inside the coroutine.
 2. The coroutine is resumed via `coroutine_handle.resume()`.
 3. If the coroutine suspends (via `co_await inner_future`), `poll` returns `Pending`.
@@ -114,6 +115,7 @@ public:
 ```
 
 When `poll_next(ctx)` is called:
+
 1. The `Context` is stored in `promise_type`, same as `Coro`.
 2. The coroutine resumes until it hits `co_yield value`, `co_return`, or throws.
 3. `co_yield value` — suspends, returns `Ready(some(value))`.
@@ -265,6 +267,7 @@ public:
 ```
 
 `TaskState<T>` must handle these scenarios safely:
+
 - Task completes before `JoinHandle` is polled — result stored, handle reads it on next poll
 - `JoinHandle` polled before task completes — waker registered, task calls `wake()` on completion
 - `JoinHandle` dropped — cancellation flag set; task checks flag at each poll and exits early
@@ -335,6 +338,7 @@ as `spawn()` — the detached task must own all its data. Use `Synchronize` when
 needs to reference parent-owned data.
 
 This three-way design mirrors Julia's pattern extended with explicit detach:
+
 - `runtime.spawn().submit()` + `co_await` → synchronize with result
 - `runtime.spawn().submit()` + `.detach()` → fire and forget, task runs to completion
 - `runtime.spawn().submit()` + drop → cancel and discard
@@ -375,8 +379,24 @@ debugging (deterministic scheduling, no data races).
 - libuv event loop is driven on the same thread between polls
 - `spawn()` pushes to the queue; waking a task re-enqueues it
 
-Each task moves through four states: **Scheduled** (in the ready queue) → **Running**
-(inside `poll()`) → **Suspended** (parked, waiting for a waker) → **Complete** (freed).
+Each task moves through four states:
+
+1. **Scheduled** (in the ready queue)
+2. **Running** (inside `poll()`)
+3. **Suspended** (parked, waiting for a waker)
+4. **Complete** (freed).
+
+```mermaid
+stateDiagram-v2
+   [*] --> Scheduled
+   Scheduled --> Running
+   Running --> Suspended: PollPending or<br/>PollResult(value) if CoroStream
+   Running --> Complete: PollResult(value) if Coro<br/>PollResult(nullopt) if CoroStream
+   Suspended --> Running: wake/poll
+   Suspended --> Complete: cancelled
+   Complete --> [*]
+```
+
 A special case is the self-wake: a future that calls `waker->wake()` from inside its own
 `poll()`. At that point the task is Running, not yet in the suspended map, so a naive
 `wake_task` would silently drop the call. The executor tracks the currently-running task's
@@ -457,6 +477,7 @@ false`), and `await_transform` (for `co_await` inside the body). These are indep
 compose without conflict in C++20.
 
 The main differences from `Coro::promise_type`:
+
 - `initial_suspend` returns `suspend_always` — the generator does not run until first polled
 - `yield_value(T)` stores the yielded value and suspends
 - When `HasFinalValue = true`, `return_value(T)` stores the value in the same slot as

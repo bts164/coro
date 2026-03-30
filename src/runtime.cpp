@@ -1,5 +1,5 @@
-#include <coro/runtime.h>
-#include <coro/single_threaded_executor.h>
+#include <coro/runtime/runtime.h>
+#include <coro/runtime/single_threaded_executor.h>
 #include <stdexcept>
 
 namespace coro {

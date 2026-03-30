@@ -1,8 +1,8 @@
 #pragma once
 
-#include <coro/executor.h>
-#include <coro/task.h>
-#include <coro/waker.h>
+#include <coro/runtime/executor.h>
+#include <coro/detail/task.h>
+#include <coro/detail/waker.h>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -43,7 +43,7 @@ public:
     void wake_task(detail::Task* key);
 
 private:
-    std::shared_ptr<Waker> make_waker(detail::Task* key);
+    std::shared_ptr<detail::Waker> make_waker(detail::Task* key);
 
     std::queue<std::shared_ptr<detail::Task>>                         m_ready;
     std::unordered_map<detail::Task*, std::shared_ptr<detail::Task>>  m_suspended;

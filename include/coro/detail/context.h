@@ -1,10 +1,10 @@
 #pragma once
 
-#include <coro/cancellation_token.h>
-#include <coro/waker.h>
+#include <coro/sync/cancellation_token.h>
+#include <coro/detail/waker.h>
 #include <memory>
 
-namespace coro {
+namespace coro::detail {
 
 // Passed to poll() / poll_next() on each scheduling tick.
 // Concrete executor implementations may subclass Context to carry

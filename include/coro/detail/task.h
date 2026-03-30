@@ -4,9 +4,9 @@
 // Type-erased, heap-allocated unit of work held by the executor.
 // Users never construct a Task directly — spawn() creates one internally.
 
-#include <coro/context.h>
+#include <coro/detail/context.h>
 #include <coro/future.h>
-#include <coro/task_state.h>
+#include <coro/detail/task_state.h>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -51,10 +51,18 @@ private:
 
         bool poll(Context& ctx) override {
             if (m_completed) return true;
-            if (m_state && m_state->cancelled.load(std::memory_order_relaxed)) return true;
+            if (m_state && m_state->cancelled.load(std::memory_order_relaxed)) {
+                m_state->mark_done();
+                return true;
+            }
 
             auto result = m_future.poll(ctx);
             if (result.isPending()) return false;
+
+            if (result.isDropped()) {
+                if (m_state) m_state->mark_done();
+                return true;
+            }
 
             m_completed = true;
             if (!m_state) return true;

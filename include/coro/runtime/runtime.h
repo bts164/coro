@@ -1,12 +1,12 @@
 #pragma once
 
-#include <coro/executor.h>
+#include <coro/runtime/executor.h>
 #include <coro/future.h>
-#include <coro/poll_result.h>
-#include <coro/spawn_builder.h>
+#include <coro/detail/poll_result.h>
+#include <coro/task/spawn_builder.h>
 #include <coro/stream.h>
-#include <coro/task.h>
-#include <coro/task_state.h>
+#include <coro/detail/task.h>
+#include <coro/detail/task_state.h>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -45,10 +45,7 @@ public:
 
         auto is_done = [&]() -> bool {
             std::lock_guard lock(state->mutex);
-            if constexpr (std::is_void_v<typename F::OutputType>)
-                return state->done || state->exception != nullptr;
-            else
-                return state->result.has_value() || state->exception != nullptr;
+            return state->terminated;
         };
 
         while (!is_done()) {

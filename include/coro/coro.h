@@ -1,12 +1,14 @@
 #pragma once
 
-#include <coro/context.h>
+#include <coro/detail/context.h>
 #include <coro/future.h>
-#include <coro/future_awaitable.h>
-#include <coro/poll_result.h>
+#include <coro/detail/future_awaitable.h>
+#include <coro/detail/poll_result.h>
+#include <coro/detail/coro_scope.h>
 #include <coroutine>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -63,17 +65,24 @@ public:
         std::optional<T> m_value;
     };
 
-    explicit Coro(std::coroutine_handle<promise_type> handle) : m_handle(handle) {}
+    explicit Coro(std::coroutine_handle<promise_type> handle)
+        : m_handle(handle)
+        , m_scope(std::make_unique<detail::CoroutineScope>()) {}
 
     Coro(const Coro&)            = delete;
     Coro& operator=(const Coro&) = delete;
 
-    Coro(Coro&& other) noexcept : m_handle(std::exchange(other.m_handle, {})) {}
+    Coro(Coro&& other) noexcept
+        : m_handle(std::exchange(other.m_handle, {}))
+        , m_scope(std::move(other.m_scope))
+        , m_cancelled(other.m_cancelled) {}
 
     Coro& operator=(Coro&& other) noexcept {
         if (this != &other) {
             if (m_handle) m_handle.destroy();
-            m_handle = std::exchange(other.m_handle, {});
+            m_handle    = std::exchange(other.m_handle, {});
+            m_scope     = std::move(other.m_scope);
+            m_cancelled = other.m_cancelled;
         }
         return *this;
     }
@@ -82,9 +91,34 @@ public:
         if (m_handle) m_handle.destroy();
     }
 
-    PollResult<T> poll(Context& ctx) {
-        if (!m_handle || m_handle.done())
+    void cancel() noexcept { m_cancelled = true; }
+
+    PollResult<T> poll(detail::Context& ctx) {
+        // Cancelled path: destroy the frame (fires JoinHandle dtors → registers children),
+        // then drain pending children before returning PollDropped.
+        if (m_cancelled) {
+            if (m_handle && !m_handle.done()) {
+                detail::CurrentCoroGuard guard(m_scope.get());
+                m_handle.destroy();
+                m_handle = {};
+            }
+            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+                return PollPending;
+            return PollDropped;
+        }
+
+        if (!m_handle)
             return PollPending;
+
+        // Frame already ran to completion but children were still draining — re-check now.
+        if (m_handle.done()) {
+            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+                return PollPending;
+            auto& p = m_handle.promise();
+            if (p.m_exception)
+                return PollError(p.m_exception);
+            return std::move(*p.m_value);
+        }
 
         auto& promise = m_handle.promise();
         promise.m_ctx = &ctx;
@@ -99,18 +133,32 @@ public:
             promise.m_poll_current = nullptr;
         }
 
-        m_handle.resume();
+        {
+            detail::CurrentCoroGuard guard(m_scope.get());
+            m_handle.resume();
+        }
 
         if (m_handle.done()) {
+            // Wait for any children spawned during this execution before completing.
+            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+                return PollPending;
             if (promise.m_exception)
                 return PollError(promise.m_exception);
             return std::move(*promise.m_value);
         }
+
+        // Coroutine suspended — check if pending children need the waker updated.
+        // (Children drain in parallel with the coroutine's own suspension.)
+        if (m_scope->has_pending())
+            m_scope->set_drain_waker(ctx.getWaker()->clone());
+
         return PollPending;
     }
 
 private:
-    std::coroutine_handle<promise_type> m_handle;
+    std::coroutine_handle<promise_type>      m_handle;
+    std::unique_ptr<detail::CoroutineScope>  m_scope;
+    bool                                     m_cancelled = false;
 };
 
 
@@ -128,17 +176,24 @@ public:
         void return_void() noexcept {}
     };
 
-    explicit Coro(std::coroutine_handle<promise_type> handle) : m_handle(handle) {}
+    explicit Coro(std::coroutine_handle<promise_type> handle)
+        : m_handle(handle)
+        , m_scope(std::make_unique<detail::CoroutineScope>()) {}
 
     Coro(const Coro&)            = delete;
     Coro& operator=(const Coro&) = delete;
 
-    Coro(Coro&& other) noexcept : m_handle(std::exchange(other.m_handle, {})) {}
+    Coro(Coro&& other) noexcept
+        : m_handle(std::exchange(other.m_handle, {}))
+        , m_scope(std::move(other.m_scope))
+        , m_cancelled(other.m_cancelled) {}
 
     Coro& operator=(Coro&& other) noexcept {
         if (this != &other) {
             if (m_handle) m_handle.destroy();
-            m_handle = std::exchange(other.m_handle, {});
+            m_handle    = std::exchange(other.m_handle, {});
+            m_scope     = std::move(other.m_scope);
+            m_cancelled = other.m_cancelled;
         }
         return *this;
     }
@@ -147,9 +202,32 @@ public:
         if (m_handle) m_handle.destroy();
     }
 
-    PollResult<void> poll(Context& ctx) {
-        if (!m_handle || m_handle.done())
+    void cancel() noexcept { m_cancelled = true; }
+
+    PollResult<void> poll(detail::Context& ctx) {
+        if (m_cancelled) {
+            if (m_handle && !m_handle.done()) {
+                detail::CurrentCoroGuard guard(m_scope.get());
+                m_handle.destroy();
+                m_handle = {};
+            }
+            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+                return PollPending;
+            return PollDropped;
+        }
+
+        if (!m_handle)
             return PollPending;
+
+        // Frame already ran to completion but children were still draining — re-check now.
+        if (m_handle.done()) {
+            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+                return PollPending;
+            auto& p = m_handle.promise();
+            if (p.m_exception)
+                return PollError(p.m_exception);
+            return PollReady;
+        }
 
         auto& promise = m_handle.promise();
         promise.m_ctx = &ctx;
@@ -160,18 +238,29 @@ public:
             promise.m_poll_current = nullptr;
         }
 
-        m_handle.resume();
+        {
+            detail::CurrentCoroGuard guard(m_scope.get());
+            m_handle.resume();
+        }
 
         if (m_handle.done()) {
+            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+                return PollPending;
             if (promise.m_exception)
                 return PollError(promise.m_exception);
             return PollReady;
         }
+
+        if (m_scope->has_pending())
+            m_scope->set_drain_waker(ctx.getWaker()->clone());
+
         return PollPending;
     }
 
 private:
-    std::coroutine_handle<promise_type> m_handle;
+    std::coroutine_handle<promise_type>      m_handle;
+    std::unique_ptr<detail::CoroutineScope>  m_scope;
+    bool                                     m_cancelled = false;
 };
 
 } // namespace coro

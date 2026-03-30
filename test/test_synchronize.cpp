@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include <coro/synchronize.h>
+#include <coro/sync/synchronize.h>
 #include <coro/future.h>
-#include <coro/runtime.h>
+#include <coro/runtime/runtime.h>
 #include <stdexcept>
 
 using namespace coro;
@@ -49,7 +49,7 @@ TEST(SynchronizeTest, WaitsForSingleChild) {
     struct IntFuture {
         using OutputType = int;
         int m_value;
-        PollResult<int> poll(Context&) { return m_value; }
+        PollResult<int> poll(detail::Context&) { return m_value; }
     };
 
     Runtime rt;
@@ -64,7 +64,7 @@ TEST(SynchronizeTest, WaitsForSingleChild) {
             using OutputType = int;
             std::shared_ptr<int> dest;
             int value;
-            PollResult<int> poll(Context&) { *dest = value; return value; }
+            PollResult<int> poll(detail::Context&) { *dest = value; return value; }
         };
         sync.spawn(WritingFuture{shared, 99}).submit();
         co_return;
@@ -86,7 +86,7 @@ TEST(SynchronizeTest, ChildWritesToSharedValue) {
         using OutputType = int;
         std::shared_ptr<int> dest;
         int value;
-        PollResult<int> poll(Context&) { *dest = value; return value; }
+        PollResult<int> poll(detail::Context&) { *dest = value; return value; }
     };
 
     rt.block_on(Synchronize([&shared](Synchronize& sync) -> Coro<void> {
@@ -105,7 +105,7 @@ TEST(SynchronizeTest, WaitsForAllChildren) {
     struct IncrFuture {
         using OutputType = int;
         std::shared_ptr<int> counter;
-        PollResult<int> poll(Context&) { ++(*counter); return *counter; }
+        PollResult<int> poll(detail::Context&) { ++(*counter); return *counter; }
     };
 
     rt.block_on(Synchronize([&counter](Synchronize& sync) -> Coro<void> {
@@ -136,7 +136,7 @@ TEST(SynchronizeTest, ChildExceptionPropagates) {
 
     struct ThrowingFuture {
         using OutputType = int;
-        PollResult<int> poll(Context&) {
+        PollResult<int> poll(detail::Context&) {
             return PollError(std::make_exception_ptr(std::runtime_error("child error")));
         }
     };

@@ -1,6 +1,6 @@
-#include <coro/waker.h>
+#include <coro/detail/waker.h>
 
-namespace coro {
+namespace coro::detail {
 
 // Out-of-line destructor anchors the vtable to this translation unit.
 Waker::~Waker() = default;

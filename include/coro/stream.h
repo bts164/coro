@@ -15,7 +15,7 @@ namespace coro {
 //
 // Mirrors Rust's Stream trait.
 template<typename S>
-concept Stream = requires(S& s, Context& ctx) {
+concept Stream = requires(S& s, detail::Context& ctx) {
     typename S::ItemType;
     { s.poll_next(ctx) } -> std::same_as<PollResult<std::optional<typename S::ItemType>>>;
 };
@@ -30,7 +30,7 @@ public:
 
     explicit NextFuture(S& stream) : m_stream(stream) {}
 
-    PollResult<OutputType> poll(Context& ctx) {
+    PollResult<OutputType> poll(detail::Context& ctx) {
         return m_stream.poll_next(ctx);
     }
 

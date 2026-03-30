@@ -3,9 +3,9 @@
 // Internal — consumer end of a bounded channel backing a spawned stream.
 // Returned by StreamSpawnBuilder::submit().
 
-#include <coro/context.h>
-#include <coro/poll_result.h>
-#include <coro/waker.h>
+#include <coro/detail/context.h>
+#include <coro/detail/poll_result.h>
+#include <coro/detail/waker.h>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -52,7 +52,7 @@ public:
     StreamHandle(StreamHandle&&) noexcept            = default;
     StreamHandle& operator=(StreamHandle&&) noexcept = default;
 
-    PollResult<std::optional<T>> poll_next(Context& ctx) {
+    PollResult<std::optional<T>> poll_next(detail::Context& ctx) {
         if (!m_channel) return std::optional<T>(std::nullopt);
 
         std::unique_lock lock(m_channel->mutex);

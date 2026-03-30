@@ -6,7 +6,7 @@
 
 using namespace coro;
 
-class MockWaker : public Waker {
+class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
     MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
@@ -17,13 +17,13 @@ template<typename T>
 class NeverFuture {
 public:
     using OutputType = T;
-    PollResult<T> poll(Context& ctx) {
+    PollResult<T> poll(detail::Context& ctx) {
         m_waker = ctx.getWaker();
         return PollPending;
     }
-    std::shared_ptr<Waker> storedWaker() const { return m_waker; }
+    std::shared_ptr<detail::Waker> storedWaker() const { return m_waker; }
 private:
-    std::shared_ptr<Waker> m_waker;
+    std::shared_ptr<detail::Waker> m_waker;
 };
 
 // Stub: should return Ready(value) — body left as PollPending until Phase 3.
@@ -32,7 +32,7 @@ class ImmediateFuture {
 public:
     using OutputType = T;
     explicit ImmediateFuture(T value) : m_value(std::move(value)) {}
-    PollResult<T> poll(Context&) {
+    PollResult<T> poll(detail::Context&) {
         return std::move(m_value);
     }
 private:
@@ -46,13 +46,13 @@ static_assert(Future<NeverFuture<std::string>>);
 static_assert(Future<ImmediateFuture<int>>);
 
 struct NoOutputType {
-    PollResult<int> poll(Context&) { return PollPending; }
+    PollResult<int> poll(detail::Context&) { return PollPending; }
 };
 static_assert(!Future<NoOutputType>);
 
 struct WrongReturnType {
     using OutputType = int;
-    int poll(Context&) { return 0; }
+    int poll(detail::Context&) { return 0; }
 };
 static_assert(!Future<WrongReturnType>);
 
@@ -60,14 +60,14 @@ static_assert(!Future<WrongReturnType>);
 
 TEST(NeverFutureTest, PollReturnsPending) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     NeverFuture<int> f;
     EXPECT_TRUE(f.poll(ctx).isPending());
 }
 
 TEST(NeverFutureTest, StoresWakerAfterPoll) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     NeverFuture<int> f;
     f.poll(ctx);
     EXPECT_EQ(f.storedWaker(), waker);
@@ -76,7 +76,7 @@ TEST(NeverFutureTest, StoresWakerAfterPoll) {
 // Disabled until Phase 3 implements ImmediateFuture::poll.
 TEST(ImmediateFutureTest, PollReturnsReady) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     ImmediateFuture<int> f(42);
     auto result = f.poll(ctx);
     EXPECT_TRUE(result.isReady());

@@ -1,10 +1,10 @@
 #pragma once
 
-#include <coro/executor.h>
-#include <coro/join_handle.h>
+#include <coro/runtime/executor.h>
+#include <coro/task/join_handle.h>
 #include <coro/stream.h>
-#include <coro/stream_handle.h>
-#include <coro/task.h>
+#include <coro/sync/stream_handle.h>
+#include <coro/detail/task.h>
 #include <memory>
 #include <optional>
 #include <string>

@@ -1,15 +1,15 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
-#include <coro/join_handle.h>
+#include <coro/task/join_handle.h>
 #include <coro/future.h>
 #include <stdexcept>
 
 using namespace coro;
 
-class MockWaker : public Waker {
+class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
+    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
 };
 
 static std::shared_ptr<detail::TaskState<int>> make_int_state() {
@@ -82,14 +82,14 @@ TEST(JoinHandleTest, VoidDetachDoesNotCancel) {
 
 TEST(JoinHandleTest, PollReturnsPendingWhenNoResult) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     JoinHandle<int> h(make_int_state());
     EXPECT_TRUE(h.poll(ctx).isPending());
 }
 
 TEST(JoinHandleTest, PollStoresWakerInState) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto state = make_int_state();
     JoinHandle<int> h(state);
     h.poll(ctx);
@@ -98,7 +98,7 @@ TEST(JoinHandleTest, PollStoresWakerInState) {
 
 TEST(JoinHandleTest, VoidPollReturnsPendingWhenNoResult) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     JoinHandle<void> h(make_void_state());
     EXPECT_TRUE(h.poll(ctx).isPending());
 }
@@ -107,7 +107,7 @@ TEST(JoinHandleTest, VoidPollReturnsPendingWhenNoResult) {
 
 TEST(JoinHandleTest, PollReturnsReadyAfterSetResult) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto state = make_int_state();
     state->setResult(42);
     JoinHandle<int> h(state);
@@ -118,7 +118,7 @@ TEST(JoinHandleTest, PollReturnsReadyAfterSetResult) {
 
 TEST(JoinHandleTest, VoidPollReturnsReadyAfterSetDone) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto state = make_void_state();
     state->setDone();
     JoinHandle<void> h(state);
@@ -129,7 +129,7 @@ TEST(JoinHandleTest, VoidPollReturnsReadyAfterSetDone) {
 
 TEST(JoinHandleTest, PollReturnsErrorAfterSetException) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto state = make_int_state();
     state->setException(std::make_exception_ptr(std::runtime_error("oops")));
     JoinHandle<int> h(state);
@@ -140,7 +140,7 @@ TEST(JoinHandleTest, PollReturnsErrorAfterSetException) {
 
 TEST(JoinHandleTest, VoidPollReturnsErrorAfterSetException) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto state = make_void_state();
     state->setException(std::make_exception_ptr(std::runtime_error("oops")));
     JoinHandle<void> h(state);
@@ -154,7 +154,7 @@ TEST(JoinHandleTest, VoidPollReturnsErrorAfterSetException) {
 TEST(JoinHandleTest, SetResultCallsWaker) {
     auto waker = std::make_shared<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(1);
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto state = make_int_state();
     JoinHandle<int> h(state);
     h.poll(ctx);              // stores waker
@@ -164,7 +164,7 @@ TEST(JoinHandleTest, SetResultCallsWaker) {
 TEST(JoinHandleTest, SetExceptionCallsWaker) {
     auto waker = std::make_shared<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(1);
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto state = make_int_state();
     JoinHandle<int> h(state);
     h.poll(ctx);

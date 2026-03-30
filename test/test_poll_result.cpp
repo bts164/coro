@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <coro/poll_result.h>
+#include <coro/detail/poll_result.h>
 
 #include <memory>
 #include <optional>
@@ -108,4 +108,29 @@ TEST(PollResultOptionalTest, ReadyNulloptSignalsExhaustion) {
 TEST(PollResultOptionalTest, PendingState) {
     PollResult<std::optional<int>> r = PollPending;
     EXPECT_TRUE(r.isPending());
+}
+
+// --- PollDropped ---
+
+TEST(PollResultTest, DroppedState) {
+    PollResult<int> r = PollDropped;
+    EXPECT_FALSE(r.isPending());
+    EXPECT_FALSE(r.isReady());
+    EXPECT_FALSE(r.isError());
+    EXPECT_TRUE(r.isDropped());
+}
+
+TEST(PollResultVoidTest, DroppedState) {
+    PollResult<void> r = PollDropped;
+    EXPECT_FALSE(r.isPending());
+    EXPECT_FALSE(r.isReady());
+    EXPECT_FALSE(r.isError());
+    EXPECT_TRUE(r.isDropped());
+}
+
+TEST(PollResultOptionalTest, DroppedState) {
+    PollResult<std::optional<int>> r = PollDropped;
+    EXPECT_TRUE(r.isDropped());
+    EXPECT_FALSE(r.isPending());
+    EXPECT_FALSE(r.isReady());
 }

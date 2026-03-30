@@ -1,11 +1,11 @@
-#include <coro/single_threaded_executor.h>
-#include <coro/context.h>
+#include <coro/runtime/single_threaded_executor.h>
+#include <coro/detail/context.h>
 
 namespace coro {
 
 namespace {
 
-struct TaskWaker final : Waker {
+struct TaskWaker final : detail::Waker {
     detail::Task*           key;
     SingleThreadedExecutor* executor;
 
@@ -56,7 +56,7 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
         m_running_task_woken = false;
 
         auto waker = make_waker(task.get());
-        Context ctx(waker);
+        detail::Context ctx(waker);
         bool done = task->poll(ctx);
 
         m_running_task_key = nullptr;
@@ -79,7 +79,7 @@ bool SingleThreadedExecutor::empty() const {
     return m_ready.empty();
 }
 
-std::shared_ptr<Waker> SingleThreadedExecutor::make_waker(detail::Task* key) {
+std::shared_ptr<detail::Waker> SingleThreadedExecutor::make_waker(detail::Task* key) {
     auto w      = std::make_shared<TaskWaker>();
     w->key      = key;
     w->executor = this;

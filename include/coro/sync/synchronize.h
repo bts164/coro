@@ -2,11 +2,11 @@
 
 #include <coro/coro.h>
 #include <coro/future.h>
-#include <coro/poll_result.h>
-#include <coro/runtime.h>
-#include <coro/task.h>
-#include <coro/task_state.h>
-#include <coro/waker.h>
+#include <coro/detail/poll_result.h>
+#include <coro/runtime/runtime.h>
+#include <coro/detail/task.h>
+#include <coro/detail/task_state.h>
+#include <coro/detail/waker.h>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -113,7 +113,7 @@ public:
         m_children.push_back(std::move(child));
     }
 
-    PollResult<void> poll(Context& ctx) {
+    PollResult<void> poll(detail::Context& ctx) {
         // First poll: create the body coroutine by invoking the user's lambda.
         if (!m_body) {
             m_body.emplace(m_fn(*this));

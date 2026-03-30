@@ -23,32 +23,13 @@ doc/                   # Design documents and feature specs (Markdown)
 
 When adding a new header, consult `doc/module_structure.md` to choose the right subfolder.
 
-## Build
+## Build / Test
+
+Do not build or test the library. The user will manually build, test and then report the results.
 
 Primary target: GCC on Linux (Ubuntu). Clang and MSVC are secondary targets — avoid GCC-specific extensions that would knowingly break them.
 
 Requires C++20. Dependencies are managed with Conan; install them before configuring:
-
-```bash
-conan install . --output-folder=build --build=missing
-cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
-cmake --build build
-```
-
-## Test
-
-```bash
-ctest --test-dir build
-# Run a single test
-ctest --test-dir build -R <test_name>
-```
-
-## Lint / Format
-
-```bash
-clang-format -i src/**/*.cpp include/**/*.h
-clang-tidy src/**/*.cpp
-```
 
 ## Core Abstractions
 
@@ -66,15 +47,18 @@ The `Executor` should be designed around a pluggable scheduling model. The inter
 
 ## Conventions
 
-### Spawned futures must be self-contained
+### Care must be taken if spawned futures are not self-contained
 
 `runtime.spawn()` and the free `spawn()` function accept any `Future` or `Stream`, but the
 C++ type system cannot enforce that the submitted future does not borrow from the spawning
-context (unlike Rust's `'static` bound). **Spawned futures must own all their data.** Never
-capture references or pointers to local variables in a future passed to `spawn()` — the
-spawning coroutine may be destroyed while the task is still running.
+context (unlike Rust's `'static` bound).
+**Spawned futures can still capture references or pointers as arguments, but with some restrictions**,
+Otherwise the spawning coroutine may be destroyed while the task is still running resulting
+in a use-after-free memory error.
 
-Use `Synchronize` instead when child tasks need to reference data owned by the parent.
+Use `Synchronize` instead when child tasks need to reference data owned by the parent. All
+coroutines inherently act like a Synchronize scope eliminating the user from having to explicitly
+use `Synchronize`
 
 ### [[nodiscard]] on Future-returning functions
 

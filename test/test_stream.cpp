@@ -6,10 +6,10 @@
 
 using namespace coro;
 
-class MockWaker : public Waker {
+class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
+    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
 };
 
 // Stub: backed by a vector; should yield items then nullopt — body stubbed until Phase 3.
@@ -18,7 +18,7 @@ class FiniteStream {
 public:
     using ItemType = T;
     explicit FiniteStream(std::vector<T> items) : m_items(std::move(items)) {}
-    PollResult<std::optional<T>> poll_next(Context&) {
+    PollResult<std::optional<T>> poll_next(detail::Context&) {
         if (m_index < m_items.size())
             return std::optional<T>(std::move(m_items[m_index++]));
         return std::optional<T>(std::nullopt);
@@ -35,7 +35,7 @@ public:
     using ItemType = T;
     explicit ErrorStream(T first, std::exception_ptr err)
         : m_first(std::move(first)), m_error(std::move(err)) {}
-    PollResult<std::optional<T>> poll_next(Context&) {
+    PollResult<std::optional<T>> poll_next(detail::Context&) {
         if (!m_sent) {
             m_sent = true;
             return std::optional<T>(std::move(m_first));
@@ -55,13 +55,13 @@ static_assert(Stream<ErrorStream<double>>);
 static_assert(Future<NextFuture<FiniteStream<int>>>);
 
 struct NoItemType {
-    PollResult<std::optional<int>> poll_next(Context&) { return PollPending; }
+    PollResult<std::optional<int>> poll_next(detail::Context&) { return PollPending; }
 };
 static_assert(!Stream<NoItemType>);
 
 struct WrongReturnType {
     using ItemType = int;
-    int poll_next(Context&) { return 0; }
+    int poll_next(detail::Context&) { return 0; }
 };
 static_assert(!Stream<WrongReturnType>);
 
@@ -69,7 +69,7 @@ static_assert(!Stream<WrongReturnType>);
 
 TEST(FiniteStreamTest, PollReturnsPendingStub) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     FiniteStream<int> s({1, 2, 3});
     auto r1 = s.poll_next(ctx);
     EXPECT_TRUE(r1.isReady());
@@ -100,7 +100,7 @@ TEST(NextFutureTest, SatisfiesFutureConcept) {
 
 TEST(NextFutureTest, DelegatesPollNext) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     FiniteStream<int> s({});
     auto n = next(s);
     // Both should return Pending since the stub always returns Pending.
@@ -112,7 +112,7 @@ TEST(NextFutureTest, DelegatesPollNext) {
 // Disabled until Phase 3 implements FiniteStream::poll_next.
 TEST(FiniteStreamTest, YieldsAllItems) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     FiniteStream<int> s({1, 2, 3});
     std::vector<int> results;
     while (true) {
@@ -126,7 +126,7 @@ TEST(FiniteStreamTest, YieldsAllItems) {
 
 TEST(ErrorStreamTest, PropagatesError) {
     auto waker = std::make_shared<MockWaker>();
-    Context ctx(waker);
+    detail::Context ctx(waker);
     auto eptr = std::make_exception_ptr(std::runtime_error("stream error"));
     ErrorStream<int> s(42, eptr);
 
