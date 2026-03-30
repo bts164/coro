@@ -55,9 +55,16 @@ struct SyncChild final : SyncChildBase {
 
 } // namespace detail
 
-// SyncSpawnBuilder — returned by Synchronize::spawn().
-// submit() registers the child with the scope and schedules it on the runtime.
-// Returns void (not JoinHandle) — the scope owns child lifetime.
+/**
+ * @brief Builder returned by `Synchronize::spawn()`.
+ *
+ * Calling `submit()` registers the child task with the enclosing @ref Synchronize scope
+ * and schedules it on the current runtime. The scope (not the caller) owns the child's lifetime.
+ *
+ * `[[nodiscard]]` — discarding it silently drops the future without submitting it.
+ *
+ * @tparam F A type satisfying @ref Future.
+ */
 template<Future F>
 class [[nodiscard]] SyncSpawnBuilder {
 public:
@@ -70,8 +77,7 @@ public:
     SyncSpawnBuilder& operator=(const SyncSpawnBuilder&) = delete;
     SyncSpawnBuilder(SyncSpawnBuilder&&)                 = default;
 
-    // Schedules the future on the current runtime and registers it with the
-    // enclosing Synchronize scope. Must be called exactly once.
+    /// @brief Schedules the future and registers it with the enclosing scope. Must be called exactly once.
     void submit() &&;
 
 private:
@@ -79,17 +85,27 @@ private:
     Synchronize* m_sync;
 };
 
-// Synchronize — structured concurrency scope.
-// Satisfies Future<void>.
-//
-// All tasks spawned through sync.spawn() inside the callable are guaranteed to
-// complete before the co_await returns, even if an exception unwinds the body.
-//
-// Usage:
-//   co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
-//       sync.spawn(child_a()).submit();
-//       sync.spawn(child_b()).submit();
-//   });
+/**
+ * @brief Explicit structured-concurrency scope. Satisfies `Future<void>`.
+ *
+ * All tasks spawned via `sync.spawn(...).submit()` inside the body lambda are guaranteed
+ * to complete before `co_await` returns, even if an exception unwinds the body.
+ * The first exception (from the body or any child) is rethrown after all children finish.
+ *
+ * @note Since `Coro<T>` already provides an implicit scope via `CoroutineScope`, `Synchronize`
+ *       is most useful when an explicit, named lifetime boundary is needed or when
+ *       non-`Coro` futures must participate in structured grouping.
+ *
+ * Example:
+ * @code
+ * co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
+ *     sync.spawn(child_a()).submit();
+ *     sync.spawn(child_b()).submit();
+ *     co_return;
+ * });
+ * // child_a and child_b are guaranteed complete here
+ * @endcode
+ */
 class Synchronize {
 public:
     using OutputType = void;
@@ -103,12 +119,13 @@ public:
     Synchronize(Synchronize&&)                 = default;
     Synchronize& operator=(Synchronize&&)      = default;
 
+    /// @brief Returns a @ref SyncSpawnBuilder for `future`. Call `.submit()` to enqueue the task.
     template<Future F>
     [[nodiscard]] SyncSpawnBuilder<F> spawn(F future) {
         return SyncSpawnBuilder<F>(std::move(future), this);
     }
 
-    // Called by SyncSpawnBuilder::submit() to register a child.
+    /// @brief Registers a child task with this scope. Called internally by `SyncSpawnBuilder::submit()`.
     void add_child(std::unique_ptr<detail::SyncChildBase> child) {
         m_children.push_back(std::move(child));
     }

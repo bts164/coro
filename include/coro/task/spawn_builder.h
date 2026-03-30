@@ -12,9 +12,17 @@
 
 namespace coro {
 
-// SpawnBuilder<F> — builder returned by Runtime::spawn(future) and the free spawn(future).
-// Configure the task with optional setters, then call submit() to enqueue it and get a handle.
-// [[nodiscard]] because discarding it silently drops the future without submitting anything.
+/**
+ * @brief Builder for submitting a @ref Future as a background task.
+ *
+ * Returned by `Runtime::spawn(future)` and the free `spawn(future)` function.
+ * Configure the task with optional setters, then call `submit()` to enqueue it
+ * and receive a @ref JoinHandle.
+ *
+ * `[[nodiscard]]` — discarding the builder silently drops the future without submitting it.
+ *
+ * @tparam F A type satisfying @ref Future.
+ */
 template<Future F>
 class [[nodiscard]] SpawnBuilder {
 public:
@@ -23,13 +31,14 @@ public:
     explicit SpawnBuilder(F future, Executor* executor)
         : m_future(std::move(future)), m_executor(executor) {}
 
+    /// @brief Sets an optional name for the task (for diagnostics).
     SpawnBuilder& name(std::string n) {
         m_name = std::move(n);
         return *this;
     }
 
-    // Submits the task to the executor and returns a JoinHandle.
-    // After submit() the builder must not be used again.
+    /// @brief Enqueues the task on the executor and returns a @ref JoinHandle.
+    /// The builder must not be used again after this call.
     JoinHandle<OutputType> submit() {
         auto state = std::make_shared<detail::TaskState<OutputType>>();
         if (m_executor)
@@ -128,8 +137,17 @@ struct StreamDriver {
 } // namespace detail
 
 
-// StreamSpawnBuilder<S> — builder returned by Runtime::spawn(stream) and free spawn(stream).
-// buffer() sets the bounded channel capacity (default: 64); submit() enqueues the task.
+/**
+ * @brief Builder for spawning a @ref Stream as a background task.
+ *
+ * Returned by `Runtime::spawn(stream)` and the free `spawn(stream)` function.
+ * The stream runs as a `StreamDriver` task that pushes items into a bounded channel;
+ * the consumer reads from the returned @ref StreamHandle.
+ *
+ * `[[nodiscard]]` — discarding the builder silently drops the stream without submitting it.
+ *
+ * @tparam S A type satisfying @ref Stream.
+ */
 template<Stream S>
 class [[nodiscard]] StreamSpawnBuilder {
 public:
@@ -138,18 +156,20 @@ public:
     explicit StreamSpawnBuilder(S stream, Executor* executor)
         : m_stream(std::move(stream)), m_executor(executor) {}
 
+    /// @brief Sets an optional name for the task (for diagnostics).
     StreamSpawnBuilder& name(std::string n) {
         m_name = std::move(n);
         return *this;
     }
 
+    /// @brief Sets the bounded channel capacity (default: 64 items).
+    /// The stream driver parks under backpressure when the buffer is full.
     StreamSpawnBuilder& buffer(std::size_t size) {
         m_buffer_size = size;
         return *this;
     }
 
-    // Creates a bounded channel, wraps the stream in a StreamDriver Task, schedules it,
-    // and returns the consumer end as a StreamHandle.
+    /// @brief Creates a bounded channel, schedules the stream driver, and returns a @ref StreamHandle.
     StreamHandle<ItemType> submit() {
         auto channel = std::make_shared<detail::Channel<ItemType>>(m_buffer_size);
         if (m_executor) {

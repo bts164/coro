@@ -33,12 +33,18 @@ struct CoroStreamReturn<T, true> {
 } // namespace detail
 
 
-// CoroStream<T, HasFinalValue> — coroutine return type for async generators.
-// Satisfies Stream<T>. Use co_yield to emit items; co_await Futures internally.
-//
-// When HasFinalValue = false (default): co_return (void) signals exhaustion.
-// When HasFinalValue = true:            co_return value emits one final item of
-//                                       type T before exhaustion.
+/**
+ * @brief Coroutine return type for async generators (async sequences).
+ *
+ * Satisfies @ref Stream<T>. Inside the coroutine body:
+ * - `co_yield value` emits an item of type `T` to the consumer.
+ * - `co_await future` suspends until `future` completes, forwarding `PollPending` upstream.
+ * - `co_return` (or `co_return value` when `HasFinalValue = true`) signals exhaustion.
+ *
+ * @tparam T            The item type yielded by the stream.
+ * @tparam HasFinalValue When `true`, `co_return value` emits one final item before exhaustion.
+ *                       When `false` (default), `co_return` takes no value.
+ */
 template<typename T, bool HasFinalValue = false>
 class CoroStream {
 public:
@@ -107,8 +113,12 @@ public:
         if (m_handle) m_handle.destroy();
     }
 
+    /// @brief Marks this stream for cancellation. Takes effect on the next `poll_next()` call.
     void cancel() noexcept { m_cancelled = true; }
 
+    /// @brief Advances the stream, yielding the next item or signalling exhaustion/cancellation.
+    /// @param ctx Carries the waker used to reschedule this task when it is ready to progress.
+    /// @return `Ready(some(T))`, `Ready(nullopt)` (exhausted), `Pending`, `Error`, or `Dropped` (cancelled).
     PollResult<std::optional<T>> poll_next(detail::Context& ctx) {
         // Cancelled path
         if (m_cancelled) {

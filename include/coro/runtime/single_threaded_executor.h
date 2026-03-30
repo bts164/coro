@@ -9,19 +9,25 @@
 
 namespace coro {
 
-// SingleThreadedExecutor — first concrete Executor implementation.
-// All tasks run on a single thread (the one that calls poll_ready_tasks / Runtime::block_on).
-//
-// Task lifecycle:
-//   Scheduled  — in m_ready, waiting to be polled
-//   Running    — currently inside poll(); tracked via m_running_task_key
-//   Suspended  — in m_suspended, waiting for an external waker
-//   Complete   — poll() returned true; freed
-//
-// Self-wake during poll(): wake_task() detects the Running state via m_running_task_key
-// and sets m_running_task_woken. After poll() returns the task is re-enqueued rather than
-// moved to m_suspended. This mirrors the RUNNING | SCHEDULED state in Tokio's task header,
-// but without atomics since only one thread ever touches the executor.
+/**
+ * @brief Single-threaded @ref Executor implementation.
+ *
+ * All tasks run on the thread that calls `poll_ready_tasks()` (i.e. the thread running
+ * `Runtime::block_on()`). Deterministic and allocation-light; the primary executor for
+ * testing and single-threaded applications.
+ *
+ * **Task lifecycle states:**
+ * | State     | Location            | Description                                  |
+ * |-----------|---------------------|----------------------------------------------|
+ * | Scheduled | `m_ready` queue     | Waiting to be polled                         |
+ * | Running   | (on the call stack) | Currently inside `poll()`                    |
+ * | Suspended | `m_suspended` map   | Waiting for an external `Waker::wake()` call |
+ * | Complete  | freed               | `poll()` returned a terminal result          |
+ *
+ * **Self-wake during `poll()`:** if a task's waker fires while the task is still Running,
+ * `wake_task()` sets `m_running_task_woken` instead of moving to Suspended. After `poll()`
+ * returns the task is re-enqueued automatically.
+ */
 class SingleThreadedExecutor : public Executor {
 public:
     SingleThreadedExecutor();
@@ -29,17 +35,17 @@ public:
 
     void schedule(std::unique_ptr<detail::Task> task) override;
 
-    // Processes all tasks currently in the ready queue (not ones enqueued during this pass).
-    // Returns true if at least one task was polled.
+    /// @brief Processes all tasks currently in the ready queue.
+    /// Tasks enqueued *during* this pass are deferred to the next call.
+    /// @return `true` if at least one task was polled.
     bool poll_ready_tasks() override;
 
-    // True if the ready queue is empty (suspended tasks may still exist).
+    /// @brief Returns `true` if the ready queue is empty.
+    /// @note Suspended tasks may still exist even when this returns `true`.
     bool empty() const;
 
-    // Called by the TaskWaker. Handles three cases:
-    //  - key == m_running_task_key: self-wake, set m_running_task_woken flag
-    //  - key in m_suspended: move to m_ready
-    //  - otherwise: already scheduled or complete, no-op
+    /// @brief Called by a `TaskWaker` to reschedule a task.
+    /// Handles self-wake (task is currently Running), normal wake (Suspended → ready), and no-op.
     void wake_task(detail::Task* key);
 
 private:

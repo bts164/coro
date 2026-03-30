@@ -33,9 +33,20 @@ struct Channel {
 
 } // namespace detail
 
-// StreamHandle<T> satisfies Stream<T>.
-// Holds the consumer end of the bounded channel; the background StreamDriver task
-// calls poll_next() on the original stream and pushes items through the channel.
+/**
+ * @brief Consumer end of a bounded channel backed by a background `StreamDriver` task.
+ *
+ * Returned by `StreamSpawnBuilder::submit()`. Satisfies `Stream<T>`.
+ *
+ * The background driver polls the original stream and pushes items into the channel.
+ * `StreamHandle::poll_next()` dequeues items from the channel, blocking under backpressure
+ * until the driver produces more.
+ *
+ * `[[nodiscard]]` — discarding it drops the consumer end; items produced by the driver
+ * will be lost.
+ *
+ * @tparam T The item type yielded by the stream.
+ */
 template<typename T>
 class [[nodiscard]] StreamHandle {
 public:

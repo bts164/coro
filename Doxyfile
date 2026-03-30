@@ -1,0 +1,17 @@
+PROJECT_NAME           = "coro"
+PROJECT_BRIEF          = "C++20 coroutines library for async task synchronization and I/O"
+OUTPUT_DIRECTORY       = doxygen
+INPUT                  = include/coro
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       =
+FILE_PATTERNS          = *.h
+EXTRACT_ALL            = YES
+GENERATE_HTML          = NO
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = __cplusplus=202002L

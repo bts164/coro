@@ -16,8 +16,8 @@ namespace coro {
 
 namespace detail {
 
-// Shared base for Coro<T> and Coro<void> promise_types.
-// Handles suspend points, exception storage, context propagation, and await_transform.
+/// @brief Shared promise base for `Coro<T>` and `Coro<void>`.
+/// Handles suspend points, exception storage, context propagation, and `await_transform`.
 struct CoroPromiseBase {
     std::suspend_always initial_suspend() noexcept { return {}; }
     std::suspend_always final_suspend() noexcept { return {}; }
@@ -49,8 +49,18 @@ struct CoroPromiseBase {
 } // namespace detail
 
 
-// Coro<T> — coroutine return type for async functions that produce a value.
-// Satisfies Future<T>. The coroutine starts suspended; the executor drives it via poll().
+/**
+ * @brief Coroutine return type for async functions that produce a value of type `T`.
+ *
+ * Satisfies @ref Future<T>. The coroutine starts suspended; the executor drives it
+ * by repeatedly calling `poll()` until it returns a non-`Pending` result.
+ *
+ * Supports cooperative cancellation via `cancel()`. Once cancelled, `poll()` destroys
+ * the coroutine frame (firing `JoinHandle` destructors in LIFO order), drains any
+ * spawned children tracked by the implicit @ref CoroutineScope, then returns `PollDropped`.
+ *
+ * @tparam T The value type produced on successful completion.
+ */
 template<typename T>
 class Coro {
 public:
@@ -91,8 +101,12 @@ public:
         if (m_handle) m_handle.destroy();
     }
 
+    /// @brief Marks this coroutine for cancellation. Takes effect on the next `poll()` call.
     void cancel() noexcept { m_cancelled = true; }
 
+    /// @brief Advances the coroutine toward completion.
+    /// @param ctx Carries the waker used to reschedule this task when it is ready to progress.
+    /// @return `PollPending`, `PollReady(T)`, `PollError`, or `PollDropped` (if cancelled and drained).
     PollResult<T> poll(detail::Context& ctx) {
         // Cancelled path: destroy the frame (fires JoinHandle dtors → registers children),
         // then drain pending children before returning PollDropped.
@@ -162,8 +176,12 @@ private:
 };
 
 
-// Coro<void> — coroutine return type for async functions that produce no value.
-// Satisfies Future<void>.
+/**
+ * @brief Coroutine return type for async functions that produce no value.
+ *
+ * Specialization of @ref Coro for `void`. Satisfies `Future<void>`.
+ * Cancellation and implicit scope drain behave identically to the primary template.
+ */
 template<>
 class Coro<void> {
 public:
@@ -202,8 +220,12 @@ public:
         if (m_handle) m_handle.destroy();
     }
 
+    /// @brief Marks this coroutine for cancellation. Takes effect on the next `poll()` call.
     void cancel() noexcept { m_cancelled = true; }
 
+    /// @brief Advances the coroutine toward completion.
+    /// @param ctx Carries the waker used to reschedule this task when it is ready to progress.
+    /// @return `PollPending`, `PollReady`, `PollError`, or `PollDropped` (if cancelled and drained).
     PollResult<void> poll(detail::Context& ctx) {
         if (m_cancelled) {
             if (m_handle && !m_handle.done()) {

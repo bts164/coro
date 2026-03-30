@@ -11,14 +11,24 @@
 
 namespace coro {
 
-// JoinHandle<T> — returned by spawn(). Satisfies Future<T>.
-//
-// The caller co_awaits the handle to retrieve the spawned task's result.
-// Dropping a JoinHandle without awaiting it cancels the task.
-// Calling detach() lets the task run to completion without cancellation;
-// the result is discarded and the caller loses all ability to synchronize.
-//
-// JoinHandle and the executor-held Task share a TaskState<T> via shared_ptr.
+/**
+ * @brief Owned handle to a spawned task. Returned by `spawn(...).submit()`. Satisfies `Future<T>`.
+ *
+ * **Awaiting:** `co_await handle` suspends the caller until the task completes and returns its value.
+ *
+ * **Dropping:** destroying a `JoinHandle<T>` without `co_await`-ing it marks the task for
+ * cancellation. If destroyed inside a coroutine's `poll()` call the enclosing
+ * `CoroutineScope` is notified and the parent coroutine waits for the child to drain before
+ * completing.
+ *
+ * **Detaching:** `std::move(handle).detach()` lets the task run to completion without
+ * cancellation. The result is discarded and the caller loses all ability to synchronize.
+ *
+ * `JoinHandle` is `[[nodiscard]]` — silently discarding it would cancel the task immediately,
+ * which is almost always unintentional.
+ *
+ * @tparam T The value type produced by the spawned task.
+ */
 template<typename T>
 class [[nodiscard]] JoinHandle {
 public:
@@ -33,9 +43,7 @@ public:
     JoinHandle(JoinHandle&&) noexcept            = default;
     JoinHandle& operator=(JoinHandle&&) noexcept = default;
 
-    // Cancels the task if not yet completed.
-    // If destroyed inside a coroutine poll() call, registers with the enclosing
-    // CoroutineScope so the parent waits for this child to finish before completing.
+    /// @brief Cancels the task and, if inside a coroutine poll(), registers with the enclosing scope.
     ~JoinHandle() {
         if (!m_state) return;  // detached via detach()
         m_state->cancelled.store(true, std::memory_order_relaxed);
@@ -51,8 +59,8 @@ public:
         }
     }
 
-    // Detaches without cancelling. The task runs to completion; the result is discarded.
-    // Consumes the JoinHandle — the caller can no longer synchronize or cancel.
+    /// @brief Detaches without cancelling. The task runs to completion; the result is discarded.
+    /// Consumes the `JoinHandle` — the caller can no longer synchronize or cancel.
     void detach() && {
         m_state.reset();
     }
@@ -73,7 +81,12 @@ private:
 };
 
 
-// JoinHandle<void> — specialization for tasks with no return value.
+/**
+ * @brief `JoinHandle` specialization for tasks that produce no value (`void`).
+ *
+ * Adds `cancelOnDestroy(bool)` to control whether the task is cancelled when the handle
+ * is dropped without being awaited (default: `true`).
+ */
 template<>
 class [[nodiscard]] JoinHandle<void> {
 public:
@@ -105,6 +118,7 @@ public:
         }
     }
 
+    /// @brief Configures whether dropping this handle cancels the task (default: `true`).
     JoinHandle& cancelOnDestroy(bool b = true) &{
         m_cancelOnDestroy = b;
         return *this;

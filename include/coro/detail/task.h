@@ -13,14 +13,33 @@
 
 namespace coro::detail {
 
+/**
+ * @brief Type-erased unit of async work owned and driven by the @ref Executor.
+ *
+ * `Task` wraps any type satisfying @ref Future behind a virtual `PollableBase` interface,
+ * erasing the concrete future type so the executor can store heterogeneous tasks in a
+ * single queue.
+ *
+ * Two construction modes:
+ * - **Fire-and-forget** — no `TaskState`; result is discarded on completion.
+ * - **Result-bearing** — holds a `shared_ptr<TaskState<T>>`; on completion writes the
+ *   result (or exception) into the state and fires the join/scope wakers.
+ *
+ * **Cancellation:** if `TaskState::cancelled` is set (by `JoinHandle` destructor) before
+ * `poll()` is called, `Task` calls `mark_done()` and returns `true` (complete) immediately
+ * without polling the inner future.
+ *
+ * Users never construct `Task` directly — `SpawnBuilder::submit()` and
+ * `Runtime::block_on()` create them internally.
+ */
 class Task {
 public:
-    // Fire-and-forget: result is discarded.
+    /// @brief Fire-and-forget constructor. Result is discarded on completion.
     template<Future F>
     explicit Task(F future)
         : m_impl(std::make_unique<Pollable<F>>(std::move(future), nullptr)) {}
 
-    // Result-bearing: result is written to state on completion.
+    /// @brief Result-bearing constructor. Writes outcome into `state` on completion.
     template<Future F>
     explicit Task(F future, std::shared_ptr<TaskState<typename F::OutputType>> state)
         : m_impl(std::make_unique<Pollable<F>>(std::move(future), std::move(state))) {}
@@ -31,16 +50,21 @@ public:
     Task(Task&&) noexcept            = default;
     Task& operator=(Task&&) noexcept = default;
 
-    // Returns true if the task completed (Ready or Error), false if still Pending.
-    // The executor uses this to decide whether to suspend or discard the task.
+    /**
+     * @brief Advances the inner future by one step.
+     * @return `true` if the task has reached a terminal state (Ready, Error, or Dropped);
+     *         `false` if still Pending and should be moved to the Suspended map.
+     */
     bool poll(Context& ctx) { return m_impl->poll(ctx); }
 
 private:
+    /// @brief Non-template virtual base for type-erased polling.
     struct PollableBase {
         virtual ~PollableBase() = default;
         virtual bool poll(Context& ctx) = 0;
     };
 
+    /// @brief Concrete template implementation holding the future and optional state.
     template<Future F>
     struct Pollable : PollableBase {
         using OutputType = typename F::OutputType;

@@ -6,12 +6,18 @@
 
 namespace coro {
 
-// SleepFuture — completes once the wall-clock deadline has passed.
-//
-// NOTE: Without a libuv event loop, this future does not proactively register a
-// waker for the deadline. It will complete on the next poll() after the deadline,
-// but the executor will not wake the task at the precise deadline time. This
-// limitation will be removed when libuv timer integration is implemented.
+/**
+ * @brief Future that completes once a wall-clock deadline has passed.
+ *
+ * Satisfies @ref Future<void>. Returns `PollReady` on the first `poll()` call after
+ * `std::chrono::steady_clock::now() >= m_deadline`.
+ *
+ * @note Without libuv timer integration the executor is **not** woken at the precise deadline.
+ *       The sleep fires on the next poll after the deadline, which may be later than requested.
+ *       This limitation will be removed when libuv timer support is added.
+ *
+ * Prefer the @ref sleep_for factory function over constructing this directly.
+ */
 struct SleepFuture {
     using OutputType = void;
 
@@ -30,7 +36,12 @@ struct SleepFuture {
     }
 };
 
-// Returns a SleepFuture that completes after the given duration.
+/**
+ * @brief Returns a @ref SleepFuture that completes after `duration` has elapsed.
+ *
+ * @param duration How long to sleep. Resolution is limited to the executor's poll frequency
+ *                 until libuv timer integration is available.
+ */
 [[nodiscard]] inline SleepFuture sleep_for(std::chrono::nanoseconds duration) {
     return SleepFuture(duration);
 }

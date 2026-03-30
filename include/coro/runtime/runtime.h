@@ -22,19 +22,37 @@ class Runtime;
 void set_current_runtime(Runtime* rt);
 Runtime& current_runtime();
 
-// Runtime — owns the executor and (eventually) the thread pool and libuv event loop.
-// Entry point: construct a Runtime, then call block_on() from main().
+/**
+ * @brief Top-level runtime object. Entry point for all async execution.
+ *
+ * Owns the @ref Executor (and, in a future phase, the thread pool and libuv event loop).
+ * Construct one `Runtime` per application and call `block_on()` to drive async work
+ * from a synchronous context (e.g. `main()`).
+ *
+ * `Runtime` is not copyable or movable.
+ */
 class Runtime {
 public:
+    /// @brief Constructs a Runtime.
+    /// @param num_threads Hint for the thread pool size (currently unused; reserved for the
+    ///                    work-stealing executor). Defaults to `hardware_concurrency()`.
     explicit Runtime(std::size_t num_threads = std::thread::hardware_concurrency());
     ~Runtime();
 
     Runtime(const Runtime&)            = delete;
     Runtime& operator=(const Runtime&) = delete;
 
-    // Runs future on the calling thread, blocking until it completes.
-    // Sets the thread-local runtime for the duration of the call.
-    // TODO: drive libuv event loop alongside the executor.
+    /**
+     * @brief Runs `future` on the calling thread, blocking until it completes.
+     *
+     * Sets the thread-local current runtime for the duration of the call so that
+     * free `spawn()` calls inside the future resolve to this runtime.
+     *
+     * @tparam F A type satisfying @ref Future.
+     * @param future The top-level future to drive to completion.
+     * @return The value produced by `future` (void for `Future<void>`).
+     * @throws Any exception propagated out of the future.
+     */
     template<Future F>
     typename F::OutputType block_on(F future) {
         set_current_runtime(this);
@@ -61,18 +79,32 @@ public:
             return std::move(*state->result);
     }
 
-    // Submit a pre-constructed task directly. Used internally by Synchronize.
+    /// @brief Submits a pre-constructed task directly. Used internally by @ref Synchronize.
     void schedule_task(std::unique_ptr<detail::Task> task) {
         m_executor->schedule(std::move(task));
     }
 
-    // Returns a builder for submitting a future as a scheduled task.
+    /**
+     * @brief Returns a builder for spawning a @ref Future as a background task.
+     *
+     * Call `.submit()` on the returned @ref SpawnBuilder to enqueue the task and
+     * receive a @ref JoinHandle.
+     *
+     * @warning Spawned futures may capture references to data owned by the spawning
+     *          coroutine. The coroutine must outlive the spawned task, or use
+     *          @ref Synchronize to enforce the lifetime boundary explicitly.
+     */
     template<Future F>
     [[nodiscard]] SpawnBuilder<F> spawn(F future) {
         return SpawnBuilder<F>(std::move(future), m_executor.get());
     }
 
-    // Returns a builder for submitting a stream as a background task.
+    /**
+     * @brief Returns a builder for spawning a @ref Stream as a background task.
+     *
+     * The stream runs as a `StreamDriver` task that pushes items into a bounded channel.
+     * Call `.submit()` on the returned @ref StreamSpawnBuilder to receive a @ref StreamHandle.
+     */
     template<Stream S>
     [[nodiscard]] StreamSpawnBuilder<S> spawn(S stream) {
         return StreamSpawnBuilder<S>(std::move(stream), m_executor.get());
@@ -83,20 +115,30 @@ private:
 };
 
 
-// Sets the thread-local runtime for the calling thread.
-// Called internally by Runtime::block_on() and worker thread startup.
+/// @brief Sets the thread-local current runtime. Called by `Runtime::block_on()` and worker threads.
 void set_current_runtime(Runtime* rt);
 
-// Returns the thread-local runtime. Throws if called outside a runtime context.
+/// @brief Returns the thread-local current runtime.
+/// @throws std::runtime_error if called outside a `Runtime::block_on()` context.
 Runtime& current_runtime();
 
-// Free spawn — equivalent to current_runtime().spawn(std::move(future)).
+/**
+ * @brief Spawns a @ref Future on the current runtime. Equivalent to `current_runtime().spawn(future)`.
+ *
+ * May only be called from within a `Runtime::block_on()` context.
+ * @return A @ref SpawnBuilder; call `.submit()` to enqueue the task.
+ */
 template<Future F>
 [[nodiscard]] SpawnBuilder<F> spawn(F future) {
     return current_runtime().spawn(std::move(future));
 }
 
-// Free spawn for streams — equivalent to current_runtime().spawn(std::move(stream)).
+/**
+ * @brief Spawns a @ref Stream on the current runtime. Equivalent to `current_runtime().spawn(stream)`.
+ *
+ * May only be called from within a `Runtime::block_on()` context.
+ * @return A @ref StreamSpawnBuilder; call `.submit()` to receive a @ref StreamHandle.
+ */
 template<Stream S>
 [[nodiscard]] StreamSpawnBuilder<S> spawn(S stream) {
     return current_runtime().spawn(std::move(stream));

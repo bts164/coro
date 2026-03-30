@@ -14,28 +14,56 @@
 
 namespace coro::detail {
 
-// A type-erased pending child entry — one per JoinHandle dropped without co_awaiting.
+/**
+ * @brief Type-erased record of a single pending child task.
+ *
+ * Registered by `JoinHandle::~JoinHandle()` when a handle is dropped inside a
+ * coroutine's `poll()` call. Holds two callbacks over the shared `TaskState`:
+ * - `is_done` — polled by `CoroutineScope` to sweep completed children.
+ * - `set_scope_waker` — called to install the drain waker so the child can
+ *   wake the parent when it finishes.
+ */
 struct PendingChild {
     std::function<bool()>                              is_done;
     std::function<void(std::shared_ptr<Waker>)>        set_scope_waker;
 };
 
-// CoroutineScope — embedded in each Coro<T>/CoroStream<T> to track spawned children
-// whose JoinHandles were dropped without being co_await-ed to completion.
-//
-// The coroutine delays its next suspension or completion (and its own PollDropped) until
-// all registered children have signalled done via their scope_waker.
+/**
+ * @brief Per-coroutine scope that tracks spawned children whose `JoinHandle`s were dropped.
+ *
+ * Every `Coro<T>` and `CoroStream<T>` owns a `CoroutineScope` (via `unique_ptr` — the
+ * scope is not movable because it contains a `std::mutex`). The scope provides the
+ * *implicit structured concurrency* guarantee: a coroutine does not complete (or return
+ * `PollDropped`) until all children it spawned and then dropped have themselves finished.
+ *
+ * ### Registration
+ * When a `JoinHandle` destructor fires while `t_current_coro` is non-null, it calls
+ * `add_child()` to register the child's `TaskState` callbacks with the enclosing scope.
+ *
+ * ### Drain
+ * After the coroutine frame completes (or is destroyed for cancellation), `Coro::poll()`
+ * calls `set_drain_waker()`. This installs a waker on every pending child so they can
+ * wake the parent when they finish. Once all children are done, `poll()` delivers the
+ * final result.
+ *
+ * ### Thread safety
+ * All methods are protected by an internal mutex — safe for the multi-threaded executor.
+ */
 class CoroutineScope {
 public:
-    // Register a pending child. Called from JoinHandle::~JoinHandle while
-    // t_current_coro points to this scope.
+    /**
+     * @brief Registers a pending child. Called from `JoinHandle::~JoinHandle()` while
+     * `t_current_coro` points to this scope.
+     */
     void add_child(std::function<bool()>                       is_done,
                    std::function<void(std::shared_ptr<Waker>)> set_scope_waker) {
         std::lock_guard lock(m_mutex);
         m_pending.push_back({std::move(is_done), std::move(set_scope_waker)});
     }
 
-    // Sweep completed children and return true if any remain.
+    /**
+     * @brief Sweeps completed children and returns `true` if any remain pending.
+     */
     bool has_pending() {
         std::lock_guard lock(m_mutex);
         m_pending.erase(
@@ -45,22 +73,26 @@ public:
         return !m_pending.empty();
     }
 
-    // Register the drain waker on all pending children using a double-check to handle
-    // the race where a child completes between has_pending() and this call.
-    // Returns true if any children are still pending after the double-check.
+    /**
+     * @brief Installs `waker` on all pending children and returns `true` if any remain.
+     *
+     * Uses a double-sweep to close the race between `has_pending()` and waker installation:
+     * 1. Remove already-done children.
+     * 2. Install the waker on remaining children.
+     * 3. Sweep again — a child may have completed between steps 1 and 2.
+     *
+     * @return `true` if at least one child is still pending after the double-sweep.
+     */
     bool set_drain_waker(std::shared_ptr<Waker> waker) {
         std::lock_guard lock(m_mutex);
         m_drain_waker = waker;
-        // First pass: remove already-done children
         m_pending.erase(
             std::remove_if(m_pending.begin(), m_pending.end(),
                 [](const PendingChild& c) { return c.is_done(); }),
             m_pending.end());
         if (m_pending.empty()) return false;
-        // Set scope_waker on remaining children
         for (auto& child : m_pending)
             child.set_scope_waker(waker);
-        // Second pass: a child may have completed between the first sweep and set_scope_waker
         m_pending.erase(
             std::remove_if(m_pending.begin(), m_pending.end(),
                 [](const PendingChild& c) { return c.is_done(); }),
@@ -74,18 +106,29 @@ private:
     std::shared_ptr<Waker>    m_drain_waker;
 };
 
-// Thread-local pointer to the coroutine currently executing inside poll().
-// Set by CurrentCoroGuard for the duration of each poll() call so that
-// JoinHandle destructors can identify their scope owner.
+/**
+ * @brief Thread-local pointer to the `CoroutineScope` of the coroutine currently executing.
+ *
+ * Set by `CurrentCoroGuard` for the duration of each `poll()` call. `JoinHandle`
+ * destructors read this to identify which scope to register with. Null outside of
+ * a coroutine `poll()` context.
+ */
 inline thread_local CoroutineScope* t_current_coro = nullptr;
 
-// RAII guard — sets t_current_coro for the duration of a poll() call and
-// restores the previous value (supporting nested coroutine polls correctly).
+/**
+ * @brief RAII guard that sets `t_current_coro` for the duration of a `poll()` call.
+ *
+ * Correctly handles nested coroutine polls by restoring the previous value on destruction,
+ * so inner coroutines point at their own scope while outer ones point at theirs.
+ */
 struct CurrentCoroGuard {
-    CoroutineScope* m_previous;
+    CoroutineScope* m_previous; ///< The scope active before this guard was constructed.
+
     explicit CurrentCoroGuard(CoroutineScope* scope) noexcept
         : m_previous(t_current_coro) { t_current_coro = scope; }
+
     ~CurrentCoroGuard() noexcept { t_current_coro = m_previous; }
+
     CurrentCoroGuard(const CurrentCoroGuard&)            = delete;
     CurrentCoroGuard& operator=(const CurrentCoroGuard&) = delete;
 };

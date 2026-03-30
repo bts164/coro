@@ -2,10 +2,52 @@ site_name: C++ Coro Library
 docs_dir: doc
 theme:
   name: readthedocs
+plugins:
+  - search
+  - mermaid2
+  - mkdoxy:
+      projects:
+        coro:
+          src-dirs: include/coro
+          doxygen-bin-path: doxygen
+          full-doc: true
+          doxygen-params:
+            EXTRACT_ALL: "YES"
+            GENERATE_HTML: "NO"
+            GENERATE_XML: "YES"
 nav:
   - Home: index.md
-  - Futures and Streams: future_and_stream.md
-  - Tasks, Executors, and Runtime: task_and_executor.md
-  - Waker & Context In-depth: waker_and_context_propagation.md
-  - Select: select.md
-  - Module Structure: module_structure.md
+  - Getting Started: getting_started.md
+  - API Reference:
+    - Key Types:
+      - Runtime: coro/classcoro_1_1Runtime.md
+      - Coro: coro/classcoro_1_1Coro.md
+      - "Coro<void>": coro/classcoro_1_1Coro_3_01void_01_4.md
+      - CoroStream: coro/classcoro_1_1CoroStream.md
+      - JoinHandle: coro/classcoro_1_1JoinHandle.md
+      - "JoinHandle<void>": coro/classcoro_1_1JoinHandle_3_01void_01_4.md
+      - SpawnBuilder: coro/classcoro_1_1SpawnBuilder.md
+      - StreamSpawnBuilder: coro/classcoro_1_1StreamSpawnBuilder.md
+      - StreamHandle: coro/classcoro_1_1StreamHandle.md
+      - Synchronize: coro/classcoro_1_1Synchronize.md
+      - SelectFuture: coro/classcoro_1_1SelectFuture.md
+      - SelectBranch: coro/structcoro_1_1SelectBranch.md
+      - SleepFuture: coro/structcoro_1_1SleepFuture.md
+    - Concepts & Free Functions:
+      - Future (concept): coro/future_8h.md
+      - Stream (concept): coro/stream_8h.md
+      - select(): coro/select_8h.md
+      - sleep_for(): coro/sleep_8h.md
+      - timeout(): coro/timeout_8h.md
+      - spawn(): coro/runtime_8h.md
+    - All Classes: coro/classes.md
+    - Namespaces: coro/namespaces.md
+    - Files: coro/files.md
+  - Internal Design Details:
+    - Futures and Streams: future_and_stream.md
+    - Tasks, Executors, and Runtime: task_and_executor.md
+    - Waker & Context In-depth: waker_and_context_propagation.md
+    - Coroutine Scope: coroutine_scope.md
+    - Select: select.md
+    - Module Structure: module_structure.md
+    - Roadmap: roadmap.md

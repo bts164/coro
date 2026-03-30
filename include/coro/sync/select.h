@@ -14,8 +14,15 @@
 
 namespace coro {
 
-// SelectBranch<N, T> — tagged result wrapper identifying which select branch won.
-// For void branches, carries no value; only the compile-time index N.
+/**
+ * @brief Tagged result wrapper identifying which branch of a `select()` call won.
+ *
+ * `index` is the compile-time branch index (0-based). For non-void branches, `value`
+ * holds the branch's result.
+ *
+ * @tparam N The compile-time branch index.
+ * @tparam T The result type of the branch (`void` for branches with no value).
+ */
 template<std::size_t N, typename T>
 struct SelectBranch {
     static constexpr std::size_t index = N;
@@ -23,13 +30,20 @@ struct SelectBranch {
     explicit SelectBranch(T v) : value(std::move(v)) {}
 };
 
+/// @brief `SelectBranch` specialization for `void` branches. Carries only the index.
 template<std::size_t N>
 struct SelectBranch<N, void> {
     static constexpr std::size_t index = N;
 };
 
-// Concept: a Future that supports cooperative cancellation via cancel().
-// Currently satisfied by Coro<T> and CoroStream<T>.
+/**
+ * @brief Concept satisfied by futures that support cooperative cancellation via `cancel()`.
+ *
+ * Currently satisfied by @ref Coro and @ref CoroStream. Non-cancellable branches
+ * are dropped immediately (not drained) when another branch wins a `select()`.
+ *
+ * @tparam F A type satisfying @ref Future.
+ */
 template<typename F>
 concept Cancellable = Future<F> && requires(F& f) { f.cancel(); };
 
@@ -51,6 +65,19 @@ struct SelectOutputTypeHelper<std::index_sequence<Is...>, Fs...> {
 enum class SelectBranchState : uint8_t { Active, Draining, Done };
 
 
+/**
+ * @brief Future that races multiple branches and returns the result of the first to complete.
+ *
+ * Polls branches in round-robin order to ensure fairness. When one branch completes
+ * (Ready or Error), all other @ref Cancellable branches are cancelled and drained before
+ * the result is delivered. Non-cancellable branches are dropped immediately.
+ *
+ * `OutputType` is `std::variant<SelectBranch<0,T0>, SelectBranch<1,T1>, ...>`.
+ *
+ * Prefer the @ref select factory function over constructing this directly.
+ *
+ * @tparam Fs The Future types for each branch.
+ */
 template<Future... Fs>
 class SelectFuture {
     static constexpr std::size_t N = sizeof...(Fs);
@@ -197,7 +224,22 @@ private:
 };
 
 
-// Factory function — deduces Future types from arguments.
+/**
+ * @brief Races multiple futures and returns the result of the first to complete.
+ *
+ * @param futures Two or more futures to race. Each must satisfy @ref Future.
+ * @return A @ref SelectFuture whose `OutputType` is
+ *         `std::variant<SelectBranch<0,T0>, SelectBranch<1,T1>, ...>`.
+ *
+ * Example:
+ * @code
+ * auto result = co_await select(fetch_data(), sleep_for(5s));
+ * if (result.index() == 0)
+ *     use(std::get<0>(result).value);  // fetch_data() won
+ * else
+ *     handle_timeout();                // sleep_for() won
+ * @endcode
+ */
 template<Future... Fs>
 [[nodiscard]] SelectFuture<std::remove_cvref_t<Fs>...> select(Fs&&... futures) {
     return SelectFuture<std::remove_cvref_t<Fs>...>(std::forward<Fs>(futures)...);
