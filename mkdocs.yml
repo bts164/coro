@@ -1,5 +1,7 @@
 site_name: C++ Coro Library
 docs_dir: doc
+watch:
+  - include/
 theme:
   name: readthedocs
 plugins:
@@ -46,6 +48,7 @@ nav:
   - Internal Design Details:
     - Futures and Streams: future_and_stream.md
     - Tasks, Executors, and Runtime: task_and_executor.md
+    - JoinSet: join_set.md
     - Waker & Context In-depth: waker_and_context_propagation.md
     - Coroutine Scope: coroutine_scope.md
     - Select: select.md

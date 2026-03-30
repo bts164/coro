@@ -23,15 +23,22 @@ struct CoroPromiseBase {
     std::suspend_always final_suspend() noexcept { return {}; }
     void unhandled_exception() noexcept { m_exception = std::current_exception(); }
 
-    // Only types satisfying Future<> may be co_await-ed inside Coro or CoroStream.
+    // Only Future<> types may be co_await-ed inside Coro or CoroStream.
     // Clears m_poll_current so a stale hook from a previous co_await is never mistakenly
     // called. Passes &m_poll_current to FutureAwaitable so await_suspend() can register
     // the re-poll hook for spurious-wake protection.
+    // Lvalue overload: future is moved into FutureAwaitable (handle is consumed).
     template<Future F>
-    FutureAwaitable<std::remove_cvref_t<F>> await_transform(F&& future) {
+    FutureAwaitable<F> await_transform(F& future) {
         m_poll_current = nullptr;
-        return FutureAwaitable<std::remove_cvref_t<F>>(
-            std::forward<F>(future), &m_ctx, &m_poll_current);
+        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current);
+    }
+
+    // Rvalue overload: future is forwarded (moved) into FutureAwaitable.
+    template<Future F>
+    FutureAwaitable<F> await_transform(F&& future) {
+        m_poll_current = nullptr;
+        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current);
     }
 
     // Non-Future types are rejected at compile time.

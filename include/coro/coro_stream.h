@@ -70,11 +70,18 @@ public:
         // Only Future<> types may be co_await-ed inside CoroStream.
         // Clears m_poll_current and passes &m_poll_current for spurious-wake protection
         // (same mechanism as CoroPromiseBase — see coro.h for full explanation).
+        // Lvalue overload: future is moved into FutureAwaitable (handle is consumed).
         template<Future F>
-        FutureAwaitable<std::remove_cvref_t<F>> await_transform(F&& future) {
+        FutureAwaitable<F> await_transform(F& future) {
             m_poll_current = nullptr;
-            return FutureAwaitable<std::remove_cvref_t<F>>(
-                std::forward<F>(future), &m_ctx, &m_poll_current);
+            return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current);
+        }
+
+        // Rvalue overload: future is forwarded (moved) into FutureAwaitable.
+        template<Future F>
+        FutureAwaitable<F> await_transform(F&& future) {
+            m_poll_current = nullptr;
+            return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current);
         }
 
         template<typename U> requires (!Future<std::remove_cvref_t<U>>)

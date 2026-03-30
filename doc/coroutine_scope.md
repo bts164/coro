@@ -200,21 +200,10 @@ checker, trading a compile-time guarantee for a runtime one.
 
 ### Interaction with explicit `Synchronize`
 
-With every coroutine acting as an implicit scope, `Synchronize` is no longer the mechanism
-that makes borrowed references safe. Its role shifts:
+> **Note:** `Synchronize` is planned for removal once `JoinSet` is implemented (see
+> `doc/roadmap.md` items 5 and 6). The pattern below will be replaced by `co_invoke` +
+> `JoinSet::drain()`. Prefer `co_invoke` for new code.
 
-- As an **explicit mid-coroutine drain point** — `co_await Synchronize(...)` still makes
-  sense when you want to wait for a batch of children at a specific point during execution
-  (e.g., to collect their results or handle their exceptions) rather than only at the end.
-- As a **safe spawn scope** for the `co_return` case — when locals must outlive a spawn that
-  reaches `co_return` before a natural suspension point, `Synchronize` is the explicit opt-in.
-- As a **named scope** that documents intent — even if the implicit guarantee makes it
-  redundant for safety, an explicit scope communicates structure to the reader.
-
-Whether `Synchronize` survives as a distinct primitive or is absorbed into the general
-coroutine machinery is an open design question.
-
-## Open Questions
-
-1. **Fate of `Synchronize`.** Given the implicit scope guarantee, does `Synchronize` remain
-   a first-class primitive, become a convenience alias, or get removed?
+`Synchronize` provides an explicit mid-coroutine drain point and a safe scope for
+reference-capturing lambdas. Both roles will be covered by `co_invoke` + `JoinSet` once
+that API lands.

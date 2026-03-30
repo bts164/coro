@@ -239,6 +239,40 @@ The return type of `timeout(d, F)` is the same as `select(F, SleepFuture)`:
 
 ---
 
+## 7. Capturing-lambda pitfall and `co_invoke`
+
+A capturing lambda that returns `Coro<T>` has a subtle use-after-free when used as an
+rvalue. The compiler lowers the lambda to an anonymous struct; `operator()` — being a member
+function — captures `this` into the coroutine frame. The struct is a temporary and is
+destroyed at the end of the full expression, before the coroutine is ever polled.
+
+```cpp
+// DANGEROUS — lambda struct destroyed at ';', before first resumption
+auto coro = [x]() -> Coro<void> {
+    co_await something();
+    use(x);          // accesses this->x — 'this' is dangling
+}();
+co_await coro;       // use-after-free
+```
+
+Use `co_invoke` instead. It moves the lambda onto the heap inside a wrapper that keeps it
+alive for the coroutine's entire lifetime:
+
+```cpp
+#include <coro/co_invoke.h>
+
+// SAFE — lambda kept alive by co_invoke
+co_await co_invoke([x]() -> Coro<void> {
+    co_await something();
+    use(x);    // safe
+});
+
+// Also works with spawn:
+auto handle = spawn(co_invoke([x]() -> Coro<void> { ... })).submit();
+```
+
+`co_invoke` also works with `CoroStream<T>` lambdas.
+
 ## Next steps
 
 - Read the **Design Docs** for a deeper explanation of the `Future`/`Stream` model,

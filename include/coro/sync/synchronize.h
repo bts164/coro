@@ -88,15 +88,29 @@ private:
 /**
  * @brief Explicit structured-concurrency scope. Satisfies `Future<void>`.
  *
+ * @deprecated `Synchronize` is planned for removal once `JoinSet` is implemented.
+ *             Prefer `co_invoke` + `JoinSet::drain()` for new code.
+ *
  * All tasks spawned via `sync.spawn(...).submit()` inside the body lambda are guaranteed
  * to complete before `co_await` returns, even if an exception unwinds the body.
  * The first exception (from the body or any child) is rethrown after all children finish.
  *
- * @note Since `Coro<T>` already provides an implicit scope via `CoroutineScope`, `Synchronize`
- *       is most useful when an explicit, named lifetime boundary is needed or when
- *       non-`Coro` futures must participate in structured grouping.
+ * **Migration path** — replace:
+ * @code
+ * co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
+ *     sync.spawn(worker(local_data)).submit();
+ * });
+ * @endcode
+ * with:
+ * @code
+ * co_await co_invoke([&]() -> Coro<void> {
+ *     JoinSet<void> js;
+ *     js.spawn(worker(local_data));
+ *     co_await js.drain();
+ * });
+ * @endcode
  *
- * Example:
+ * Example (current API):
  * @code
  * co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
  *     sync.spawn(child_a()).submit();

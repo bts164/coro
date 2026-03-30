@@ -71,7 +71,7 @@ configure and submit tasks. This includes:
 Types that coordinate between concurrently running tasks. This is the future home of channels
 (mpsc, oneshot), mutexes, and other inter-task communication. Current members:
 - `Synchronize` — structured concurrency scope; guarantees all child tasks finish before the
-  parent continues
+  parent continues (**planned for removal** after `JoinSet` lands)
 - `StreamHandle<T>` — consumer end of the bounded channel that backs `spawn(stream)`
 - `CancellationToken` — cooperative cancellation signal passed via `Context`
 

@@ -11,9 +11,9 @@ distinct user-facing types:
   Uses `co_yield` to produce values and can `co_await` futures internally.
 - **`JoinHandle<T>`** — returned by `spawn()`. Satisfies `Future<T>`. Allows the caller to
   `co_await` the result of a spawned task.
-- **`Synchronize`** — structured concurrency scope inspired by Julia's `@sync`. Guarantees
-  all tasks spawned within it complete before the scope exits, even if an exception unwinds
-  the parent. The safe alternative to `runtime.spawn()` when child tasks share parent data.
+- **`Synchronize`** — structured concurrency scope. Guarantees all tasks spawned within it
+  complete before the scope exits. **Planned for removal** once `JoinSet` is implemented;
+  use `co_invoke` + `JoinSet::drain()` for new code.
 
 **`Task`** is an internal, type-erased heap-allocated unit of work. It wraps any `Future<T>`,
 not just coroutines. Users never construct a `Task` directly — `spawn()` creates one

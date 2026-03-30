@@ -14,6 +14,8 @@ set(TEST_TARGETS
     test_stream_handle
     test_coro_scope
     test_select
+    test_co_invoke
+    test_join_set
 )
 
 foreach(t ${TEST_TARGETS})
