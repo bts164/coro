@@ -68,28 +68,34 @@ SelectFuture<Fs...> select(Fs&&... futures);
 4. First inner future that returns `Error` propagates immediately (same drop behaviour)
 5. If all return `Pending`, return `Pending`
 
-## Open Questions
+## Design Decisions
 
-1. **Result type** — `std::variant<T1, T2, T3>` requires `std::visit` or index checking
-   to determine which branch won. Is there a more ergonomic alternative that still works
-   without macros? One option: a tagged struct `SelectResult<N, variant>` that exposes
-   the winning index as a compile-time constant. Another: separate `select_index()` that
-   returns the index alongside the variant.
+1. **Result type** — `SelectBranch<N, T>` tagged wrappers in a `std::variant`. Each
+   branch result is wrapped in `SelectBranch<N, T>` where N is the branch index. This
+   avoids duplicate-type issues when branches have the same `OutputType` (including `void`),
+   and lets the caller use `std::holds_alternative<SelectBranch<0, T>>` to identify the
+   winning branch. For `void` branches, `SelectBranch<N, void>` carries no value — only
+   the index.
 
-2. **Homogeneous select** — If all futures have the same `OutputType`, a `std::variant`
-   with identical types is awkward. Should `select` special-case this to return
-   `OutputType` directly (without variant) when all types match?
+2. **Homogeneous select** — Handled automatically by the `SelectBranch<N, T>` tagging.
+   `select(f1, f2)` where both return `void` produces
+   `std::variant<SelectBranch<0,void>, SelectBranch<1,void>>` — the two alternatives are
+   distinct types so the variant is well-formed.
 
-3. **Error handling** — If the winning future returns `Error`, that propagates. But what
-   if a non-winning future returns `Error` before the winner does? Options:
-   - First `Ready` or `Error` wins, same as `Ready`
-   - Only the first `Ready` wins; `Error` from non-winners is silently dropped
-   - Any `Error` from any branch propagates immediately
+3. **Error handling** — First `Ready` OR `Error` wins. Whichever branch resolves first
+   (value or error) is treated as the winner; all other branches are cancelled and drained.
+   Errors from non-winning branches are silently dropped.
 
-4. **Fairness implementation** — Randomizing poll order requires a RNG. Should this be
-   seeded per-task, per-`SelectFuture` instance, or use a thread-local? A biased or
-   round-robin scheme could be simpler and still fair enough in practice.
+4. **Fairness** — Round-robin: `SelectFuture` keeps a `m_poll_start` index that advances
+   by one each poll. Branches are polled starting from `m_poll_start % N`, wrapping around.
+   No RNG needed; this is fair and deterministic.
 
-5. **select over streams** — Should there be a `select_stream(s1, s2, ...)` variant that
-   merges multiple streams into one, yielding items from whichever stream is ready first?
-   This is Tokio's `tokio_stream::StreamExt::merge()`. Separate combinator or unified API?
+5. **select over streams** — Out of scope; addressed separately if needed.
+
+## Cancellation and drain
+
+When a branch wins, each losing branch that satisfies `Cancellable` (i.e., has a `cancel()`
+method — currently `Coro<T>` and `CoroStream<T>`) is cancelled and then polled until it
+returns `PollDropped`. Non-`Cancellable` futures are dropped immediately. `SelectFuture`
+holds the winning result internally and does not return it until all cancelled branches have
+returned `PollDropped`.

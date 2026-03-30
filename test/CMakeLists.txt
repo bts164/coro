@@ -13,6 +13,7 @@ set(TEST_TARGETS
     test_synchronize
     test_stream_handle
     test_coro_scope
+    test_select
 )
 
 foreach(t ${TEST_TARGETS})
