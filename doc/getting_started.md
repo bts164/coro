@@ -133,7 +133,54 @@ coro::spawn(fetch(1)).submit().detach();  // fire and forget
 
 ---
 
-## 4. Async generators
+## 4. Fan-out with `JoinSet`
+
+When you need to spawn many tasks of the same type and collect their results, `JoinSet<T>`
+is cleaner than managing individual `JoinHandle`s. It satisfies `Stream<T>`, so results
+arrive in completion order and compose naturally with `next()`.
+
+```cpp
+#include <coro/task/join_set.h>
+#include <coro/co_invoke.h>
+
+coro::Coro<int> compute(int x) { co_return x * x; }
+
+coro::Coro<void> run() {
+    co_await coro::co_invoke([&]() -> coro::Coro<void> {
+        coro::JoinSet<int> js;
+        for (int i = 1; i <= 5; ++i)
+            js.spawn(compute(i));
+
+        while (auto result = co_await coro::next(js))
+            std::cout << *result << " ";  // prints squares in completion order
+        std::cout << "\n";
+    });
+}
+```
+
+For `void` tasks, use `JoinSet<void>` and `drain()` to wait for all to finish:
+
+```cpp
+coro::Coro<void> run() {
+    co_await coro::co_invoke([&]() -> coro::Coro<void> {
+        coro::JoinSet<void> js;
+        js.spawn(task_a());
+        js.spawn(task_b());
+        co_await js.drain();  // waits for both; rethrows first exception if any
+    });
+}
+```
+
+Dropping a `JoinSet` without calling `drain()` cancels all pending tasks. The enclosing
+`co_invoke` scope ensures they finish draining before the coroutine returns.
+
+> **Note:** `JoinSet::spawn()` uses `co_invoke` internally to schedule tasks, so it must be
+> called from within a `Runtime::block_on()` context. Always wrap fan-out work in `co_invoke`
+> to keep lambda captures alive for the full duration (see section 8).
+
+---
+
+## 5. Async generators
 
 `CoroStream<T>` is an async generator: use `co_yield` to emit items and `co_return`
 to signal exhaustion. Consume it with `co_await coro::next(stream)` in a loop.
@@ -168,7 +215,7 @@ the awaited future resolves.
 
 ---
 
-## 5. Racing futures with `select`
+## 6. Racing futures with `select`
 
 `select()` races two or more futures and returns as soon as one completes.
 The result is a `std::variant` of `SelectBranch<N, T>` values identifying which
@@ -200,7 +247,7 @@ int main() {
 
 ---
 
-## 6. Timeouts
+## 7. Timeouts
 
 `timeout(duration, future)` is a convenience wrapper around `select` that races your
 future against a `sleep_for` timer.
@@ -239,7 +286,7 @@ The return type of `timeout(d, F)` is the same as `select(F, SleepFuture)`:
 
 ---
 
-## 7. Capturing-lambda pitfall and `co_invoke`
+## 8. Capturing-lambda pitfall and `co_invoke`
 
 A capturing lambda that returns `Coro<T>` has a subtle use-after-free when used as an
 rvalue. The compiler lowers the lambda to an anonymous struct; `operator()` — being a member
