@@ -51,7 +51,7 @@ struct ThrowingVoidFuture {
 
 TEST(JoinSetTest, SpawnAndDrainInt) {
     // Spawn three tasks and drain. No results collected.
-    Runtime rt;
+    Runtime rt(1);
     int drain_count = 0;
 
     rt.block_on(co_invoke([&drain_count]() -> Coro<void> {
@@ -68,7 +68,7 @@ TEST(JoinSetTest, SpawnAndDrainInt) {
 
 TEST(JoinSetTest, CollectResultsViaNext) {
     // Results arrive in completion order (immediate tasks complete in spawn order).
-    Runtime rt;
+    Runtime rt(1);
     std::vector<int> results;
 
     rt.block_on(co_invoke([&results]() -> Coro<void> {
@@ -86,7 +86,7 @@ TEST(JoinSetTest, CollectResultsViaNext) {
 }
 
 TEST(JoinSetTest, EmptyJoinSetDrainCompletesImmediately) {
-    Runtime rt;
+    Runtime rt(1);
     bool reached = false;
 
     rt.block_on(co_invoke([&reached]() -> Coro<void> {
@@ -99,7 +99,7 @@ TEST(JoinSetTest, EmptyJoinSetDrainCompletesImmediately) {
 }
 
 TEST(JoinSetTest, EmptyJoinSetNextReturnsNulloptImmediately) {
-    Runtime rt;
+    Runtime rt(1);
     bool got_nullopt = false;
 
     rt.block_on(co_invoke([&got_nullopt]() -> Coro<void> {
@@ -112,7 +112,7 @@ TEST(JoinSetTest, EmptyJoinSetNextReturnsNulloptImmediately) {
 }
 
 TEST(JoinSetTest, DrainRethrowsFirstException) {
-    Runtime rt;
+    Runtime rt(1);
     bool caught = false;
 
     rt.block_on(co_invoke([&caught]() -> Coro<void> {
@@ -132,7 +132,7 @@ TEST(JoinSetTest, DrainRethrowsFirstException) {
 }
 
 TEST(JoinSetTest, NextRethrowsExceptionInline) {
-    Runtime rt;
+    Runtime rt(1);
     bool caught = false;
 
     rt.block_on(co_invoke([&caught]() -> Coro<void> {
@@ -154,8 +154,8 @@ TEST(JoinSetTest, NextRethrowsExceptionInline) {
 // -----------------------------------------------------------------------
 
 TEST(JoinSetVoidTest, SpawnAndDrain) {
-    Runtime rt;
-    int completed = 0;
+    Runtime rt(1);
+    std::atomic<int> completed = 0;
 
     rt.block_on(co_invoke([&completed]() -> Coro<void> {
         JoinSet<void> js;
@@ -174,8 +174,8 @@ TEST(JoinSetVoidTest, SpawnAndDrain) {
 }
 
 TEST(JoinSetVoidTest, DrainRethrowsFirstException) {
-    Runtime rt;
-    bool caught = false;
+    Runtime rt(1);
+    std::atomic_bool caught = false;
 
     rt.block_on(co_invoke([&caught]() -> Coro<void> {
         JoinSet<void> js;
@@ -185,7 +185,7 @@ TEST(JoinSetVoidTest, DrainRethrowsFirstException) {
         try {
             co_await js.drain();
         } catch (const std::runtime_error& e) {
-            caught = (std::string(e.what()) == "void task failed");
+            caught.store((std::string(e.what()) == "void task failed"));
         }
     }));
 
@@ -193,7 +193,7 @@ TEST(JoinSetVoidTest, DrainRethrowsFirstException) {
 }
 
 TEST(JoinSetVoidTest, EmptyDrainCompletesImmediately) {
-    Runtime rt;
+    Runtime rt(1);
     bool reached = false;
 
     rt.block_on(co_invoke([&reached]() -> Coro<void> {
@@ -212,7 +212,7 @@ TEST(JoinSetVoidTest, EmptyDrainCompletesImmediately) {
 TEST(JoinSetTest, CancelOnDropDoesNotHang) {
     // Dropping JoinSet with pending tasks inside co_invoke must not hang.
     // The enclosing CoroutineScope drains cancelled tasks before completing.
-    Runtime rt;
+    Runtime rt(1);
     bool reached_after = false;
 
     rt.block_on(co_invoke([&reached_after]() -> Coro<void> {
@@ -230,7 +230,7 @@ TEST(JoinSetTest, CancelOnDropDoesNotHang) {
 }
 
 TEST(JoinSetVoidTest, CancelOnDropDoesNotHang) {
-    Runtime rt;
+    Runtime rt(1);
     bool reached_after = false;
 
     rt.block_on(co_invoke([&reached_after]() -> Coro<void> {
@@ -251,7 +251,7 @@ TEST(JoinSetVoidTest, CancelOnDropDoesNotHang) {
 
 TEST(JoinSetTest, ComposesWithCoInvoke) {
     // Tasks spawned via co_invoke into a JoinSet — lambda lifetime safe.
-    Runtime rt;
+    Runtime rt(1);
     std::vector<int> results;
     std::vector<int> inputs = {1, 2, 3, 4, 5};
 
@@ -270,15 +270,15 @@ TEST(JoinSetTest, ComposesWithCoInvoke) {
 
 TEST(JoinSetVoidTest, ComposesWithCoInvokeAndCapture) {
     // Verify reference-capture safety via co_invoke + JoinSet<void>.
-    Runtime rt;
-    int sum = 0;
+    Runtime rt(1);
+    std::atomic<int> sum = 0;
     std::vector<int> data = {10, 20, 30};
 
     rt.block_on(co_invoke([&]() -> Coro<void> {
         JoinSet<void> js;
         for (int x : data)
             js.spawn(co_invoke([x, &sum]() -> Coro<void> {
-                sum += x;
+                sum.fetch_add(x);
                 co_return;
             }));
         co_await js.drain();

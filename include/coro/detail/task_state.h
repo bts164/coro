@@ -4,6 +4,7 @@
 // Shared ref-counted state between an executor-held Task and its JoinHandle.
 
 #include <atomic>
+#include <condition_variable>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -12,6 +13,41 @@
 #include <coro/detail/waker.h>
 
 namespace coro::detail {
+
+/**
+ * @brief Non-template base for @ref TaskState.
+ *
+ * Holds the fields required for `wait_for_completion()` to block the calling
+ * thread until the task reaches a terminal state. Separated from the template
+ * so the executor interface can accept either specialisation without templates.
+ *
+ * `mutex`, `cv`, and `terminated` are always accessed together: `terminated`
+ * is set inside `mutex`, and `cv.notify_all()` is called in the same critical
+ * section, so `wait_until_done()` can never miss the wakeup.
+ */
+struct TaskStateBase {
+    mutable std::mutex      mutex;
+    std::condition_variable cv;
+    bool                    terminated{false};
+
+    // RACE CONDITION NOTE: this is safe because every code path that sets
+    // `terminated = true` also calls `cv.notify_all()` *in the same critical
+    // section* (under `mutex`). This guarantees no lost wakeup: the waiter
+    // holds `mutex` while evaluating the predicate, so either it sees
+    // `terminated == true` before sleeping, or the notifier hasn't acquired
+    // the lock yet and will call notify_all() after the waiter enters wait().
+    //
+    // When implementing a new executor's wait_for_completion(), use this
+    // function rather than rolling your own condvar loop. The key invariant to
+    // preserve in all terminal methods (setResult, setDone, setException,
+    // mark_done) is: set `terminated = true` AND call `cv.notify_all()` while
+    // holding `mutex`. Breaking this invariant reintroduces the lost wakeup.
+    void wait_until_done() {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [this]{ return terminated; });
+    }
+};
+
 
 /**
  * @brief Shared state between a @ref Task held by the executor and its @ref JoinHandle.
@@ -31,14 +67,12 @@ namespace coro::detail {
  * @tparam T The value type produced by the task.
  */
 template<typename T>
-struct TaskState {
-    mutable std::mutex     mutex;
+struct TaskState : TaskStateBase {
     std::atomic<bool>      cancelled{false};    ///< Set by `JoinHandle` destructor; checked by `Task::poll()`.
     std::shared_ptr<Waker> join_waker;          ///< Wakes the `JoinHandle` awaiter on completion.
     std::shared_ptr<Waker> scope_waker;         ///< Wakes the parent `CoroutineScope` on completion.
     std::optional<T>       result;              ///< Set by `setResult()` on successful completion.
     std::exception_ptr     exception;           ///< Set by `setException()` on fault.
-    bool                   terminated{false};   ///< True once the task has reached any terminal state.
 
     /// @brief Returns `true` if the task has reached a terminal state (success, error, or cancelled).
     bool is_complete() const {
@@ -53,6 +87,7 @@ struct TaskState {
         {
             std::lock_guard lock(mutex);
             terminated = true;
+            cv.notify_all();
             join_wk = std::move(join_waker);
             scope_wk = std::move(scope_waker);
         }
@@ -67,6 +102,7 @@ struct TaskState {
             std::lock_guard lock(mutex);
             result = std::move(value);
             terminated = true;
+            cv.notify_all();
             join_wk = std::move(join_waker);
             scope_wk = std::move(scope_waker);
         }
@@ -81,6 +117,7 @@ struct TaskState {
             std::lock_guard lock(mutex);
             exception = std::move(e);
             terminated = true;
+            cv.notify_all();
             join_wk = std::move(join_waker);
             scope_wk = std::move(scope_waker);
         }
@@ -96,14 +133,12 @@ struct TaskState {
  * and `setDone()` replaces `setResult()`.
  */
 template<>
-struct TaskState<void> {
-    mutable std::mutex     mutex;
+struct TaskState<void> : TaskStateBase {
     std::atomic<bool>      cancelled{false};
     std::shared_ptr<Waker> join_waker;
     std::shared_ptr<Waker> scope_waker;
     bool                   done{false};         ///< Set by `setDone()` on successful completion.
     std::exception_ptr     exception;
-    bool                   terminated{false};
 
     /// @brief Returns `true` if the task has reached a terminal state.
     bool is_complete() const {
@@ -117,6 +152,7 @@ struct TaskState<void> {
         {
             std::lock_guard lock(mutex);
             terminated = true;
+            cv.notify_all();
             join_wk = std::move(join_waker);
             scope_wk = std::move(scope_waker);
         }
@@ -131,6 +167,7 @@ struct TaskState<void> {
             std::lock_guard lock(mutex);
             done = true;
             terminated = true;
+            cv.notify_all();
             join_wk = std::move(join_waker);
             scope_wk = std::move(scope_waker);
         }
@@ -145,6 +182,7 @@ struct TaskState<void> {
             std::lock_guard lock(mutex);
             exception = std::move(e);
             terminated = true;
+            cv.notify_all();
             join_wk = std::move(join_waker);
             scope_wk = std::move(scope_waker);
         }

@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+if(ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread -g)
+    add_link_options(-fsanitize=thread)
+endif()
+
 find_package(GTest REQUIRED)
 
 add_library(coro
@@ -13,6 +19,7 @@ add_library(coro
     src/context.cpp
     src/executor.cpp
     src/single_threaded_executor.cpp
+    src/work_sharing_executor.cpp
     src/runtime.cpp
 )
 target_include_directories(coro PUBLIC include)

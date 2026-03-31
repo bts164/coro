@@ -75,6 +75,16 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
     return true;
 }
 
+void SingleThreadedExecutor::wait_for_completion(detail::TaskStateBase& state) {
+    while (true) {
+        {
+            std::lock_guard lock(state.mutex);
+            if (state.terminated) return;
+        }
+        if (!poll_ready_tasks()) return;
+    }
+}
+
 bool SingleThreadedExecutor::empty() const {
     return m_ready.empty();
 }

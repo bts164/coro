@@ -10,12 +10,12 @@ set(TEST_TARGETS
     test_join_handle
     test_executor_task
     test_runtime
-    test_synchronize
     test_stream_handle
     test_coro_scope
     test_select
     test_co_invoke
     test_join_set
+    test_work_sharing_executor
 )
 
 foreach(t ${TEST_TARGETS})

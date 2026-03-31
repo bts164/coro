@@ -30,7 +30,7 @@ struct TwoPollFuture {
 TEST(CoInvokeTest, ValueCaptureAccessedAfterSuspension) {
     // The captured value must be accessible after the coroutine suspends and resumes.
     // Without co_invoke, the lambda temporary would be destroyed before resumption.
-    Runtime rt;
+    Runtime rt(1);
     int result = 0;
     int polls  = 0;
 
@@ -45,7 +45,7 @@ TEST(CoInvokeTest, ValueCaptureAccessedAfterSuspension) {
 
 TEST(CoInvokeTest, ValueCaptureByValue) {
     // Captures an integer by value; verifies the copy is owned by the wrapper.
-    Runtime rt;
+    Runtime rt(1);
     int captured = 99;
     int result   = 0;
     int polls    = 0;
@@ -59,7 +59,7 @@ TEST(CoInvokeTest, ValueCaptureByValue) {
 }
 
 TEST(CoInvokeTest, ReturnsValue) {
-    Runtime rt;
+    Runtime rt(1);
     int polls = 0;
 
     int result = rt.block_on(co_invoke([&polls]() -> Coro<int> {
@@ -73,7 +73,7 @@ TEST(CoInvokeTest, ReturnsValue) {
 TEST(CoInvokeTest, IsMoveConstructible) {
     // Future concept requires move constructibility.
     // Moving CoInvokeFuture must not invalidate the coroutine's this pointer.
-    Runtime rt;
+    Runtime rt(1);
     int result = 0;
     int polls  = 0;
 
@@ -92,7 +92,7 @@ TEST(CoInvokeTest, IsMoveConstructible) {
 // --- Composition with spawn ---
 static_assert(Future<JoinHandle<void>>);
 TEST(CoInvokeTest, ComposesWithSpawn) {
-    Runtime rt;
+    Runtime rt(1);
     int result = 0;
     int polls  = 0;
 
@@ -111,7 +111,7 @@ TEST(CoInvokeTest, ComposesWithSpawn) {
 
 TEST(CoInvokeStreamTest, YieldsItemsAfterSuspension) {
     // Verifies that a CoroStream lambda accessed after suspension works correctly.
-    Runtime rt;
+    Runtime rt(1);
     int polls = 0;
     std::vector<int> items;
 
@@ -129,7 +129,7 @@ TEST(CoInvokeStreamTest, YieldsItemsAfterSuspension) {
 }
 
 TEST(CoInvokeStreamTest, ValueCaptureInStream) {
-    Runtime rt;
+    Runtime rt(1);
     int base = 10;
     std::vector<int> items;
 

@@ -61,15 +61,7 @@ public:
         m_executor->schedule(
             std::make_unique<detail::Task>(std::move(future), state));
 
-        auto is_done = [&]() -> bool {
-            std::lock_guard lock(state->mutex);
-            return state->terminated;
-        };
-
-        while (!is_done()) {
-            if (!m_executor->poll_ready_tasks())
-                break;  // queue empty — no I/O support yet, so we're stuck
-        }
+        m_executor->wait_for_completion(*state);
 
         set_current_runtime(nullptr);
 

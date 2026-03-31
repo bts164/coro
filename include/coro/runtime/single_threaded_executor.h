@@ -2,6 +2,7 @@
 
 #include <coro/runtime/executor.h>
 #include <coro/detail/task.h>
+#include <coro/detail/task_state.h>
 #include <coro/detail/waker.h>
 #include <memory>
 #include <queue>
@@ -39,6 +40,9 @@ public:
     /// Tasks enqueued *during* this pass are deferred to the next call.
     /// @return `true` if at least one task was polled.
     bool poll_ready_tasks() override;
+
+    /// @brief Spins on `poll_ready_tasks()` until `state.terminated` is true.
+    void wait_for_completion(detail::TaskStateBase& state) override;
 
     /// @brief Returns `true` if the ready queue is empty.
     /// @note Suspended tasks may still exist even when this returns `true`.

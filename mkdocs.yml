@@ -49,8 +49,10 @@ nav:
     - Futures and Streams: future_and_stream.md
     - Tasks, Executors, and Runtime: task_and_executor.md
     - JoinSet: join_set.md
+    - Work-Sharing Executor: work_sharing_executor.md
     - Waker & Context In-depth: waker_and_context_propagation.md
     - Coroutine Scope: coroutine_scope.md
     - Select: select.md
     - Module Structure: module_structure.md
-    - Roadmap: roadmap.md
+  - Roadmap and Future Plans:
+    - Roadmap Overview: roadmap.md

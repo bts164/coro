@@ -2,7 +2,17 @@
 
 Planned and designed work not yet implemented, in rough priority order.
 
-## 1. Cancellation propagation tests
+## Remove `Synchronize`
+
+`JoinSet` is complete and tests pass. `Synchronize` can now be deleted:
+
+- Remove `include/coro/sync/synchronize.h`
+- Remove `test/test_synchronize.cpp` and its `CMakeLists.txt` entry
+- Remove all `Synchronize` references from docs (`task_and_executor.md`,
+  `coroutine_scope.md`, `module_structure.md`, `getting_started.md`)
+- Remove `Runtime::schedule_task()` if it was only used by `Synchronize`
+
+## Cancellation propagation tests
 
 The end-to-end cancellation tests deferred in `test/test_coro_scope.cpp` can now be written — `select` and `timeout` are both implemented. Specifically:
 
@@ -11,7 +21,130 @@ The end-to-end cancellation tests deferred in `test/test_coro_scope.cpp` can now
 
 These tests require no new infrastructure; they are Phase 3 validation for the interaction between `CoroutineScope`, `SelectFuture`, and `Coro<T>`.
 
-## 2. libuv integration
+## ~~Work-sharing executor~~ — complete
+
+`WorkSharingExecutor` is implemented and all tests pass. `Runtime` now selects the executor
+at construction time: `num_threads <= 1` → `SingleThreadedExecutor`, otherwise
+`WorkSharingExecutor`. Design documented in `doc/work_sharing_executor.md`.
+
+## Channels — `mpsc`, `oneshot`, `watch`, & `broadcast`
+
+User-facing async channels for inter-task communication. The internal `Channel<T>` backing
+`StreamHandle` already provides the core machinery; this item exposes it as a public API
+and adds an `oneshot` variant.
+
+### `mpsc` — multi-producer, single-consumer
+
+```cpp
+auto [tx, rx] = coro::mpsc::channel<int>(/*buffer=*/16);
+// Producer side (Future<void>):
+co_await tx.send(42);
+// Consumer side (Stream<int>):
+while (auto item = co_await coro::next(rx))
+    use(*item);
+```
+
+- `Sender<T>` — `Future<void>` that resolves once the item is buffered or the receiver
+  is ready. Multiple `Sender`s can be created by cloning (`tx.clone()`).
+- `Receiver<T>` — satisfies `Stream<T>`; yields items in send order; signals exhaustion
+  when all senders are dropped.
+- Bounded buffer with backpressure: `send()` suspends when full.
+
+### `oneshot` — single-value, single-producer, single-consumer
+
+```cpp
+auto [tx, rx] = coro::oneshot::channel<int>();
+coro::spawn(co_invoke([tx = std::move(tx)]() mutable -> coro::Coro<void> {
+    tx.send(99);  // synchronous — oneshot send never blocks
+})).submit().detach();
+int value = co_await rx;  // rx satisfies Future<T>
+```
+
+- `OneshotSender<T>` — synchronous `send(T)`; dropping without sending causes `rx` to
+  receive `PollError`.
+- `OneshotReceiver<T>` — satisfies `Future<T>`; resolves when the sender fires or errors
+  if the sender is dropped.
+
+### `watch` — single-producer, multi-consumer, latest-value
+
+A channel that holds exactly one value. Any number of receivers can observe the current
+value or wait for the next change. New sends overwrite the previous value — there is no
+queue and receivers never apply backpressure.
+
+```cpp
+auto [tx, rx] = coro::watch::channel<int>(/*initial=*/0);
+
+// Sender (any thread / task):
+tx.send(42);  // synchronous overwrite; never blocks
+
+// Receiver — await the next change, then read the current value:
+co_await rx.changed();  // suspends until a new value is sent
+int current = rx.borrow();
+
+// Clone to give independent cursors to multiple tasks:
+auto rx2 = rx.clone();
+```
+
+- `WatchSender<T>` — synchronous `send(T)` (no suspension); last write wins.
+- `WatchReceiver<T>` — `changed()` returns `Future<void>` that resolves when a new value
+  has been sent since the last `borrow()` or `changed()` call. `borrow()` returns a
+  const reference to the current value under a read lock. Cloneable for fan-out.
+- Use case: configuration/state that many tasks need to observe, where only the latest
+  value matters (e.g. feature flags, connection state, metrics thresholds).
+
+### `broadcast` — single-producer, multi-consumer, all-values
+
+**Lower priority that the other three, and may be deferred**
+
+A channel where every active receiver sees every message. Unlike `watch`, no values are
+dropped as long as the slowest receiver keeps up; a receiver that falls too far behind
+receives a lag error indicating missed messages.
+
+```cpp
+auto [tx, rx] = coro::broadcast::channel<int>(/*capacity=*/64);
+
+// Clone rx to give each subscriber an independent cursor:
+auto rx2 = rx.clone();
+
+// Producer:
+co_await tx.send(1);
+co_await tx.send(2);
+
+// Each receiver sees all messages sent after its creation:
+while (auto item = co_await coro::next(rx))
+    use(*item);
+```
+
+- `BroadcastSender<T>` — `send(T)` returns `Future<void>`; suspends if all receiver
+  buffers are full (slowest receiver applies backpressure).
+- `BroadcastReceiver<T>` — satisfies `Stream<T>`; yields messages in send order.
+  If a receiver falls behind by more than `capacity` messages it receives a lag error
+  on the next `next()` call. Cloneable.
+- Use case: event buses, log fanout, pub/sub within a single runtime.
+
+Lives in `include/coro/sync/channel.h`.
+
+## Async `Mutex<T>`
+
+`std::mutex` blocks the OS thread, starving the executor. `Mutex<T>` suspends the *task*
+until the lock is free, yielding the thread back to the executor in the meantime.
+
+```cpp
+coro::Mutex<std::vector<int>> shared;
+
+coro::Coro<void> append(int value) {
+    auto guard = co_await shared.lock();  // suspends if contended; never blocks thread
+    guard->push_back(value);
+}   // guard released here
+```
+
+- `Mutex<T>` owns `T` and exposes it only through the guard, enforcing lock discipline.
+- `lock()` returns `Future<MutexGuard<T>>`; the guard releases on destruction.
+- Fair queuing: waiting tasks are woken in FIFO order.
+
+Lives in `include/coro/sync/mutex.h`.
+
+## libuv integration
 
 Currently `SleepFuture` is clock-polling only: the executor is not woken at the deadline; it only fires when the executor happens to re-poll. This needs:
 
@@ -21,20 +154,16 @@ Currently `SleepFuture` is clock-polling only: the executor is not woken at the 
 
 The waker/context design already supports this — leaf futures call `ctx.getWaker()` and store it for the callback to fire.
 
-## 3. Work-stealing executor
+## Work-stealing executor
 
 A multi-threaded work-stealing executor to replace (or sit alongside) `SingleThreadedExecutor`. Modelled on Tokio's scheduler:
 
 - Per-thread run queues with work-stealing on underload.
 - The `Executor` interface is already designed to be pluggable; `Runtime` can select the implementation at construction time (e.g. `num_threads == 1` → single-threaded, otherwise work-stealing).
 - Thread-local `t_current_coro` and the `CoroutineScope` mutex are already safe for multi-threaded use.
+- Natural evolution from the work-sharing executor — the shared queue becomes per-thread queues with a steal path added.
 
-## 4. ~~`co_invoke` — safe capturing-lambda coroutines~~ — complete
-
-Implemented in `include/coro/co_invoke.h`. See the Doxygen comment on `co_invoke()` for
-the full problem description and usage examples. Tests in `test/test_co_invoke.cpp`.
-
-## 5. ~~Fate of `Synchronize`~~ — resolved: remove after `JoinSet` lands
+## ~~Fate of `Synchronize`~~ — resolved: remove after `JoinSet` lands
 
 Once `JoinSet` (item 6) is implemented and its tests pass, `Synchronize` will be removed.
 
@@ -66,7 +195,112 @@ co_await co_invoke([&]() -> Coro<void> {
 });
 ```
 
-## 6. ~~`JoinSet<T>` — structured concurrency with explicit result collection~~ — complete
+## Stream combinators
 
-Implemented in `include/coro/task/join_set.h`. See `doc/join_set.md` for the full design.
-Tests in `test/test_join_set.cpp`.
+The `Stream` concept and `next()` are implemented but there are no combinators. Without
+them, every stream consumer must write a boilerplate `while (auto item = co_await next(s))`
+loop. Modelled on Rust's `StreamExt` / `Iterator`:
+
+- **`map(stream, fn)`** — transform each item: `Stream<T>` → `Stream<U>`
+- **`filter(stream, pred)`** — drop items that don't satisfy a predicate
+- **`take(stream, n)`** — yield at most `n` items then signal exhaustion
+- **`chain(s1, s2)`** — concatenate two streams of the same item type
+- **`flat_map(stream, fn)`** — map each item to a stream and flatten one level
+
+All combinators are lazy (zero-cost wrappers satisfying `Stream`) and live in
+`include/coro/stream/` (new subdirectory). Each has a corresponding free function
+returning a `[[nodiscard]]` adaptor type.
+
+## `AbortHandle`
+
+Currently the only way to cancel a spawned task is to drop its `JoinHandle`, which also
+gives up the ability to observe the result. `AbortHandle` decouples cancellation from
+result collection:
+
+```cpp
+auto [handle, abort] = coro::spawn(task()).submit_with_abort();
+abort.abort();          // request cancellation
+co_await handle;        // still await completion (receives PollDropped / exception)
+```
+
+- `AbortHandle` — a lightweight cancellation token tied to one task; `abort()` marks the
+  underlying `TaskState::cancelled`.
+- `JoinHandle` — unchanged; still the only way to await the result.
+- `SpawnBuilder::submit_with_abort()` returns `pair<JoinHandle<T>, AbortHandle>`.
+
+Lives in `include/coro/task/abort_handle.h`.
+
+## libuv I/O primitives
+
+Dependent on item 2 (libuv integration). Once the event loop is wired into `block_on`,
+expose async I/O wrappers in `include/coro/io/`:
+
+- **`TcpListener` / `TcpStream`** — accept connections, read/write with backpressure.
+- **`UdpSocket`** — async send/recv.
+- **`File`** — async read/write using libuv's thread-pool file I/O.
+- **DNS resolution** — `resolve(hostname)` returning `Future<IpAddress>`.
+
+Each wraps the corresponding libuv handle, storing a `Waker` in the callback and waking
+the task when the operation completes.
+
+## `spawn_blocking()`
+
+Run a blocking closure on a dedicated thread pool without stalling the async executor.
+Essential for CPU-intensive work or unavoidable blocking I/O.
+
+```cpp
+int result = co_await coro::spawn_blocking([]() -> int {
+    return expensive_computation();  // runs on thread pool, not executor thread
+});
+```
+
+- Submits the closure to a `std::thread` pool (or libuv's thread pool once integrated).
+- Returns a `Future<T>` that resolves when the thread completes.
+- The calling task suspends (freeing the executor thread) until the blocking work finishes.
+
+Lives in `include/coro/task/spawn_blocking.h`.
+
+## libwebsockets integration
+
+Dependent on the libuv integration item. Wraps [libwebsockets](https://libwebsockets.org)
+using the libuv event loop as the backend, exposing async WebSocket client and server
+primitives that compose naturally with the rest of the library.
+
+```cpp
+#include <coro/io/websocket.h>
+
+// Client:
+coro::Coro<void> run() {
+    auto ws = co_await coro::WebSocket::connect("wss://example.com/feed");
+
+    // Send a message:
+    co_await ws.send("hello");
+
+    // Receive messages as a stream:
+    while (auto msg = co_await coro::next(ws))
+        std::cout << msg->text() << "\n";
+}
+
+// Server:
+coro::Coro<void> serve() {
+    auto listener = coro::WebSocketListener::bind("0.0.0.0", 9000);
+    while (auto conn = co_await coro::next(listener)) {
+        coro::spawn(co_invoke([conn = std::move(*conn)]() mutable -> coro::Coro<void> {
+            while (auto msg = co_await coro::next(conn))
+                co_await conn.send(msg->text());  // echo
+        })).submit().detach();
+    }
+}
+```
+
+- `WebSocket` — satisfies `Stream<Message>` for incoming frames; `send()` returns
+  `Future<void>`. Backed by a libwebsockets context driven by the libuv event loop,
+  so no dedicated thread is needed.
+- `WebSocketListener` — satisfies `Stream<WebSocket>`; yields one `WebSocket` per
+  accepted connection.
+- `Message` — carries the frame payload and type (`text`, `binary`, `ping`, `close`).
+- Fragmented frames are reassembled before delivery.
+- TLS is handled by libwebsockets' built-in OpenSSL/mbedTLS integration.
+
+Lives in `include/coro/io/websocket.h`. Requires libwebsockets built with libuv event
+loop support (`-DLWS_WITH_LIBUV=ON`).

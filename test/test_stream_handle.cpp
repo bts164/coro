@@ -26,7 +26,7 @@ Coro<std::vector<T>> drain(StreamHandle<T> handle) {
 // --- Basic functionality ---
 
 TEST(StreamHandleTest, EmptyStreamYieldsNothing) {
-    Runtime rt;
+    Runtime rt(1);
 
     auto make_empty = []() -> CoroStream<int> {
         co_return;
@@ -38,7 +38,7 @@ TEST(StreamHandleTest, EmptyStreamYieldsNothing) {
 }
 
 TEST(StreamHandleTest, SingleItemStream) {
-    Runtime rt;
+    Runtime rt(1);
 
     auto make_stream = []() -> CoroStream<int> {
         co_yield 42;
@@ -51,7 +51,7 @@ TEST(StreamHandleTest, SingleItemStream) {
 }
 
 TEST(StreamHandleTest, MultipleItems) {
-    Runtime rt;
+    Runtime rt(1);
 
     auto make_stream = []() -> CoroStream<int> {
         co_yield 1;
@@ -70,7 +70,7 @@ TEST(StreamHandleTest, MultipleItems) {
 // --- Buffer size ---
 
 TEST(StreamHandleTest, SmallBufferDrainsCorrectly) {
-    Runtime rt;
+    Runtime rt(1);
 
     auto make_stream = []() -> CoroStream<int> {
         for (int i = 0; i < 10; ++i)
@@ -88,7 +88,7 @@ TEST(StreamHandleTest, SmallBufferDrainsCorrectly) {
 // --- Exception propagation ---
 
 TEST(StreamHandleTest, ExceptionPropagatesFromStream) {
-    Runtime rt;
+    Runtime rt(1);
 
     auto make_stream = []() -> CoroStream<int> {
         co_yield 1;
@@ -104,7 +104,7 @@ TEST(StreamHandleTest, ExceptionPropagatesFromStream) {
 // --- Default-constructed handle ---
 
 TEST(StreamHandleTest, DefaultConstructedHandleIsExhausted) {
-    Runtime rt;
+    Runtime rt(1);
 
     StreamHandle<int> handle;
     auto items = rt.block_on(drain(std::move(handle)));

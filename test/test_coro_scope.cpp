@@ -191,14 +191,14 @@ Coro<void> spawns_and_returns(std::shared_ptr<int> out, bool cancel = false) {
 }
 
 TEST(CoroutineScopeIntegration, CoroutineWaitsForDroppedChildBeforeCompleting) {
-    Runtime rt;
+    Runtime rt(1);
     auto shared = std::make_shared<int>(0);
     rt.block_on(spawns_and_returns(shared, false));
     EXPECT_EQ(*shared, 42);
 }
 
 TEST(CoroutineScopeIntegration, CoroutineCancelsDroppedChildBeforeCompleting) {
-    Runtime rt;
+    Runtime rt(1);
     auto shared = std::make_shared<int>(0);
     rt.block_on(spawns_and_returns(shared, true));
     EXPECT_EQ(*shared, 0);
@@ -221,7 +221,7 @@ Coro<void> spawns_multiple(std::shared_ptr<int> counter) {
 }
 
 TEST(CoroutineScopeIntegration, CoroutineWaitsForAllDroppedChildren) {
-    Runtime rt;
+    Runtime rt(1);
     auto counter = std::make_shared<int>(0);
     // Each WritingFuture overwrites counter; last one to run wins.
     // We just verify all three ran (counter was touched), not the final value.
@@ -242,7 +242,7 @@ Coro<void> outer_calls_inner(std::shared_ptr<int> out) {
 }
 
 TEST(CoroutineScopeIntegration, NestedCoroutineDrainsItsOwnChildren) {
-    Runtime rt;
+    Runtime rt(1);
     auto shared = std::make_shared<int>(0);
     rt.block_on(outer_calls_inner(shared));
     EXPECT_EQ(*shared, 99);

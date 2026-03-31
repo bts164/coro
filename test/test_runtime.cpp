@@ -53,7 +53,7 @@ static_assert(Stream<IntStream>);
 // --- Runtime construction ---
 
 TEST(RuntimeTest, IsConstructibleWithDefaultThreadCount) {
-    Runtime rt;
+    Runtime rt(1);
     (void)rt;
 }
 
@@ -65,23 +65,23 @@ TEST(RuntimeTest, IsConstructibleWithExplicitThreadCount) {
 // --- block_on: basic futures ---
 
 TEST(RuntimeTest, BlockOnReturnsIntResult) {
-    Runtime rt;
+    Runtime rt(1);
     int result = rt.block_on(ImmediateIntFuture{42});
     EXPECT_EQ(result, 42);
 }
 
 TEST(RuntimeTest, BlockOnVoidCompletes) {
-    Runtime rt;
+    Runtime rt(1);
     rt.block_on(ImmediateVoidFuture{});  // should not throw or hang
 }
 
 TEST(RuntimeTest, BlockOnRethrowsException) {
-    Runtime rt;
+    Runtime rt(1);
     EXPECT_THROW(rt.block_on(ThrowingFuture{}), std::runtime_error);
 }
 
 TEST(RuntimeTest, BlockOnSelfWakingFuture) {
-    Runtime rt;
+    Runtime rt(1);
     int result = rt.block_on(SelfWakingFuture{7});
     EXPECT_EQ(result, 7);
 }
@@ -102,22 +102,22 @@ Coro<int> throwing_coro() {
 }
 
 TEST(RuntimeTest, BlockOnSimpleCoro) {
-    Runtime rt;
+    Runtime rt(1);
     EXPECT_EQ(rt.block_on(simple_coro()), 99);
 }
 
 TEST(RuntimeTest, BlockOnVoidCoro) {
-    Runtime rt;
+    Runtime rt(1);
     rt.block_on(void_coro());
 }
 
 TEST(RuntimeTest, BlockOnCoroAwaitingImmediateFuture) {
-    Runtime rt;
+    Runtime rt(1);
     EXPECT_EQ(rt.block_on(coro_awaiting_immediate()), 55);
 }
 
 TEST(RuntimeTest, BlockOnCoroRethrowsException) {
-    Runtime rt;
+    Runtime rt(1);
     EXPECT_THROW(rt.block_on(throwing_coro()), std::runtime_error);
 }
 
@@ -129,32 +129,32 @@ Coro<int> spawns_task() {
 }
 
 TEST(RuntimeTest, BlockOnCoroThatSpawnsTask) {
-    Runtime rt;
+    Runtime rt(1);
     EXPECT_EQ(rt.block_on(spawns_task()), 123);
 }
 
 // --- SpawnBuilder interface ---
 
 TEST(RuntimeTest, SpawnBuilderSubmitReturnsJoinHandle) {
-    Runtime rt;
+    Runtime rt(1);
     JoinHandle<int> h = rt.spawn(ImmediateIntFuture{1}).submit();
     (void)h;
 }
 
 TEST(RuntimeTest, SpawnBuilderNameIsChainable) {
-    Runtime rt;
+    Runtime rt(1);
     JoinHandle<int> h = rt.spawn(ImmediateIntFuture{1}).name("my-task").submit();
     (void)h;
 }
 
 TEST(RuntimeTest, StreamBuilderSubmitReturnsStreamHandle) {
-    Runtime rt;
+    Runtime rt(1);
     StreamHandle<int> h = rt.spawn(IntStream{}).submit();
     (void)h;
 }
 
 TEST(RuntimeTest, StreamBuilderNameAndBufferAreChainable) {
-    Runtime rt;
+    Runtime rt(1);
     StreamHandle<int> h = rt.spawn(IntStream{}).name("reader").buffer(128).submit();
     (void)h;
 }
@@ -162,7 +162,7 @@ TEST(RuntimeTest, StreamBuilderNameAndBufferAreChainable) {
 // --- Thread-local runtime ---
 
 TEST(RuntimeTest, SetAndGetCurrentRuntime) {
-    Runtime rt;
+    Runtime rt(1);
     set_current_runtime(&rt);
     EXPECT_EQ(&current_runtime(), &rt);
     set_current_runtime(nullptr);
@@ -174,7 +174,7 @@ TEST(RuntimeTest, CurrentRuntimeThrowsWhenUnset) {
 }
 
 TEST(RuntimeTest, FreeSpawnDelegatesToCurrentRuntime) {
-    Runtime rt;
+    Runtime rt(1);
     set_current_runtime(&rt);
     JoinHandle<int> h = coro::spawn(ImmediateIntFuture{1}).submit();
     set_current_runtime(nullptr);
