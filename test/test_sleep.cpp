@@ -65,7 +65,7 @@ TEST(TimeoutTest, DeadlineWinsAgainstSlowFuture) {
     auto result = rt.block_on([]() -> Coro<int> {
         // sleep_for(500ms) is the "slow future"; timeout wraps it with a 50ms deadline.
         // The inner sleep should be cancelled by the timeout.
-        auto r = co_await timeout(50min, sleep_for(500min));
+        auto r = co_await timeout(50ms, sleep_for(500ms));
         co_return static_cast<int>(r.index()); // 1 = timeout branch
     }());
     auto elapsed = std::chrono::steady_clock::now() - start;

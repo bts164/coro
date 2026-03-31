@@ -3,9 +3,14 @@
 #include <coro/runtime/single_threaded_executor.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
 
 using namespace coro;
 using namespace coro::detail;
+using namespace std::chrono_literals;
 
 class MockWaker : public Waker {
 public:
@@ -122,11 +127,12 @@ TEST(SingleThreadedExecutorTest, ScheduleAndPollTask) {
     EXPECT_EQ(*state->result, 7);
 }
 
-TEST(SingleThreadedExecutorTest, PendingTaskMovedToSuspended) {
+TEST(SingleThreadedExecutorTest, PendingTaskBecomesIdle) {
     SingleThreadedExecutor ex;
     ex.schedule(std::make_unique<Task>(NeverFuture{}));
     ex.poll_ready_tasks();
-    // Task returned Pending — ready queue is empty but task lives in suspended.
+    // Task returned Pending without storing a waker — transitions to Idle and
+    // then drops immediately (no waker holds the ref). Ready queue is empty.
     EXPECT_TRUE(ex.empty());
 }
 
@@ -159,4 +165,103 @@ TEST(SingleThreadedExecutorTest, SetResultCallsJoinWaker) {
     state->join_waker = join_waker;
     ex.schedule(std::make_unique<Task>(ImmediateFuture{1}, state));
     ex.poll_ready_tasks();
+}
+
+TEST(SingleThreadedExecutorTest, WaitForComplete) {
+    auto join_waker = std::make_shared<MockWaker>();
+    EXPECT_CALL(*join_waker, wake()).Times(1);
+
+    SingleThreadedExecutor ex;
+    auto state = std::make_shared<TaskState<int>>();
+    state->join_waker = join_waker;
+    ex.schedule(std::make_unique<Task>(ImmediateFuture{1}, state));
+    ex.poll_ready_tasks();
+}
+
+// A future that suspends on the first poll, hands the waker to a std::promise
+// for safe cross-thread transfer, then returns the value on the second poll.
+// std::promise::set_value / future::get provide the happens-before needed to
+// avoid a data race between the future setting the waker and the waker thread
+// reading it.
+struct PromiseWakeFuture {
+    using OutputType = int;
+    int                                         m_value;
+    std::promise<std::shared_ptr<detail::Waker>>* m_promise;
+    bool                                         m_first = true;
+
+    PollResult<int> poll(Context& ctx) {
+        if (m_first) {
+            m_first = false;
+            m_promise->set_value(ctx.getWaker()->clone());
+            return PollPending;
+        }
+        return m_value;
+    }
+};
+
+TEST(SingleThreadedExecutorTest, ExternalThreadWakeup) {
+    // Verifies that a task suspended waiting for an external wake is correctly
+    // resumed when wake() is called from another thread, and that
+    // wait_for_completion() does not return prematurely.
+    std::promise<std::shared_ptr<detail::Waker>> waker_promise;
+    auto waker_future = waker_promise.get_future();
+
+    SingleThreadedExecutor ex;
+    auto state = std::make_shared<TaskState<int>>();
+    ex.schedule(std::make_unique<Task>(PromiseWakeFuture{99, &waker_promise}, state));
+
+    // The waker thread blocks on future::get() until the task has been polled
+    // and set the promise — no sleep-based races.
+    std::thread waker_thread([wf = std::move(waker_future)]() mutable {
+        wf.get()->wake();
+    });
+
+    ex.wait_for_completion(*state);
+    waker_thread.join();
+
+    std::lock_guard lock(state->mutex);
+    ASSERT_TRUE(state->result.has_value());
+    EXPECT_EQ(*state->result, 99);
+}
+
+TEST(SingleThreadedExecutorTest, WaitForCompletionDoesNotReturnEarlyWithPendingTask) {
+    // Regression test for the premature-return bug: the old implementation
+    // exited wait_for_completion() when the ready queue was empty, before the
+    // task had a chance to be woken externally. With the injection queue +
+    // condvar fix it must block until the task completes.
+    std::promise<std::shared_ptr<detail::Waker>> waker_promise;
+    auto waker_future = waker_promise.get_future();
+
+    SingleThreadedExecutor ex;
+    auto state = std::make_shared<TaskState<int>>();
+    ex.schedule(std::make_unique<Task>(PromiseWakeFuture{7, &waker_promise}, state));
+
+    std::thread waker_thread([wf = std::move(waker_future)]() mutable {
+        wf.get()->wake();
+    });
+
+    ex.wait_for_completion(*state);
+    waker_thread.join();
+
+    std::lock_guard lock(state->mutex);
+    ASSERT_TRUE(state->result.has_value());
+    EXPECT_EQ(*state->result, 7);
+}
+
+// --- SchedulingState tests ---
+
+TEST(SchedulingStateTest, InitialStateIsIdle) {
+    Task t(ImmediateFuture{1});
+    EXPECT_EQ(t.scheduling_state.load(), SchedulingState::Idle);
+}
+
+TEST(SchedulingStateTest, ScheduleSetsNotified) {
+    SingleThreadedExecutor ex;
+    // Schedule a NeverFuture so we can inspect the state after schedule().
+    // The task goes into the injection queue (Notified).
+    NeverFuture nf{};
+    auto task_ptr = std::make_unique<Task>(nf);
+    Task* raw = task_ptr.get();
+    ex.schedule(std::move(task_ptr));
+    EXPECT_EQ(raw->scheduling_state.load(), SchedulingState::Notified);
 }

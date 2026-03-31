@@ -3,13 +3,12 @@
 #include <coro/runtime/executor.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
-#include <coro/detail/waker.h>
+#include <coro/detail/work_stealing_deque.h>
 #include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace coro {
@@ -17,67 +16,67 @@ namespace coro {
 class Runtime;
 
 /**
- * @brief Multi-threaded @ref Executor with a single shared task queue.
+ * @brief Multi-threaded @ref Executor with per-worker local queues.
  *
- * All N worker threads pull from and push to the same `m_queue`, protected by `m_mutex`.
- * Tasks run in parallel across threads; there is no per-thread affinity or work-stealing.
+ * N worker threads each own a @ref WorkStealingDeque for lock-free local
+ * wakeups. Cross-thread (remote) wakeups go to a shared injection queue
+ * protected by `m_mutex`.
  *
- * **Task lifecycle states:**
- * | State     | Location            | Description                                        |
- * |-----------|---------------------|----------------------------------------------------|
- * | Ready     | `m_queue` deque     | Waiting to be dequeued by a worker                 |
- * | Running   | (worker call stack) | Currently inside `poll()`; tracked in `m_self_woken` |
- * | Suspended | `m_suspended` map   | Waiting for an external `Waker::wake()` call       |
- * | Done      | freed               | `poll()` returned a terminal result                |
+ * **Task lifecycle states** (tracked via Task::scheduling_state):
+ * | State              | Location                   | Description                          |
+ * |--------------------|----------------------------|--------------------------------------|
+ * | Notified           | local queue or inj. queue  | Waiting to be polled                 |
+ * | Running            | (worker call stack)        | Currently inside `poll()`            |
+ * | RunningAndNotified | (worker call stack)        | Inside `poll()`, wake() already fired|
+ * | Idle               | owned by TaskWaker         | Waiting for an external wakeup       |
+ * | Done               | freed                      | `poll()` returned a terminal result  |
  *
- * **Self-wake during `poll()`:** if `wake_task()` fires while a task is Running, the
- * `m_self_woken` flag for that task is set to `true`. After `poll()` returns the worker
- * checks the flag and re-enqueues the task rather than moving it to Suspended.
+ * **Suspension:** there is no `m_suspended` map. A task in Idle is kept alive
+ * solely by the `shared_ptr<Task>` stored in its TaskWaker.
  *
- * **Thread-locals:** each worker thread sets `t_current_runtime` at startup so that
- * `coro::spawn()` and `JoinSet::spawn()` resolve to the owning `Runtime`.
+ * **Thread-locals:** each worker sets `t_current_runtime` and
+ * `t_current_timer_service` at startup, and a per-executor worker index
+ * (`t_worker_index`) used by `enqueue()` to identify the local queue.
  */
 class WorkSharingExecutor : public Executor {
 public:
     /// @param num_threads Number of worker threads to create.
-    /// @param runtime Back-pointer to the owning Runtime, used to set `t_current_runtime`
-    ///                on each worker thread.
+    /// @param runtime Back-pointer to the owning Runtime.
     WorkSharingExecutor(std::size_t num_threads, Runtime* runtime);
     ~WorkSharingExecutor() override;
 
     WorkSharingExecutor(const WorkSharingExecutor&)            = delete;
     WorkSharingExecutor& operator=(const WorkSharingExecutor&) = delete;
 
-    /// @brief Enqueues the task and wakes one worker.
+    /// @brief Enqueues the task and routes it to the injection queue (or local
+    /// queue if called from a worker thread), then wakes a worker if needed.
     void schedule(std::unique_ptr<detail::Task> task) override;
 
-    /// @brief Returns `true` if the ready queue is non-empty.
-    /// @note Workers drive execution autonomously; `block_on` does not call this.
+    /// @brief Route a newly-notified task to the appropriate queue.
+    /// Worker thread → local queue, no lock. Any other thread → injection queue.
+    void enqueue(std::shared_ptr<detail::Task> task) override;
+
+    /// @brief Returns `true` if the injection queue is non-empty.
+    /// Workers drive execution autonomously; `block_on` does not call this.
     bool poll_ready_tasks() override;
 
-    /// @brief Delegates to `state.wait_until_done()`, blocking on `state.cv`.
-    /// No executor-level condvar involved — the state owns the completion signal.
+    /// @brief Delegates to `state.wait_until_done()`.
     void wait_for_completion(detail::TaskStateBase& state) override;
 
-    /// @brief Called by a `TaskWaker` to reschedule a task.
-    /// If the task is currently Running, sets its self-wake flag.
-    /// Otherwise moves it from `m_suspended` to `m_queue` and wakes a worker.
-    void wake_task(detail::Task* key);
-
 private:
-    /// @brief Main loop executed by each worker thread.
-    void worker_loop();
+    void worker_loop(int worker_index);
 
-    std::deque<std::shared_ptr<detail::Task>>                        m_queue;
-    std::unordered_map<detail::Task*, std::shared_ptr<detail::Task>> m_suspended;
-    std::unordered_map<detail::Task*, bool>                          m_self_woken;
+    // Per-worker local queues — no lock for the owning worker.
+    std::vector<detail::WorkStealingDeque<std::shared_ptr<detail::Task>>> m_local_queues;
 
-    std::mutex               m_mutex;
+    // Injection queue — remote enqueue() calls and initial schedule() land here.
+    std::deque<std::shared_ptr<detail::Task>> m_injection_queue;
+    std::mutex               m_mutex;   ///< Guards m_injection_queue and m_stop.
     std::condition_variable  m_cv;
     bool                     m_stop{false};
-    std::vector<std::thread> m_workers;
 
-    Runtime* m_runtime;
+    std::vector<std::thread> m_workers;
+    Runtime*                 m_runtime;
 };
 
 } // namespace coro

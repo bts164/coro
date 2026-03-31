@@ -3,31 +3,35 @@
 #include <coro/runtime/executor.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
-#include <coro/detail/waker.h>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <queue>
-#include <unordered_map>
+#include <thread>
 
 namespace coro {
 
 /**
  * @brief Single-threaded @ref Executor implementation.
  *
- * All tasks run on the thread that calls `poll_ready_tasks()` (i.e. the thread running
- * `Runtime::block_on()`). Deterministic and allocation-light; the primary executor for
- * testing and single-threaded applications.
+ * All tasks run on the thread that calls `wait_for_completion()` (i.e. the
+ * thread running `Runtime::block_on()`). Deterministic and allocation-light;
+ * the primary executor for testing and single-threaded applications.
  *
- * **Task lifecycle states:**
- * | State     | Location            | Description                                  |
- * |-----------|---------------------|----------------------------------------------|
- * | Scheduled | `m_ready` queue     | Waiting to be polled                         |
- * | Running   | (on the call stack) | Currently inside `poll()`                    |
- * | Suspended | `m_suspended` map   | Waiting for an external `Waker::wake()` call |
- * | Complete  | freed               | `poll()` returned a terminal result          |
+ * **Task lifecycle states** (tracked via Task::scheduling_state):
+ * | State              | Location              | Description                          |
+ * |--------------------|-----------------------|--------------------------------------|
+ * | Notified           | `m_ready` queue       | Waiting to be polled                 |
+ * | Running            | (on the call stack)   | Currently inside `poll()`            |
+ * | RunningAndNotified | (on the call stack)   | Inside `poll()`, wake() already fired|
+ * | Idle               | owned by TaskWaker    | Waiting for an external wakeup       |
+ * | Done               | freed                 | `poll()` returned a terminal result  |
  *
- * **Self-wake during `poll()`:** if a task's waker fires while the task is still Running,
- * `wake_task()` sets `m_running_task_woken` instead of moving to Suspended. After `poll()`
- * returns the task is re-enqueued automatically.
+ * **External wakeups:** `TimerService` and other external threads call `enqueue()`
+ * via `TaskWaker::wake()`. External calls are routed to `m_incoming_wakes` (the
+ * injection queue), protected by `m_remote_mutex`. `wait_for_completion()` blocks
+ * on `m_remote_cv` when the ready queue is empty rather than returning prematurely.
  */
 class SingleThreadedExecutor : public Executor {
 public:
@@ -36,30 +40,32 @@ public:
 
     void schedule(std::unique_ptr<detail::Task> task) override;
 
-    /// @brief Processes all tasks currently in the ready queue.
-    /// Tasks enqueued *during* this pass are deferred to the next call.
+    /// @brief Route a newly-notified task to the appropriate queue.
+    /// Local thread (poll thread) → directly to m_ready, no lock.
+    /// Any other thread → m_incoming_wakes + m_remote_cv signal.
+    void enqueue(std::shared_ptr<detail::Task> task) override;
+
+    /// @brief Drains the injection queue, then polls all ready tasks once.
     /// @return `true` if at least one task was polled.
     bool poll_ready_tasks() override;
 
-    /// @brief Spins on `poll_ready_tasks()` until `state.terminated` is true.
+    /// @brief Blocks until `state.terminated`. Drives the poll loop internally.
     void wait_for_completion(detail::TaskStateBase& state) override;
 
-    /// @brief Returns `true` if the ready queue is empty.
-    /// @note Suspended tasks may still exist even when this returns `true`.
+    /// @brief Returns `true` if the ready queue and injection queue are both empty.
     bool empty() const;
 
-    /// @brief Called by a `TaskWaker` to reschedule a task.
-    /// Handles self-wake (task is currently Running), normal wake (Suspended → ready), and no-op.
-    void wake_task(detail::Task* key);
-
 private:
-    std::shared_ptr<detail::Waker> make_waker(detail::Task* key);
+    std::queue<std::shared_ptr<detail::Task>> m_ready;
 
-    std::queue<std::shared_ptr<detail::Task>>                         m_ready;
-    std::unordered_map<detail::Task*, std::shared_ptr<detail::Task>>  m_suspended;
+    // Injection queue — remote enqueue() calls land here.
+    std::deque<std::shared_ptr<detail::Task>> m_incoming_wakes;
+    mutable std::mutex                        m_remote_mutex;
+    std::condition_variable                   m_remote_cv;
 
-    detail::Task* m_running_task_key   = nullptr;  // non-null while a task is being polled
-    bool          m_running_task_woken = false;     // set by wake_task() during Running state
+    // Identity of the thread currently running wait_for_completion().
+    // Used by enqueue() to distinguish local vs. remote wakeups.
+    std::thread::id m_poll_thread_id;
 };
 
 } // namespace coro

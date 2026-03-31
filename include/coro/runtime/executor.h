@@ -20,7 +20,16 @@ public:
     virtual ~Executor();
 
     /// @brief Submit a task for scheduling. The executor takes ownership.
+    /// Sets `task->scheduling_state` to `Notified` before enqueuing.
     virtual void schedule(std::unique_ptr<detail::Task> task) = 0;
+
+    /// @brief Route a task to the appropriate ready queue.
+    ///
+    /// Called by `TaskWaker::wake()` after winning the `Idle → Notified` CAS.
+    /// Implementations check the calling thread's identity:
+    /// - Same thread as the owning worker → local queue, no lock.
+    /// - Any other thread → mutex-protected injection queue + condvar signal.
+    virtual void enqueue(std::shared_ptr<detail::Task> task) = 0;
 
     /// @brief Poll all currently-ready tasks once.
     /// @return `true` if at least one task was processed; `false` if the ready queue was empty.

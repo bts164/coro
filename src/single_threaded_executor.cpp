@@ -1,48 +1,44 @@
 #include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
+#include <cstdlib>
+#include <iostream>
 
 namespace coro {
-
-namespace {
-
-struct TaskWaker final : detail::Waker {
-    detail::Task*           key;
-    SingleThreadedExecutor* executor;
-
-    void wake() override {
-        executor->wake_task(key);
-    }
-
-    std::shared_ptr<Waker> clone() override {
-        return std::make_shared<TaskWaker>(*this);
-    }
-};
-
-} // namespace
 
 SingleThreadedExecutor::SingleThreadedExecutor() = default;
 SingleThreadedExecutor::~SingleThreadedExecutor() = default;
 
 void SingleThreadedExecutor::schedule(std::unique_ptr<detail::Task> task) {
-    m_ready.push(std::shared_ptr<detail::Task>(std::move(task)));
+    auto shared = std::shared_ptr<detail::Task>(std::move(task));
+    shared->scheduling_state.store(
+        detail::SchedulingState::Notified, std::memory_order_relaxed);
+    enqueue(std::move(shared));
 }
 
-void SingleThreadedExecutor::wake_task(detail::Task* key) {
-    if (key == m_running_task_key) {
-        // Self-wake: task is currently inside poll(). Mark it for re-enqueue
-        // after poll() returns instead of searching m_suspended.
-        m_running_task_woken = true;
-        return;
+void SingleThreadedExecutor::enqueue(std::shared_ptr<detail::Task> task) {
+    if (std::this_thread::get_id() == m_poll_thread_id) {
+        // Local path: we are the poll thread — push directly, no lock needed.
+        m_ready.push(std::move(task));
+    } else {
+        // Remote path: external thread — hand off via injection queue.
+        {
+            std::lock_guard lock(m_remote_mutex);
+            m_incoming_wakes.push_back(std::move(task));
+        }
+        m_remote_cv.notify_one();
     }
-    auto it = m_suspended.find(key);
-    if (it != m_suspended.end()) {
-        m_ready.push(std::move(it->second));
-        m_suspended.erase(it);
-    }
-    // Not found: task is already scheduled or complete — no-op.
 }
 
 bool SingleThreadedExecutor::poll_ready_tasks() {
+    // Drain injection queue first so remote wakes are never starved.
+    {
+        std::lock_guard lock(m_remote_mutex);
+        for (auto& t : m_incoming_wakes)
+            m_ready.push(std::move(t));
+        m_incoming_wakes.clear();
+    }
+
     if (m_ready.empty()) return false;
 
     // Snapshot count so tasks enqueued by synchronous wakers during this pass
@@ -52,48 +48,82 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
         auto task = std::move(m_ready.front());
         m_ready.pop();
 
-        m_running_task_key   = task.get();
-        m_running_task_woken = false;
+        // CAS Notified → Running. Failure means a bug — two threads dequeuing
+        // the same task, or incorrect state management.
+        auto expected = detail::SchedulingState::Notified;
+        if (!task->scheduling_state.compare_exchange_strong(
+                expected, detail::SchedulingState::Running,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed))
+        {
+            std::cerr << "[coro] SingleThreadedExecutor: unexpected scheduling_state "
+                      << static_cast<int>(expected)
+                      << " during Notified→Running transition (expected Notified=2)\n";
+            std::abort();
+        }
 
-        auto waker = make_waker(task.get());
+        auto waker = std::make_shared<TaskWaker>();
+        waker->task     = task;
+        waker->executor = this;
         detail::Context ctx(waker);
         bool done = task->poll(ctx);
 
-        m_running_task_key = nullptr;
-
-        if (!done) {
-            if (m_running_task_woken) {
-                // wake() was called during poll() — re-enqueue for the next pass.
-                m_ready.push(std::move(task));
+        if (done) {
+            // Task completed — drop it (destructor fires here).
+        } else {
+            // Try Running → Idle: park the task, waker owns the only ref.
+            expected = detail::SchedulingState::Running;
+            if (task->scheduling_state.compare_exchange_strong(
+                    expected, detail::SchedulingState::Idle,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
+            {
+                task.reset(); // waker holds the only ref; parks until wake() fires
             } else {
-                // Task is waiting on an external event — park it in m_suspended.
-                m_suspended[task.get()] = std::move(task);
+                // CAS failed: state must be RunningAndNotified — wake() fired during poll().
+                expected = detail::SchedulingState::RunningAndNotified;
+                if (!task->scheduling_state.compare_exchange_strong(
+                        expected, detail::SchedulingState::Notified,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed))
+                {
+                    std::cerr << "[coro] SingleThreadedExecutor: unexpected scheduling_state "
+                              << static_cast<int>(expected)
+                              << " during RunningAndNotified→Notified transition\n";
+                    std::abort();
+                }
+                // Re-enqueue via local path (we are the poll thread).
+                m_ready.push(std::move(task));
             }
         }
-        // done == true: task completed, drop it here.
     }
     return true;
 }
 
 void SingleThreadedExecutor::wait_for_completion(detail::TaskStateBase& state) {
+    m_poll_thread_id = std::this_thread::get_id();
+
     while (true) {
         {
             std::lock_guard lock(state.mutex);
-            if (state.terminated) return;
+            if (state.terminated) break;
         }
-        if (!poll_ready_tasks()) return;
+        if (poll_ready_tasks()) continue;
+
+        // Ready queue and injection queue are both empty.
+        // Block until a remote wake arrives. state.terminated cannot change
+        // while blocked here since tasks only complete during poll_ready_tasks().
+        std::unique_lock lock(m_remote_mutex);
+        m_remote_cv.wait(lock, [this] { return !m_incoming_wakes.empty(); });
     }
+
+    m_poll_thread_id = {};
 }
 
 bool SingleThreadedExecutor::empty() const {
-    return m_ready.empty();
-}
-
-std::shared_ptr<detail::Waker> SingleThreadedExecutor::make_waker(detail::Task* key) {
-    auto w      = std::make_shared<TaskWaker>();
-    w->key      = key;
-    w->executor = this;
-    return w;
+    if (!m_ready.empty()) return false;
+    std::lock_guard lock(m_remote_mutex);
+    return m_incoming_wakes.empty();
 }
 
 } // namespace coro

@@ -1,9 +1,22 @@
-# Waker and Context Propagation
+# Tasks, Wakers, and Context Propagation
 
 ## Overview
 
-A task has exactly one `Context` and one `Waker`. Every future in the coroutine stack beneath
-that task shares the same `Context`. This document explains why, how the `Context` flows
+A task is the basic unit of non-blocking execution — the async counterpart to an OS thread.
+Like a thread, a task is spawned with an entry point (any `Future` or coroutine) and can call
+into sub-routines. Unlike a thread, each coroutine frame is heap-allocated rather than placed
+on the OS stack. This lets a coroutine suspend at any `co_await` point and be resumed later by
+the executor without any risk of its local state being overwritten in the meantime.
+
+As we will explain in detail later, the heap allocation also changes the shape of the call graph.
+A thread has a linear call *stack*; a task has a call *tree* — a parent coroutine can spawn multiple
+children and interleave their execution concurrently. Concurrently means interleaved, not parallel:
+so only one coroutine in a task ever runs at any given time, but a parent does not need to wait
+for one child to complete before resuming.
+
+To drive task execution a task, the `Runtime` creates exactly one `Context` and one `Waker` on
+every tick of the event loop. Every future in the coroutine stack beneath that task shares the
+same `Context` for the current poll cycle. This document explains why, how the `Context` flows
 down through nested `co_await` calls, and what happens when the waker fires.
 
 ## Tasks vs Threads

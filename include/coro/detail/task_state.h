@@ -15,6 +15,29 @@
 namespace coro::detail {
 
 /**
+ * @brief Atomic scheduling lifecycle state for a Task.
+ *
+ * The explicit atomic field (rather than implicitly tracking state via which
+ * data structure holds the task) allows lock-free CAS transitions in TaskWaker
+ * and the executor worker loops.
+ *
+ * Transitions:
+ *   schedule()           : Idle → Notified  (set explicitly before first enqueue)
+ *   worker dequeues      : Notified → Running  (CAS; failure = bug)
+ *   poll() Pending + no concurrent wake : Running → Idle  (CAS; waker owns shared_ptr)
+ *   poll() Pending + concurrent wake    : Running → RunningAndNotified (CAS in wake())
+ *   post-poll RunningAndNotified detected: RunningAndNotified → Notified (CAS; re-enqueue)
+ *   wake() while Idle    : Idle → Notified  (CAS in TaskWaker::wake(); calls enqueue())
+ *   wake() while Running : Running → RunningAndNotified  (CAS; worker re-enqueues)
+ */
+enum class SchedulingState : uint8_t {
+    Idle               = 0,  ///< Suspended; waker holds the only shared_ptr<Task> ref
+    Running            = 1,  ///< Inside poll(); owned by the worker
+    Notified           = 2,  ///< In a ready queue; waiting to be polled
+    RunningAndNotified = 3,  ///< Inside poll() AND wake() fired; worker re-enqueues after poll
+};
+
+/**
  * @brief Non-template base for @ref TaskState.
  *
  * Holds the fields required for `wait_for_completion()` to block the calling

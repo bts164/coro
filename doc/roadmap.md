@@ -56,34 +56,6 @@ The end-to-end cancellation tests deferred in `test/test_coro_scope.cpp` can now
 
 These tests require no new infrastructure; they are Phase 3 validation for the interaction between `CoroutineScope`, `SelectFuture`, and `Coro<T>`.
 
-## ~~Work-sharing executor~~ — complete
-
-`WorkSharingExecutor` is implemented and all tests pass. `Runtime` now selects the executor
-at construction time: `num_threads <= 1` → `SingleThreadedExecutor`, otherwise
-`WorkSharingExecutor`. Design documented in `doc/executor_design.md`.
-
-## Executor local queue and injection queue
-
-Design documented in `doc/executor_design.md`. Fixes a correctness bug in
-`SingleThreadedExecutor` and lays the groundwork for a work-stealing executor.
-
-### `SingleThreadedExecutor` (correctness fix)
-
-The timer service background thread calling `wake_task` races with the poll loop:
-- `wake_task` accesses `m_ready`, `m_suspended`, and the self-wake flag without a mutex.
-- `wait_for_completion` exits early when the ready queue is empty, even if tasks are
-  suspended awaiting timer or I/O wakeups.
-
-Fix: split `wake_task` into a local path (same thread — existing code, no lock) and a
-remote path (different thread — mutex-protected `m_incoming_wakes` injection queue +
-`m_remote_cv`). `wait_for_completion` blocks on `m_remote_cv` instead of returning early.
-
-### `WorkSharingExecutor` (performance optimization)
-
-External wakes are already safe (all paths hold `m_mutex`). Adding per-worker local queues
-reduces contention: a worker re-enqueuing a just-polled task goes to its local queue with
-no lock; only cross-thread wakes use the shared injection queue. This is also the direct
-precursor to the work-stealing executor.
 
 ## Channels — `mpsc`, `oneshot`, `watch`, & `broadcast`
 

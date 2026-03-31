@@ -1,42 +1,35 @@
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/timer_service.h>
+#include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
+#include <cstdlib>
+#include <iostream>
 
 namespace coro {
 
-namespace {
-
-struct TaskWaker final : detail::Waker {
-    detail::Task*         key;
-    WorkSharingExecutor*  executor;
-
-    void wake() override {
-        executor->wake_task(key);
-    }
-
-    std::shared_ptr<Waker> clone() override {
-        return std::make_shared<TaskWaker>(*this);
-    }
-};
-
-} // namespace
+// Thread-locals identifying which WorkSharingExecutor owns this thread and
+// which worker slot it occupies. Both must be checked in enqueue() to avoid
+// routing a cross-executor wake to the wrong local queue.
+thread_local WorkSharingExecutor* t_owning_executor = nullptr;
+thread_local int                  t_worker_index    = -1;
 
 WorkSharingExecutor::WorkSharingExecutor(std::size_t num_threads, Runtime* runtime)
-    : m_runtime(runtime)
+    : m_local_queues(num_threads)
+    , m_runtime(runtime)
 {
     m_workers.reserve(num_threads);
     for (std::size_t i = 0; i < num_threads; ++i)
-        m_workers.emplace_back([this] { worker_loop(); });
+        m_workers.emplace_back([this, i] { worker_loop(static_cast<int>(i)); });
 }
 
 WorkSharingExecutor::~WorkSharingExecutor() {
     {
         std::lock_guard lock(m_mutex);
         // RACE CONDITION NOTE: m_stop must be set *inside* m_mutex before notify_all().
-        // If set outside the lock, a worker can evaluate the cv predicate (!m_queue.empty() || m_stop)
-        // as false, then we set m_stop=true and call notify_all(), and the worker then enters wait()
-        // and sleeps forever (lost wakeup). Holding the lock while setting m_stop closes this window.
+        // If set outside the lock, a worker can evaluate the cv predicate as false,
+        // then we set m_stop=true and call notify_all(), and the worker enters wait()
+        // and sleeps forever (lost wakeup).
         m_stop = true;
     }
     m_cv.notify_all();
@@ -45,104 +38,123 @@ WorkSharingExecutor::~WorkSharingExecutor() {
 }
 
 void WorkSharingExecutor::schedule(std::unique_ptr<detail::Task> task) {
-    {
-        std::lock_guard lock(m_mutex);
-        m_queue.push_back(std::shared_ptr<detail::Task>(std::move(task)));
+    auto shared = std::shared_ptr<detail::Task>(std::move(task));
+    shared->scheduling_state.store(
+        detail::SchedulingState::Notified, std::memory_order_relaxed);
+    enqueue(std::move(shared));
+}
+
+void WorkSharingExecutor::enqueue(std::shared_ptr<detail::Task> task) {
+    const int idx = t_worker_index;
+    if (idx >= 0 && t_owning_executor == this) {
+        // Local path: this is a worker of *this* executor — push to its own queue, no lock.
+        m_local_queues[idx].push(std::move(task));
+    } else {
+        // Remote path: external or main thread — use shared injection queue.
+        {
+            std::lock_guard lock(m_mutex);
+            m_injection_queue.push_back(std::move(task));
+        }
+        m_cv.notify_one();
     }
-    m_cv.notify_one();
 }
 
 bool WorkSharingExecutor::poll_ready_tasks() {
     std::lock_guard lock(m_mutex);
-    return !m_queue.empty();
+    return !m_injection_queue.empty();
 }
 
 void WorkSharingExecutor::wait_for_completion(detail::TaskStateBase& state) {
     state.wait_until_done();
 }
 
-void WorkSharingExecutor::wake_task(detail::Task* key) {
-    std::lock_guard lock(m_mutex);
-
-    // If the task is currently Running (in m_self_woken), set the self-wake flag.
-    auto self_it = m_self_woken.find(key);
-    if (self_it != m_self_woken.end()) {
-        self_it->second = true;
-        return;
-    }
-
-    // Otherwise move from Suspended to Ready and wake a worker.
-    auto sus_it = m_suspended.find(key);
-    if (sus_it != m_suspended.end()) {
-        m_queue.push_back(std::move(sus_it->second));
-        m_suspended.erase(sus_it);
-        m_cv.notify_one();
-    }
-    // Not found: task is already Ready, Running, or Done — no-op.
-}
-
-void WorkSharingExecutor::worker_loop() {
+void WorkSharingExecutor::worker_loop(int worker_index) {
+    t_owning_executor = this;
+    t_worker_index    = worker_index;
     set_current_runtime(m_runtime);
     set_current_timer_service(&m_runtime->timer_service());
 
     while (true) {
         std::shared_ptr<detail::Task> task;
-        {
+
+        // Try the local queue first — no lock needed.
+        if (auto local = m_local_queues[worker_index].pop()) {
+            task = std::move(*local);
+        } else {
+            // Local queue empty — wait for the injection queue or shutdown.
             std::unique_lock lock(m_mutex);
             m_cv.wait(lock, [&] {
-                return !m_queue.empty() || m_stop;
+                return !m_injection_queue.empty() || m_stop;
             });
-
-            if (m_stop && m_queue.empty())
-                break;
-
-            task = std::move(m_queue.front());
-            m_queue.pop_front();
-            m_self_woken[task.get()] = false;
+            if (!m_injection_queue.empty()) {
+                task = std::move(m_injection_queue.front());
+                m_injection_queue.pop_front();
+            }
+            // lock released here
         }
 
-        // Poll outside the lock so other workers can dequeue and wake_task() can acquire.
-        auto w = std::make_shared<TaskWaker>();
-        w->key      = task.get();
-        w->executor = this;
-        detail::Context ctx(w);
+        if (!task) {
+            // m_stop was set and injection queue was empty. Check local queue
+            // one more time (a concurrent enqueue may have just pushed to it).
+            if (auto local = m_local_queues[worker_index].pop())
+                task = std::move(*local);
+            else
+                break; // truly nothing left — exit
+        }
+
+        // CAS Notified → Running. Failure is a bug (double-dequeue or bad state).
+        auto expected = detail::SchedulingState::Notified;
+        if (!task->scheduling_state.compare_exchange_strong(
+                expected, detail::SchedulingState::Running,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed))
+        {
+            std::cerr << "[coro] WorkSharingExecutor: unexpected scheduling_state "
+                      << static_cast<int>(expected)
+                      << " during Notified→Running transition (expected Notified=2)\n";
+            std::abort();
+        }
+
+        auto waker = std::make_shared<TaskWaker>();
+        waker->task     = task;
+        waker->executor = this;
+        detail::Context ctx(waker);
         bool done = task->poll(ctx);
 
-        bool self_woke = false;
-        {
-            std::lock_guard lock(m_mutex);
-            auto it = m_self_woken.find(task.get());
-            if (it != m_self_woken.end()) {
-                self_woke = it->second;
-                m_self_woken.erase(it);
-            }
-
-            if (done) {
-                // RACE CONDITION NOTE: notify_all() must be called *inside* m_mutex.
-                // Any waiter that blocks on m_cv must evaluate its predicate under m_mutex.
-                // If notify_all() were called after releasing the lock, a waiter could check
-                // the predicate (false), then we release + notify, then the waiter enters
-                // wait() and sleeps forever (lost wakeup).
-                //
-                // NOTE: wait_for_completion() no longer blocks on m_cv — it uses
-                // state.wait_until_done() which blocks on state.cv (a different condvar).
-                // This notify_all is therefore vestigial for that purpose, but the rule
-                // above still applies if m_cv is ever used as a completion signal again.
-                m_cv.notify_all();
-            } else if (self_woke) {
-                m_queue.push_back(std::move(task));
-                m_cv.notify_one();
+        if (done) {
+            task.reset(); // destructor fires here, outside any lock
+        } else {
+            // Try Running → Idle: park the task, waker owns the only ref.
+            expected = detail::SchedulingState::Running;
+            if (task->scheduling_state.compare_exchange_strong(
+                    expected, detail::SchedulingState::Idle,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
+            {
+                task.reset(); // waker holds the only ref; parks until wake() fires
             } else {
-                m_suspended[task.get()] = std::move(task);
+                // wake() fired during poll() — state is RunningAndNotified.
+                expected = detail::SchedulingState::RunningAndNotified;
+                if (!task->scheduling_state.compare_exchange_strong(
+                        expected, detail::SchedulingState::Notified,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed))
+                {
+                    std::cerr << "[coro] WorkSharingExecutor: unexpected scheduling_state "
+                              << static_cast<int>(expected)
+                              << " during RunningAndNotified→Notified transition\n";
+                    std::abort();
+                }
+                // Re-enqueue via local path (we are a worker thread).
+                enqueue(std::move(task));
             }
         }
-
-        if (done)
-            task.reset(); // destructor fires here, outside the lock
     }
 
     set_current_runtime(nullptr);
     set_current_timer_service(nullptr);
+    t_owning_executor = nullptr;
+    t_worker_index    = -1;
 }
 
 } // namespace coro

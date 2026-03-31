@@ -105,32 +105,42 @@ This mirrors Tokio, which initializes new task state with the `SCHEDULED` flag s
 Unlike the conceptual states shown in the executor state diagrams (which are implicit in
 which data structure holds the task's `shared_ptr`), `SchedulingState` is an explicit
 field that must be stored. The CAS operations that replace `m_suspended` have nothing to
-operate on without it. It is added to `TaskStateBase` alongside the existing `cancelled`
-atomic:
+operate on without it.
+
+**Implementation note:** `scheduling_state` lives in `Task`, not `TaskStateBase`. The
+original design placed it in `TaskStateBase`, but fire-and-forget tasks (created by
+`spawn().submit().detach()`) have `m_state = nullptr` — they have no `TaskStateBase` at
+all, yet still need a scheduling state for the waker CAS to work. Placing the field
+directly in `Task` handles both cases uniformly:
 
 ```cpp
-struct TaskStateBase {
-    // ...existing fields...
+class Task {
+public:
     std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
+    // ...
 };
 ```
 
+**C++ note:** `std::atomic<T>` is not movable. `Task` previously had
+`Task(Task&&) noexcept = default`, which would produce a deleted move constructor once
+`scheduling_state` was added. Explicit move operations were required that load/store the
+atomic value rather than trying to move it.
+
 ### TaskWaker
 
-`TaskWaker` holds a `shared_ptr<Task>` (to push to a queue on wake) and a
-`shared_ptr<TaskStateBase>` (to CAS the scheduling state). The executor pointer is
-retained to determine which queue to target:
+`TaskWaker` holds exactly two fields: a `shared_ptr<Task>` (to push to a queue on wake)
+and an `Executor*` to determine which queue to target. No `shared_ptr<TaskStateBase>` is
+needed because `scheduling_state` lives directly in `Task`:
 
 ```cpp
 struct TaskWaker : detail::Waker {
-    shared_ptr<detail::Task>          task;
-    shared_ptr<detail::TaskStateBase> state;
-    Executor*                         executor;
+    shared_ptr<detail::Task> task;
+    Executor*                executor;
 
     void wake() override {
         // Try Idle → Notified: first waker to fire; push task to queue.
         auto expected = SchedulingState::Idle;
-        if (state->scheduling_state.compare_exchange_strong(
+        if (task->scheduling_state.compare_exchange_strong(
                 expected, SchedulingState::Notified,
                 std::memory_order_acq_rel, std::memory_order_relaxed)) {
             executor->enqueue(task);
@@ -138,7 +148,7 @@ struct TaskWaker : detail::Waker {
         }
         // Try Running → RunningAndNotified: poll() is in progress; worker re-enqueues after.
         expected = SchedulingState::Running;
-        state->scheduling_state.compare_exchange_strong(
+        task->scheduling_state.compare_exchange_strong(
             expected, SchedulingState::RunningAndNotified,
             std::memory_order_acq_rel, std::memory_order_relaxed);
         // If neither CAS succeeds the task is already Notified or RunningAndNotified — no-op.
@@ -156,10 +166,8 @@ succeeds and pushes to the queue; the rest are no-ops. Each clone holds its own
 `shared_ptr<Task>` ref, so the task remains alive until the winning clone transfers its
 ref to the queue.
 
-The executor constructs `TaskWaker` immediately before calling `poll()`. At that point it
-holds all three required fields: `shared_ptr<Task>` (just dequeued), `shared_ptr<TaskStateBase>`
-(via the aliasing constructor `shared_ptr<TaskStateBase>(task, &task->state)` since
-`TaskState<T>` inherits from `TaskStateBase`), and `Executor*` (`this`).
+The executor constructs `TaskWaker` immediately before calling `poll()` using just the
+two required fields: `shared_ptr<Task>` (just dequeued) and `Executor*` (`this`).
 
 ### Executor::enqueue()
 
@@ -167,6 +175,13 @@ holds all three required fields: `shared_ptr<Task>` (just dequeued), `shared_ptr
 identity — local queue (no lock) for the owning worker, injection queue (with lock) for
 any other thread. This replaces `wake_task(key)`, which had to look up the task in
 `m_suspended`. With the waker owning the `shared_ptr<Task>`, no lookup is needed.
+
+**Initial schedule always uses the injection queue.** `schedule()` is called by
+`Runtime::block_on()` before `wait_for_completion()` sets `m_poll_thread_id`
+(single-threaded) or before any worker thread is running (work-sharing). In both cases
+the caller is not a worker of the executor, so the first enqueue always takes the
+injection/remote path. This is correct and expected — the poll thread or first worker
+will drain it on its first iteration.
 
 ### Worker loop integration
 
@@ -210,6 +225,7 @@ struct TaskStateBase {
     mutable std::mutex      mutex;
     std::condition_variable cv;
     bool                    terminated{false};
+    std::atomic<bool>       cancelled{false};
 
     // RACE CONDITION NOTE: this is safe because every code path that sets
     // `terminated = true` also calls `cv.notify_all()` *in the same critical section*
@@ -219,11 +235,10 @@ struct TaskStateBase {
         std::unique_lock lock(mutex);
         cv.wait(lock, [this]{ return terminated; });
     }
-
-    std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
-    std::atomic<bool>            cancelled{false};
 };
 ```
+
+`scheduling_state` does **not** live here — see the implementation note in [Task Scheduling State](#task-scheduling-state).
 
 Every terminal method (`setResult`, `setDone`, `setException`, `mark_done`) sets
 `terminated = true` and calls `cv.notify_all()` **inside the same lock**, eliminating
@@ -560,6 +575,22 @@ unchanged.
 per-instance `std::mutex` + `std::deque`. This keeps the interface stable for a future
 drop-in lock-free replacement.
 
+**Thread-local state (updated):**
+
+The original design used a single `t_worker_index` thread-local. This is insufficient
+when multiple `WorkSharingExecutor` instances exist simultaneously — worker thread 0 of
+executor A and worker thread 0 of executor B have the same index, so a cross-executor
+`enqueue()` call from A's worker would incorrectly push to B's local queue at index 0.
+The fix is two thread-locals:
+
+```cpp
+thread_local WorkSharingExecutor* t_owning_executor = nullptr;  // which executor owns this thread
+thread_local int                  t_worker_index    = -1;       // which slot within that executor
+```
+
+`enqueue()` checks both: `t_worker_index >= 0 && t_owning_executor == this`. Only when
+both match is the local (lock-free) path taken.
+
 **Updated enqueue routing:**
 
 `TaskWaker::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS.
@@ -567,8 +598,8 @@ drop-in lock-free replacement.
 
 ```
 enqueue(task):
-    if this_thread is a worker thread:
-        m_local_queue[this_worker].push(task)   // no lock
+    if t_worker_index >= 0 AND t_owning_executor == this:
+        m_local_queue[t_worker_index].push(task)   // no lock
     else:
         lock(m_mutex)
         m_injection_queue.push_back(task)
@@ -629,12 +660,12 @@ isolated to the worker loop and does not affect wake routing.
 
 | | `SingleThreadedExecutor` | `WorkSharingExecutor` |
 |---|---|---|
-| **External wake status** | Broken (data race + premature return) — planned fix | Correct (mutex-protected) — planned optimization |
-| **Suspended task storage** | `m_suspended` map *(current)* → `Idle` atomic state in waker *(planned)* | `m_suspended` map *(current)* → `Idle` atomic state in waker *(planned)* |
-| **Self-wake detection** | `m_running_task_key/woken` flags *(current)* → `RunningAndNotified` CAS *(planned)* | `m_self_woken` map *(current)* → `RunningAndNotified` CAS *(planned)* |
-| **Local enqueue path** | Direct to `m_ready`, no lock *(planned)* | Direct to `m_local_queue[i]`, no lock *(planned)* |
-| **Remote enqueue path** | `m_incoming_wakes` + `m_remote_cv` *(planned)* | `m_injection_queue` + `m_cv` *(planned)* |
-| **wait_for_completion** | Block on `m_remote_cv` when ready queue empty *(planned)* | `state.wait_until_done()` *(current)* |
+| **External wake safety** | `m_incoming_wakes` injection queue; `m_remote_cv` blocks when idle | `m_injection_queue` + `m_cv`; workers block when both local and injection queues empty |
+| **Suspended task storage** | `Idle` atomic state; waker holds the only `shared_ptr<Task>` ref | `Idle` atomic state; waker holds the only `shared_ptr<Task>` ref |
+| **Self-wake detection** | `RunningAndNotified` CAS in `TaskWaker::wake()` | `RunningAndNotified` CAS in `TaskWaker::wake()` |
+| **Local enqueue path** | Direct to `m_ready`, no lock (poll thread only) | Direct to `m_local_queue[t_worker_index]`, no lock (owning worker only) |
+| **Remote enqueue path** | `m_incoming_wakes` + `m_remote_cv.notify_one()` | `m_injection_queue` + `m_cv.notify_one()` |
+| **wait_for_completion** | Drives poll loop; blocks on `m_remote_cv` when ready queue empty | Delegates entirely to `state.wait_until_done()` |
 
 ---
 
@@ -642,10 +673,12 @@ isolated to the worker loop and does not affect wake routing.
 
 | File | Status | Contents |
 |---|---|---|
-| `include/coro/detail/task_state.h` | Needs update | Add `SchedulingState` enum + atomic field to `TaskStateBase` |
-| `include/coro/detail/work_stealing_deque.h` | Planned | `WorkStealingDeque<T>` — mutex-backed, Chase-Lev interface |
-| `include/coro/runtime/executor.h` | Needs update | Add `enqueue(shared_ptr<Task>)` virtual method |
-| `include/coro/runtime/single_threaded_executor.h` | Needs update | Add injection queue fields; remove `m_suspended`, self-wake fields |
-| `src/single_threaded_executor.cpp` | Needs update | `enqueue` routing; CAS-based worker loop; fix `wait_for_completion` |
-| `include/coro/runtime/work_sharing_executor.h` | Needs update | Add per-worker local queues; remove `m_suspended`, `m_self_woken` |
-| `src/work_sharing_executor.cpp` | Needs update | `enqueue` routing; CAS-based worker loop |
+| `include/coro/detail/task_state.h` | Complete | `SchedulingState` enum |
+| `include/coro/detail/task.h` | Complete | `scheduling_state` atomic in `Task`; explicit move ctor/assign |
+| `include/coro/detail/work_stealing_deque.h` | Complete | `WorkStealingDeque<T>` — mutex-backed, Chase-Lev interface |
+| `include/coro/runtime/executor.h` | Complete | `enqueue(shared_ptr<Task>)` pure virtual |
+| `include/coro/runtime/task_waker.h` | Complete | Shared `TaskWaker` — `shared_ptr<Task>` + `Executor*` |
+| `include/coro/runtime/single_threaded_executor.h` | Complete | Injection queue fields; `m_suspended` and self-wake fields removed |
+| `src/single_threaded_executor.cpp` | Complete | `enqueue` routing; CAS-based poll loop; fixed `wait_for_completion` |
+| `include/coro/runtime/work_sharing_executor.h` | Complete | Per-worker local queues; `m_suspended`, `m_self_woken` removed |
+| `src/work_sharing_executor.cpp` | Complete | Dual thread-locals; `enqueue` routing; CAS-based worker loop |

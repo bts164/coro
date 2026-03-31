@@ -31,7 +31,7 @@ nav:
       - SpawnBuilder: coro/classcoro_1_1SpawnBuilder.md
       - StreamSpawnBuilder: coro/classcoro_1_1StreamSpawnBuilder.md
       - StreamHandle: coro/classcoro_1_1StreamHandle.md
-      - Synchronize: coro/classcoro_1_1Synchronize.md
+      - JoinSet: coro/classcoro_1_1JoinSet.md
       - SelectFuture: coro/classcoro_1_1SelectFuture.md
       - SelectBranch: coro/structcoro_1_1SelectBranch.md
       - SleepFuture: coro/structcoro_1_1SleepFuture.md
@@ -46,12 +46,10 @@ nav:
     - Namespaces: coro/namespaces.md
     - Files: coro/files.md
   - Internal Design Details:
-    - Futures and Streams:
-      - Overview: future_and_stream.md
-      - Waker & Context In-depth: waker_and_context_propagation.md
-    - Tasks, Executors, and Runtime:
-      - Overview: task_and_executor.md
-      - Executor Design: executor_design.md
+    - Futures and Streams: future_and_stream.md
+    - Tasks, Wakers, and Context: waker_and_context_propagation.md
+    - Tasks, Executors, and Runtime: task_and_executor.md
+    - Executor Detailed Design: executor_design.md
     - Synchronization:
       - Coroutine Scope: coroutine_scope.md
       - JoinSet: join_set.md

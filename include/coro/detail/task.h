@@ -47,8 +47,31 @@ public:
     Task(const Task&)            = delete;
     Task& operator=(const Task&) = delete;
 
-    Task(Task&&) noexcept            = default;
-    Task& operator=(Task&&) noexcept = default;
+    // std::atomic is not movable, so we must provide explicit move operations
+    // that load/store the atomic value rather than defaulting.
+    Task(Task&& other) noexcept
+        : scheduling_state(other.scheduling_state.load(std::memory_order_relaxed))
+        , m_impl(std::move(other.m_impl))
+    {}
+
+    Task& operator=(Task&& other) noexcept {
+        if (this != &other) {
+            scheduling_state.store(
+                other.scheduling_state.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            m_impl = std::move(other.m_impl);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Atomic scheduling state. Managed exclusively by the executor and TaskWaker.
+     *
+     * Starts at Idle. schedule() sets it to Notified before the first enqueue.
+     * After that all transitions are CAS operations — see SchedulingState for the
+     * full transition table.
+     */
+    std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
 
     /**
      * @brief Advances the inner future by one step.
