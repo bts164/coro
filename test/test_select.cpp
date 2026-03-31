@@ -75,20 +75,20 @@ TEST(SelectBranchTest, ValueIsAccessible) {
 // --- Basic select behaviour ---
 
 TEST(SelectTest, FirstBranchWinsImmediately) {
-    Runtime rt;
+    Runtime rt(1);
     auto result = rt.block_on(select(ImmediateInt{7}, NeverFuture{}));
     EXPECT_TRUE((std::holds_alternative<SelectBranch<0, int>>(result)));
     EXPECT_EQ((std::get<SelectBranch<0, int>>(result).value), 7);
 }
 
 TEST(SelectTest, SecondBranchWinsWhenFirstNeverReady) {
-    Runtime rt;
+    Runtime rt(1);
     auto result = rt.block_on(select(NeverFuture{}, ImmediateVoid{}));
     EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(result)));
 }
 
 TEST(SelectTest, ThreeBranchesFirstWins) {
-    Runtime rt;
+    Runtime rt(1);
     auto result = rt.block_on(select(ImmediateInt{1}, ImmediateInt{2}, ImmediateInt{3}));
     // First branch polled first — wins immediately.
     EXPECT_TRUE((std::holds_alternative<SelectBranch<0, int>>(result)));
@@ -96,7 +96,7 @@ TEST(SelectTest, ThreeBranchesFirstWins) {
 }
 
 TEST(SelectTest, ErrorFromWinningBranchPropagates) {
-    Runtime rt;
+    Runtime rt(1);
     EXPECT_THROW(
         rt.block_on(select(ThrowingFuture{}, NeverFuture{})),
         std::runtime_error
@@ -104,7 +104,7 @@ TEST(SelectTest, ErrorFromWinningBranchPropagates) {
 }
 
 TEST(SelectTest, ErrorFromFirstBranchWinsOverPendingSecond) {
-    Runtime rt;
+    Runtime rt(1);
     EXPECT_THROW(
         rt.block_on(select(ThrowingFuture{}, CountdownFuture{3, 99})),
         std::runtime_error
@@ -112,7 +112,7 @@ TEST(SelectTest, ErrorFromFirstBranchWinsOverPendingSecond) {
 }
 
 TEST(SelectTest, SecondBranchWinsAfterFirstPends) {
-    Runtime rt;
+    Runtime rt(1);
     auto result = rt.block_on(select(CountdownFuture{3, 10}, ImmediateInt{20}));
     // First poll: CountdownFuture returns Pending, ImmediateInt returns Ready → second wins.
     EXPECT_TRUE((std::holds_alternative<SelectBranch<1, int>>(result)));
@@ -144,7 +144,7 @@ Coro<void> coro_that_spawns_and_blocks(std::shared_ptr<int> out) {
 // select cancels the slow coroutine branch; that branch's spawned children must drain
 // before select delivers the winning result.
 TEST(SelectTest, CancelledCoroBranchDrainsChildrenBeforeSelectCompletes) {
-    Runtime rt;
+    Runtime rt(1);
     auto shared = std::make_shared<int>(0);
 
     rt.block_on([](std::shared_ptr<int> out) -> Coro<void> {
@@ -163,7 +163,7 @@ TEST(SelectTest, CancelledCoroBranchDrainsChildrenBeforeSelectCompletes) {
 // --- timeout ---
 
 TEST(TimeoutTest, FutureCompletesBeforeTimeout) {
-    Runtime rt;
+    Runtime rt(1);
     using namespace std::chrono_literals;
     auto result = rt.block_on(timeout(1000s, ImmediateInt{42}));
     // Branch 0 (the future) wins.
@@ -172,7 +172,7 @@ TEST(TimeoutTest, FutureCompletesBeforeTimeout) {
 }
 
 TEST(TimeoutTest, TimeoutFiresWhenFutureNeverCompletes) {
-    Runtime rt;
+    Runtime rt(1);
     using namespace std::chrono_literals;
     // duration = 0 means the deadline is already in the past on first poll.
     auto result = rt.block_on(timeout(0ns, NeverFuture{}));

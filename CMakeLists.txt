@@ -20,6 +20,7 @@ add_library(coro
     src/executor.cpp
     src/single_threaded_executor.cpp
     src/work_sharing_executor.cpp
+    src/timer_service.cpp
     src/runtime.cpp
 )
 target_include_directories(coro PUBLIC include)

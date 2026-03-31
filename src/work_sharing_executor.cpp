@@ -1,5 +1,6 @@
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/runtime.h>
+#include <coro/runtime/timer_service.h>
 #include <coro/detail/context.h>
 
 namespace coro {
@@ -82,6 +83,7 @@ void WorkSharingExecutor::wake_task(detail::Task* key) {
 
 void WorkSharingExecutor::worker_loop() {
     set_current_runtime(m_runtime);
+    set_current_timer_service(&m_runtime->timer_service());
 
     while (true) {
         std::shared_ptr<detail::Task> task;
@@ -140,6 +142,7 @@ void WorkSharingExecutor::worker_loop() {
     }
 
     set_current_runtime(nullptr);
+    set_current_timer_service(nullptr);
 }
 
 } // namespace coro

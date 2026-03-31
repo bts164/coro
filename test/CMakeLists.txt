@@ -16,6 +16,7 @@ set(TEST_TARGETS
     test_co_invoke
     test_join_set
     test_work_sharing_executor
+    test_sleep
 )
 
 foreach(t ${TEST_TARGETS})

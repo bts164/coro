@@ -1,6 +1,7 @@
 #pragma once
 
 #include <coro/runtime/executor.h>
+#include <coro/runtime/timer_service.h>
 #include <coro/future.h>
 #include <coro/detail/poll_result.h>
 #include <coro/task/spawn_builder.h>
@@ -56,6 +57,7 @@ public:
     template<Future F>
     typename F::OutputType block_on(F future) {
         set_current_runtime(this);
+        set_current_timer_service(&m_timer_service);
 
         auto state = std::make_shared<detail::TaskState<typename F::OutputType>>();
         m_executor->schedule(
@@ -64,6 +66,7 @@ public:
         m_executor->wait_for_completion(*state);
 
         set_current_runtime(nullptr);
+        set_current_timer_service(nullptr);
 
         if (state->exception)
             std::rethrow_exception(state->exception);
@@ -102,7 +105,14 @@ public:
         return StreamSpawnBuilder<S>(std::move(stream), m_executor.get());
     }
 
+    /// @brief Returns the runtime's timer service. Used by worker threads to set their thread-local.
+    TimerService& timer_service() { return m_timer_service; }
+
 private:
+    // m_timer_service must be declared before m_executor so it is destroyed *after* the executor.
+    // Worker threads call set_current_timer_service(&m_timer_service); they must all have joined
+    // (executor destructor) before the TimerService destructor fires its stop signal.
+    TimerService              m_timer_service;
     std::unique_ptr<Executor> m_executor;
 };
 

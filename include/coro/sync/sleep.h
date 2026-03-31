@@ -2,6 +2,7 @@
 
 #include <coro/detail/poll_result.h>
 #include <coro/detail/context.h>
+#include <coro/runtime/timer_service.h>
 #include <chrono>
 
 namespace coro {
@@ -26,12 +27,15 @@ struct SleepFuture {
     explicit SleepFuture(std::chrono::nanoseconds duration)
         : m_deadline(std::chrono::steady_clock::now() + duration) {}
 
-    PollResult<void> poll(detail::Context&) {
+    PollResult<void> poll(detail::Context& ctx) {
         if (std::chrono::steady_clock::now() >= m_deadline)
             return PollReady;
-        // TODO: register a libuv timer waker so the executor is woken at m_deadline.
-        // Until then, this returns Pending without registering a waker — the task
-        // will only wake if another future in the same task wakes it.
+        // Register a wakeup with the runtime's TimerService. The timer thread will call
+        // waker->wake() at m_deadline, moving this task from Suspended back to Ready.
+        // If poll() is called again before the deadline fires (e.g. woken by another
+        // branch of a select), we re-register — the extra wake is a no-op in the executor.
+        // TODO: replace with a libuv timer registration when I/O integration is added.
+        schedule_wakeup(m_deadline, ctx.getWaker());
         return PollPending;
     }
 };

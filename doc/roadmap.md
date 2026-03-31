@@ -12,6 +12,41 @@ Planned and designed work not yet implemented, in rough priority order.
   `coroutine_scope.md`, `module_structure.md`, `getting_started.md`)
 - Remove `Runtime::schedule_task()` if it was only used by `Synchronize`
 
+## Document: C++ vs. Rust cancellation model
+
+Write a design document (`doc/cancellation_model.md`) explaining why C++ coroutines cannot
+be cancelled by simply dropping the task, and what consequences this has throughout the
+library's design. This is one of the most fundamental differences from Tokio and should be
+documented prominently. Key points to cover:
+
+- **Why Rust can drop:** a Rust `Future` is a plain value; dropping it at any `await`
+  point is safe because the compiler synthesizes `Drop` for all locals in scope and the
+  borrow checker guarantees no dangling references. Cancellation in Tokio is literally
+  "stop holding the `JoinHandle`" — the task's memory is freed immediately.
+- **Why C++ cannot:** a C++ coroutine frame is heap-allocated by the compiler. The only
+  way to run destructors for locals and release resources is to *resume* the coroutine and
+  let it unwind. Dropping the `shared_ptr<Task>` mid-suspension destroys the frame
+  without running any destructors — a resource leak or, if child tasks hold references to
+  parent-owned data, a use-after-free.
+- **The `PollDropped` contract:** cancellation is delivered as a poll signal
+  (`PollDropped`), not an exception. The coroutine must resume, observe the signal,
+  propagate it to any child tasks it has spawned (waiting for their `PollDropped` before
+  continuing), and then return its own `PollDropped`. Only after this full drain is the
+  task's memory safe to free.
+- **Impact on executor design:** a cancelled task in `Idle` state must be re-enqueued
+  (via `waker->wake()` after setting `cancelled`) so it is polled through the `PollDropped`
+  path. The executor cannot simply discard it.
+- **Impact on `CoroutineScope` / `JoinSet`:** these primitives exist partly *because* of
+  this constraint — they provide a structured way to ensure all child tasks are drained
+  before the parent scope exits, which is mandatory rather than optional.
+- **Impact on `select` / `timeout`:** the losing branch of a `select` or an expired
+  `timeout` must be cancelled and fully drained before the result is delivered to the
+  caller. This adds latency that Tokio does not have.
+- **User-facing implication:** spawned tasks that capture references to parent-owned data
+  are safe *only* within a scope that guarantees the parent outlives all children
+  (`CoroutineScope`, `JoinSet`). This is the C++ analogue of Rust's `'static` bound on
+  `tokio::spawn`.
+
 ## Cancellation propagation tests
 
 The end-to-end cancellation tests deferred in `test/test_coro_scope.cpp` can now be written — `select` and `timeout` are both implemented. Specifically:
@@ -25,7 +60,30 @@ These tests require no new infrastructure; they are Phase 3 validation for the i
 
 `WorkSharingExecutor` is implemented and all tests pass. `Runtime` now selects the executor
 at construction time: `num_threads <= 1` → `SingleThreadedExecutor`, otherwise
-`WorkSharingExecutor`. Design documented in `doc/work_sharing_executor.md`.
+`WorkSharingExecutor`. Design documented in `doc/executor_design.md`.
+
+## Executor local queue and injection queue
+
+Design documented in `doc/executor_design.md`. Fixes a correctness bug in
+`SingleThreadedExecutor` and lays the groundwork for a work-stealing executor.
+
+### `SingleThreadedExecutor` (correctness fix)
+
+The timer service background thread calling `wake_task` races with the poll loop:
+- `wake_task` accesses `m_ready`, `m_suspended`, and the self-wake flag without a mutex.
+- `wait_for_completion` exits early when the ready queue is empty, even if tasks are
+  suspended awaiting timer or I/O wakeups.
+
+Fix: split `wake_task` into a local path (same thread — existing code, no lock) and a
+remote path (different thread — mutex-protected `m_incoming_wakes` injection queue +
+`m_remote_cv`). `wait_for_completion` blocks on `m_remote_cv` instead of returning early.
+
+### `WorkSharingExecutor` (performance optimization)
+
+External wakes are already safe (all paths hold `m_mutex`). Adding per-worker local queues
+reduces contention: a worker re-enqueuing a just-polled task goes to its local queue with
+no lock; only cross-thread wakes use the shared injection queue. This is also the direct
+precursor to the work-stealing executor.
 
 ## Channels — `mpsc`, `oneshot`, `watch`, & `broadcast`
 
@@ -304,3 +362,30 @@ coro::Coro<void> serve() {
 
 Lives in `include/coro/io/websocket.h`. Requires libwebsockets built with libuv event
 loop support (`-DLWS_WITH_LIBUV=ON`).
+
+## Logging
+
+The library currently has no structured logging. Executor internals, task lifecycle
+events, and fatal invariant violations (e.g. unexpected CAS failures on `SchedulingState`)
+need a way to emit diagnostics without coupling to a specific logging framework.
+
+Design goals:
+
+- **Zero-cost when disabled:** logging calls compile away entirely when the log level is
+  below the threshold. No heap allocation, no format string evaluation.
+- **Pluggable sink:** the library does not own stderr. Users wire in their own sink
+  (spdlog, std::print, a custom callback) via a single registration point.
+- **Structured levels:** at minimum `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`.
+  `FATAL` logs and then calls `std::terminate()` — used for executor invariant violations
+  where continuing would produce undefined behaviour.
+- **Task identity:** log messages emitted from within a task should optionally include a
+  task ID so scheduler traces can be correlated across threads.
+
+Suggested events to instrument once logging exists:
+
+- Task created / scheduled / polled / completed / cancelled
+- `SchedulingState` transitions (at `TRACE` level)
+- CAS failures that indicate bugs (`FATAL`)
+- `TimerService` wakeup firing
+- Worker thread start / stop
+- Injection queue drain counts (task budget enforcement)
