@@ -16,7 +16,19 @@ Runtime::Runtime(std::size_t num_threads) {
         m_executor = std::make_unique<WorkSharingExecutor>(num_threads, this);
 }
 
-Runtime::~Runtime() = default;
+Runtime::~Runtime() {
+    // Stop the timer thread before the executor is destroyed. The timer thread fires
+    // wakers that call executor::enqueue(), which touches executor-owned state
+    // (m_remote_cv). If we let the executor be destroyed first (the default member
+    // destruction order: m_executor before m_timer_service), the timer thread can
+    // call into already-destroyed executor memory — a use-after-free / data race.
+    //
+    // After stop() returns the timer thread has joined and will never call wake() again,
+    // so it is safe for the executor (and its condition variables) to be destroyed next.
+    m_timer_service.stop();
+    // m_executor and m_timer_service are then destroyed in reverse declaration order
+    // by the implicit member destructors that follow this body.
+}
 
 void set_current_runtime(Runtime* rt) {
     t_current_runtime = rt;

@@ -53,6 +53,7 @@ nav:
     - Synchronization:
       - Coroutine Scope: coroutine_scope.md
       - JoinSet: join_set.md
+      - Channels: channels.md
       - Select: select.md
     - Module Structure: module_structure.md
   - Roadmap and Future Plans:

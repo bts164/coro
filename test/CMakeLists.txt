@@ -17,6 +17,9 @@ set(TEST_TARGETS
     test_join_set
     test_work_sharing_executor
     test_sleep
+    test_oneshot
+    test_mpsc
+    test_watch
 )
 
 foreach(t ${TEST_TARGETS})

@@ -37,6 +37,11 @@ public:
     void schedule(std::chrono::steady_clock::time_point deadline,
                   std::shared_ptr<detail::Waker> waker);
 
+    /// @brief Signals the timer thread to stop and blocks until it has joined.
+    /// Safe to call multiple times; subsequent calls are no-ops.
+    /// Must be called before any executor that holds wakers is destroyed.
+    void stop();
+
 private:
     struct Entry {
         std::chrono::steady_clock::time_point deadline;

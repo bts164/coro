@@ -2,6 +2,34 @@
 
 Planned and designed work not yet implemented, in rough priority order.
 
+## Migrate error-returning futures to `std::expected`
+
+The library's error handling policy is `std::expected<T, E>` as the default, with
+`.value()` as the exception-throwing escape hatch. Currently `JoinHandle` and
+`PollResult` use `std::exception_ptr` and rethrow on `await_resume`. These should be
+updated:
+
+- `JoinHandle<T>::await_resume()` should return `std::expected<T, std::exception_ptr>`
+  instead of rethrowing unconditionally.
+- `PollResult<T>` error state should be reexamined in light of this policy.
+- Any other futures or combinators that can fail (e.g. `timeout`) should return
+  `std::expected` rather than throwing.
+
+This is a breaking API change; coordinate with the channel implementation work since
+channels establish the pattern.
+
+## C++20 compatibility (`std::expected` shim)
+
+The library currently targets C++23 and uses `std::expected<T, E>` for fallible
+operations (channel send/recv results, etc.). To support C++20 targets:
+
+- Introduce a thin `include/coro/detail/expected.h` that either aliases `std::expected`
+  (C++23) or aliases `tl::expected` / a hand-rolled drop-in (C++20).
+- All library code uses `coro::detail::expected<T, E>` instead of `std::expected<T, E>`
+  directly, so the switch is a one-line change per site.
+- `tl::expected` (Conan package `tl-expected`) is the preferred fallback — it is a
+  single header, well-tested, and API-compatible with the C++23 standard.
+
 ## Remove `Synchronize`
 
 `JoinSet` is complete and tests pass. `Synchronize` can now be deleted:

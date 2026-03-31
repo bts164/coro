@@ -11,15 +11,20 @@ TimerService::TimerService()
     : m_thread([this]{ timer_loop(); })
 {}
 
-TimerService::~TimerService() {
+void TimerService::stop() {
     {
         std::lock_guard lock(m_mutex);
-        // RACE CONDITION NOTE: m_stop must be set inside m_mutex before notify_all().
-        // Same pattern as WorkSharingExecutor — see comments there for the full explanation.
+        // m_stop must be set inside m_mutex before notify_all() — same pattern as
+        // WorkSharingExecutor. See comments there for the full explanation.
         m_stop = true;
     }
     m_cv.notify_all();
-    m_thread.join();
+    if (m_thread.joinable())
+        m_thread.join();
+}
+
+TimerService::~TimerService() {
+    stop();
 }
 
 void TimerService::schedule(std::chrono::steady_clock::time_point deadline,
