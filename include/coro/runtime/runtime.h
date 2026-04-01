@@ -34,10 +34,24 @@ Runtime& current_runtime();
  */
 class Runtime {
 public:
-    /// @brief Constructs a Runtime.
-    /// @param num_threads Hint for the thread pool size (currently unused; reserved for the
-    ///                    work-stealing executor). Defaults to `hardware_concurrency()`.
+    /// @brief Constructs a Runtime with the default executor for the given thread count.
+    /// `num_threads <= 1` → SingleThreadedExecutor; otherwise → WorkStealingExecutor.
     explicit Runtime(std::size_t num_threads = std::thread::hardware_concurrency());
+
+    /// @brief Constructs a Runtime with an explicit executor type.
+    ///
+    /// The executor is constructed as `ExecutorType(args..., this)` — `this` is appended
+    /// automatically so callers do not need to pass the Runtime pointer explicitly.
+    ///
+    /// Example:
+    /// @code
+    /// Runtime rt(std::in_place_type<WorkSharingExecutor>, 4);
+    /// @endcode
+    template<typename ExecutorType, typename... Args>
+    explicit Runtime(std::in_place_type_t<ExecutorType>, Args&&... args)
+        : m_executor(std::make_unique<ExecutorType>(std::forward<Args>(args)..., this))
+    {}
+
     ~Runtime();
 
     Runtime(const Runtime&)            = delete;

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/work_sharing_executor.h>
+#include <utility>
 #include <coro/coro.h>
 #include <coro/task/join_handle.h>
 #include <coro/task/join_set.h>
@@ -80,12 +81,12 @@ Coro<void> count_tasks_coro(std::atomic<int>& counter, int n) {
 // ---------------------------------------------------------------------------
 
 TEST(WorkSharingExecutorTest, RuntimeConstructsWithMultipleThreads) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     (void)rt;
 }
 
 TEST(WorkSharingExecutorTest, RuntimeConstructsWithFourThreads) {
-    Runtime rt(4);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 4);
     (void)rt;
 }
 
@@ -94,22 +95,22 @@ TEST(WorkSharingExecutorTest, RuntimeConstructsWithFourThreads) {
 // ---------------------------------------------------------------------------
 
 TEST(WorkSharingExecutorTest, BlockOnSimpleCoroReturnsValue) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     EXPECT_EQ(rt.block_on(simple_coro()), 42);
 }
 
 TEST(WorkSharingExecutorTest, BlockOnVoidCoroCompletes) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     rt.block_on(void_coro());
 }
 
 TEST(WorkSharingExecutorTest, BlockOnRethrowsException) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     EXPECT_THROW(rt.block_on(throwing_coro()), std::runtime_error);
 }
 
 TEST(WorkSharingExecutorTest, BlockOnImmediateFutureReturnsValue) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     EXPECT_EQ(rt.block_on(ImmediateInt{7}), 7);
 }
 
@@ -118,7 +119,7 @@ TEST(WorkSharingExecutorTest, BlockOnImmediateFutureReturnsValue) {
 // ---------------------------------------------------------------------------
 
 TEST(WorkSharingExecutorTest, SpawnFromWorkerThreadReturnsValue) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     EXPECT_EQ(rt.block_on(nested_spawn_coro()), 99);
 }
 
@@ -127,14 +128,14 @@ TEST(WorkSharingExecutorTest, SpawnFromWorkerThreadReturnsValue) {
 // ---------------------------------------------------------------------------
 
 TEST(WorkSharingExecutorTest, MultipleConcurrentTasksAllComplete) {
-    Runtime rt(4);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 4);
     std::atomic<int> counter{0};
     rt.block_on(count_tasks_coro(counter, 10));
     EXPECT_EQ(counter.load(), 10);
 }
 
 TEST(WorkSharingExecutorTest, LargerFanOutAllTasksComplete) {
-    Runtime rt(4);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 4);
     std::atomic<int> counter{0};
     rt.block_on(count_tasks_coro(counter, 100));
     EXPECT_EQ(counter.load(), 100);
@@ -160,7 +161,7 @@ Coro<int> sum_of_squares(int n) {
 }
 
 TEST(WorkSharingExecutorTest, JoinSetCollectsResultsOnMultiThreadedRuntime) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     // 1^2 + 2^2 + 3^2 + 4^2 = 30
     EXPECT_EQ(rt.block_on(sum_of_squares(4)), 30);
 }
@@ -184,7 +185,7 @@ Coro<void> join_set_with_exception() {
 }
 
 TEST(WorkSharingExecutorTest, JoinSetExceptionPropagatesOnMultiThreadedRuntime) {
-    Runtime rt(2);
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     EXPECT_THROW(rt.block_on(join_set_with_exception()), std::runtime_error);
 }
 

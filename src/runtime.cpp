@@ -1,6 +1,6 @@
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/single_threaded_executor.h>
-#include <coro/runtime/work_sharing_executor.h>
+#include <coro/runtime/work_stealing_executor.h>
 #include <stdexcept>
 
 namespace coro {
@@ -13,7 +13,7 @@ Runtime::Runtime(std::size_t num_threads) {
     if (num_threads <= 1)
         m_executor = std::make_unique<SingleThreadedExecutor>();
     else
-        m_executor = std::make_unique<WorkSharingExecutor>(num_threads, this);
+        m_executor = std::make_unique<WorkStealingExecutor>(num_threads, this);
 }
 
 Runtime::~Runtime() {

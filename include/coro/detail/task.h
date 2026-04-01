@@ -74,6 +74,17 @@ public:
     std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
 
     /**
+     * @brief Index of the worker that last ran this task, or -1 if unknown.
+     *
+     * Written by the WorkStealingExecutor worker loop after each poll() call,
+     * while the task is in the Running state. Read by enqueue() to route
+     * re-enqueued tasks back to the same worker's local queue (task affinity).
+     * The Running → Idle CAS provides the happens-before edge that makes a
+     * plain int safe here.
+     */
+    int last_worker_index = -1;
+
+    /**
      * @brief Advances the inner future by one step.
      * @return `true` if the task has reached a terminal state (Ready, Error, or Dropped);
      *         `false` if still Pending and should be moved to the Suspended map.

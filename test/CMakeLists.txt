@@ -16,6 +16,7 @@ set(TEST_TARGETS
     test_co_invoke
     test_join_set
     test_work_sharing_executor
+    test_work_stealing_executor
     test_sleep
     test_oneshot
     test_mpsc

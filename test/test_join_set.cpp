@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <coro/coro.h>
 #include <coro/co_invoke.h>
+#include <coro/sync/join.h>
 #include <coro/task/join_set.h>
 #include <coro/runtime/runtime.h>
 #include <stdexcept>
@@ -305,5 +306,28 @@ TEST(JoinSetTest, Skynet) {
 
 TEST(JoinSetTest, SkynetMultiThreaded) {
     size_t result = Runtime().block_on(skynet(0, 1000000));
+    EXPECT_EQ(result, 499999500000);
+}
+
+template<std::size_t... Is>
+Coro<size_t> skynet_join1(size_t my_num, size_t remaining, std::index_sequence<Is...> seq) {
+    if (remaining == 1) co_return my_num;
+    auto results = co_await join(skynet_join1(my_num + Is*(remaining/10), remaining/10, seq)...);
+    co_return (std::get<Is>(results) + ...);;
+}
+
+Coro<size_t> skynet_join0(size_t my_num, size_t remaining) {
+    if (remaining == 1) co_return my_num;
+    JoinSet<size_t> js;
+    for (size_t i = 0; i < 10; ++i)
+        js.spawn(skynet_join1(my_num + i*(remaining/10), remaining/10, std::make_index_sequence<10>{}));
+    size_t sum = 0;
+    while (auto item = co_await next(js))
+        sum += item .value();
+    co_return sum;
+}
+
+TEST(JoinSetTest, SkynetMultiThreadedJoin) {
+    size_t result = Runtime().block_on(skynet_join0(0, 1000000));
     EXPECT_EQ(result, 499999500000);
 }
