@@ -2,6 +2,8 @@
 #include <gmock/gmock.h>
 #include <coro/coro.h>
 #include <coro/future.h>
+#include <coro/sync/join.h>
+#include <coro/runtime/runtime.h>
 #include <stdexcept>
 #include <string>
 
@@ -268,4 +270,18 @@ TEST(CoroTest, SpuriousWakeDoesNotResumeCoroutine) {
     auto r = c.poll(ctx);
     EXPECT_TRUE(r.isReady());
     EXPECT_EQ(r.value(), 55);
+}
+
+template<std::size_t... Is>
+Coro<size_t> skynet(size_t my_num, size_t remaining, std::index_sequence<Is...> seq) {
+    if (remaining == 1) {
+        co_return my_num;
+    }
+    auto results = co_await join(skynet(my_num + Is*(remaining/10), remaining/10, seq)...);
+    co_return ((std::get<Is>(results)) + ...);
+}
+
+TEST(CoroTest, Skynet) {
+    size_t result = Runtime(4).block_on(skynet(0, 1000000, std::make_index_sequence<10>{}));
+    EXPECT_EQ(result, 499999500000);
 }

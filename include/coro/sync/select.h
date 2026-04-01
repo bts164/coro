@@ -36,18 +36,6 @@ struct SelectBranch<N, void> {
     static constexpr std::size_t index = N;
 };
 
-/**
- * @brief Concept satisfied by futures that support cooperative cancellation via `cancel()`.
- *
- * Currently satisfied by @ref Coro and @ref CoroStream. Non-cancellable branches
- * are dropped immediately (not drained) when another branch wins a `select()`.
- *
- * @tparam F A type satisfying @ref Future.
- */
-template<typename F>
-concept Cancellable = Future<F> && requires(F& f) { f.cancel(); };
-
-
 namespace detail {
 
 // Build std::variant<SelectBranch<0,T0>, SelectBranch<1,T1>, ...> from a pack of Futures.
@@ -62,6 +50,7 @@ struct SelectOutputTypeHelper<std::index_sequence<Is...>, Fs...> {
 } // namespace detail
 
 
+//! Branch state for a `select()` future.
 enum class SelectBranchState : uint8_t { Active, Draining, Done };
 
 

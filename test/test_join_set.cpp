@@ -286,3 +286,24 @@ TEST(JoinSetVoidTest, ComposesWithCoInvokeAndCapture) {
 
     EXPECT_EQ(sum, 60);
 }
+
+Coro<size_t> skynet(size_t my_num, size_t remaining) {
+    if (remaining == 1) co_return my_num;
+    JoinSet<size_t> js;
+    for (size_t i = 0; i < 10; ++i)
+        js.spawn(skynet(my_num + i*(remaining/10), remaining/10));
+    size_t sum = 0;
+    while (auto item = co_await next(js))
+        sum += item .value();
+    co_return sum;
+}
+
+TEST(JoinSetTest, Skynet) {
+    size_t result = Runtime(1).block_on(skynet(0, 1000000));
+    EXPECT_EQ(result, 499999500000);
+}
+
+TEST(JoinSetTest, SkynetMultiThreaded) {
+    size_t result = Runtime().block_on(skynet(0, 1000000));
+    EXPECT_EQ(result, 499999500000);
+}

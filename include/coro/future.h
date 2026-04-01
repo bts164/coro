@@ -29,4 +29,15 @@ concept Future = requires(F& f, detail::Context& ctx) {
     { f.poll(ctx) } -> std::same_as<PollResult<typename F::OutputType>>;
 };
 
+/**
+ * @brief Concept satisfied by futures that support cooperative cancellation via `cancel()`.
+ *
+ * Currently satisfied by @ref Coro and @ref CoroStream. Non-cancellable branches
+ * are dropped immediately (not drained) when another branch wins a `select()`.
+ *
+ * @tparam F A type satisfying @ref Future.
+ */
+template<typename F>
+concept Cancellable = Future<F> && requires(F& f) { f.cancel(); };
+
 } // namespace coro
