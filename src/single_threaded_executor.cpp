@@ -6,7 +6,10 @@
 
 namespace coro {
 
-SingleThreadedExecutor::SingleThreadedExecutor() = default;
+SingleThreadedExecutor::SingleThreadedExecutor(Runtime* /*runtime*/) :
+    m_poll_thread_id() // default-constructed to no thread
+{}
+
 SingleThreadedExecutor::~SingleThreadedExecutor() = default;
 
 void SingleThreadedExecutor::schedule(std::unique_ptr<detail::Task> task) {

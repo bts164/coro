@@ -4,6 +4,9 @@
 #include <coro/sync/join.h>
 #include <coro/task/join_set.h>
 #include <coro/runtime/runtime.h>
+#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/work_sharing_executor.h>
+#include <coro/runtime/work_stealing_executor.h>
 #include <stdexcept>
 #include <vector>
 #include <algorithm>
@@ -288,32 +291,110 @@ TEST(JoinSetVoidTest, ComposesWithCoInvokeAndCapture) {
     EXPECT_EQ(sum, 60);
 }
 
+class SkynetLookup {
+private:
+    static SkynetLookup& initialize()
+    {
+        static SkynetLookup lookup;
+        return lookup;
+    }
+    std::size_t skynet(size_t m, size_t r)
+    {
+        if (r == 1) {
+            expected[m][r] = m;
+            return m;
+        }
+        size_t sum = 0;
+        for (size_t i = 0; i < 10; ++i)
+            sum += skynet(m + i*(r/10), r/10);
+        expected[m][r] = sum;
+        return sum;
+    }
+    SkynetLookup() {
+        skynet(0,1000000);
+    }
+    std::map<size_t, std::map<size_t, uint64_t>> expected;
+public:
+    static inline SkynetLookup const &instance = initialize();
+    size_t operator[](size_t m, size_t r) const {
+        return expected.at(m).at(r);
+    }
+};
+
+#include <co_assert.h>
+
 Coro<size_t> skynet(size_t my_num, size_t remaining) {
     if (remaining == 1) co_return my_num;
-    JoinSet<size_t> js;
+    std::vector<JoinHandle<size_t>> handles;
     for (size_t i = 0; i < 10; ++i)
-        js.spawn(skynet(my_num + i*(remaining/10), remaining/10));
+        handles.emplace_back(
+            coro::spawn(skynet(my_num + i*(remaining/10), remaining/10))
+                .submit()
+        );
     size_t sum = 0;
-    while (auto item = co_await next(js))
-        sum += item .value();
+    for (auto &h : handles) {
+        sum += co_await h;
+    }
+    size_t exp = SkynetLookup::instance[my_num, remaining];
+    CO_ASSERT_EQ(sum, exp)
+        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
     co_return sum;
 }
 
-TEST(JoinSetTest, Skynet) {
-    size_t result = Runtime(1).block_on(skynet(0, 1000000));
-    EXPECT_EQ(result, 499999500000);
+TEST(JoinSetTest, SkynetSingleThreaded) {
+    size_t result = Runtime(std::in_place_type<SingleThreadedExecutor>).block_on(skynet(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
-TEST(JoinSetTest, SkynetMultiThreaded) {
-    size_t result = Runtime().block_on(skynet(0, 1000000));
-    EXPECT_EQ(result, 499999500000);
+TEST(JoinSetTest, SkynetWorkSharing) {
+    size_t result = Runtime(std::in_place_type<WorkSharingExecutor>).block_on(skynet(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+}
+
+TEST(JoinSetTest, SkynetWorkStealing) {
+    size_t result = Runtime(std::in_place_type<WorkStealingExecutor>).block_on(skynet(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+}
+
+Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
+    if (remaining == 1) co_return my_num;
+    JoinSet<size_t> js;
+    for (size_t i = 0; i < 10; ++i)
+        js.spawn(skynet_joinset(my_num + i*(remaining/10), remaining/10));
+    size_t sum = 0;
+    while (auto item = co_await next(js)) {
+        sum += item .value();
+    }
+    size_t exp = SkynetLookup::instance[my_num, remaining];
+    CO_ASSERT_EQ(sum, exp)
+        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
+    co_return sum;
+}
+
+TEST(JoinSetTest, SkynetJoinSetSingleThreaded) {
+    size_t result = Runtime(std::in_place_type<SingleThreadedExecutor>).block_on(skynet_joinset(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+}
+
+TEST(JoinSetTest, SkynetJoinSetWorkSharing) {
+    size_t result = Runtime(std::in_place_type<WorkSharingExecutor>).block_on(skynet_joinset(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+}
+
+TEST(JoinSetTest, SkynetJoinSetWorkStealing) {
+    size_t result = Runtime(std::in_place_type<WorkStealingExecutor>).block_on(skynet_joinset(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
 template<std::size_t... Is>
 Coro<size_t> skynet_join1(size_t my_num, size_t remaining, std::index_sequence<Is...> seq) {
     if (remaining == 1) co_return my_num;
     auto results = co_await join(skynet_join1(my_num + Is*(remaining/10), remaining/10, seq)...);
-    co_return (std::get<Is>(results) + ...);;
+    size_t sum = (std::get<Is>(results) + ...);
+    size_t exp = SkynetLookup::instance[my_num, remaining];
+    CO_ASSERT_EQ(sum, exp)
+        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
+    co_return sum;
 }
 
 Coro<size_t> skynet_join0(size_t my_num, size_t remaining) {
@@ -322,12 +403,26 @@ Coro<size_t> skynet_join0(size_t my_num, size_t remaining) {
     for (size_t i = 0; i < 10; ++i)
         js.spawn(skynet_join1(my_num + i*(remaining/10), remaining/10, std::make_index_sequence<10>{}));
     size_t sum = 0;
-    while (auto item = co_await next(js))
+    while (auto item = co_await next(js)) {
         sum += item .value();
+    }
+    size_t exp = SkynetLookup::instance[my_num, remaining];
+    CO_ASSERT_EQ(sum, exp)
+        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
     co_return sum;
 }
 
-TEST(JoinSetTest, SkynetMultiThreadedJoin) {
-    size_t result = Runtime().block_on(skynet_join0(0, 1000000));
-    EXPECT_EQ(result, 499999500000);
+TEST(JoinSetTest, SkynetJoinSingleThreaded) {
+    size_t result = Runtime(std::in_place_type<SingleThreadedExecutor>).block_on(skynet_join1(0, 1000000, std::make_index_sequence<10>{}));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+}
+
+TEST(JoinSetTest, SkynetJoinWorkSharing) {
+    size_t result = Runtime(std::in_place_type<WorkSharingExecutor>).block_on(skynet_join0(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+}
+
+TEST(JoinSetTest, SkynetJoinWorkStealing) {
+    size_t result = Runtime(std::in_place_type<WorkStealingExecutor>).block_on(skynet_join0(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }

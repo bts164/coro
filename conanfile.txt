@@ -1,5 +1,6 @@
 [requires]
 gtest/1.14.0
+libuv/1.48.0
 
 [generators]
 CMakeToolchain

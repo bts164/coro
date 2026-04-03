@@ -101,13 +101,13 @@ TEST(WorkStealingExecutorTest, ConstructsWithFourThreads) {
 
 TEST(WorkStealingExecutorTest, DirectConstruction) {
     Runtime rt(1); // for thread-local setup
-    WorkStealingExecutor exec(2, &rt);
+    WorkStealingExecutor exec(&rt, 2);
     (void)exec;
 }
 
 TEST(WorkStealingExecutorTest, RejectsMoreThanMaxWorkers) {
     Runtime rt(1);
-    EXPECT_THROW(WorkStealingExecutor(65, &rt), std::invalid_argument);
+    EXPECT_THROW(WorkStealingExecutor(&rt, 65), std::invalid_argument);
 }
 
 // ---------------------------------------------------------------------------
@@ -222,4 +222,53 @@ TEST(WorkStealingExecutorTest, StressHighTaskCount) {
     std::atomic<int> counter{0};
     rt.block_on(count_tasks_coro(counter, 1000));
     EXPECT_EQ(counter.load(), 1000);
+}
+
+class ArgMarker
+{
+public:
+    ArgMarker(std::atomic<bool>& id) :
+        m_id(&id)
+    {
+        m_id->store(false, std::memory_order_release);
+    }
+    ArgMarker(const ArgMarker&) = delete;
+    ArgMarker(ArgMarker&&other) :
+        m_id(std::exchange(other.m_id, nullptr))
+    {}
+    ArgMarker& operator=(const ArgMarker&) = delete;
+    ArgMarker& operator=(ArgMarker&&) = delete;
+    ~ArgMarker()
+    {
+        if (m_id) {
+            m_id->store(true, std::memory_order_release);
+            //std::cout << "Set arg to true\n" << std::flush;
+        }
+    }
+private:
+    std::atomic_bool *m_id = nullptr;
+};
+
+#include <co_assert.h>
+#include <coro/runtime/work_sharing_executor.h>
+Coro<size_t> skynet(size_t my_num, size_t remaining, ArgMarker arg_lifetime_marker) {
+    //auto arg = std::move(arg_lifetime_marker);
+    std::atomic_bool arg_markers[10];
+    if (remaining == 1) co_return my_num;
+    std::optional<JoinHandle<size_t>> handles[10];
+    for (size_t i = 0; i < 10; ++i)
+        handles[i].emplace(coro::spawn(skynet(my_num + i*(remaining/10), remaining/10, ArgMarker(arg_markers[i]))).submit());
+    size_t sum = 0;
+    for (size_t i = 0; i < 10; ++i) {
+        sum += co_await handles[i].value();
+        CO_ASSERT_EQ((arg_markers[i].load(std::memory_order_acquire)), true)
+            << "Argument lifetimes not as expected: (" << my_num << ", " << remaining << ", " << i << ") not set after completion";
+    }
+    co_return sum;
+}
+TEST(WorkStealingExecutorTest, SkynetSynchronize) {
+    Runtime rt(std::in_place_type<WorkStealingExecutor>);
+    std::atomic_bool arg_marker{false};
+    rt.block_on(skynet(0, 1000000, ArgMarker(arg_marker)));
+    ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
 }

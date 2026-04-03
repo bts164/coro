@@ -18,6 +18,7 @@ set(TEST_TARGETS
     test_work_sharing_executor
     test_work_stealing_executor
     test_sleep
+    test_io_service
     test_oneshot
     test_mpsc
     test_watch
@@ -25,6 +26,7 @@ set(TEST_TARGETS
 
 foreach(t ${TEST_TARGETS})
     add_executable(${t} ${t}.cpp)
+    target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(${t} PRIVATE coro GTest::gtest GTest::gtest_main GTest::gmock)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()

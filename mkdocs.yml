@@ -6,7 +6,8 @@ theme:
   name: readthedocs
 plugins:
   - search
-  - mermaid2
+  - mermaid2:
+      version: '11.13.0'
   - mkdoxy:
       projects:
         coro:
@@ -22,22 +23,29 @@ nav:
   - Getting Started: getting_started.md
   - API Reference:
     - Key Types:
-      - Runtime: coro/classcoro_1_1Runtime.md
-      - Coro: coro/classcoro_1_1Coro.md
-      - "Coro<void>": coro/classcoro_1_1Coro_3_01void_01_4.md
-      - CoroStream: coro/classcoro_1_1CoroStream.md
-      - JoinHandle: coro/classcoro_1_1JoinHandle.md
-      - "JoinHandle<void>": coro/classcoro_1_1JoinHandle_3_01void_01_4.md
-      - SpawnBuilder: coro/classcoro_1_1SpawnBuilder.md
-      - StreamSpawnBuilder: coro/classcoro_1_1StreamSpawnBuilder.md
-      - StreamHandle: coro/classcoro_1_1StreamHandle.md
-      - JoinSet: coro/classcoro_1_1JoinSet.md
-      - SelectFuture: coro/classcoro_1_1SelectFuture.md
-      - SelectBranch: coro/structcoro_1_1SelectBranch.md
-      - SleepFuture: coro/structcoro_1_1SleepFuture.md
+      - Runtime & Executors:
+        - Runtime: coro/classcoro_1_1Runtime.md
+        - SingleThreadedExecutor: coro/classcoro_1_1SingleThreadedExecutor.md
+        - WorkStealingExecutor: coro/classcoro_1_1WorkStealingExecutor.md
+        - WorkSharingExecutor: coro/classcoro_1_1WorkSharingExecutor.md
+      - Coroutine Types:
+        - Coro: coro/classcoro_1_1Coro.md
+        - CoroStream: coro/classcoro_1_1CoroStream.md
+      - Task Handles:
+        - JoinHandle: coro/classcoro_1_1JoinHandle.md
+        - SpawnBuilder: coro/classcoro_1_1SpawnBuilder.md
+        - StreamSpawnBuilder: coro/classcoro_1_1StreamSpawnBuilder.md
+        - StreamHandle: coro/classcoro_1_1StreamHandle.md
+      - Combinators:
+        - JoinSet: coro/classcoro_1_1JoinSet.md
+        - JoinFuture: coro/classcoro_1_1JoinFuture.md
+        - SelectFuture: coro/classcoro_1_1SelectFuture.md
+      - Timers:
+        - SleepFuture: coro/structcoro_1_1SleepFuture.md
     - Concepts & Free Functions:
       - Future (concept): coro/future_8h.md
       - Stream (concept): coro/stream_8h.md
+      - join(): coro/join_8h.md
       - select(): coro/select_8h.md
       - sleep_for(): coro/sleep_8h.md
       - timeout(): coro/timeout_8h.md
@@ -49,7 +57,11 @@ nav:
     - Futures and Streams: future_and_stream.md
     - Tasks, Wakers, and Context: waker_and_context_propagation.md
     - Tasks, Executors, and Runtime: task_and_executor.md
-    - Executor Detailed Design: executor_design.md
+    - Executor Design:
+      - Overview: executor_design.md
+      - Work-Stealing Scheduler: work_stealing_executor.md
+    - I/O Integration:
+      - libuv Integration: libuv_integration.md
     - Synchronization:
       - Coroutine Scope: coroutine_scope.md
       - JoinSet: join_set.md

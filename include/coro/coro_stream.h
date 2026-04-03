@@ -108,7 +108,10 @@ public:
 
     CoroStream& operator=(CoroStream&& other) noexcept {
         if (this != &other) {
-            if (m_handle) m_handle.destroy();
+            if (m_handle) {
+                detail::CurrentCoroGuard guard(m_scope.get());
+                m_handle.destroy();
+            }
             m_handle    = std::exchange(other.m_handle, {});
             m_scope     = std::move(other.m_scope);
             m_cancelled = other.m_cancelled;
@@ -117,7 +120,12 @@ public:
     }
 
     ~CoroStream() {
-        if (m_handle) m_handle.destroy();
+        if (m_handle) {
+            // Set t_current_coro so any JoinHandle destructors in the frame register
+            // their children with this scope before the frame memory is freed.
+            detail::CurrentCoroGuard guard(m_scope.get());
+            m_handle.destroy();
+        }
     }
 
     /// @brief Marks this stream for cancellation. Takes effect on the next `poll_next()` call.
@@ -143,8 +151,9 @@ public:
             return std::optional<T>(std::nullopt);
 
         // Frame already ran to completion — emit any unemitted final value, then drain
-        // children before signalling exhaustion. This path is re-entered on each poll
-        // after the frame finishes until all children have drained.
+        // children before signalling exhaustion or propagating the exception.
+        // This path is re-entered on each poll after the frame finishes until all
+        // children have drained.
         if (m_handle.done()) {
             if constexpr (HasFinalValue) {
                 auto& p = m_handle.promise();
@@ -156,6 +165,9 @@ public:
             }
             if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
                 return PollPending;
+            auto& p = m_handle.promise();
+            if (p.m_exception)
+                return PollError(p.m_exception);
             return std::optional<T>(std::nullopt);
         }
 
@@ -176,15 +188,16 @@ public:
             m_handle.resume();
         }
 
-        if (promise.m_exception)
-            return PollError(promise.m_exception);
-
+        // Yielded value takes priority — deliver it before checking for completion.
         if (promise.m_yielded.has_value()) {
             auto val = std::move(*promise.m_yielded);
             promise.m_yielded.reset();
             return std::optional<T>(std::move(val));
         }
 
+        // Frame reached final_suspend (normally or via unhandled exception).
+        // Drain children before delivering exhaustion or propagating the exception —
+        // children may still hold references to locals that were alive at co_return.
         if (m_handle.done()) {
             if constexpr (HasFinalValue) {
                 if (promise.m_final_value.has_value()) {
@@ -195,6 +208,8 @@ public:
             }
             if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
                 return PollPending;
+            if (promise.m_exception)
+                return PollError(promise.m_exception);
             return std::optional<T>(std::nullopt);
         }
 

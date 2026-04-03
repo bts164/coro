@@ -12,6 +12,7 @@ if(ENABLE_TSAN)
 endif()
 
 find_package(GTest REQUIRED)
+find_package(libuv REQUIRED)
 
 add_library(coro
     src/waker.cpp
@@ -21,10 +22,11 @@ add_library(coro
     src/single_threaded_executor.cpp
     src/work_sharing_executor.cpp
     src/work_stealing_executor.cpp
-    src/timer_service.cpp
+    src/io_service.cpp
     src/runtime.cpp
 )
 target_include_directories(coro PUBLIC include)
+target_link_libraries(coro PUBLIC libuv::uv_a)
 
 enable_testing()
 add_subdirectory(test)

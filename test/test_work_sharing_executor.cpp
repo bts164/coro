@@ -195,7 +195,7 @@ TEST(WorkSharingExecutorTest, JoinSetExceptionPropagatesOnMultiThreadedRuntime) 
 
 TEST(WorkSharingExecutorTest, DirectConstructionAndSchedule) {
     Runtime rt(1);  // use rt for thread-local setup
-    WorkSharingExecutor exec(2, &rt);
+    WorkSharingExecutor exec(&rt, 2);
     // schedule an immediate task; executor should not crash on destruction
     exec.schedule(std::make_unique<detail::Task>(
         ImmediateVoid{},

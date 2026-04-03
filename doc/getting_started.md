@@ -19,6 +19,7 @@ Add these headers to your source files as needed:
 #include <coro/coro.h>               // Coro<T> — async function return type
 #include <coro/coro_stream.h>        // CoroStream<T> — async generator return type
 #include <coro/runtime/runtime.h>    // Runtime, spawn()
+#include <coro/sync/join.h>          // join()
 #include <coro/sync/select.h>        // select()
 #include <coro/sync/sleep.h>         // sleep_for()
 #include <coro/sync/timeout.h>       // timeout()
@@ -59,6 +60,18 @@ int main() {
     coro::Runtime rt;
     rt.block_on(say_hello());
 }
+```
+
+### Choosing a runtime
+
+`Runtime` accepts an optional thread count. With more than one thread it uses
+the work-stealing multi-threaded executor; with one thread it runs everything on
+the calling thread (useful for testing and single-threaded applications).
+
+```cpp
+coro::Runtime rt;       // hardware_concurrency() threads — work-stealing executor
+coro::Runtime rt(4);    // 4 threads — work-stealing executor
+coro::Runtime rt(1);    // 1 thread  — single-threaded executor (deterministic)
 ```
 
 ---
@@ -131,6 +144,50 @@ To let the task run without cancelling or waiting for it, call `detach()`:
 coro::spawn(fetch(1)).submit().detach();  // fire and forget
 ```
 
+### Task lifetime and the scope safety problem
+
+In Rust, `tokio::spawn()` requires `'static` — spawned tasks must own all their data,
+making it a compile-time error to capture a reference into the spawning context. C++ has
+no equivalent constraint, so it is possible to spawn a task that borrows from the parent
+coroutine:
+
+```cpp
+coro::Coro<void> unsafe_example() {
+    int local_data = 42;
+    // Dangerous — child captures a pointer to local_data.
+    auto h = coro::spawn(worker(&local_data)).submit();
+    co_return;  // local_data destroyed here; child may still be running
+}
+```
+
+To close this gap, every `Coro<T>` implicitly tracks its spawned children and defers
+frame destruction until they have drained. This catches most cases automatically — but
+there is one gap: at `co_return`, locals are destroyed before the implicit drain wait
+begins, so a child that references a local can still see dangling memory.
+
+**The safe patterns are:**
+
+1. **Pass owned data** — move values into the child instead of capturing references.
+2. **Use `co_invoke` + `JoinSet::drain()`** — `co_invoke` keeps the lambda (and its
+   captures) alive for the full lifetime of the scope, and `drain()` ensures all
+   children finish before locals are destroyed.
+
+```cpp
+coro::Coro<void> safe_example() {
+    int shared_value = 42;
+
+    co_await coro::co_invoke([&]() -> coro::Coro<void> {
+        coro::JoinSet<void> js;
+        js.spawn(worker(&shared_value));  // safe — co_invoke keeps shared_value alive
+        co_await js.drain();              // all children done before this scope exits
+    });
+    // shared_value still alive here
+}
+```
+
+See the [Coroutine Scope design document](coroutine_scope.md) for a full explanation of
+the implicit scope mechanism, its limits, and how it compares to Rust's `'static` bound.
+
 ---
 
 ## 4. Fan-out with `JoinSet`
@@ -176,11 +233,45 @@ Dropping a `JoinSet` without calling `drain()` cancels all pending tasks. The en
 
 > **Note:** `JoinSet::spawn()` uses `co_invoke` internally to schedule tasks, so it must be
 > called from within a `Runtime::block_on()` context. Always wrap fan-out work in `co_invoke`
-> to keep lambda captures alive for the full duration (see section 8).
+> to keep lambda captures alive for the full duration (see section 11).
 
 ---
 
-## 5. Async generators
+## 5. Joining a fixed set of futures
+
+`join()` runs a fixed set of heterogeneous futures concurrently and waits for **all** of
+them to complete. Unlike `JoinSet`, the number and types of branches are fixed at compile
+time. Results are returned as a `std::tuple` in branch order.
+
+```cpp
+#include <coro/sync/join.h>
+
+coro::Coro<int>         fetch_int()    { co_return 42; }
+coro::Coro<std::string> fetch_string() { co_return "hello"; }
+
+coro::Coro<void> run() {
+    auto [n, s] = co_await coro::join(fetch_int(), fetch_string());
+    std::cout << n << " " << s << "\n";  // 42 hello
+}
+```
+
+`void`-returning branches contribute a `VoidJoinBranch{}` placeholder in the tuple:
+
+```cpp
+coro::Coro<void> side_effect() { co_return; }
+
+coro::Coro<void> run() {
+    auto [n, _] = co_await coro::join(fetch_int(), side_effect());
+    std::cout << n << "\n";  // 42
+}
+```
+
+If any branch throws, the remaining branches are cancelled and drained, then the first
+exception is re-thrown. Use `JoinSet` instead when the number of branches is dynamic.
+
+---
+
+## 6. Async generators
 
 `CoroStream<T>` is an async generator: use `co_yield` to emit items and `co_return`
 to signal exhaustion. Consume it with `co_await coro::next(stream)` in a loop.
@@ -215,11 +306,30 @@ the awaited future resolves.
 
 ---
 
-## 6. Racing futures with `select`
+## 7. Sleeping
+
+`sleep_for()` suspends the current coroutine for a duration without blocking any
+worker thread. Other tasks continue to run on the executor while a coroutine sleeps.
+
+```cpp
+#include <coro/sync/sleep.h>
+#include <chrono>
+
+coro::Coro<void> run() {
+    using namespace std::chrono_literals;
+    std::cout << "before\n";
+    co_await coro::sleep_for(100ms);
+    std::cout << "after\n";
+}
+```
+
+---
+
+## 8. Racing futures with `select`
 
 `select()` races two or more futures and returns as soon as one completes.
 The result is a `std::variant` of `SelectBranch<N, T>` values identifying which
-branch won and carrying its result.
+branch won and carrying its result. All other branches are cancelled and drained.
 
 ```cpp
 #include <coro/coro.h>
@@ -247,7 +357,7 @@ int main() {
 
 ---
 
-## 7. Timeouts
+## 9. Timeouts
 
 `timeout(duration, future)` is a convenience wrapper around `select` that races your
 future against a `sleep_for` timer.
@@ -286,7 +396,145 @@ The return type of `timeout(d, F)` is the same as `select(F, SleepFuture)`:
 
 ---
 
-## 8. Capturing-lambda pitfall and `co_invoke`
+## 10. Channels
+
+> *"Do not communicate by sharing memory; instead, share memory by communicating."*
+> — Go team
+
+Channels are the practical expression of this principle: rather than protecting shared
+state with mutexes, pass ownership of data between coroutines so only one task holds it
+at a time making channels much less likely to be misused. Three variants are provided:
+
+| Variant | Producers | Consumers | Notes |
+|---|---|---|---|
+| `oneshot` | 1 | 1 | Single value; send is synchronous |
+| `mpsc`    | N (cloneable sender) | 1 | Bounded buffer; backpressured send |
+| `watch`   | 1 | N (cloneable receiver) | Last-value-wins; send never suspends |
+
+### RAII handles and disconnection
+
+Every channel end is a RAII handle. Dropping a handle signals disconnection to the other
+side automatically — no explicit `close()` call is needed:
+
+- **Sender dropped** — any receiver waiting for a value wakes immediately and gets a
+  `ChannelError` result. For `mpsc`, dropping all senders closes the channel and causes
+  the receiver's `next()` loop to terminate naturally.
+- **Receiver dropped** — any sender waiting to send wakes immediately and gets its value
+  back in the error slot of the returned `std::expected`, so move-only values are never
+  silently lost.
+
+For `watch`, the sender dropping is the normal way to signal that no more updates will
+arrive. Receivers observe this as an error on their next `changed()` call and can exit
+cleanly — it is not an unexpected failure.
+
+### Error handling
+
+All channel operations return `std::expected<T, ChannelError>` rather than throwing.
+Call `.value()` to throw on error, or check the result explicitly.
+
+```cpp
+#include <coro/sync/oneshot.h>
+#include <coro/sync/mpsc.h>
+#include <coro/sync/watch.h>
+```
+
+### oneshot — single value, one sender, one receiver
+
+Use `oneshot` to hand a single result from one task to another.
+`send()` is synchronous and can be called from any thread.
+
+```cpp
+coro::Coro<void> run() {
+    auto [tx, rx] = coro::oneshot::channel<int>();
+
+    // Spawn a task that sends the result back.
+    auto h = coro::spawn(coro::co_invoke(
+        [tx = std::move(tx)]() mutable -> coro::Coro<void> {
+            tx.send(42);
+            co_return;
+        })).submit();
+
+    auto result = co_await rx;      // std::expected<int, ChannelError>
+    std::cout << result.value() << "\n";  // 42
+    co_await h;
+}
+```
+
+If the sender is dropped without calling `send()`, `co_await rx` returns
+`std::unexpected(ChannelError::Closed)`.
+
+### mpsc — bounded queue, multiple producers, one consumer
+
+Use `mpsc` for producer/consumer pipelines. The receiver satisfies `Stream<T>`,
+so consume it with `next()` in a loop.
+
+```cpp
+coro::Coro<void> run() {
+    co_await coro::co_invoke([&]() -> coro::Coro<void> {
+        auto [tx, rx] = coro::mpsc::channel<int>(/*capacity=*/16);
+
+        // Two producer tasks.
+        coro::JoinSet<void> producers;
+        for (int i = 0; i < 2; ++i) {
+            producers.spawn(coro::co_invoke(
+                [tx = tx.clone(), i]() mutable -> coro::Coro<void> {
+                    for (int j = 0; j < 3; ++j)
+                        co_await tx.send(i * 10 + j);
+                }));
+        }
+
+        // Consume until all senders are dropped.
+        while (auto v = co_await coro::next(rx))
+            std::cout << *v << " ";
+        std::cout << "\n";
+
+        co_await producers.drain();
+    });
+}
+```
+
+`send()` suspends the producer if the buffer is full, providing natural
+backpressure. Use `trySend()` for a non-blocking attempt.
+
+### watch — last-value channel, one sender, many receivers
+
+Use `watch` to broadcast configuration or state that multiple tasks need to
+observe. Receivers call `changed()` to wait for the next update, then `borrow()`
+to read the current value under a shared lock.
+
+```cpp
+coro::Coro<void> run() {
+    co_await coro::co_invoke([&]() -> coro::Coro<void> {
+        auto [tx, rx] = coro::watch::channel<int>(/*initial=*/0);
+
+        // Spawn a watcher.
+        auto h = coro::spawn(coro::co_invoke(
+            [rx = std::move(rx)]() mutable -> coro::Coro<void> {
+                while (true) {
+                    auto r = co_await rx.changed();
+                    if (!r) co_return;          // sender dropped — channel closed
+                    std::cout << *rx.borrow() << "\n";
+                }
+            })).submit();
+
+        tx.send(1);
+        tx.send(2);
+        tx.send(3);
+        // Dropping tx closes the channel; the watcher's changed() will return an error.
+        co_await h;
+    });
+}
+```
+
+`rx.clone()` creates an independent receiver with its own cursor — useful when
+multiple tasks need to track changes independently.
+
+> **Note:** do not hold a `BorrowGuard` across a `co_await` point. Doing so keeps
+> the shared read lock held while suspended, which blocks all `send()` calls.
+
+---
+
+## 11. Capturing-lambda pitfall and `co_invoke`
 
 A capturing lambda that returns `Coro<T>` has a subtle use-after-free when used as an
 rvalue. The compiler lowers the lambda to an anonymous struct; `operator()` — being a member

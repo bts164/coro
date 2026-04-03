@@ -13,21 +13,15 @@ Runtime::Runtime(std::size_t num_threads) {
     if (num_threads <= 1)
         m_executor = std::make_unique<SingleThreadedExecutor>();
     else
-        m_executor = std::make_unique<WorkStealingExecutor>(num_threads, this);
+        m_executor = std::make_unique<WorkStealingExecutor>(this, num_threads);
 }
 
 Runtime::~Runtime() {
-    // Stop the timer thread before the executor is destroyed. The timer thread fires
-    // wakers that call executor::enqueue(), which touches executor-owned state
-    // (m_remote_cv). If we let the executor be destroyed first (the default member
-    // destruction order: m_executor before m_timer_service), the timer thread can
-    // call into already-destroyed executor memory — a use-after-free / data race.
-    //
-    // After stop() returns the timer thread has joined and will never call wake() again,
-    // so it is safe for the executor (and its condition variables) to be destroyed next.
-    m_timer_service.stop();
-    // m_executor and m_timer_service are then destroyed in reverse declaration order
-    // by the implicit member destructors that follow this body.
+    // m_executor is declared after m_io_service, so it is destroyed first (reverse
+    // declaration order). The executor destructor joins all worker threads, ensuring
+    // no further waker->wake() calls arrive before IoService shuts down.
+    // IoService::~IoService() then stops the I/O thread and closes the loop.
+    // No explicit action needed here.
 }
 
 void set_current_runtime(Runtime* rt) {

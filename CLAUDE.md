@@ -47,6 +47,11 @@ The `Executor` should be designed around a pluggable scheduling model. The inter
 
 ## Conventions
 
+### Document potential or known race conditions with comments
+
+Briefly point out potential or known race conditions inline in the code with comments. Even if you're not 100% sure, err on the side of caution and add
+a comment pointing out the potential race condition.
+
 ### Care must be taken if spawned futures are not self-contained
 
 `runtime.spawn()` and the free `spawn()` function accept any `Future` or `Stream`, but the

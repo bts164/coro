@@ -40,9 +40,9 @@ class Runtime;
  */
 class WorkSharingExecutor : public Executor {
 public:
-    /// @param num_threads Number of worker threads to create.
-    /// @param runtime Back-pointer to the owning Runtime.
-    WorkSharingExecutor(std::size_t num_threads, Runtime* runtime);
+    /// @param runtime     Back-pointer to the owning Runtime.
+    /// @param num_threads Number of worker threads to create (default: hardware concurrency).
+    WorkSharingExecutor(Runtime* runtime, std::size_t num_threads = std::thread::hardware_concurrency());
     ~WorkSharingExecutor() override;
 
     WorkSharingExecutor(const WorkSharingExecutor&)            = delete;

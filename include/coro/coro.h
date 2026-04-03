@@ -96,7 +96,10 @@ public:
 
     Coro& operator=(Coro&& other) noexcept {
         if (this != &other) {
-            if (m_handle) m_handle.destroy();
+            if (m_handle) {
+                detail::CurrentCoroGuard guard(m_scope.get());
+                m_handle.destroy();
+            }
             m_handle    = std::exchange(other.m_handle, {});
             m_scope     = std::move(other.m_scope);
             m_cancelled = other.m_cancelled;
@@ -105,7 +108,12 @@ public:
     }
 
     ~Coro() {
-        if (m_handle) m_handle.destroy();
+        if (m_handle) {
+            // Set t_current_coro so any JoinHandle destructors in the frame register
+            // their children with this scope before the frame memory is freed.
+            detail::CurrentCoroGuard guard(m_scope.get());
+            m_handle.destroy();
+        }
     }
 
     /// @brief Marks this coroutine for cancellation. Takes effect on the next `poll()` call.
@@ -215,7 +223,10 @@ public:
 
     Coro& operator=(Coro&& other) noexcept {
         if (this != &other) {
-            if (m_handle) m_handle.destroy();
+            if (m_handle) {
+                detail::CurrentCoroGuard guard(m_scope.get());
+                m_handle.destroy();
+            }
             m_handle    = std::exchange(other.m_handle, {});
             m_scope     = std::move(other.m_scope);
             m_cancelled = other.m_cancelled;
@@ -224,7 +235,12 @@ public:
     }
 
     ~Coro() {
-        if (m_handle) m_handle.destroy();
+        if (m_handle) {
+            // Set t_current_coro so any JoinHandle destructors in the frame register
+            // their children with this scope before the frame memory is freed.
+            detail::CurrentCoroGuard guard(m_scope.get());
+            m_handle.destroy();
+        }
     }
 
     /// @brief Marks this coroutine for cancellation. Takes effect on the next `poll()` call.

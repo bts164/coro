@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -43,9 +44,9 @@ class WorkStealingExecutor : public Executor {
 public:
     static constexpr std::size_t MAX_WORKERS = 64;
 
-    /// @param num_threads Number of worker threads. Must be in [2, MAX_WORKERS].
     /// @param runtime     Back-pointer to the owning Runtime.
-    WorkStealingExecutor(std::size_t num_threads, Runtime* runtime);
+    /// @param num_threads Number of worker threads (default: hardware concurrency). Must be in [2, MAX_WORKERS].
+    WorkStealingExecutor(Runtime* runtime, std::size_t num_threads = std::thread::hardware_concurrency());
     ~WorkStealingExecutor() override;
 
     WorkStealingExecutor(const WorkStealingExecutor&)            = delete;
@@ -99,6 +100,12 @@ private:
     std::deque<std::shared_ptr<detail::Task>> m_injection_queue;
     std::mutex                                m_mutex; ///< Guards m_injection_queue and m_stop.
     bool                                      m_stop{false};
+
+    // --- Construction barrier ---
+
+    /// Counted down to 0 by the constructor after all WorkerSlots are pushed.
+    /// Each worker waits on this before reading m_workers.size().
+    std::latch m_start_latch{1};
 
     // --- Parking / searching protocol ---
 

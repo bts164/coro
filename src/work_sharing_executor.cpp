@@ -1,6 +1,6 @@
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/timer_service.h>
+#include <coro/runtime/io_service.h>
 #include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
 #include <cstdlib>
@@ -14,7 +14,7 @@ namespace coro {
 thread_local WorkSharingExecutor* t_owning_executor = nullptr;
 thread_local int                  t_worker_index    = -1;
 
-WorkSharingExecutor::WorkSharingExecutor(std::size_t num_threads, Runtime* runtime)
+WorkSharingExecutor::WorkSharingExecutor(Runtime* runtime, std::size_t num_threads)
     : m_local_queues(num_threads)
     , m_runtime(runtime)
 {
@@ -72,7 +72,7 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     t_owning_executor = this;
     t_worker_index    = worker_index;
     set_current_runtime(m_runtime);
-    set_current_timer_service(&m_runtime->timer_service());
+    set_current_io_service(&m_runtime->io_service());
 
     while (true) {
         std::shared_ptr<detail::Task> task;
@@ -152,7 +152,7 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     }
 
     set_current_runtime(nullptr);
-    set_current_timer_service(nullptr);
+    set_current_io_service(nullptr);
     t_owning_executor = nullptr;
     t_worker_index    = -1;
 }

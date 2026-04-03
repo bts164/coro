@@ -12,6 +12,9 @@
 
 namespace coro {
 
+//! Forward declaration to avoid circular dependency with Runtime.
+class Runtime;
+
 /**
  * @brief Single-threaded @ref Executor implementation.
  *
@@ -35,7 +38,9 @@ namespace coro {
  */
 class SingleThreadedExecutor : public Executor {
 public:
-    SingleThreadedExecutor();
+    /// @param runtime Unused back-pointer; accepted for compatibility with the Runtime
+    ///                template constructor (`Runtime(std::in_place_type<SingleThreadedExecutor>)`).
+    explicit SingleThreadedExecutor(Runtime* runtime = nullptr);
     ~SingleThreadedExecutor() override;
 
     void schedule(std::unique_ptr<detail::Task> task) override;

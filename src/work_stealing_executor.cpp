@@ -1,6 +1,6 @@
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/timer_service.h>
+#include <coro/runtime/io_service.h>
 #include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
 #include <bit>
@@ -16,7 +16,7 @@ namespace coro {
 thread_local WorkStealingExecutor* t_wse_owning_executor = nullptr;
 thread_local int                   t_wse_worker_index    = -1;
 
-WorkStealingExecutor::WorkStealingExecutor(std::size_t num_threads, Runtime* runtime)
+WorkStealingExecutor::WorkStealingExecutor(Runtime* runtime, std::size_t num_threads)
     : m_local_queues(num_threads)
     , m_runtime(runtime)
 {
@@ -30,6 +30,8 @@ WorkStealingExecutor::WorkStealingExecutor(std::size_t num_threads, Runtime* run
             worker_loop(static_cast<int>(i));
         });
     }
+    // All WorkerSlots are now in m_workers. Let the workers proceed.
+    m_start_latch.count_down();
 }
 
 WorkStealingExecutor::~WorkStealingExecutor() {
@@ -92,10 +94,15 @@ void WorkStealingExecutor::notify_if_needed() {
 }
 
 void WorkStealingExecutor::worker_loop(int worker_index) {
+    // Wait until the constructor has finished pushing all WorkerSlots so that
+    // m_workers.size() is stable before we read it. RACE: reading m_workers
+    // while the constructor is still push_back()-ing would be undefined.
+    m_start_latch.wait();
+
     t_wse_owning_executor = this;
     t_wse_worker_index    = worker_index;
     set_current_runtime(m_runtime);
-    set_current_timer_service(&m_runtime->timer_service());
+    set_current_io_service(&m_runtime->io_service());
 
     const int    n            = static_cast<int>(m_workers.size());
     const int    max_search   = std::max(1, n / 2);
@@ -245,7 +252,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     }
 
     set_current_runtime(nullptr);
-    set_current_timer_service(nullptr);
+    set_current_io_service(nullptr);
     t_wse_owning_executor = nullptr;
     t_wse_worker_index    = -1;
 }

@@ -21,6 +21,36 @@ The root cause is deeper than `Synchronize`: any future combinator that can aban
 creates this hazard for any coroutine in that branch that has spawned tasks holding borrowed
 references.
 
+## Requirements
+
+Regardless of how a coroutine stops executing — normal completion (`co_return`), exception,
+or cancellation — the following ordering must be guaranteed:
+
+1. **Drain children before destroying the frame.** The coroutine must wait for all spawned
+   child tasks that were not explicitly `co_await`ed to completion (and not explicitly
+   detached) to finish before its coroutine frame is freed. This is the coroutine scope
+   guarantee: no child task may outlive the frame that owns the data it references.
+
+2. **Destroy the state machine only after the drain.** The C++ coroutine frame — which holds
+   all local variables, function arguments captured at the initial suspend point, and any
+   intermediate awaitable state — must not be freed (i.e. `handle.destroy()` must not have
+   been called, or its effects must not be visible to running children) until the drain in
+   step 1 is complete. Once the drain is complete, the frame is destroyed, running all
+   remaining local destructors in LIFO order exactly as the language guarantees for ordinary
+   stack frames.
+
+These two steps apply uniformly across all termination paths:
+
+| Termination path | Children drained? | Frame destroyed after? |
+|---|---|---|
+| `co_return` (normal) | Yes | Yes |
+| Uncaught exception | Yes | Yes |
+| Cancellation (cancelled flag set) | Yes | Yes |
+| Coroutine dropped without awaiting | Yes | Yes |
+
+Detached tasks (`JoinHandle::detach()`) are explicitly opted out of this guarantee and are
+not tracked.
+
 ## Proposed Design — Every Coroutine Is an Implicit Scope
 
 ### Core idea
