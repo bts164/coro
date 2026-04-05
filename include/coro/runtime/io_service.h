@@ -1,38 +1,13 @@
 #pragma once
 
-#include <coro/detail/waker.h>
 #include <uv.h>
-#include <atomic>
-#include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <atomic>
 
 namespace coro {
-
-// ---------------------------------------------------------------------------
-// TimerState
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Shared state between a @ref SleepFuture and the I/O thread.
- *
- * Heap-allocated and reference-counted so that either the future or the I/O
- * thread can outlive the other without dangling pointers.
- *
- * @warning `handle` must remain the first data member so that `&state->handle`
- *          is the same address as `state` itself — but do NOT rely on a raw
- *          pointer cast because `TimerState` is not standard-layout (it
- *          contains `std::atomic<std::shared_ptr<>>`). Always set
- *          `handle.data = state` explicitly in `StartTimer::execute()` and
- *          recover via `static_cast<TimerState*>(handle->data)`.
- */
-struct TimerState : std::enable_shared_from_this<TimerState> {
-    uv_timer_t                                  handle;  // must remain first field
-    std::atomic<std::shared_ptr<detail::Waker>> waker;   // written by worker, read by I/O thread
-    std::atomic<bool>                           fired{false};
-};
 
 // ---------------------------------------------------------------------------
 // IoRequest — polymorphic command
@@ -41,61 +16,17 @@ struct TimerState : std::enable_shared_from_this<TimerState> {
 /**
  * @brief Abstract base for all requests submitted to @ref IoService.
  *
- * Each subclass encapsulates one libuv operation. @ref IoService::process_queue()
- * calls `execute()` on the I/O thread without knowing the concrete type, so
- * adding new I/O operations (TCP, UDP, file, …) requires only a new subclass.
+ * Each concrete subclass encapsulates one libuv operation and is defined
+ * privately by the Future that needs it — @ref IoService knows nothing about
+ * specific operation types. @ref IoService::process_queue() calls `execute()`
+ * on the I/O thread without knowing the concrete type, so adding new I/O
+ * operations (TCP, UDP, file, …) requires only a new subclass, defined
+ * alongside the Future that uses it.
  */
 struct IoRequest {
     virtual ~IoRequest() = default;
     /// Called on the I/O thread with exclusive access to the uv_loop.
     virtual void execute(uv_loop_t* loop) = 0;
-};
-
-// ---------------------------------------------------------------------------
-// Callbacks (defined in io_service.cpp; used by StartTimer / CancelTimer)
-// ---------------------------------------------------------------------------
-
-/// Fired by libuv when a timer deadline expires.
-void timer_cb(uv_timer_t* handle);
-
-/// Fired by libuv after uv_close() completes; frees the TimerState.
-void close_cb(uv_handle_t* handle);
-
-// ---------------------------------------------------------------------------
-// Concrete request types — timer phase
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Registers a one-shot timer on the I/O thread.
- *
- * `state` is a raw pointer; its lifetime is guaranteed by either the owning
- * @ref SleepFuture (while alive) or by the @ref CancelTimer that follows it
- * in the FIFO queue (which holds a `shared_ptr<TimerState>`). Do not reorder
- * the queue.
- */
-struct StartTimer : IoRequest {
-    TimerState*                            state;     // raw; see lifetime note above
-    std::chrono::steady_clock::time_point  deadline;
-
-    StartTimer(TimerState* s, std::chrono::steady_clock::time_point d)
-        : state(s), deadline(d) {}
-
-    void execute(uv_loop_t* loop) override;
-};
-
-/**
- * @brief Cancels and closes a pending timer on the I/O thread.
- *
- * Holds a `shared_ptr<TimerState>` to keep the state alive until the I/O
- * thread processes this request (the @ref SleepFuture destructor may have
- * already released its own reference by this point).
- */
-struct CancelTimer : IoRequest {
-    std::shared_ptr<TimerState> state;
-
-    explicit CancelTimer(std::shared_ptr<TimerState> s) : state(std::move(s)) {}
-
-    void execute(uv_loop_t* loop) override;
 };
 
 // ---------------------------------------------------------------------------
@@ -112,6 +43,9 @@ struct CancelTimer : IoRequest {
  * `IoService` must be declared **before** the @ref Executor in @ref Runtime
  * so that it is destroyed *after* all executor worker threads have joined.
  * This guarantees that `waker->wake()` is never called after the loop closes.
+ *
+ * `IoService` has no knowledge of any specific I/O operation type. All
+ * operation-specific state and callbacks live in the Future that owns them.
  */
 class IoService {
 public:

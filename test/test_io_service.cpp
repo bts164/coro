@@ -66,7 +66,6 @@ TEST(IoServiceTest, ThreadLocalIsPerThread) {
 
     IoService* seen_in_thread = nullptr;
     std::thread t([&] {
-        // Worker thread starts with no service set.
         set_current_io_service(&svc2);
         seen_in_thread = &current_io_service();
         set_current_io_service(nullptr);
@@ -80,43 +79,22 @@ TEST(IoServiceTest, ThreadLocalIsPerThread) {
 }
 
 // ---------------------------------------------------------------------------
-// TimerState
-// ---------------------------------------------------------------------------
-
-// TimerState fields are accessible and atomic operations compile.
-TEST(TimerStateTest, AtomicFieldsCompile) {
-    auto state = std::make_shared<TimerState>();
-    EXPECT_FALSE(state->fired.load());
-
-    // exchange returns the old value.
-    bool old = state->fired.exchange(true);
-    EXPECT_FALSE(old);
-    EXPECT_TRUE(state->fired.load());
-}
-
-// TimerState waker can be stored and loaded atomically.
-TEST(TimerStateTest, WakerAtomicStoreLoad) {
-    auto state = std::make_shared<TimerState>();
-    auto waker = std::make_shared<MockWaker>();
-    state->waker.store(waker);
-    EXPECT_EQ(state->waker.load(), waker);
-}
-
-// ---------------------------------------------------------------------------
 // Request submission
 // ---------------------------------------------------------------------------
 
-// Submitting a CancelTimer for a state that was never started does not crash.
-// (fired.exchange(true) returns false → would call uv_timer_stop on uninitialised
-//  handle in a real loop, but with a live IoService the I/O thread handles it.)
-TEST(IoServiceTest, SubmitCancelTimerDoesNotCrash) {
+// Submitting a no-op IoRequest does not crash and is processed by the I/O thread.
+TEST(IoServiceTest, SubmitNoOpRequestDoesNotCrash) {
+    struct NoOp : IoRequest {
+        std::atomic<bool>& executed;
+        explicit NoOp(std::atomic<bool>& flag) : executed(flag) {}
+        void execute(uv_loop_t*) override { executed.store(true); }
+    };
+
     IoService svc;
-    auto state = std::make_shared<TimerState>();
-    // Mark as already fired so CancelTimer::execute() is a safe no-op.
-    state->fired.store(true);
-    svc.submit(std::make_unique<CancelTimer>(state));
-    // Give the I/O thread a moment to process the queue.
+    std::atomic<bool> ran{false};
+    svc.submit(std::make_unique<NoOp>(ran));
     std::this_thread::sleep_for(10ms);
+    EXPECT_TRUE(ran.load());
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +117,7 @@ TEST(SleepFutureTest, PollReadyWhenDeadlinePassed) {
 }
 
 // SleepFuture with a future deadline returns PollPending on first poll and
-// submits a StartTimer to the IoService.
+// submits a StartRequest to the IoService.
 TEST(SleepFutureTest, PollPendingWhenDeadlineFuture) {
     IoService svc;
     set_current_io_service(&svc);
@@ -149,15 +127,14 @@ TEST(SleepFutureTest, PollPendingWhenDeadlineFuture) {
     detail::Context ctx(waker);
     auto result = f.poll(ctx);
     EXPECT_TRUE(result.isPending());
-    EXPECT_NE(f.m_state, nullptr);  // state was allocated
 
-    // Destructor submits CancelTimer — must not crash.
+    // Destructor submits CancelRequest — must not crash.
     set_current_io_service(nullptr);
 }
 
-// Dropping a SleepFuture after first poll (mid-wait) submits a CancelTimer.
+// Dropping a SleepFuture after first poll (mid-wait) submits a CancelRequest.
 // This tests the cancellation path without relying on the timer actually firing.
-TEST(SleepFutureTest, DestructorSubmitsCancelTimer) {
+TEST(SleepFutureTest, DestructorSubmitsCancelRequest) {
     IoService svc;
     set_current_io_service(&svc);
 
@@ -165,8 +142,8 @@ TEST(SleepFutureTest, DestructorSubmitsCancelTimer) {
         SleepFuture f(500ms);
         auto waker = std::make_shared<MockWaker>();
         detail::Context ctx(waker);
-        f.poll(ctx);  // registers timer; m_state is set
-        // f destroyed here → CancelTimer submitted
+        f.poll(ctx);  // registers timer; destructor will cancel it
+        // f destroyed here → CancelRequest submitted
     }
     // Give I/O thread time to process the cancel.
     std::this_thread::sleep_for(20ms);

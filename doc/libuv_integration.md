@@ -157,58 +157,30 @@ void IoService::process_queue() {
 }
 ```
 
-Concrete request types for this phase:
-
-```cpp
-struct StartTimer : IoRequest {
-    TimerState*                            state;    // raw pointer; SleepFuture or CancelTimer keeps shared_ptr alive
-    std::chrono::steady_clock::time_point  deadline;
-
-    void execute(uv_loop_t* loop) override {
-        uv_timer_init(loop, &state->handle);
-        state->handle.data = state;  // back-pointer for timer_cb / close_cb; must be set before uv_timer_start
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now()).count();
-        uv_timer_start(&state->handle, timer_cb, std::max<int64_t>(0, ms), 0);
-    }
-};
-
-struct CancelTimer : IoRequest {
-    std::shared_ptr<TimerState> state;  // keeps TimerState alive until I/O thread processes this
-
-    void execute(uv_loop_t* /*loop*/) override {
-        // Atomically claim the close. If timer_cb already set fired=true it owns uv_close;
-        // we must not call it again.
-        if (!state->fired.exchange(true)) {
-            uv_timer_stop(&state->handle);
-            uv_close(reinterpret_cast<uv_handle_t*>(&state->handle), close_cb);
-        }
-    }
-};
-```
-
-The two static callbacks used by both request types:
-
-```cpp
-// Both run on the I/O thread.
-
-static void timer_cb(uv_timer_t* handle) {
-    auto* state = static_cast<TimerState*>(handle->data);
-    if (!state->fired.exchange(true)) {
-        state->waker.load()->wake();
-        uv_close(reinterpret_cast<uv_handle_t*>(handle), close_cb);
-    }
-}
-
-static void close_cb(uv_handle_t* handle) {
-    // Decrement the shared_ptr ref count, freeing TimerState when it reaches zero.
-    delete static_cast<TimerState*>(handle->data);
-}
-```
-
 Follow-on I/O primitives (`TcpConnect`, `TcpRead`, `UdpSend`, `FileRead`, etc.) each add
-a new `IoRequest` subclass in `include/coro/io/` without modifying `IoService` or
-`process_queue()` at all.
+a new `IoRequest` subclass without modifying `IoService` or `process_queue()` at all.
+
+### I/O operation ownership model
+
+**`IoService` is kept completely ignorant of every concrete operation type.** All
+operation-specific state structs, request types, and libuv callbacks are private
+implementation details of the Future that owns them — not shared types in any header.
+
+The rule for where to define them:
+
+- **Private nested types** when one Future owns all the request types. `SleepFuture`
+  is the only type that ever constructs a `StartRequest` or `CancelRequest`, so they
+  are private nested structs of `SleepFuture`. libuv callbacks (`timer_cb`, `close_cb`)
+  are private `static` methods of the same class. No other header needs to know they exist.
+
+- **`coro::detail::<op>` namespace** when two or more sibling Futures need to share
+  state — for example, a future TCP layer where a connect future, a read future, and a
+  write future all share the same `uv_tcp_t` handle. Nesting in either sibling would be
+  arbitrary; a dedicated detail namespace groups them without implying ownership. `friend`
+  declarations across unrelated types are avoided.
+
+This keeps `io_service.h` minimal (only `IoRequest`, `IoService`, and the thread-local
+accessors) and makes each I/O subsystem fully self-contained.
 
 ---
 
@@ -219,30 +191,21 @@ Each `SleepFuture` instance manages exactly one `uv_timer_t` heap allocation:
 ```
 State            Who owns the handle
 ─────────────    ────────────────────────────────────────────────────────────
-Pending          SleepFuture holds the raw pointer; has submitted StartTimer
+Pending          SleepFuture holds shared_ptr<State>; has submitted StartRequest
 Fired            timer_cb running on I/O thread; calls wake() then uv_close()
 Closing          libuv closing asynchronously; close_cb will free it
-Cancelled        SleepFuture destructor submitted CancelTimer before firing
+Cancelled        SleepFuture destructor submitted CancelRequest before firing
 Closed           close_cb ran; handle freed; nothing holds the pointer
 ```
 
-`TimerState` is allocated on the heap and shared between `SleepFuture` and the I/O thread:
+`SleepFuture::State` is allocated on the heap and shared between `SleepFuture` and the
+I/O thread via `shared_ptr`. `CancelRequest` also holds a `shared_ptr<State>` so the
+state stays alive until the I/O thread processes the request, regardless of when
+`SleepFuture` is destroyed.
 
-```cpp
-struct TimerState {
-    uv_timer_t                                  handle;  // must be first field; address must be stable
-    std::atomic<std::shared_ptr<detail::Waker>> waker;   // written by worker, read by I/O thread
-    std::atomic<bool>                           fired{false};
-};
-```
-
-`SleepFuture` holds a `std::shared_ptr<TimerState>`. `CancelTimer` also holds a
-`shared_ptr<TimerState>` so the state stays alive until the I/O thread processes the
-request, regardless of when `SleepFuture` is destroyed.
-
-**Double-close prevention** — both `timer_cb` and `CancelTimer::execute()` claim the
+**Double-close prevention** — both `timer_cb` and `CancelRequest::execute()` claim the
 `uv_close` call via an atomic exchange on `fired`. Whichever side wins `fired.exchange(true)`
-first owns the close; the other side is a no-op:
+first owns the close; the other side is a safe no-op:
 
 ```
 timer_cb (I/O thread):
@@ -250,71 +213,80 @@ timer_cb (I/O thread):
         waker->wake()
         uv_close(&state->handle, close_cb)
 
-CancelTimer::execute() (I/O thread):
+CancelRequest::execute() (I/O thread):
     if (!state->fired.exchange(true))  // wins → owns uv_close
         uv_timer_stop(&state->handle)
         uv_close(&state->handle, close_cb)
 ```
 
-`close_cb` releases the `shared_ptr<TimerState>` stored in `handle->data`, dropping the
-last reference and freeing the state.
+`close_cb` deletes the heap-allocated `shared_ptr<State>` wrapper stored in
+`handle->data`, dropping the last reference and freeing the state.
 
 ---
 
-## Updated `SleepFuture` Design
+## `SleepFuture` Design
+
+All timer-specific types are private to `SleepFuture`. Nothing outside `sleep.h` needs
+to know they exist — `IoService` in particular has zero knowledge of timers.
 
 ```cpp
-struct SleepFuture {
+// include/coro/sync/sleep.h
+
+class SleepFuture {
+public:
     using OutputType = void;
+    // ... constructor, destructor, poll() ...
+
+private:
+    // Shared between the worker thread (poll()) and the I/O thread (timer_cb).
+    struct State : std::enable_shared_from_this<State> {
+        uv_timer_t                                  handle;  // must be first field
+        std::atomic<std::shared_ptr<detail::Waker>> waker;   // RACE: written by worker, read by I/O thread
+        std::atomic<bool>                           fired{false};
+    };
+
+    // Arms the one-shot timer on the I/O thread.
+    struct StartRequest : IoRequest {
+        std::shared_ptr<State>                 state;
+        std::chrono::steady_clock::time_point  deadline;
+        void execute(uv_loop_t* loop) override;
+    };
+
+    // Cancels and closes the timer handle on the I/O thread.
+    struct CancelRequest : IoRequest {
+        std::shared_ptr<State> state;
+        void execute(uv_loop_t* loop) override;
+    };
+
+    // libuv callbacks — static to satisfy C function-pointer ABI.
+    // Both run exclusively on the I/O thread.
+    static void timer_cb(uv_timer_t* handle);
+    static void close_cb(uv_handle_t* handle);
 
     std::chrono::steady_clock::time_point m_deadline;
-    // Null until first poll(); set when we've registered with IoService.
-    std::shared_ptr<TimerState> m_state;
-
-    explicit SleepFuture(std::chrono::nanoseconds duration)
-        : m_deadline(std::chrono::steady_clock::now() + duration) {}
-
-    ~SleepFuture() {
-        if (m_state) {
-            // Pass the shared_ptr into CancelTimer so TimerState outlives this destructor.
-            // CancelTimer::execute() uses fired.exchange(true) to avoid double-close if
-            // the timer already fired before the I/O thread processes the cancel.
-            current_io_service().submit(std::make_unique<CancelTimer>(m_state));
-        }
-    }
-
-    PollResult<void> poll(detail::Context& ctx) {
-        if (std::chrono::steady_clock::now() >= m_deadline)
-            return PollReady;
-        if (!m_state) {
-            // First poll: register with the I/O driver.
-            m_state = std::make_shared<TimerState>();
-            m_state->waker = ctx.getWaker();
-            current_io_service().submit(
-                std::make_unique<StartTimer>(m_state.get(), m_deadline));
-        } else {
-            // Re-polled before timer fired (e.g. woken by another select branch).
-            // Atomically update the waker — timer_cb may read it concurrently on the I/O thread.
-            m_state->waker.store(ctx.getWaker());
-        }
-        return PollPending;
-    }
+    std::shared_ptr<State>                m_state;        // null until first poll()
+    IoService*                            m_io_service = nullptr;  // cached on first poll()
 };
 ```
+
+`StartRequest` and `CancelRequest` are private nested structs of `SleepFuture`, so they
+have full access to `SleepFuture`'s private members (including `State`) without any
+`friend` declarations. The callbacks are private `static` methods — they satisfy the C
+function-pointer ABI required by libuv while remaining scoped to `SleepFuture`.
 
 ### Waker concurrency
 
 `timer_cb` on the I/O thread reads `state->waker` while a re-polled `SleepFuture` on a
-worker thread may be writing it. `TimerState::waker` is therefore
+worker thread may be writing it. `State::waker` is therefore
 `std::atomic<std::shared_ptr<detail::Waker>>` (C++20 specialisation), making the store in
 `poll()` and the load in `timer_cb` race-free without a mutex.
 
 ### Timer resolution
 
-libuv timers have **millisecond resolution**. `StartTimer::execute()` converts the remaining
-duration to milliseconds using `std::chrono::ceil<milliseconds>` (rounding **up**), so the
-timer never fires before the deadline. A sub-millisecond remainder is always rounded up to
-the next whole millisecond.
+libuv timers have **millisecond resolution**. `StartRequest::execute()` converts the
+remaining duration to milliseconds using `std::chrono::ceil<milliseconds>` (rounding
+**up**), so the timer never fires before the deadline. A sub-millisecond remainder is
+always rounded up to the next whole millisecond.
 
 > **Rounding caveat:** because the delay is re-derived from `steady_clock::now()` at the
 > moment `execute()` runs on the I/O thread (not at `submit()` time), any queuing latency
@@ -326,8 +298,7 @@ the next whole millisecond.
 
 In practice this is not a meaningful limitation: the round-trip through the executor and
 I/O thread already adds latency on the order of microseconds to milliseconds, so
-sub-millisecond timer precision is not achievable regardless. Document this limitation in
-the `sleep_for` API comment when implementing.
+sub-millisecond timer precision is not achievable regardless.
 
 ---
 
