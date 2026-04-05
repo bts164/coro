@@ -44,7 +44,7 @@ public:
         if (std::uncaught_exceptions() > 0) return; // already unwinding
         ADD_FAILURE() << m_msg.str();
         std::cerr << m_msg.str() << "\n" <<std::flush;
-        std::exit(-1);
+        std::terminate();
     }
 
 private:

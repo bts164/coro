@@ -52,7 +52,7 @@ public:
 
     /// @brief Drains the injection queue, then polls all ready tasks once.
     /// @return `true` if at least one task was polled.
-    bool poll_ready_tasks() override;
+    bool poll_ready_tasks();
 
     /// @brief Blocks until `state.terminated`. Drives the poll loop internally.
     void wait_for_completion(detail::TaskStateBase& state) override;

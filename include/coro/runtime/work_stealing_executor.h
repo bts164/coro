@@ -66,9 +66,6 @@ public:
     /// workers are currently searching.
     void enqueue(std::shared_ptr<detail::Task> task) override;
 
-    /// @brief Returns `true` if the injection queue is non-empty.
-    bool poll_ready_tasks() override;
-
     /// @brief Delegates to `state.wait_until_done()`.
     void wait_for_completion(detail::TaskStateBase& state) override;
 

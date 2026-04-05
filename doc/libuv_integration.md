@@ -311,12 +311,23 @@ worker thread may be writing it. `TimerState::waker` is therefore
 
 ### Timer resolution
 
-libuv timers have **millisecond resolution**. A `sleep_for` duration shorter than 1ms is
-rounded up to 1ms by `StartTimer::execute()` via `std::max<int64_t>(0, ms)`. In practice
-this is not a meaningful limitation: the round-trip through the executor and I/O thread
-already adds latency on the order of microseconds to milliseconds, so sub-millisecond
-timer precision is not achievable regardless. Document this limitation in the `sleep_for`
-API comment when implementing.
+libuv timers have **millisecond resolution**. `StartTimer::execute()` converts the remaining
+duration to milliseconds using `std::chrono::ceil<milliseconds>` (rounding **up**), so the
+timer never fires before the deadline. A sub-millisecond remainder is always rounded up to
+the next whole millisecond.
+
+> **Rounding caveat:** because the delay is re-derived from `steady_clock::now()` at the
+> moment `execute()` runs on the I/O thread (not at `submit()` time), any queuing latency
+> between the worker thread calling `submit()` and the I/O thread processing the request
+> shortens the effective remaining duration before the ceil. In the worst case the timer
+> still fires at or after the original deadline, but callers must not assume it fires
+> exactly at `deadline` — actual wakeup will typically be 0–2 ms late due to OS scheduling
+> and the round-trip through the I/O thread.
+
+In practice this is not a meaningful limitation: the round-trip through the executor and
+I/O thread already adds latency on the order of microseconds to milliseconds, so
+sub-millisecond timer precision is not achievable regardless. Document this limitation in
+the `sleep_for` API comment when implementing.
 
 ---
 

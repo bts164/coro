@@ -73,11 +73,6 @@ void WorkStealingExecutor::enqueue(std::shared_ptr<detail::Task> task) {
     notify_if_needed();
 }
 
-bool WorkStealingExecutor::poll_ready_tasks() {
-    std::lock_guard lock(m_mutex);
-    return !m_injection_queue.empty();
-}
-
 void WorkStealingExecutor::wait_for_completion(detail::TaskStateBase& state) {
     state.wait_until_done();
 }
@@ -223,6 +218,8 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         const bool done = task->poll(ctx);
 
         if (done) {
+            task->scheduling_state.store(
+                detail::SchedulingState::Done, std::memory_order_relaxed);
             task.reset();
         } else {
             // Try Running → Idle.
@@ -234,8 +231,14 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
             {
                 task.reset(); // waker holds the only ref
             } else {
-                // wake() fired during poll() — RunningAndNotified.
-                expected = detail::SchedulingState::RunningAndNotified;
+                // CAS failed: expected now holds the actual state. The only valid
+                // state here is RunningAndNotified — wake() fired during poll().
+                if (expected != detail::SchedulingState::RunningAndNotified) {
+                    std::cerr << "[coro] WorkStealingExecutor: unexpected scheduling_state "
+                              << static_cast<int>(expected)
+                              << " after Running→Idle CAS failure (expected RunningAndNotified=3)\n";
+                    std::abort();
+                }
                 if (!task->scheduling_state.compare_exchange_strong(
                         expected, detail::SchedulingState::Notified,
                         std::memory_order_acq_rel,

@@ -57,7 +57,7 @@ void StartTimer::execute(uv_loop_t* loop) {
     // across the uv_close → close_cb boundary. close_cb deletes the wrapper, which
     // decrements the ref count. TimerState is freed when all three owners release.
     state->handle.data = new std::shared_ptr<TimerState>(state->shared_from_this());
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    auto ms = std::chrono::ceil<std::chrono::milliseconds>(
         deadline - std::chrono::steady_clock::now()).count();
     uv_timer_start(&state->handle, timer_cb, static_cast<uint64_t>(std::max<int64_t>(0, ms)), 0);
 }

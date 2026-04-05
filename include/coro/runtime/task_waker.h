@@ -27,27 +27,50 @@ struct TaskWaker final : detail::Waker {
     Executor*                     executor;
 
     void wake() override {
-        // Fast path: task is Idle — first waker to fire transitions it to Notified
-        // and hands ownership to the queue.
+        // Loop so that a CAS failure retries with the freshly-observed state.
+        // compare_exchange_strong updates `expected` on failure, so each iteration
+        // starts from the actual current state. A CAS failure in Idle or Running
+        // breaks out of the switch and loops; all terminal states return directly.
         auto expected = detail::SchedulingState::Idle;
-        if (task->scheduling_state.compare_exchange_strong(
-                expected, detail::SchedulingState::Notified,
-                std::memory_order_acq_rel,
-                std::memory_order_relaxed))
-        {
-            executor->enqueue(task);
-            return;
-        }
+        while (true) {
+            switch (expected) {
+            case detail::SchedulingState::Idle:
+                // Common path: task is suspended. Transition to Notified and enqueue.
+                if (task->scheduling_state.compare_exchange_strong(
+                        expected, detail::SchedulingState::Notified,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed))
+                {
+                    executor->enqueue(task);
+                    return;
+                }
+                break; // expected updated by CAS; retry with the new state
 
-        // Task is Running (inside poll()). Mark it RunningAndNotified so the
-        // worker re-enqueues it after poll() returns instead of parking.
-        expected = detail::SchedulingState::Running;
-        task->scheduling_state.compare_exchange_strong(
-            expected, detail::SchedulingState::RunningAndNotified,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed);
-        // If neither CAS succeeds the task is already Notified or
-        // RunningAndNotified — another waker won the race, no-op.
+            case detail::SchedulingState::Running:
+                // Task is mid-poll. Mark it RunningAndNotified so the worker
+                // re-enqueues it after poll() returns instead of parking.
+                if (task->scheduling_state.compare_exchange_strong(
+                        expected, detail::SchedulingState::RunningAndNotified,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed))
+                {
+                    return;
+                }
+                break; // expected updated by CAS; retry with the new state
+
+            case detail::SchedulingState::Notified:
+            case detail::SchedulingState::RunningAndNotified:
+                // Already queued or already flagged for re-enqueue — no-op.
+                return;
+
+            case detail::SchedulingState::Done:
+                // Task completed before this wake() arrived — no-op.
+                return;
+
+            default:
+                std::abort(); // unknown state — bug in executor
+            }
+        }
     }
 
     std::shared_ptr<detail::Waker> clone() override {

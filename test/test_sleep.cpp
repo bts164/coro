@@ -16,10 +16,10 @@ TEST(SleepTest, SleepForCompletesAfterDuration) {
     Runtime rt(1);
     auto start = std::chrono::steady_clock::now();
     rt.block_on([]() -> Coro<void> {
-        co_await sleep_for(50ms);
+        co_await sleep_for(100ms);
     }());
     auto elapsed = std::chrono::steady_clock::now() - start;
-    EXPECT_GE(elapsed, 50ms);
+    EXPECT_GE(elapsed, 100ms);
 }
 
 // sleep_for does not complete significantly before the deadline.

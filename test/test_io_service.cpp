@@ -184,7 +184,10 @@ TEST(SleepIntegrationTest, SleepForCompletesAfterDuration) {
     Runtime rt(1);
     auto start = std::chrono::steady_clock::now();
     rt.block_on([]() -> Coro<void> {
+        auto start = std::chrono::steady_clock::now();
         co_await sleep_for(50ms);
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        EXPECT_GE(elapsed, 50ms);
     }());
     auto elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_GE(elapsed, 50ms);

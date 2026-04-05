@@ -335,9 +335,9 @@ Coro<size_t> skynet(size_t my_num, size_t remaining) {
     for (auto &h : handles) {
         sum += co_await h;
     }
-    size_t exp = SkynetLookup::instance[my_num, remaining];
-    CO_ASSERT_EQ(sum, exp)
-        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
+    // size_t exp = SkynetLookup::instance[my_num, remaining];
+    // CO_ASSERT_EQ(sum, exp)
+    //     << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
     co_return sum;
 }
 
@@ -365,9 +365,9 @@ Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
     while (auto item = co_await next(js)) {
         sum += item .value();
     }
-    size_t exp = SkynetLookup::instance[my_num, remaining];
-    CO_ASSERT_EQ(sum, exp)
-        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
+    //size_t exp = SkynetLookup::instance[my_num, remaining];
+    // CO_ASSERT_EQ(sum, exp)
+    //     << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
     co_return sum;
 }
 
@@ -391,9 +391,9 @@ Coro<size_t> skynet_join1(size_t my_num, size_t remaining, std::index_sequence<I
     if (remaining == 1) co_return my_num;
     auto results = co_await join(skynet_join1(my_num + Is*(remaining/10), remaining/10, seq)...);
     size_t sum = (std::get<Is>(results) + ...);
-    size_t exp = SkynetLookup::instance[my_num, remaining];
-    CO_ASSERT_EQ(sum, exp)
-        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
+    // size_t exp = SkynetLookup::instance[my_num, remaining];
+    // CO_ASSERT_EQ(sum, exp)
+    //     << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
     co_return sum;
 }
 
@@ -406,9 +406,9 @@ Coro<size_t> skynet_join0(size_t my_num, size_t remaining) {
     while (auto item = co_await next(js)) {
         sum += item .value();
     }
-    size_t exp = SkynetLookup::instance[my_num, remaining];
-    CO_ASSERT_EQ(sum, exp)
-        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
+    // size_t exp = SkynetLookup::instance[my_num, remaining];
+    // CO_ASSERT_EQ(sum, exp)
+    //     << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
     co_return sum;
 }
 

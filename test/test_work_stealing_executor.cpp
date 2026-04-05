@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <coro/runtime/runtime.h>
+#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/coro.h>
 #include <coro/task/join_handle.h>
@@ -226,49 +228,104 @@ TEST(WorkStealingExecutorTest, StressHighTaskCount) {
 
 class ArgMarker
 {
+    ArgMarker() = default;
 public:
-    ArgMarker(std::atomic<bool>& id) :
-        m_id(&id)
+    static inline std::atomic_size_t depth_counters[7];
+    static inline std::atomic_size_t clone_depth_counters[7];
+    static void reset_counters() {
+        for (auto& c : depth_counters)
+            c.store(0, std::memory_order_release);
+        for (auto& c : clone_depth_counters)
+            c.store(0, std::memory_order_release);
+    }
+
+    ArgMarker(std::atomic_size_t& id, size_t depth) :
+        m_id(&id),
+        m_depth(depth)
     {
-        m_id->store(false, std::memory_order_release);
+        m_id->store(0, std::memory_order_release);
+    }
+    ArgMarker clone() const
+    {
+        ArgMarker a;
+        a.m_id = m_id;
+        a.m_clone_depth = m_depth;
+        return a;
     }
     ArgMarker(const ArgMarker&) = delete;
     ArgMarker(ArgMarker&&other) :
-        m_id(std::exchange(other.m_id, nullptr))
+        m_id(std::exchange(other.m_id, nullptr)),
+        m_depth(std::exchange(other.m_depth, std::nullopt)),
+        m_clone_depth(std::exchange(other.m_clone_depth, std::nullopt))
     {}
     ArgMarker& operator=(const ArgMarker&) = delete;
     ArgMarker& operator=(ArgMarker&&) = delete;
     ~ArgMarker()
     {
         if (m_id) {
-            m_id->store(true, std::memory_order_release);
+            m_id->fetch_add(1);
+        }
+        if (m_depth) {
+            depth_counters[m_depth.value()].fetch_add(1);
+            //std::cout << "Set arg to true\n" << std::flush;
+        }
+        if (m_clone_depth) {
+            clone_depth_counters[m_clone_depth.value()].fetch_add(1);
             //std::cout << "Set arg to true\n" << std::flush;
         }
     }
 private:
-    std::atomic_bool *m_id = nullptr;
+    std::atomic_size_t *m_id = nullptr;
+    std::optional<std::size_t> m_depth;
+    std::optional<std::size_t> m_clone_depth;
 };
 
 #include <co_assert.h>
 #include <coro/runtime/work_sharing_executor.h>
-Coro<size_t> skynet(size_t my_num, size_t remaining, ArgMarker arg_lifetime_marker) {
-    //auto arg = std::move(arg_lifetime_marker);
-    std::atomic_bool arg_markers[10];
-    if (remaining == 1) co_return my_num;
-    std::optional<JoinHandle<size_t>> handles[10];
-    for (size_t i = 0; i < 10; ++i)
-        handles[i].emplace(coro::spawn(skynet(my_num + i*(remaining/10), remaining/10, ArgMarker(arg_markers[i]))).submit());
-    size_t sum = 0;
-    for (size_t i = 0; i < 10; ++i) {
-        sum += co_await handles[i].value();
-        CO_ASSERT_EQ((arg_markers[i].load(std::memory_order_acquire)), true)
-            << "Argument lifetimes not as expected: (" << my_num << ", " << remaining << ", " << i << ") not set after completion";
+#include <coro/sync/join.h>
+
+template<std::size_t... Is>
+Coro<size_t> skynet(size_t my_num, size_t remaining, size_t depth, ArgMarker arg_lifetime_marker, std::index_sequence<Is...> seq) {
+    size_t sum;
+    {
+        auto arg = arg_lifetime_marker.clone();
+        if (remaining == 1) co_return my_num;
+
+        static constexpr size_t N = sizeof...(Is);
+        std::atomic_size_t arg_markers[N];
+        JoinHandle<size_t> handles[N] = {
+            coro::spawn(
+                skynet(my_num + Is*(remaining/N), remaining/N, depth - 1, ArgMarker(arg_markers[Is], depth - 1), std::make_index_sequence<N>{})
+            ).submit()
+            ...
+        };
+        auto results = co_await coro::join(std::move(handles[Is])...);
+        for (size_t i = 0; i < N; ++i) {
+            size_t n = arg_markers[i].load(std::memory_order_acquire);
+            CO_ASSERT_EQ(n, 2)
+                << "Argument lifetimes not as expected: " << n << " != 2 (" << my_num << ", " << remaining << ", " << i << ") not set after completion";
+        }
+        sum = ((std::get<Is>(results) + ...));
     }
     co_return sum;
 }
-TEST(WorkStealingExecutorTest, SkynetSynchronize) {
+TEST(WorkSharingExecutorTest, SkynetSynchronizeSingle) {
+    Runtime rt(std::in_place_type<SingleThreadedExecutor>);
+    std::atomic_size_t arg_marker{0};
+    rt.block_on(skynet(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
+    ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
+}
+
+TEST(WorkSharingExecutorTest, SkynetSynchronizeShare) {
+    Runtime rt(std::in_place_type<WorkSharingExecutor>);
+    std::atomic_size_t arg_marker{0};
+    rt.block_on(skynet(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
+    ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
+}
+
+TEST(WorkSharingExecutorTest, SkynetSynchronizeSteal) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
-    std::atomic_bool arg_marker{false};
-    rt.block_on(skynet(0, 1000000, ArgMarker(arg_marker)));
+    std::atomic_size_t arg_marker{0};
+    rt.block_on(skynet(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
     ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
 }

@@ -123,6 +123,12 @@ public:
     /// @param ctx Carries the waker used to reschedule this task when it is ready to progress.
     /// @return `PollPending`, `PollReady(T)`, `PollError`, or `PollDropped` (if cancelled and drained).
     PollResult<T> poll(detail::Context& ctx) {
+        struct Destroy
+        {
+            ~Destroy() { std::exchange(self->m_handle, nullptr).destroy(); }
+            Coro *self;
+        };
+
         // Cancelled path: destroy the frame (fires JoinHandle dtors → registers children),
         // then drain pending children before returning PollDropped.
         if (m_cancelled) {
@@ -143,7 +149,8 @@ public:
         if (m_handle.done()) {
             if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
                 return PollPending;
-            auto& p = m_handle.promise();
+            Destroy cleanup(this);
+             auto& p = m_handle.promise();
             if (p.m_exception)
                 return PollError(p.m_exception);
             return std::move(*p.m_value);
@@ -171,6 +178,9 @@ public:
             // Wait for any children spawned during this execution before completing.
             if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
                 return PollPending;
+            
+            Destroy cleanup(this);
+
             if (promise.m_exception)
                 return PollError(promise.m_exception);
             return std::move(*promise.m_value);

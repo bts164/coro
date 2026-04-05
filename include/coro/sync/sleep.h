@@ -33,6 +33,9 @@ struct SleepFuture {
     std::chrono::steady_clock::time_point m_deadline;
     /// Null until first poll(); once set, owned jointly with the I/O thread.
     std::shared_ptr<TimerState> m_state;
+    /// Captured from the thread-local on first poll() so the destructor can
+    /// submit CancelTimer even if the thread-local has since been cleared.
+    IoService* m_io_service = nullptr;
 
     explicit SleepFuture(std::chrono::nanoseconds duration)
         : m_deadline(std::chrono::steady_clock::now() + duration) {}
@@ -43,7 +46,9 @@ struct SleepFuture {
             // to avoid a double-close if the timer already fired before we get there.
             // Pass m_state as a shared_ptr so TimerState stays alive until the I/O
             // thread processes the request, even though we release m_state below.
-            current_io_service().submit(std::make_unique<CancelTimer>(m_state));
+            // Use the cached m_io_service rather than current_io_service() because
+            // the thread-local may have been cleared by the time the destructor runs.
+            m_io_service->submit(std::make_unique<CancelTimer>(m_state));
         }
     }
 
@@ -54,14 +59,26 @@ struct SleepFuture {
     SleepFuture& operator=(SleepFuture&&)      = default;
 
     PollResult<void> poll(detail::Context& ctx) {
+        // Check the fired flag before the clock: libuv and steady_clock both use
+        // CLOCK_MONOTONIC on Linux, but OS jitter can cause the timer callback to
+        // fire a few microseconds before steady_clock::now() crosses m_deadline.
+        // In that case the clock check would return PollPending while the one-shot
+        // timer is already gone — causing the task to hang forever. Treating fired==true
+        // as authoritative avoids this liveness bug regardless of sub-millisecond jitter.
+        if (m_state && m_state->fired.load(std::memory_order_acquire))
+            return PollReady;
+
         if (std::chrono::steady_clock::now() >= m_deadline)
             return PollReady;
 
         if (!m_state) {
             // First poll: allocate shared state and register the timer.
+            // Cache the IoService pointer so the destructor can cancel the timer
+            // even if the thread-local is cleared before this future is destroyed.
+            m_io_service = &current_io_service();
             m_state = std::make_shared<TimerState>();
             m_state->waker.store(ctx.getWaker());
-            current_io_service().submit(
+            m_io_service->submit(
                 std::make_unique<StartTimer>(m_state.get(), m_deadline));
         } else {
             // Re-polled before timer fired (e.g. woken by a select branch).

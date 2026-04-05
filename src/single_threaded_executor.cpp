@@ -72,6 +72,8 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
         bool done = task->poll(ctx);
 
         if (done) {
+            task->scheduling_state.store(
+                detail::SchedulingState::Done, std::memory_order_relaxed);
             // Task completed — drop it (destructor fires here).
         } else {
             // Try Running → Idle: park the task, waker owns the only ref.
@@ -83,8 +85,14 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
             {
                 task.reset(); // waker holds the only ref; parks until wake() fires
             } else {
-                // CAS failed: state must be RunningAndNotified — wake() fired during poll().
-                expected = detail::SchedulingState::RunningAndNotified;
+                // CAS failed: expected now holds the actual state. The only valid
+                // state here is RunningAndNotified — wake() fired during poll().
+                if (expected != detail::SchedulingState::RunningAndNotified) {
+                    std::cerr << "[coro] SingleThreadedExecutor: unexpected scheduling_state "
+                              << static_cast<int>(expected)
+                              << " after Running→Idle CAS failure (expected RunningAndNotified=3)\n";
+                    std::abort();
+                }
                 if (!task->scheduling_state.compare_exchange_strong(
                         expected, detail::SchedulingState::Notified,
                         std::memory_order_acq_rel,

@@ -87,6 +87,7 @@ lifecycle, and an atomic state field in `TaskStateBase` tracks the current phase
 | **Running** | The executor / worker | Currently inside `poll()` |
 | **Notified** | A ready queue | Queued and waiting to be polled |
 | **RunningAndNotified** | The executor / worker | `wake()` fired during `poll()`; worker re-enqueues after poll returns |
+| **Done** | About to be destroyed | `poll()` returned `Ready`; terminal — no further transitions |
 
 ```cpp
 enum class SchedulingState : uint8_t {
@@ -94,6 +95,7 @@ enum class SchedulingState : uint8_t {
     Running            = 1,
     Notified           = 2,
     RunningAndNotified = 3,
+    Done               = 4,
 };
 ```
 
@@ -138,20 +140,32 @@ struct TaskWaker : detail::Waker {
     Executor*                executor;
 
     void wake() override {
-        // Try Idle → Notified: first waker to fire; push task to queue.
+        // Loop so that a CAS failure retries with the freshly-observed state.
+        // compare_exchange_strong updates `expected` on failure, so each iteration
+        // handles the actual current state. A CAS failure in Idle or Running
+        // breaks out of the switch and loops; all terminal states return directly.
         auto expected = SchedulingState::Idle;
-        if (task->scheduling_state.compare_exchange_strong(
-                expected, SchedulingState::Notified,
-                std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            executor->enqueue(task);
-            return;
+        while (true) {
+            switch (expected) {
+            case SchedulingState::Idle:
+                if (CAS(expected → Notified)) { executor->enqueue(task); return; }
+                break; // expected updated; retry
+
+            case SchedulingState::Running:
+                if (CAS(expected → RunningAndNotified)) { return; }
+                break; // expected updated; retry
+
+            case SchedulingState::Notified:
+            case SchedulingState::RunningAndNotified:
+                return; // already pending — no-op
+
+            case SchedulingState::Done:
+                return; // task completed — no-op
+
+            default:
+                std::abort(); // unknown state — bug
+            }
         }
-        // Try Running → RunningAndNotified: poll() is in progress; worker re-enqueues after.
-        expected = SchedulingState::Running;
-        task->scheduling_state.compare_exchange_strong(
-            expected, SchedulingState::RunningAndNotified,
-            std::memory_order_acq_rel, std::memory_order_relaxed);
-        // If neither CAS succeeds the task is already Notified or RunningAndNotified — no-op.
     }
 };
 ```
@@ -161,10 +175,17 @@ ensuring the worker that picks it up sees all writes made by the waking thread b
 CAS. `relaxed` on the failure path is safe because no memory ordering guarantee is needed
 when nothing is transferred.
 
+The loop is necessary because the state can change between two CAS attempts. For example,
+if an `Idle → Notified` CAS fails because a worker just transitioned the task to `Running`,
+the next iteration correctly handles `Running → RunningAndNotified`. Conversely, if
+`Running → RunningAndNotified` fails because the worker completed and moved back to `Idle`,
+the next iteration retries `Idle → Notified`. Without the loop, that second scenario would
+be a silent dropped wakeup.
+
 Multiple waker clones may race to call `wake()`. Only the first `Idle → Notified` CAS
-succeeds and pushes to the queue; the rest are no-ops. Each clone holds its own
-`shared_ptr<Task>` ref, so the task remains alive until the winning clone transfers its
-ref to the queue.
+succeeds and pushes to the queue; the rest observe `Notified` (or `RunningAndNotified`)
+and return as no-ops. Each clone holds its own `shared_ptr<Task>` ref, so the task remains
+alive until the winning clone transfers its ref to the queue.
 
 The executor constructs `TaskWaker` immediately before calling `poll()` using just the
 two required fields: `shared_ptr<Task>` (just dequeued) and `Executor*` (`this`).
@@ -304,14 +325,25 @@ Each task is in exactly one state at any moment:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Notified : schedule() / enqueue()
-    Notified --> Running : poll thread dequeues
-    Running --> Idle : poll() Pending, CAS Running→Idle succeeds
-    Running --> Notified : poll() Pending, CAS fails (RunningAndNotified) → re-enqueue
-    Running --> Done : poll() Ready / Error
-    Idle --> Notified : wake() CAS Idle→Notified, pushed to m_ready or m_incoming_wakes
+    [*] --> Notified : schedule()
+    Notified --> Running : poll_ready_tasks() — CAS Notified→Running
+    Running --> Idle : poll_ready_tasks() — CAS Running→Idle succeeds
+    Running --> RunningAndNotified : TaskWaker wake() — CAS Running→RunningAndNotified
+    RunningAndNotified --> Notified : poll_ready_tasks() — CAS RunningAndNotified→Notified, re-enqueue
+    Running --> Done : poll_ready_tasks() — poll() returns Ready/Error
+    Idle --> Notified : TaskWaker wake() — CAS Idle→Notified, pushed to m_ready / m_incoming_wakes
     Done --> [*]
 ```
+
+| Transition | Function |
+|---|---|
+| `[*] → Notified` | `schedule()` — stores `Notified` before first `enqueue()` call |
+| `Notified → Running` | `poll_ready_tasks()` — CAS before invoking `task->poll()` |
+| `Running → Idle` | `poll_ready_tasks()` — CAS after `poll()` returns `Pending`; succeeds when no concurrent wake |
+| `Running → RunningAndNotified` | `TaskWaker::wake()` — second CAS when task is mid-poll |
+| `RunningAndNotified → Notified` | `poll_ready_tasks()` — CAS after `poll()` returns `Pending`; fires when first CAS failed; re-enqueues via `m_ready` |
+| `Running → Done` | `poll_ready_tasks()` — `poll()` returned `true`; task dropped in place |
+| `Idle → Notified` | `TaskWaker::wake()` — first CAS; calls `enqueue()` which routes to `m_ready` (local) or `m_incoming_wakes` (remote) |
 
 ### Planned data model
 
@@ -403,31 +435,27 @@ classDiagram
     class Executor {
         <<abstract>>
         +schedule(task) void
-        +poll_ready_tasks() bool
+        +enqueue(task) void
         +wait_for_completion(state) void
     }
     class SingleThreadedExecutor {
         -m_ready: queue~Task~
-        -m_suspended: map~Task*|Task~
-        -m_running_task_key: Task*
-        -m_running_task_woken: bool
+        -m_incoming_wakes: deque~Task~
+        -m_remote_mutex: mutex
+        -m_remote_cv: condition_variable
+        -m_poll_thread_id: thread_id
         +poll_ready_tasks() bool
         +wait_for_completion(state) void
-        +wake_task(key) void
     }
     class WorkSharingExecutor {
-        -m_queue: deque~Task~
-        -m_suspended: map~Task*|Task~
-        -m_self_woken: map~Task*|bool~
+        -m_local_queues: vector~WorkStealingDeque~
+        -m_injection_queue: deque~Task~
         -m_mutex: mutex
         -m_cv: condition_variable
         -m_stop: bool
         -m_workers: vector~thread~
-        +schedule(task) void
-        +poll_ready_tasks() bool
         +wait_for_completion(state) void
-        -worker_loop() void
-        -wake_task(key) void
+        -worker_loop(index) void
     }
     Executor <|-- SingleThreadedExecutor
     Executor <|-- WorkSharingExecutor
@@ -450,31 +478,35 @@ WorkSharingExecutor
 `m_queue`, `m_suspended`, and `m_self_woken` share one mutex because moving a task
 between them is always one atomic operation.
 
-### Task state machine (current implementation)
+### Task state machine
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Ready : schedule() / wake_task()
-    Ready --> Running : worker dequeues
-    Running --> Suspended : poll() returns Pending, no self-wake
-    Running --> Ready : poll() returns Pending + self-wake flag set
-    Running --> Done : poll() returns Ready / Error
-    Suspended --> Ready : wake_task() called
+    [*] --> Notified : schedule()
+    Notified --> Running : worker_loop() — CAS Notified→Running
+    Running --> Idle : worker_loop() — CAS Running→Idle succeeds
+    Running --> RunningAndNotified : TaskWaker::wake() — CAS Running→RunningAndNotified
+    RunningAndNotified --> Notified : worker_loop() — CAS RunningAndNotified→Notified, re-enqueue
+    Running --> Done : worker_loop() — poll() returns Ready/Error
+    Idle --> Notified : TaskWaker::wake() — CAS Idle→Notified, pushed to local queue / injection queue
     Done --> [*]
 ```
 
-**Self-wake** (waker fires while the task is mid-poll on a worker thread) is handled with
-a per-task boolean flag in `m_self_woken`:
+| Transition | Function |
+|---|---|
+| `[*] → Notified` | `schedule()` — stores `Notified` before first `enqueue()` call |
+| `Notified → Running` | `worker_loop()` — CAS before invoking `task->poll()` |
+| `Running → Idle` | `worker_loop()` — CAS after `poll()` returns `Pending`; succeeds when no concurrent wake |
+| `Running → RunningAndNotified` | `TaskWaker::wake()` — second CAS when task is mid-poll on a worker |
+| `RunningAndNotified → Notified` | `worker_loop()` — CAS after `poll()` returns `Pending`; fires when first CAS failed; re-enqueues via `enqueue()` |
+| `Running → Done` | `worker_loop()` — `poll()` returned `true`; task dropped outside any lock |
+| `Idle → Notified` | `TaskWaker::wake()` — first CAS; calls `enqueue()` which routes to `m_local_queues[t_worker_index]` (local) or `m_injection_queue` (remote) |
 
-- `wake_task(key)`: if `key` is in `m_self_woken` (currently Running), set
-  `m_self_woken[key] = true`. Otherwise move from `m_suspended` to `m_queue` and
-  `notify_one`.
-- After `poll()` returns: check and erase the `m_self_woken` entry. If it was true,
-  re-enqueue; if false, move to `m_suspended`.
-
-The planned design replaces `Suspended`, `m_suspended`, and `m_self_woken` with the
-atomic `SchedulingState` described in the [Task Scheduling State](#task-scheduling-state)
-section above.
+**Self-wake** (waker fires while the task is mid-poll on a worker thread) is handled
+lock-free via the `Running → RunningAndNotified` CAS in `TaskWaker::wake()`. No shared
+`m_self_woken` map is needed — after `poll()` returns `Pending`, `worker_loop()` attempts
+`Running → Idle`; if that CAS fails the state must be `RunningAndNotified`, so the worker
+CASes to `Notified` and re-enqueues.
 
 ### Worker thread loop
 

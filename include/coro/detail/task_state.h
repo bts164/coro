@@ -29,12 +29,14 @@ namespace coro::detail {
  *   post-poll RunningAndNotified detected: RunningAndNotified → Notified (CAS; re-enqueue)
  *   wake() while Idle    : Idle → Notified  (CAS in TaskWaker::wake(); calls enqueue())
  *   wake() while Running : Running → RunningAndNotified  (CAS; worker re-enqueues)
+ *   poll() returns Ready : Running → Done  (store; terminal)
  */
 enum class SchedulingState : uint8_t {
     Idle               = 0,  ///< Suspended; waker holds the only shared_ptr<Task> ref
     Running            = 1,  ///< Inside poll(); owned by the worker
     Notified           = 2,  ///< In a ready queue; waiting to be polled
     RunningAndNotified = 3,  ///< Inside poll() AND wake() fired; worker re-enqueues after poll
+    Done               = 4,  ///< poll() returned Ready; terminal — task will be destroyed
 };
 
 /**
