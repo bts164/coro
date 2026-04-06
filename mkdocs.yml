@@ -62,11 +62,13 @@ nav:
       - Work-Stealing Scheduler: work_stealing_executor.md
     - I/O Integration:
       - libuv Integration: libuv_integration.md
+      - WebSocket Stream: websocket_stream.md
     - Synchronization:
       - Coroutine Scope: coroutine_scope.md
       - JoinSet: join_set.md
       - Channels: channels.md
       - Select: select.md
     - Module Structure: module_structure.md
+  - Examples: examples.md
   - Roadmap and Future Plans:
     - Roadmap Overview: roadmap.md

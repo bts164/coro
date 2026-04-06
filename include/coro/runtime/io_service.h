@@ -7,6 +7,11 @@
 #include <thread>
 #include <atomic>
 
+// Forward declaration — full type defined by <libwebsockets.h>, included only by
+// translation units that use lws directly. IoService holds the context by pointer
+// so this header does not need to pull in the lws headers.
+struct lws_context;
+
 namespace coro {
 
 // ---------------------------------------------------------------------------
@@ -61,13 +66,19 @@ public:
     /// Signals the I/O thread to stop and joins it. Idempotent.
     void stop();
 
+    /// Returns the libwebsockets context owned by this IoService.
+    /// Non-null only after the I/O thread has started. Must only be used
+    /// from the I/O thread or before the first submit() call.
+    lws_context* lws_ctx() const noexcept { return m_lws_ctx; }
+
 private:
     static void io_async_cb(uv_async_t* handle);   // wakes the loop from any thread
     void io_thread_loop();
     void process_queue();   // called from io_async_cb on the I/O thread
 
-    uv_loop_t  m_uv_loop;
-    uv_async_t m_async;     // cross-thread doorbell — the only thread-safe libuv primitive
+    uv_loop_t    m_uv_loop;
+    lws_context* m_lws_ctx = nullptr;  // created at start of io_thread_loop(), destroyed in stop()
+    uv_async_t   m_async;   // cross-thread doorbell — the only thread-safe libuv primitive
 
     std::thread m_io_thread;
 

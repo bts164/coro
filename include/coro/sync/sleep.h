@@ -4,6 +4,7 @@
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
 #include <coro/runtime/io_service.h>
+#include <coro/task/join_set.h>
 #include <uv.h>
 #include <atomic>
 #include <chrono>
@@ -40,7 +41,8 @@ public:
     using OutputType = void;
 
     explicit SleepFuture(std::chrono::nanoseconds duration)
-        : m_deadline(std::chrono::steady_clock::now() + duration) {}
+        : m_deadline(std::chrono::round<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() + duration)) {}
 
     ~SleepFuture() {
         if (m_state) {
@@ -60,13 +62,21 @@ public:
     SleepFuture& operator=(SleepFuture&&)      = default;
 
     PollResult<void> poll(detail::Context& ctx) {
+        auto now = std::chrono::steady_clock::now();
+
         // Check the fired flag before the clock: libuv and steady_clock both use
         // CLOCK_MONOTONIC on Linux, but OS jitter can cause the timer callback to
         // fire a few microseconds before steady_clock::now() crosses m_deadline.
         // Treating fired==true as authoritative avoids a liveness bug where the
         // clock check returns PollPending with the one-shot timer already consumed.
-        if (m_state && m_state->fired.load(std::memory_order_acquire))
+        if (m_state &&m_state->fired.load(std::memory_order_acquire)) {
+            if (now < m_deadline) {
+                // std::cerr << "SleepFuture: fired was set before deadline (now=" << now.time_since_epoch().count()
+                //             << "ns, deadline=" << m_deadline.time_since_epoch().count() << "ns)\n";
+                //std::abort();
+            }
             return PollReady;
+        }
 
         if (std::chrono::steady_clock::now() >= m_deadline)
             return PollReady;
@@ -112,10 +122,13 @@ private:
     // close_cb (which only receives a void*) can decrement the ref count.
     // -----------------------------------------------------------------------
     struct StartRequest : IoRequest {
-        std::shared_ptr<State>                        state;
-        std::chrono::steady_clock::time_point         deadline;
+        std::shared_ptr<State>                                              state;
+        std::chrono::time_point<std::chrono::steady_clock,
+                                std::chrono::milliseconds>                  deadline;
 
-        StartRequest(std::shared_ptr<State> s, std::chrono::steady_clock::time_point d)
+        StartRequest(std::shared_ptr<State> s,
+                     std::chrono::time_point<std::chrono::steady_clock,
+                                             std::chrono::milliseconds> d)
             : state(std::move(s)), deadline(d) {}
 
         void execute(uv_loop_t* loop) override {
@@ -123,10 +136,11 @@ private:
             // Store a heap-allocated shared_ptr wrapper in handle->data.
             // close_cb deletes this wrapper, decrementing the ref count.
             state->handle.data = new std::shared_ptr<State>(state);
-            // ceil rounds up so the timer never fires before the deadline.
-            // See doc/libuv_integration.md § Timer resolution.
-            auto ms = std::chrono::ceil<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now()).count();
+            // m_deadline is already in whole milliseconds (ceiled at construction),
+            // so this subtraction is exact — no rounding needed here.
+            auto now_ms = std::chrono::floor<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now());
+            auto ms = (deadline - now_ms).count();
             uv_timer_start(&state->handle, timer_cb,
                            static_cast<uint64_t>(std::max<int64_t>(0, ms)), 0);
         }
@@ -179,7 +193,11 @@ private:
     // -----------------------------------------------------------------------
     // SleepFuture data members
     // -----------------------------------------------------------------------
-    std::chrono::steady_clock::time_point m_deadline;
+    // Stored in whole milliseconds, ceiled at construction. This makes the
+    // timer resolution explicit regardless of the platform's steady_clock
+    // precision, and means no rounding decisions are deferred to execute().
+    std::chrono::time_point<std::chrono::steady_clock,
+                            std::chrono::milliseconds> m_deadline;
     std::shared_ptr<State>                m_state;       // null until first poll()
     IoService*                            m_io_service = nullptr;  // cached on first poll()
 };

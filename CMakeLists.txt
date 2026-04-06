@@ -11,8 +11,10 @@ if(ENABLE_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
+find_package(gperftools REQUIRED)
 find_package(GTest REQUIRED)
 find_package(libuv REQUIRED)
+find_package(Libwebsockets REQUIRED)
 
 add_library(coro
     src/waker.cpp
@@ -24,9 +26,13 @@ add_library(coro
     src/work_stealing_executor.cpp
     src/io_service.cpp
     src/runtime.cpp
+    src/tcp_stream.cpp
+    src/ws_stream.cpp
+    src/ws_listener.cpp
 )
 target_include_directories(coro PUBLIC include)
-target_link_libraries(coro PUBLIC libuv::uv_a)
+target_link_libraries(coro PUBLIC gperftools::gperftools libuv::uv_a websockets cap)
 
 enable_testing()
+add_subdirectory(examples/io)
 add_subdirectory(test)

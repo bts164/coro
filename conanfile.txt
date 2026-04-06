@@ -1,6 +1,11 @@
 [requires]
+gperftools/2.17.2
 gtest/1.14.0
-libuv/1.48.0
+libuv/1.47.0
+libwebsockets/4.3.5
+
+[options]
+libwebsockets*:with_libuv=True
 
 [generators]
 CMakeToolchain

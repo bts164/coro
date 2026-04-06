@@ -33,17 +33,25 @@ public:
         : m_future(std::forward<F>(future)), m_ctx_ptr(ctx_ptr), m_poll_hook(poll_hook) {}
 
     // Poll once eagerly. If the future completes synchronously, skip suspension entirely.
-    bool await_ready() {
-        m_result = m_future.poll(**m_ctx_ptr);
+    bool await_ready() noexcept{
+        try {
+            m_result = m_future.poll(**m_ctx_ptr);
+        } catch (...) {
+            m_result = PollError(std::current_exception());
+        }
         return !m_result.isPending();
     }
 
     // Called only when await_ready() returned false.
     // Registers the re-poll hook with the promise so that the outer poll()
     // can verify the future is ready before resuming this coroutine.
-    void await_suspend(std::coroutine_handle<>) {
-        *m_poll_hook = [this]() -> bool {
-            m_result = m_future.poll(**m_ctx_ptr);
+    void await_suspend(std::coroutine_handle<>) noexcept{
+        *m_poll_hook = [this]() noexcept -> bool {
+            try {
+                m_result = m_future.poll(**m_ctx_ptr);
+            } catch (...) {
+                m_result = PollError(std::current_exception());
+            }
             return !m_result.isPending();
         };
     }
