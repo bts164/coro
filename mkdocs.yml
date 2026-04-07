@@ -19,8 +19,8 @@ plugins:
             GENERATE_HTML: "NO"
             GENERATE_XML: "YES"
 nav:
-  - Home: index.md
-  - Getting Started: getting_started.md
+  - Introduction: index.md
+  - Getting Started Guide: getting_started.md
   - API Reference:
     - Key Types:
       - Runtime & Executors:

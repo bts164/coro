@@ -16,6 +16,7 @@ namespace coro {
 thread_local WorkStealingExecutor* t_wse_owning_executor = nullptr;
 thread_local int                   t_wse_worker_index    = -1;
 
+
 WorkStealingExecutor::WorkStealingExecutor(Runtime* runtime, std::size_t num_threads)
     : m_local_queues(num_threads)
     , m_runtime(runtime)
@@ -215,7 +216,9 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         waker->task     = task;
         waker->executor = this;
         detail::Context ctx(waker);
+        detail::Task::current = task.get();
         const bool done = task->poll(ctx);
+        detail::Task::current = nullptr;
 
         if (done) {
             task->scheduling_state.store(

@@ -15,14 +15,38 @@
 #include <coro/io/ws_stream.h>
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <random>
 #include <string_view>
 #include <vector>
 #include <span>
 #include <string_view>
+#include <format>
+#include <filesystem>
+
+// Returns the current system time as an ISO 8601 string with milliseconds,
+// e.g. "2026-04-06T21:34:56.123Z".
+static std::string iso8601_now() {
+    auto now = std::chrono::system_clock::now();
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch()) % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", std::gmtime(&t));
+    char result[40];
+    std::snprintf(result, sizeof(result), "%s.%03dZ", buf, (int)ms.count());
+    return result;
+}
 
 using namespace coro;
+
+#define LOG(__ID__, __MSG__, ...) \
+    std::printf("[%s] %s:%d %d - " __MSG__ "\n", \
+        iso8601_now().c_str(), \
+        std::filesystem::path(__FILE__).filename().string().c_str(), \
+        __LINE__, __ID__, ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // run_client
@@ -30,19 +54,19 @@ using namespace coro;
 // Connects to the local echo server, sends one message, receives the echo,
 // and prints it. Demonstrates the full connect → send → receive → close cycle.
 // ---------------------------------------------------------------------------
-static Coro<void> run_client(size_t id, std::string_view message) {
+static Coro<void> run_client(int id, std::string message) {
     using namespace std::chrono_literals;
     // connect() parses the URL, submits a WsConnectRequest to IoService, and
     // suspends until lws fires LWS_CALLBACK_CLIENT_ESTABLISHED.
+    struct Defer {
+        Defer(int id) : id_(id) {}
+        ~Defer() { LOG(id_, "Connection %d closed", id_); }
+        int id_;
+    } defer(id);
+
     WsStream ws = co_await WsStream::connect("ws://127.0.0.1:9001/");
 
-    std::printf("%lu: Connected. Sending: %.*s\n", id,
-                static_cast<int>(message.size()), message.data());
-    struct Defer {
-        Defer(size_t id) : id_(id) {}
-        ~Defer() { std::printf("%lu: Connection closed\n", id_); }
-        size_t id_;
-    } defer(id);
+    LOG(id, "Connected. Sending: %.*s", static_cast<int>(message.size()), message.data());
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -50,16 +74,16 @@ static Coro<void> run_client(size_t id, std::string_view message) {
 
     for (size_t i = 0; i < 5; ++i) {
         size_t delay = distr(gen);
-        std::printf("%lu: Sleeping for %zu ms...\n", id, delay);
+        LOG(id, "Sleeping for %zu ms...", delay);
         co_await coro::sleep_for(std::chrono::milliseconds(delay));
 
-        std::printf("%lu: Sending: %.*s\n", id,
-                    static_cast<int>(message.size()), message.data());
+        std::string msg = std::format("{} from {} iteration {}", message, id, i);
+        LOG(id, "Sending: %s", msg.c_str());
         // send() enqueues the message and suspends until LWS_CALLBACK_CLIENT_WRITEABLE
         // fires and lws_write() completes. The string_view overload sends a text frame.
-        auto sendResult = co_await coro::timeout(2s, ws.send(message));
+        auto sendResult = co_await coro::timeout(2s, ws.send(msg));
         if (0 != sendResult.index()) {
-            std::printf("%lu: Send timeout\n", id);
+            LOG(id, "Send timeout");
             co_return;
         }
 
@@ -67,15 +91,14 @@ static Coro<void> run_client(size_t id, std::string_view message) {
         // message (FrameMode::Full is the default).
         auto receiveResult = co_await coro::timeout(2s, ws.receive());
         if (0 != receiveResult.index()) {
-            std::printf("%lu: Receive timeout\n", id);
+            LOG(id, "Receive timeout");
             co_return;
         }
         WsStream::Message &reply = std::get<0>(receiveResult).value;
 
         std::string_view text(reinterpret_cast<const char*>(reply.data.data()),
                               reply.data.size());
-        std::printf("%lu: Echo:      %.*s\n", id,
-                    static_cast<int>(text.size()), text.data());
+        LOG(id, "Echo: %s", std::string(reply.as_text()).c_str());
     }
 
     // WsStream destructor submits a WsCloseRequest, sending a Close frame.
@@ -85,12 +108,13 @@ static Coro<void> run_client(size_t id, std::string_view message) {
 // main
 // ---------------------------------------------------------------------------
 coro::Coro<int> async_main(int argc, char* argv[]) {
-    std::string_view message = (argc > 1) ? argv[1] : "hello, world";
+    std::string message = (argc > 1) ? argv[1] : "hello, world";
     coro::JoinSet<void> clients;
-    for (size_t i = 0; i < 1; ++i) {
+    for (int i = 0; i < 10; ++i) {
         clients.spawn(run_client(i, message));
     }
     co_await clients.drain();
+    LOG(-1, "All clients completed");
     co_return 0;
 }
 

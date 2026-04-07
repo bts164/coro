@@ -24,7 +24,15 @@ void IoService::io_async_cb(uv_async_t* handle) {
     svc->process_queue();
 
     if (svc->m_stopping.load()) {
-        // Closing the async handle removes the last libuv reference; uv_run() returns.
+        // Destroy the lws context on the I/O thread before closing the async handle.
+        // This must happen here, not in stop() after join(), because lws_context_destroy()
+        // removes lws's uv handles from the loop — if they remain, uv_run() never returns
+        // and join() deadlocks. After this call, the async handle is the only remaining
+        // handle, so closing it causes uv_run() to return.
+        if (svc->m_lws_ctx) {
+            lws_context_destroy(svc->m_lws_ctx);
+            svc->m_lws_ctx = nullptr;
+        }
         uv_close(reinterpret_cast<uv_handle_t*>(handle), nullptr);
     }
 }
@@ -56,16 +64,10 @@ void IoService::stop() {
 
     uv_async_send(&m_async);  // wake the loop so io_async_cb sees m_stopping
 
+    // m_lws_ctx is destroyed on the I/O thread in io_async_cb before uv_run() returns,
+    // so by the time join() completes the lws context is already gone.
     if (m_io_thread.joinable())
         m_io_thread.join();
-
-    // Destroy the lws context before closing the uv loop. lws_context_destroy()
-    // closes all open WebSocket connections synchronously, ensuring no lws handles
-    // remain on the loop when uv_loop_close() is called.
-    if (m_lws_ctx) {
-        lws_context_destroy(m_lws_ctx);
-        m_lws_ctx = nullptr;
-    }
 
     // Flush any handles that are still closing (e.g. in-flight CancelRequests
     // that arrived just before stop()). uv_loop_close returns UV_EBUSY if any

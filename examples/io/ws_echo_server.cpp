@@ -14,9 +14,33 @@
 #include <coro/io/ws_listener.h>
 #include <coro/io/ws_stream.h>
 #include <coro/sync/timeout.h>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <string>
+#include <filesystem>
+
+// Returns the current system time as an ISO 8601 string with milliseconds,
+// e.g. "2026-04-06T21:34:56.123Z".
+static std::string iso8601_now() {
+    auto now = std::chrono::system_clock::now();
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch()) % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", std::gmtime(&t));
+    char result[40];
+    std::snprintf(result, sizeof(result), "%s.%03dZ", buf, (int)ms.count());
+    return result;
+}
 
 using namespace coro;
+
+#define LOG(__ID__, __MSG__, ...) \
+    std::printf("[%s] %s:%d %d - " __MSG__ "\n", \
+        iso8601_now().c_str(), \
+        std::filesystem::path(__FILE__).filename().string().c_str(), \
+        __LINE__, __ID__, ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // handle_connection
@@ -24,36 +48,34 @@ using namespace coro;
 // Owns one WsStream for the lifetime of a single client connection. Receives
 // messages and echoes them back with the same opcode until EOF or error.
 // ---------------------------------------------------------------------------
-static Coro<void> handle_connection(WsStream ws, size_t id) {
+static Coro<void> handle_connection(WsStream ws, int id) {
     using namespace std::chrono_literals;
     struct Defer {
-        Defer(size_t id) : id_(id) {}
-        ~Defer() { std::printf("%lu: Connection closed\n", id_); }
-        size_t id_;
+        Defer(int id) : id_(id) {}
+        ~Defer() { LOG(id_, "Connection closed"); }
+        int id_;
     } defer(id);
     for (;;) {
         auto receiveResult = co_await coro::timeout(20s, ws.receive());
         if (0 != receiveResult.index()) {
-            std::printf("%lu: Receive timeout\n", id);
+            LOG(id, "Receive timeout");
             co_return;
         }
         WsStream::Message &msg = std::get<0>(receiveResult).value;
-
+        //WsStream::Message msg = co_await ws.receive();
         if (msg.data.empty()) {
-            std::printf("%lu: EOF\n", id);
+            LOG(id, "EOF");
             co_return;  // clean close from client
         }
-        std::printf("%lu: Received message (%zu bytes, %s)\n",
-            id, msg.data.size(),
-            msg.is_text ? "text" : "binary");
+        LOG(id, "Received message \"%s\"", std::string(msg.as_text()).c_str());
         auto sendResult = co_await coro::timeout(
             2s, ws.send(msg.data, msg.is_text ? WsStream::OpCode::Text
                                               : WsStream::OpCode::Binary));
         if (0 != sendResult.index()) {
-            std::printf("%lu: Send timeout\n", id);
+            LOG(id, "Send timeout");
             co_return;  // client stopped responding
         }
-        std::printf("%lu: Echoed message\n", id);
+        LOG(id, "Echoed message \"%s\"", std::string(msg.as_text()).c_str());
     }
     // WsStream destructor sends a Close frame when the coroutine returns.
 }
@@ -66,19 +88,19 @@ static Coro<void> handle_connection(WsStream ws, size_t id) {
 // when run_server exits.
 // ---------------------------------------------------------------------------
 static Coro<void> run_server() {
-    std::printf("Starting WebSocket echo server...\n");
+    LOG(-1, "Starting WebSocket echo server...");
     // WsListener::bind() registers a listening socket with lws via IoService.
     WsListener listener = co_await WsListener::bind("127.0.0.1", 9001);
-    std::printf("WebSocket echo server listening on ws://127.0.0.1:9001\n");
+    LOG(-1, "WebSocket echo server listening on ws://127.0.0.1:9001");
 
     // JoinSet tracks all active sessions. Dropping it (on cancellation) cancels
     // every in-flight session and waits for them to drain.
     JoinSet<void> sessions;
 
-    for (size_t i = 0;; ++i) {
+    for (int i = 0;; ++i) {
         // accept() suspends until a client completes the WebSocket handshake.
         WsStream ws = co_await listener.accept();
-        std::printf("Accepted new connection %lu\n", i);
+        LOG(-1, "Accepted new connection %d", i);
         sessions.spawn(handle_connection(std::move(ws), i));
     }
 }
@@ -88,6 +110,6 @@ static Coro<void> run_server() {
 // ---------------------------------------------------------------------------
 int main() {
     Runtime rt;
-    std::printf("Starting runtime...\n");
+    LOG(-1, "Starting runtime...");
     rt.block_on(run_server());
 }

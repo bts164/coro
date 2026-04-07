@@ -8,6 +8,8 @@
 #include <coro/future.h>
 #include <coro/detail/task_state.h>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -73,6 +75,9 @@ public:
      */
     std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
 
+    /// @brief Optional human-readable name set via SpawnBuilder::name(). Empty if unset.
+    std::string name;
+
     /**
      * @brief Index of the worker that last ran this task, or -1 if unknown.
      *
@@ -90,6 +95,17 @@ public:
      *         `false` if still Pending and should be moved to the Suspended map.
      */
     bool poll(Context& ctx) { return m_impl->poll(ctx); }
+
+    /// @brief The task currently being polled on this thread, or nullptr if
+    /// called outside a task poll. Set by the executor before each poll() call
+    /// and cleared afterward. Provides access to any task property (e.g. name)
+    /// without a separate thread-local per property.
+    static thread_local Task* current;
+
+    /// @brief Returns the name of the currently-polling task, or "" if none.
+    static std::string_view current_name() {
+        return current ? std::string_view(current->name) : std::string_view{};
+    }
 
 private:
     /// @brief Non-template virtual base for type-erased polling.

@@ -6,6 +6,7 @@
 
 namespace coro {
 
+
 SingleThreadedExecutor::SingleThreadedExecutor(Runtime* /*runtime*/) :
     m_poll_thread_id() // default-constructed to no thread
 {}
@@ -69,7 +70,9 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
         waker->task     = task;
         waker->executor = this;
         detail::Context ctx(waker);
+        detail::Task::current = task.get();
         bool done = task->poll(ctx);
+        detail::Task::current = nullptr;
 
         if (done) {
             task->scheduling_state.store(

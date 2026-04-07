@@ -110,8 +110,9 @@ coro::Coro<int> fetch(int id) {
 
 coro::Coro<void> run() {
     // Spawn both tasks before awaiting either — they run concurrently.
-    auto h1 = coro::spawn(fetch(1)).submit();
-    auto h2 = coro::spawn(fetch(2)).submit();
+    // .name() is optional; it tags the task for debugging.
+    auto h1 = coro::spawn(fetch(1)).name("fetch-1").submit();
+    auto h2 = coro::spawn(fetch(2)).name("fetch-2").submit();
 
     int a = co_await h1;  // 10
     int b = co_await h2;  // 20
@@ -194,7 +195,7 @@ the implicit scope mechanism, its limits, and how it compares to Rust's `'static
 
 When you need to spawn many tasks of the same type and collect their results, `JoinSet<T>`
 is cleaner than managing individual `JoinHandle`s. It satisfies `Stream<T>`, so results
-arrive in completion order and compose naturally with `next()`.
+arrive in completion order (not spawn order) and compose naturally with `next()`.
 
 ```cpp
 #include <coro/task/join_set.h>
@@ -231,9 +232,8 @@ coro::Coro<void> run() {
 Dropping a `JoinSet` without calling `drain()` cancels all pending tasks. The enclosing
 `co_invoke` scope ensures they finish draining before the coroutine returns.
 
-> **Note:** `JoinSet::spawn()` uses `co_invoke` internally to schedule tasks, so it must be
-> called from within a `Runtime::block_on()` context. Always wrap fan-out work in `co_invoke`
-> to keep lambda captures alive for the full duration (see section 11).
+> **Note:** When spawning tasks that capture references to locals, wrap the fan-out in
+> `co_invoke` to keep the captures alive for the full duration of the `JoinSet` (see section 11).
 
 ---
 
@@ -411,6 +411,8 @@ at a time making channels much less likely to be misused. Three variants are pro
 | `mpsc`    | N (cloneable sender) | 1 | Bounded buffer; backpressured send |
 | `watch`   | 1 | N (cloneable receiver) | Last-value-wins; send never suspends |
 
+> *NOTE*: Tokio also provides a broadcast channel that is not implemented yet, but likely will be added in the near future
+
 ### RAII handles and disconnection
 
 Every channel end is a RAII handle. Dropping a handle signals disconnection to the other
@@ -567,6 +569,164 @@ auto handle = spawn(co_invoke([x]() -> Coro<void> { ... })).submit();
 ```
 
 `co_invoke` also works with `CoroStream<T>` lambdas.
+
+## 12. Async I/O
+
+The runtime integrates a libuv event loop so that network I/O suspends a coroutine
+without blocking any worker thread. Two I/O abstractions are provided: `TcpStream`
+for raw TCP and `WsStream`/`WsListener` for WebSocket.
+
+All I/O operations require a running `Runtime` — they are not usable from plain
+synchronous code.
+
+### TcpStream — raw TCP
+
+`TcpStream` is a connected, async TCP socket. Connect with `co_await
+TcpStream::connect(host, port)`, then read and write using byte spans.
+
+```cpp
+#include <coro/io/tcp_stream.h>
+#include <coro/runtime/runtime.h>
+#include <array>
+#include <cstddef>
+#include <iostream>
+#include <string_view>
+
+coro::Coro<void> run() {
+    coro::TcpStream tcp = co_await coro::TcpStream::connect("example.com", 80);
+
+    // Write: span must remain valid until the future resolves.
+    std::string_view req = "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n";
+    co_await tcp.write({
+        reinterpret_cast<const std::byte*>(req.data()), req.size()
+    });
+
+    // Read: returns bytes read, or 0 on EOF.
+    std::array<std::byte, 4096> buf;
+    while (std::size_t n = co_await tcp.read(buf)) {
+        std::cout << std::string_view(reinterpret_cast<const char*>(buf.data()), n);
+    }
+}
+
+int main() {
+    coro::Runtime rt;
+    rt.block_on(run());
+}
+```
+
+**Ownership rules:**
+- The buffer passed to `read()` must remain valid until the future resolves — do not
+  let it go out of scope across a `co_await`.
+- The data span passed to `write()` must similarly remain valid until the future
+  resolves.
+- Dropping a `ReadFuture` or `WriteFuture` mid-flight is not safe in the current
+  implementation. Always `co_await` them to completion or use `timeout()` around the
+  whole operation.
+
+### WsStream — WebSocket client
+
+`WsStream` is a connected async WebSocket stream. `connect()` parses the URL,
+performs the opening handshake, and returns a ready-to-use stream.
+
+```cpp
+#include <coro/io/ws_stream.h>
+#include <coro/runtime/runtime.h>
+#include <iostream>
+
+coro::Coro<void> run() {
+    // Connect to a WebSocket server.  ws:// and wss:// (TLS) are both supported.
+    coro::WsStream ws = co_await coro::WsStream::connect("ws://localhost:9001/");
+
+    // Send a text frame — string_view overload picks Text opcode automatically.
+    co_await ws.send("hello");
+
+    // Receive the echo.
+    coro::WsStream::Message reply = co_await ws.receive();
+    std::cout << reply.as_text() << "\n";  // "hello"
+
+    // Destructor sends a WebSocket Close frame automatically.
+}
+
+int main() {
+    coro::Runtime rt;
+    rt.block_on(run());
+}
+```
+
+`receive()` returns a `Message`:
+
+| Field | Type | Description |
+|---|---|---|
+| `data` | `std::vector<std::byte>` | Raw payload bytes |
+| `is_text` | `bool` | `true` for a text frame, `false` for binary |
+| `is_final` | `bool` | Always `true` in the default `Full` mode |
+| `as_text()` | `std::string_view` | Convenient text view; throws if `is_text` is false |
+
+`send()` has two overloads:
+
+```cpp
+co_await ws.send("hello");                        // text frame (string_view)
+co_await ws.send(span_of_bytes, OpCode::Binary);  // binary frame
+```
+
+Use `timeout()` to guard individual operations against a stalled peer:
+
+```cpp
+using namespace std::chrono_literals;
+
+auto result = co_await coro::timeout(2s, ws.receive());
+if (result.index() != 0) { /* timed out */ }
+coro::WsStream::Message& msg = std::get<0>(result).value;
+```
+
+To request specific subprotocols, pass them as a third argument to `connect()`:
+
+```cpp
+coro::WsStream ws = co_await coro::WsStream::connect(
+    "ws://localhost:9001/", coro::WsStream::FrameMode::Full, {"my-protocol"});
+```
+
+### WsListener — WebSocket server
+
+`WsListener` binds a port and accepts incoming WebSocket connections. Each accepted
+connection is a `WsStream` with the same API as the client side.
+
+```cpp
+#include <coro/io/ws_listener.h>
+#include <coro/io/ws_stream.h>
+#include <coro/task/join_set.h>
+#include <coro/runtime/runtime.h>
+#include <iostream>
+
+static coro::Coro<void> handle(coro::WsStream ws) {
+    for (;;) {
+        coro::WsStream::Message msg = co_await ws.receive();
+        if (msg.data.empty()) co_return;  // client closed
+        co_await ws.send(msg.data, msg.is_text ? coro::WsStream::OpCode::Text
+                                               : coro::WsStream::OpCode::Binary);
+    }
+}
+
+coro::Coro<void> run_server() {
+    coro::WsListener listener = co_await coro::WsListener::bind("127.0.0.1", 9001);
+
+    coro::JoinSet<void> sessions;
+    for (int i = 0;; ++i) {
+        coro::WsStream ws = co_await listener.accept();
+        sessions.spawn(handle(std::move(ws)));
+    }
+}
+
+int main() {
+    coro::Runtime rt;
+    rt.block_on(run_server());
+}
+```
+
+Dropping `WsListener` destroys the server context; active `WsStream`s that were
+already accepted are unaffected.
+
+---
 
 ## Next steps
 

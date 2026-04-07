@@ -41,9 +41,11 @@ public:
     /// The builder must not be used again after this call.
     JoinHandle<OutputType> submit() {
         auto state = std::make_shared<detail::TaskState<OutputType>>();
-        if (m_executor)
-            m_executor->schedule(
-                std::make_unique<detail::Task>(std::move(m_future), state));
+        if (m_executor) {
+            auto task = std::make_unique<detail::Task>(std::move(m_future), state);
+            task->name = std::move(m_name);
+            m_executor->schedule(std::move(task));
+        }
         return JoinHandle<OutputType>(std::move(state));
     }
 
@@ -173,8 +175,10 @@ public:
     StreamHandle<ItemType> submit() {
         auto channel = std::make_shared<detail::Channel<ItemType>>(m_buffer_size);
         if (m_executor) {
-            m_executor->schedule(std::make_unique<detail::Task>(
-                detail::StreamDriver<S>{std::move(m_stream), channel, std::nullopt}));
+            auto task = std::make_unique<detail::Task>(
+                detail::StreamDriver<S>{std::move(m_stream), channel, std::nullopt});
+            task->name = std::move(m_name);
+            m_executor->schedule(std::move(task));
         }
         return StreamHandle<ItemType>(std::move(channel));
     }

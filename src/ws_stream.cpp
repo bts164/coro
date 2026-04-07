@@ -107,9 +107,10 @@ struct WsCloseRequest : coro::IoRequest {
 
     void execute(uv_loop_t* /*loop*/) override {
         if (state->wsi && !state->closed.load()) {
-            lws_close_reason(state->wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
-            // Setting the close reason causes lws to send the Close frame on the
-            // next writeable callback. Request one now.
+            // Set the flag so the WRITEABLE callback knows to close rather than send.
+            // lws_close_reason() outside a protocol callback is a no-op; the close
+            // must be initiated by returning -1 from within the callback itself.
+            state->closing.store(true, std::memory_order_release);
             lws_callback_on_writable(state->wsi);
         }
     }
@@ -123,6 +124,13 @@ struct WsCloseRequest : coro::IoRequest {
 
 namespace detail::ws {
 
+#define LOGSTDOUT(...)
+// do { \
+//     std::printf("client_protocol_cb:%d -  ", __LINE__); \
+//     std::printf(__VA_ARGS__); \
+//     std::fflush(stdout); \
+// } while (0)
+
 int protocol_cb(lws* wsi, lws_callback_reasons reason,
                 void* /*user*/, void* in, std::size_t len) {
 
@@ -135,15 +143,18 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
     case LWS_CALLBACK_CLIENT_ESTABLISHED:
         if (state.connect.cancelled.load(std::memory_order_acquire)) {
             // ConnectFuture was dropped — initiate close immediately.
-            lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
+            state.closing.store(true, std::memory_order_release);
             lws_callback_on_writable(wsi);
+            LOGSTDOUT("connection established but already cancelled\n");
         } else {
             state.connect.complete.store(true, std::memory_order_release);
+            LOGSTDOUT("connection established\n");
             if (auto w = state.connect.waker.load()) w->wake();
         }
         break;
 
     case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        LOGSTDOUT("connection error\n");
         state.connect.error = -1;  // TODO: surface lws error string
         state.connect.complete.store(true, std::memory_order_release);
         if (auto w = state.connect.waker.load()) w->wake();
@@ -156,62 +167,103 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
         bool is_text        = (lws_frame_is_binary(wsi) == 0);
         auto* bytes         = static_cast<const std::byte*>(in);
 
-        std::printf("protocol_cb: received %zu bytes (final=%d, text=%d)\n", len, final_fragment, is_text);
+        LOGSTDOUT("received %zu bytes (final=%d, text=%d)\n", len, final_fragment, is_text);
         std::shared_ptr<detail::Waker> waker_to_wake;
         {
             std::lock_guard lk(state.receive.mutex);
             if (state.receive.cancelled) {
+                LOGSTDOUT("receive cancelled, discarding data\n");
                 state.receive.buffer.clear();
                 break;
             }
             state.receive.buffer.insert(state.receive.buffer.end(), bytes, bytes + len);
 
             if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
+                LOGSTDOUT("message complete, waking receiver\n");
                 state.receive.is_text  = is_text;
                 state.receive.is_final = final_fragment;
                 state.receive.complete = true;
                 waker_to_wake = state.receive.waker.load();
+            } else {
+                LOGSTDOUT("message fragment received, waiting for more\n");
             }
         }
         if (waker_to_wake) waker_to_wake->wake();
+
+        // Re-arm rx delivery. Without this, lws (especially on the libuv backend)
+        // pauses further LWS_CALLBACK_CLIENT_RECEIVE events after the first message
+        // until the application explicitly signals it is ready for more data.
+        lws_rx_flow_control(wsi, 1);
         break;
     }
 
     case LWS_CALLBACK_CLIENT_WRITEABLE: {
+        LOGSTDOUT("writeable\n");
+        // Close takes priority over pending sends. lws_close_reason() sets the
+        // close status code; returning -1 triggers the actual close handshake.
+        if (state.closing.load(std::memory_order_acquire)) {
+            LOGSTDOUT("closing connection\n");
+            lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
+            return -1;
+        }
+
         std::shared_ptr<SendSubState> sub;
         {
             std::lock_guard lk(state.send_queue_mutex);
-            if (state.send_queue.empty()) break;
+            if (state.send_queue.empty()) {
+                LOGSTDOUT("writeable but send queue is empty\n");
+                break;
+            }
             sub = state.send_queue.front();
             state.send_queue.pop_front();
         }
 
-        if (!sub->cancelled.load(std::memory_order_acquire)) {
-            // lws_write requires LWS_PRE bytes of padding before the payload.
-            std::vector<std::byte> buf(LWS_PRE + sub->data.size());
-            std::copy(sub->data.begin(), sub->data.end(), buf.begin() + LWS_PRE);
-            int flags = (sub->opcode == WsStream::OpCode::Binary)
-                            ? LWS_WRITE_BINARY : LWS_WRITE_TEXT;
-            int r = lws_write(wsi,
-                              reinterpret_cast<unsigned char*>(buf.data() + LWS_PRE),
-                              sub->data.size(),
-                              static_cast<lws_write_protocol>(flags));
-            sub->error = (r < 0) ? r : 0;
-            sub->data  = {};
+        std::shared_ptr<detail::Waker> waker_to_wake;
+        {
+            std::lock_guard lk(sub->mutex);
+            if (!sub->cancelled) {
+                // Copy data under the lock before touching the span — the destructor
+                // sets cancelled and the caller may free their buffer concurrently.
+                // lws_write requires LWS_PRE bytes of padding before the payload.
+                std::vector<std::byte> buf(LWS_PRE + sub->data.size());
+                std::copy(sub->data.begin(), sub->data.end(), buf.begin() + LWS_PRE);
+                int flags = (sub->opcode == WsStream::OpCode::Binary)
+                                ? LWS_WRITE_BINARY : LWS_WRITE_TEXT;
+                int r = lws_write(wsi,
+                                  reinterpret_cast<unsigned char*>(buf.data() + LWS_PRE),
+                                  buf.size() - LWS_PRE,
+                                  static_cast<lws_write_protocol>(flags));
+                if (r < 0) {
+                    LOGSTDOUT("lws_write error %d\n", r);
+                } else {
+                    LOGSTDOUT("sent %zu bytes\n", buf.size() - LWS_PRE);
+                }
+                sub->error = (r < 0) ? r : 0;
+                sub->data  = {};
+            } else {
+                LOGSTDOUT("send cancelled, skipping\n");
+            }
+            sub->complete = true;
+            waker_to_wake = sub->waker.load();
         }
-        sub->complete.store(true, std::memory_order_release);
-        if (auto w = sub->waker.load()) w->wake();
+        LOGSTDOUT("send complete, waking sender\n");
+        if (waker_to_wake) waker_to_wake->wake();
 
         // If more sends are queued, request another WRITEABLE callback.
         {
             std::lock_guard lk(state.send_queue_mutex);
-            if (!state.send_queue.empty())
+            if (!state.send_queue.empty()) {
+                LOGSTDOUT("more sends queued, requesting another writeable callback\n");
                 lws_callback_on_writable(wsi);
+            } else {
+                LOGSTDOUT("no more sends queued\n");
+            }
         }
         break;
     }
 
     case LWS_CALLBACK_CLIENT_CLOSED: {
+        LOGSTDOUT("connection closed\n");
         state.wsi = nullptr;
         state.closed.store(true, std::memory_order_release);
         // Wake any receive future blocked on this connection.
@@ -225,9 +277,14 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
         {
             std::lock_guard lk(state.send_queue_mutex);
             for (auto& sub : state.send_queue) {
-                sub->error = -1;
-                sub->complete.store(true, std::memory_order_release);
-                if (auto w = sub->waker.load()) w->wake();
+                std::shared_ptr<detail::Waker> send_waker;
+                {
+                    std::lock_guard slk(sub->mutex);
+                    sub->error    = -1;
+                    sub->complete = true;
+                    send_waker    = sub->waker.load();
+                }
+                if (send_waker) send_waker->wake();
             }
             state.send_queue.clear();
         }
@@ -381,10 +438,15 @@ WsStream::ReceiveFuture::ReceiveFuture(std::shared_ptr<detail::ws::ConnectionSta
     , m_io_service(io_service) {}
 
 WsStream::ReceiveFuture::~ReceiveFuture() {
-    if (m_state) {
+    // Only cancel if this future was never consumed. poll() resets complete=false
+    // after consuming the message, so checking complete alone is insufficient —
+    // m_done distinguishes "already returned PollReady" from "still in flight".
+    if (m_state && !m_done) {
         std::lock_guard lk(m_state->receive.mutex);
-        if (!m_state->receive.complete)
+        if (!m_state->receive.complete) {
+            LOGSTDOUT("receive future dropped, cancelling receive\n");
             m_state->receive.cancelled = true;
+        }
     }
 }
 
@@ -403,6 +465,7 @@ PollResult<WsStream::Message> WsStream::ReceiveFuture::poll(detail::Context& ctx
         m_state->receive.complete  = false;
         m_state->receive.cancelled = false;
 
+        m_done = true;
         return msg;
     }
 
@@ -429,16 +492,17 @@ WsStream::SendFuture::SendFuture(std::shared_ptr<detail::ws::ConnectionState> st
 }
 
 WsStream::SendFuture::~SendFuture() {
-    if (m_sub_state && !m_sub_state->complete.load(std::memory_order_acquire))
-        m_sub_state->cancelled.store(true, std::memory_order_release);
+    if (m_sub_state) {
+        std::lock_guard lk(m_sub_state->mutex);
+        if (!m_sub_state->complete)
+            m_sub_state->cancelled = true;
+    }
 }
 
 PollResult<void> WsStream::SendFuture::poll(detail::Context& ctx) {
-    if (m_state->closed.load(std::memory_order_acquire) &&
-        !m_sub_state->complete.load(std::memory_order_acquire))
-        throw std::runtime_error("WsStream::send: connection closed");
+    std::lock_guard lk(m_sub_state->mutex);
 
-    if (m_sub_state->complete.load(std::memory_order_acquire)) {
+    if (m_sub_state->complete) {
         if (m_sub_state->error != 0)
             throw std::system_error(std::error_code(-m_sub_state->error,
                                                     std::system_category()),
@@ -446,13 +510,16 @@ PollResult<void> WsStream::SendFuture::poll(detail::Context& ctx) {
         return PollReady;
     }
 
+    if (m_state->closed.load(std::memory_order_acquire))
+        throw std::runtime_error("WsStream::send: connection closed");
+
     m_sub_state->waker.store(ctx.getWaker());
 
     if (!m_started) {
         m_started = true;
         // Enqueue the sub-state and request a WRITEABLE callback.
         {
-            std::lock_guard lk(m_state->send_queue_mutex);
+            std::lock_guard lk2(m_state->send_queue_mutex);
             m_state->send_queue.push_back(m_sub_state);
         }
         m_io_service->submit(std::make_unique<WsWritableRequest>(m_state));

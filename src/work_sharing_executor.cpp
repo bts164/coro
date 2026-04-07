@@ -114,7 +114,9 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
         waker->task     = task;
         waker->executor = this;
         detail::Context ctx(waker);
+        detail::Task::current = task.get();
         bool done = task->poll(ctx);
+        detail::Task::current = nullptr;
 
         if (done) {
             task->scheduling_state.store(

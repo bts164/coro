@@ -56,6 +56,10 @@ public:
      * @brief A received WebSocket message (or fragment in Partial mode).
      */
     struct Message {
+        std::string_view as_text() const {
+            if (!is_text) throw std::logic_error("Message::as_text: not a text frame");
+            return std::string_view(reinterpret_cast<const char*>(data.data()), data.size());
+        }
         std::vector<std::byte> data;      ///< Payload bytes.
         bool                   is_text;   ///< true = text frame, false = binary.
         bool                   is_final;  ///< Always true in Full mode; may be false in Partial mode.
@@ -126,7 +130,9 @@ public:
     private:
         std::shared_ptr<detail::ws::ConnectionState> m_state;
         IoService*                                   m_io_service;
-        bool                                         m_started = false;
+        // Set to true when poll() returns PollReady so the destructor knows the
+        // future was already consumed and must not set cancelled on the shared state.
+        bool                                         m_done = false;
     };
 
     /**
@@ -261,12 +267,18 @@ struct ReceiveSubState {
 };
 
 struct SendSubState {
+    // mutex guards data, opcode, error, complete, and cancelled.
+    // The I/O thread (WRITEABLE callback) checks cancelled then reads data under the lock.
+    // SendFuture::~SendFuture sets cancelled under the lock, preventing a window where
+    // the I/O thread passes the cancelled check and then reads a dangling data span after
+    // the caller's buffer has been freed.
+    std::mutex                                         mutex;
     std::atomic<std::shared_ptr<coro::detail::Waker>> waker;
-    std::atomic<bool>                                  complete{false};
-    std::atomic<bool>                                  cancelled{false};  // set by SendFuture dtor
+    bool                                               complete{false};
+    bool                                               cancelled{false};  // set by SendFuture dtor
     std::span<const std::byte>                         data;     // non-owning; caller keeps alive
     coro::WsStream::OpCode                             opcode = coro::WsStream::OpCode::Text;
-    int                                                error  = 0;        // set before complete=true
+    int                                                error  = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -283,6 +295,11 @@ struct ConnectionState {
     std::mutex                   send_queue_mutex;
     std::deque<std::shared_ptr<SendSubState>> send_queue;  // shared_ptr keeps sub-state alive
     std::atomic<bool>            closed{false};
+    // Set by WsCloseRequest; checked in the WRITEABLE callback, which calls
+    // lws_close_reason() then returns -1 to trigger the lws close handshake.
+    // lws_close_reason() outside a callback is a no-op; the close must be
+    // initiated by returning -1 from within a protocol callback.
+    std::atomic<bool>            closing{false};
 };
 
 // ---------------------------------------------------------------------------
