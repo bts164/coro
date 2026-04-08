@@ -1,6 +1,6 @@
-# WebSocket Stream Design
+# WebSocket Stream
 
-Design document for `WsStream` — an async WebSocket client built on
+`WsStream` and `WsListener` — async WebSocket client and server built on
 [libwebsockets](https://libwebsockets.org/) using the shared libuv event loop as the backend.
 
 ---

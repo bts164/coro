@@ -12,8 +12,8 @@ distinct user-facing types:
 - **`JoinHandle<T>`** — returned by `spawn()`. Satisfies `Future<T>`. Allows the caller to
   `co_await` the result of a spawned task.
 - **`Synchronize`** — structured concurrency scope. Guarantees all tasks spawned within it
-  complete before the scope exits. **Planned for removal** once `JoinSet` is implemented;
-  use `co_invoke` + `JoinSet::drain()` for new code.
+  complete before the scope exits. **Deprecated** — prefer `co_invoke` + `JoinSet::drain()`
+  for new code.
 
 **`Task`** is an internal, type-erased heap-allocated unit of work. It wraps any `Future<T>`,
 not just coroutines. Users never construct a `Task` directly — `spawn()` creates one
@@ -22,23 +22,7 @@ internally.
 The `Executor` drives tasks by polling them. The `Runtime` bundles the executor, thread pool,
 and libuv I/O reactor into a single user-facing object.
 
-## Requirements
-
-- `Coro<T>` is the return type of coroutine functions and satisfies `Future<T>`
-- `CoroStream<T>` is the return type of async generator functions and satisfies `Stream<T>`
-- `spawn()` accepts **any** type satisfying `Future<T>`, not only `Coro<T>`
-- `spawn()` returns a `JoinHandle<T>` that can be `co_await`ed to retrieve the result
-- `Task` is an internal type-erased wrapper — not part of the public API
-- The executor interface is abstract, allowing alternative scheduler implementations
-- The first concrete executor is single-threaded — simpler to implement and useful for testing and debugging
-- The second concrete executor uses a multi-threaded work-stealing scheduler
-- The `Runtime` owns the thread pool and libuv event loop
-- `co_await future` inside a `Coro` or `CoroStream` coroutine must correctly integrate with the poll model
-- `Synchronize` guarantees all child tasks complete before the scope exits, including during exception unwinding
-- Dropping a `JoinHandle` without awaiting it cancels the task and detaches
-- `JoinHandle::detach()` explicitly detaches without cancelling — the task runs to completion independently and the parent loses all ability to synchronize or cancel it
-
-## Proposed Design
+## Design
 
 ### Runtime vs Executor split
 
@@ -76,8 +60,8 @@ Coro<int> compute()
 
 Coro<void> my_async_main()
 {
-    JoinHandle<int> h = runtime.spawn(compute());   // Coro<int> — accepted as any Future
-    JoinHandle<int> h2 = runtime.spawn(ImmediateFuture<int>(7));  // hand-written Future also works
+    JoinHandle<int> h = runtime.spawn(compute()).submit();   // Coro<int> — accepted as any Future
+    JoinHandle<int> h2 = runtime.spawn(ImmediateFuture<int>(7)).submit();  // hand-written Future also works
     int result = co_await h;
 }
 ```
@@ -281,10 +265,11 @@ back-pressure.
 
 ### Synchronize
 
-`Synchronize` is a structured concurrency scope inspired by Julia's `@sync` / `@async`
-pattern. Any tasks spawned through a `Synchronize` scope are guaranteed to complete before
-the scope's `co_await` returns — including when an exception unwinds the parent coroutine.
-This makes it the safe choice when child tasks need to reference data owned by the parent.
+> **Deprecated** — prefer `co_invoke` + `JoinSet::drain()` for new code.
+
+`Synchronize` is a structured concurrency scope that guarantees all tasks spawned within it
+complete before the scope's `co_await` returns — including when an exception unwinds the
+parent coroutine. It predates `JoinSet` and is retained for compatibility.
 
 ```cpp
 Coro<void> parent()
@@ -292,34 +277,25 @@ Coro<void> parent()
     int local = 42;
 
     co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
-        // Safe to capture &local — Synchronize guarantees it outlives all children.
         sync.spawn(child(local)).name("child-a").submit();
         sync.spawn(other_child(local)).name("child-b").submit();
-        // co_await other futures here too
     });
-    // All children are guaranteed finished here, even if an exception was thrown above.
+    // All children guaranteed finished here.
 }
 ```
 
-`Synchronize::spawn()` has the same builder interface as `Runtime::spawn()`. Internally it
-uses `current_runtime()` (the thread-local runtime) to submit tasks, the same mechanism as
-the free `spawn()` function. When the `Synchronize` coroutine is `co_await`ed, it drives all
-child tasks to completion and re-throws the first exception encountered (if any) after all
-children have finished.
-
-`Synchronize` is the idiomatic way to structure fan-out / fan-in patterns:
+Prefer the equivalent `JoinSet` pattern for new code:
 
 ```cpp
-Coro<void> fetch_all(std::vector<Url> urls)
+Coro<void> parent()
 {
-    std::vector<Result> results(urls.size());
-
-    co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
-        for (std::size_t i = 0; i < urls.size(); ++i)
-            sync.spawn(fetch(urls[i], results[i])).submit();
+    int local = 42;
+    co_await co_invoke([&]() -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(child(local));
+        js.spawn(other_child(local));
+        co_await js.drain();
     });
-    // All fetches done, results populated.
-    process(results);
 }
 ```
 
@@ -506,12 +482,10 @@ cleanest approach is to store a `Context*` in the `promise_type` on each `poll()
 
 ### libuv integration point
 
-libuv callbacks run on the event loop thread. When a callback fires (e.g. a read completes),
-it calls `waker->wake()`, which posts the task back to the executor's queue. The libuv loop
-runs on a dedicated thread inside `Runtime` and communicates with worker threads via a
-thread-safe queue and a `uv_async_t` handle.
-
-## Design Considerations (continued)
+libuv callbacks run on the `IoService` thread. When a callback fires (e.g. a timer or read
+completes), it calls `waker->wake()`, which posts the task back to the executor via the
+injection queue. The `IoService` runs on a dedicated thread inside `Runtime` and communicates
+with worker threads via `uv_async_t` notifications.
 
 ### spawn() ownership
 
@@ -562,7 +536,3 @@ only discarded when the `JoinHandle` is destroyed without being awaited.
 
 For tasks spawned inside a `Synchronize` scope, the first exception is re-thrown by the
 `co_await Synchronize(...)` expression after all children have completed.
-
-## Open Questions
-
-None.

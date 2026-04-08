@@ -21,7 +21,7 @@ The root cause is deeper than `Synchronize`: any future combinator that can aban
 creates this hazard for any coroutine in that branch that has spawned tasks holding borrowed
 references.
 
-## Requirements
+## Guarantee
 
 Regardless of how a coroutine stops executing — normal completion (`co_return`), exception,
 or cancellation — the following ordering must be guaranteed:
@@ -51,7 +51,7 @@ These two steps apply uniformly across all termination paths:
 Detached tasks (`JoinHandle::detach()`) are explicitly opted out of this guarantee and are
 not tracked.
 
-## Proposed Design — Every Coroutine Is an Implicit Scope
+## Design — Every Coroutine Is an Implicit Scope
 
 ### Core idea
 
@@ -230,10 +230,20 @@ checker, trading a compile-time guarantee for a runtime one.
 
 ### Interaction with explicit `Synchronize`
 
-> **Note:** `Synchronize` is planned for removal once `JoinSet` is implemented (see
-> `doc/roadmap.md` items 5 and 6). The pattern below will be replaced by `co_invoke` +
-> `JoinSet::drain()`. Prefer `co_invoke` for new code.
+> **Deprecated:** prefer `co_invoke` + `JoinSet::drain()` for new code.
 
 `Synchronize` provides an explicit mid-coroutine drain point and a safe scope for
-reference-capturing lambdas. Both roles will be covered by `co_invoke` + `JoinSet` once
-that API lands.
+reference-capturing lambdas. Both roles are now covered by `co_invoke` + `JoinSet`.
+
+The safe `Synchronize` example above can be rewritten as:
+
+```cpp
+Coro<void> safe_example() {
+    int local_data = 42;
+    co_await co_invoke([&]() -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(worker(&local_data));
+        co_await js.drain();  // guaranteed drain point while local_data is alive
+    });
+}
+```

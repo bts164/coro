@@ -28,8 +28,8 @@ sequenceDiagram
 
 ## Motivation
 
-`Synchronize` (now scheduled for removal) drained children implicitly and discarded their
-results. `JoinSet` makes the lifecycle **explicit** and gives the user full control:
+`Synchronize` (deprecated — prefer `co_invoke` + `JoinSet::drain()`) drained children
+implicitly and discarded their results. `JoinSet` makes the lifecycle **explicit** and gives the user full control:
 
 - Consume results one-by-one as they complete (`next()`)
 - Wait for all to finish and discard results (`drain()`)

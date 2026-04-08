@@ -570,7 +570,57 @@ auto handle = spawn(co_invoke([x]() -> Coro<void> { ... })).submit();
 
 `co_invoke` also works with `CoroStream<T>` lambdas.
 
-## 12. Async I/O
+## 12. Running blocking code with `spawn_blocking`
+
+Some work is inherently blocking — legacy library calls, CPU-intensive computation,
+or synchronous file I/O. Calling these directly from a coroutine would park an executor
+worker thread for the duration, starving all other tasks on that thread.
+
+`spawn_blocking()` submits the callable to a dedicated `BlockingPool` thread. The executor
+thread is released immediately and can pick up other tasks while the blocking work runs.
+The result is returned as a `BlockingHandle<T>`, which is a `Future` you can `co_await`.
+
+```cpp
+#include <coro/task/spawn_blocking.h>
+#include <coro/runtime/runtime.h>
+#include <thread>
+#include <chrono>
+
+coro::Coro<void> run() {
+    using namespace std::chrono_literals;
+
+    // The executor thread is free while this sleeps on the blocking pool.
+    int result = co_await coro::spawn_blocking([] {
+        std::this_thread::sleep_for(100ms);  // blocking — fine on the pool
+        return 42;
+    });
+    std::cout << result << "\n";  // 42
+}
+
+int main() {
+    coro::Runtime rt;
+    rt.block_on(run());
+}
+```
+
+Exception propagation works the same as with any other future:
+
+```cpp
+co_await coro::spawn_blocking([]() -> int {
+    throw std::runtime_error("oops");
+});  // exception propagates to the awaiting coroutine
+```
+
+**Ownership rules:** the callable must own all its data — do not capture references or
+pointers into the spawning coroutine's locals. The blocking thread may outlive the
+spawning coroutine if the `BlockingHandle` is dropped without awaiting.
+
+The `BlockingPool` grows lazily up to a configurable cap (default: 512 threads) and
+shrinks threads back after a keep-alive idle period.
+
+---
+
+## 13. Async I/O
 
 The runtime integrates a libuv event loop so that network I/O suspends a coroutine
 without blocking any worker thread. Two I/O abstractions are provided: `TcpStream`
@@ -732,4 +782,5 @@ already accepted are unaffected.
 
 - Read the **Design Docs** for a deeper explanation of the `Future`/`Stream` model,
   the executor architecture, and the coroutine scope lifetime guarantees.
-- Browse the **API Reference** for the full class and function documentation.
+- Browse the worked examples under `examples/` for self-contained programs covering
+  common patterns.

@@ -6,21 +6,11 @@
 and completes when the first one produces a result, dropping (cancelling) the rest.
 Inspired by Tokio's `select!` macro, adapted for C++ without macros.
 
-## Requirements
+Inner futures are **concurrent but not parallel** — they run on the same task, interleaving
+via suspension points. For parallel first-one-wins, spawn each future and `select` over the
+`JoinHandle`s. Branch polling order advances round-robin each poll to prevent starvation.
 
-- `select(f1, f2, ...)` accepts any number of futures, potentially of different output types
-- Returns a type satisfying `Future`
-- Completes when the first inner future returns `Ready`, drops the remaining futures
-- If all inner futures return `Pending`, registers the outer task's waker via the shared
-  `Context` and returns `Pending`
-- Inner futures are **concurrent but not parallel** — they run on the same task and thread,
-  interleaving via suspension points
-- For parallel first-one-wins, spawn each future and `select` over the `JoinHandle`s
-- Branch polling order is randomized each poll to prevent starvation
-
-## Proposed Design
-
-### Interface
+## Interface
 
 ```cpp
 // Returns SelectFuture<F1, F2, F3> which satisfies Future<std::variant<T1, T2, T3>>
@@ -33,7 +23,7 @@ auto result = co_await select(
 std::visit([](auto& val) { ... }, result);
 ```
 
-### SelectFuture
+## SelectFuture
 
 ```cpp
 template<Future... Fs>
@@ -55,7 +45,7 @@ template<Future... Fs>
 SelectFuture<Fs...> select(Fs&&... futures);
 ```
 
-### How poll() works
+## How poll() works
 
 1. Shuffle the poll order for this tick (fairness — avoids starvation of later futures)
 2. Poll each inner future in shuffled order, passing the same `Context` through
@@ -68,7 +58,7 @@ SelectFuture<Fs...> select(Fs&&... futures);
 4. First inner future that returns `Error` propagates immediately (same drop behaviour)
 5. If all return `Pending`, return `Pending`
 
-## Design Decisions
+## Design decisions
 
 1. **Result type** — `SelectBranch<N, T>` tagged wrappers in a `std::variant`. Each
    branch result is wrapped in `SelectBranch<N, T>` where N is the branch index. This

@@ -226,11 +226,9 @@ worker loop (park sequence):
   7. resume worker loop
 ```
 
-#### This phase
-
-`WorkStealingExecutor` uses per-worker `std::binary_semaphore` parking from the start,
+`WorkStealingExecutor` uses per-worker `std::binary_semaphore` parking,
 replacing the shared `m_mutex` + `m_cv` used by `WorkSharingExecutor`. The semaphore
-approach is adopted because:
+approach was adopted because:
 
 - It is the natural C++ equivalent of Tokio's `park()`/`unpark()`.
 - It makes Q4 (notify on local enqueue) cheap enough to always do correctly: check
@@ -371,24 +369,19 @@ will fail if two workers race to claim the same task (which should not happen si
 
 ---
 
-## Testing Approach
+## Tests
 
-Phase 2 will stub out `WorkStealingExecutor` and add tests. Phase 3 validates them.
+Unit tests are in `test/test_work_stealing_executor.cpp`. Key cases covered:
 
-**Unit tests (new):**
-- `test_work_stealing_executor.cpp`
-  - Workers complete tasks when work is uneven (one spawning coroutine fans out N tasks).
-  - Tasks complete correctly with `N` workers and `M >> N` short-lived tasks.
-  - Stealing occurs: verify that with 1 task pinned to worker 0's local queue and 3
-    idle workers, one of the idle workers steals and executes the task.
-  - Shutdown drains all in-flight tasks.
+- Workers complete tasks when work is uneven (one spawning coroutine fans out N tasks).
+- Tasks complete correctly with `N` workers and `M >> N` short-lived tasks.
+- Stealing occurs: verify that with tasks pinned to worker 0's local queue, idle workers
+  steal and execute them.
+- Shutdown drains all in-flight tasks.
+- Skynet benchmark (disabled by default — run with `--gtest_also_run_disabled_tests`).
 
-**Existing tests** that must continue to pass:
-- All `test_sleep` tests (timer service wakeups via the remote path).
-- All `test_join_handle`, `test_join_set`, `test_coro_scope` tests.
-- All channel tests (`test_mpsc`, `test_watch`, `test_oneshot`).
-
-Run with ThreadSanitizer enabled to catch data races in the steal path.
+All existing tests (`test_sleep`, `test_join_handle`, `test_join_set`, `test_coro_scope`,
+channel tests) also exercise the work-stealing executor via `Runtime`.
 
 ---
 
@@ -559,10 +552,7 @@ eliminates the reclamation problem.
 
 ## Open Questions
 
-**Q2 — Chase-Lev: deferred.**
-The `WorkStealingDeque` will remain mutex-backed for this phase. Chase-Lev is documented
-in the [Future Work](#future-work-chase-lev-lock-free-deque) section as a follow-on
-once the stealing logic and tests are stable.
-
-
+**Chase-Lev lock-free deque:** the `WorkStealingDeque` is currently mutex-backed.
+Chase-Lev is documented in the [Future Work](#future-work-chase-lev-lock-free-deque)
+section as a follow-on once profiling shows deque contention is a real bottleneck.
 

@@ -34,8 +34,8 @@ Runtime::Runtime(std::size_t num_threads) {
 
 ## Local Wake vs. Remote Wake
 
-When the `TimerService` background thread calls `Waker::wake()`, it originates from a
-thread that is not the poll loop. The same is true of future I/O completion callbacks.
+When the `IoService` background thread calls `Waker::wake()` (e.g. from a libuv timer or
+I/O callback), it originates from a thread that is not the poll loop.
 Every executor must therefore handle wakeups from threads it does not own.
 
 Tokio and similar runtimes distinguish two categories of wakeup:
@@ -296,29 +296,6 @@ m_executor->wait_for_completion(*state);
 
 ## SingleThreadedExecutor
 
-### Current issues
-
-`SingleThreadedExecutor` was designed under the assumption that all wakers fire
-synchronously from within `poll()` on the calling thread. The `TimerService` background
-thread violates this:
-
-**Issue 1 — Data race:** `wake_task` accesses `m_running_task_key`, `m_running_task_woken`,
-and `m_ready` without any mutex. An external thread calling `wake_task` from a different
-thread is an unsynchronized concurrent write — a TSan-detectable data race.
-
-**Issue 2 — Premature return:** `wait_for_completion` exits as soon as `poll_ready_tasks()`
-returns `false`:
-
-```cpp
-while (true) {
-    if (state.terminated) return;
-    if (!poll_ready_tasks()) return;  // exits when ready queue is empty
-}
-```
-
-If a task is in the `Idle` state awaiting a timer, the ready queue empties and `block_on`
-returns before the future completes.
-
 ### Task states
 
 Each task is in exactly one state at any moment:
@@ -345,9 +322,7 @@ stateDiagram-v2
 | `Running → Done` | `poll_ready_tasks()` — `poll()` returned `true`; task dropped in place |
 | `Idle → Notified` | `TaskWaker::wake()` — first CAS; calls `enqueue()` which routes to `m_ready` (local) or `m_incoming_wakes` (remote) |
 
-### Planned data model
-
-Fields added:
+### Data model
 
 ```
 m_poll_thread_id : thread::id                    ← set when wait_for_completion is entered
@@ -356,15 +331,11 @@ m_remote_mutex   : mutex                         ← guards m_incoming_wakes
 m_remote_cv      : condition_variable            ← signalled by remote enqueue(); waited on by wait_for_completion
 ```
 
-Fields removed:
+The fields `m_suspended`, `m_running_task_key`, and `m_running_task_woken` that existed
+in earlier iterations have been replaced by the `SchedulingState` CAS machine — a task in
+`Idle` is kept alive solely by the `shared_ptr<Task>` inside its waker.
 
-```
-m_suspended          ← replaced by Idle state; waker owns the shared_ptr<Task>
-m_running_task_key   ← replaced by Running / RunningAndNotified atomic state
-m_running_task_woken ← replaced by RunningAndNotified atomic state
-```
-
-### Planned enqueue routing
+### Enqueue routing
 
 `TaskWaker::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS
 succeeds. `enqueue` routes based on thread identity:
@@ -385,7 +356,7 @@ enqueue(task):
 The `Running → RunningAndNotified` self-wake CAS is handled entirely inside
 `TaskWaker::wake()` — no executor involvement needed.
 
-### Planned poll_ready_tasks — drain injection queue first
+### poll_ready_tasks — drain injection queue first
 
 ```
 poll_ready_tasks():
@@ -399,7 +370,7 @@ poll_ready_tasks():
     ...
 ```
 
-### Planned wait_for_completion — block instead of exit
+### wait_for_completion — block until done
 
 ```
 wait_for_completion(state):
@@ -461,22 +432,22 @@ classDiagram
     Executor <|-- WorkSharingExecutor
 ```
 
-### Current data model
+### Data model
 
 ```
 WorkSharingExecutor
 │
-├── m_queue     : deque<shared_ptr<Task>>          ← ready tasks, mutex-protected
-├── m_suspended : map<Task*, shared_ptr<Task>>     ← parked tasks, same mutex
-├── m_self_woken: map<Task*, bool>                 ← tracks tasks mid-poll
-├── m_mutex     : mutex                            ← guards all of the above
-├── m_cv        : condition_variable               ← workers wait here
-├── m_stop      : bool                             ← shutdown signal, set under m_mutex
-└── m_workers   : vector<thread>                   ← N worker threads
+├── m_local_queues  : vector<WorkStealingDeque<shared_ptr<Task>>>  ← per-worker local queues
+├── m_injection_queue : deque<shared_ptr<Task>>                    ← remote enqueue path
+├── m_mutex         : mutex                    ← guards m_injection_queue and m_stop only
+├── m_cv            : condition_variable       ← workers wait here when both queues empty
+├── m_stop          : bool                     ← shutdown signal, set under m_mutex
+└── m_workers       : vector<thread>           ← N worker threads
 ```
 
-`m_queue`, `m_suspended`, and `m_self_woken` share one mutex because moving a task
-between them is always one atomic operation.
+There is no `m_suspended` map — a task in `Idle` is kept alive solely by the
+`shared_ptr<Task>` inside its waker. There is no `m_self_woken` map — self-wake is
+handled by the `Running → RunningAndNotified` CAS in `TaskWaker::wake()`.
 
 ### Task state machine
 
@@ -513,43 +484,46 @@ CASes to `Notified` and re-enqueues.
 ```
 worker_loop():
     set_current_runtime(m_runtime)
-    set_current_timer_service(&m_runtime->timer_service())
+    set_current_io_service(&m_runtime->io_service())
 
     loop:
-        lock(m_mutex)
-        wait on m_cv until: m_queue non-empty OR m_stop
-        if m_stop and m_queue empty → break
+        // Try local queue first (no lock), then injection queue.
+        task = m_local_queues[this_worker].pop()
+        if not task:
+            lock(m_mutex)
+            wait on m_cv until: m_injection_queue non-empty OR m_stop
+            if m_stop and m_injection_queue empty → break
+            task = m_injection_queue.pop_front()
+            unlock(m_mutex)
 
-        task = dequeue front of m_queue
-        m_self_woken[task] = false
-        unlock(m_mutex)
+        expected = Notified
+        ASSERT CAS(expected → Running) succeeds
 
         waker = TaskWaker(task, this)
-        done = task->poll(Context(waker))      ← runs outside the lock
+        done = task->poll(Context(waker))      ← runs outside any lock
 
-        lock(m_mutex)
-        self_woke = m_self_woken[task]; erase entry
         if done:
-            m_cv.notify_all()                  ← inside lock — no lost wakeup
-        elif self_woke:
-            m_queue.push_back(task)
-            m_cv.notify_one()
+            drop task
         else:
-            m_suspended[task] = task
-        unlock(m_mutex)
-
-        if done: drop task                     ← destructor fires outside the lock
+            // Try Running → Idle; re-enqueue if woken during poll
+            expected = Running
+            if CAS(expected → Idle):
+                task.reset()    // waker holds the only ref
+            else:
+                expected = RunningAndNotified
+                ASSERT CAS(expected → Notified) succeeds
+                enqueue(task)
 
     set_current_runtime(nullptr)
-    set_current_timer_service(nullptr)
+    set_current_io_service(nullptr)
 ```
 
 **Key invariants:**
-- `task->poll()` runs outside `m_mutex` so other workers can dequeue concurrently and
-  `wake_task()` can acquire the lock.
-- `m_cv.notify_all()` on task completion is called **inside** `m_mutex`. Calling it after
-  the lock release creates a lost-wakeup window if the waiter checks `terminated` between
-  the release and the notify.
+- `task->poll()` runs without holding `m_mutex` so other workers can dequeue and remote
+  wakers can push to the injection queue concurrently.
+- `m_cv.notify_all()` on task completion is called **inside** `m_mutex` (via
+  `TaskStateBase::wait_until_done`). Calling it after the lock release creates a
+  lost-wakeup window.
 - `m_stop = true` is set **inside** `m_mutex` before `notify_all()` in the destructor,
   for the same reason.
 
@@ -559,8 +533,8 @@ Two thread-locals are set on each worker at startup:
 
 | Thread-local | Set by | Used by |
 |---|---|---|
-| `t_current_runtime` | Worker thread startup | `coro::spawn()`, `JoinSet::spawn()` |
-| `t_current_timer_service` | Worker thread startup | `coro::schedule_wakeup()` in `SleepFuture::poll()` |
+| `t_current_runtime` | Worker thread startup | `coro::spawn()`, `JoinSet::spawn()`, `spawn_blocking()` |
+| `t_current_io_service` | Worker thread startup | `SleepFuture::poll()`, any future that submits to `IoService` |
 
 ### Shutdown
 
@@ -572,113 +546,29 @@ The destructor:
 Outstanding tasks in `m_queue` and `m_suspended` are dropped when their `shared_ptr`s
 destruct.
 
-### Planned: per-worker local queues
-
-External wakes via `wake_task` are already safe — every code path holds `m_mutex`. The
-planned change is a performance optimization that also serves as the foundation for the
-work-stealing executor on the roadmap.
-
-Under the current design every wake, whether from the same worker or a remote thread,
-acquires the single global `m_mutex`. With many tasks and many workers this lock becomes
-a bottleneck.
-
-**New data model:**
-
-```
-Per-worker (thread-local):
-    m_local_queue[i] : WorkStealingDeque<shared_ptr<Task>>  ← see detail below
-
-Shared:
-    m_injection_queue : deque<shared_ptr<Task>>  ← remote enqueue() calls land here
-    m_mutex           : mutex                    ← guards m_injection_queue only
-    m_cv              : condition_variable
-```
-
-`m_suspended`, `m_self_woken`, and the `m_mutex` coverage of suspended/self-woken state
-are all removed. `m_suspended` is replaced by the `Idle` scheduling state — a task in
-`Idle` is kept alive solely by the `shared_ptr<Task>` inside its `Waker`. Self-wake is
-handled by the `Running → RunningAndNotified` CAS in `TaskWaker::wake()` with no shared
-data structure. `m_mutex` narrows to guard only `m_injection_queue`; each
-`WorkStealingDeque` manages its own internal mutex. When `WorkStealingDeque` is eventually
-replaced with a lock-free implementation, the `m_mutex` / `m_injection_queue` boundary is
-unchanged.
-
-`WorkStealingDeque` presents a Chase-Lev interface (`push`, `pop`, `steal`) backed by a
-per-instance `std::mutex` + `std::deque`. This keeps the interface stable for a future
-drop-in lock-free replacement.
-
-**Thread-local state (updated):**
-
-The original design used a single `t_worker_index` thread-local. This is insufficient
-when multiple `WorkSharingExecutor` instances exist simultaneously — worker thread 0 of
-executor A and worker thread 0 of executor B have the same index, so a cross-executor
-`enqueue()` call from A's worker would incorrectly push to B's local queue at index 0.
-The fix is two thread-locals:
-
-```cpp
-thread_local WorkSharingExecutor* t_owning_executor = nullptr;  // which executor owns this thread
-thread_local int                  t_worker_index    = -1;       // which slot within that executor
-```
-
-`enqueue()` checks both: `t_worker_index >= 0 && t_owning_executor == this`. Only when
-both match is the local (lock-free) path taken.
-
-**Updated enqueue routing:**
+### Enqueue routing
 
 `TaskWaker::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS.
-`enqueue` routes based on thread identity — no `m_suspended` lookup needed:
+Two thread-locals identify the calling worker:
+
+```cpp
+thread_local WorkSharingExecutor* t_owning_executor = nullptr;
+thread_local int                  t_worker_index    = -1;
+```
+
+`enqueue()` routes based on both — `t_owning_executor == this` ensures cross-executor
+calls always take the injection path:
 
 ```
 enqueue(task):
     if t_worker_index >= 0 AND t_owning_executor == this:
-        m_local_queue[t_worker_index].push(task)   // no lock
+        m_local_queues[t_worker_index].push(task)   // no lock
     else:
         lock(m_mutex)
         m_injection_queue.push_back(task)
         unlock(m_mutex)
         m_cv.notify_one()
 ```
-
-**Updated worker loop — local queue first:**
-
-```
-worker_loop():
-    set_current_runtime(m_runtime)
-    set_current_timer_service(&m_runtime->timer_service())
-
-    loop:
-        task = m_local_queue[this_worker].pop()   // no lock
-        if not task:
-            lock(m_mutex)
-            wait until: m_injection_queue non-empty OR m_stop
-            task = m_injection_queue.pop_front()
-            unlock(m_mutex)
-
-        expected = Notified
-        ASSERT CAS(expected → Running) succeeds, else log unexpected state and terminate
-        done = task->poll(ctx)
-
-        if done:
-            drop task
-        else:
-            // Try Running → Idle; if wake() fired concurrently state is RunningAndNotified
-            expected = Running
-            if CAS(expected → Idle) succeeds:
-                task.reset()   // waker holds the only ref; parks until wake() fires
-            else:
-                // State must be RunningAndNotified — assert and re-enqueue
-                expected = RunningAndNotified
-                ASSERT CAS(expected → Notified) succeeds, else log unexpected state and terminate
-                enqueue(task)  // re-enqueue via local path
-
-    set_current_runtime(nullptr)
-    set_current_timer_service(nullptr)
-```
-
-**Relationship to work-stealing:** the only additional step needed for a work-stealing
-executor is a steal path — when both the local queue and the injection queue are empty,
-attempt to take a task from the back of another worker's local queue. That change is
-isolated to the worker loop and does not affect wake routing.
 
 > **Note — task budget:** a worker that continuously receives local wakes will never
 > yield to check the injection queue, starving remote wakes. Tokio uses a per-turn budget

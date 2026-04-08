@@ -2,30 +2,15 @@
 
 ## Overview
 
-The library currently uses a `TimerService` — a dedicated background thread with a
-`std::priority_queue` of `(deadline, Waker)` pairs — as a temporary stand-in for real
-timer support. `SleepFuture::poll()` calls `schedule_wakeup(deadline, waker)` which
-posts to this queue. There is no I/O support yet.
+The library uses libuv as its I/O reactor. A dedicated `IoService` class owns a
+`uv_loop_t` and runs it on a background thread. Worker threads submit requests to it
+via a thread-safe queue, and libuv callbacks call `waker->wake()` when events fire,
+routing tasks back into the executor via the standard `enqueue()` injection path.
 
-The goal of libuv integration is to replace `TimerService` with a proper event loop and
-add async I/O primitives (`TcpStream`, `File`, DNS, etc.) that compose naturally with the
-rest of the library. The waker/context design already supports this — leaf futures call
-`ctx.getWaker()` and store it for an external callback to fire. Nothing about `Waker` or
-`Context` needs to change.
-
----
-
-## Goals
-
-- **Replace `TimerService`** with a libuv-backed I/O driver so timers are OS-precise
-  (epoll/kqueue) rather than busy-polled.
-- **Provide an `IoService` abstraction** that worker threads can reach via a thread-local,
-  analogous to the existing `schedule_wakeup()` / `set_current_timer_service()` API.
-- **Keep `Waker` / `Context` / `Executor` unchanged.** Only `SleepFuture` and `Runtime`
-  change on the consuming side.
-- **Lay the foundation for async I/O primitives** (`TcpStream`, `UdpSocket`, `File`, DNS)
-  that will be added in a follow-on phase (`include/coro/io/`).
-- **Correct shutdown ordering**: executor threads must join before the I/O loop closes.
+`IoService` backs `sleep_for()` / `SleepFuture` today and serves as the foundation for
+all async I/O primitives in `include/coro/io/` (`TcpStream`, `WsStream`, `WsListener`).
+`Waker`, `Context`, and `Executor` are unchanged — leaf futures call `ctx.getWaker()`,
+store it, and the I/O callback fires it when the event arrives.
 
 ---
 
@@ -123,9 +108,9 @@ void set_current_io_service(IoService* svc);
 IoService& current_io_service();
 ```
 
-The existing `set_current_timer_service` / `schedule_wakeup` free functions and
-`TimerService` class are **removed**. Their only caller (`SleepFuture::poll`) is updated
-to use `current_io_service().submit(StartTimer{...})` instead.
+The `TimerService` class and `set_current_timer_service` / `schedule_wakeup` free
+functions that were used in earlier iterations have been removed. `SleepFuture::poll()`
+now calls `current_io_service().submit(StartRequest{...})` directly.
 
 ---
 
@@ -379,127 +364,68 @@ than a conditional check in the destructor and eliminates the TOCTOU window that
 
 ---
 
-## Relationship to Existing Abstractions
+## Relationship to other abstractions
 
-| Abstraction | Change |
+| Abstraction | Notes |
 |---|---|
-| `Waker` / `Context` | None |
-| `Executor::enqueue()` | None |
-| `SleepFuture::poll()` | Replaces `schedule_wakeup()` with `IoService::submit(StartTimer{...})`; adds `~SleepFuture` for cancellation |
-| `TimerService` | **Removed** — replaced by `IoService` |
-| `set_current_timer_service` / `schedule_wakeup` | **Removed** — replaced by `set_current_io_service` / `current_io_service()` |
-| `Runtime` | Replaces `m_timer_service` with `m_io_service`; calls `set_current_io_service` in `block_on` and worker thread startup |
+| `Waker` / `Context` | Unchanged |
+| `Executor::enqueue()` | Unchanged — I/O callbacks wake tasks via the normal injection path |
+| `SleepFuture` | Submits `StartRequest`/`CancelRequest` to `IoService`; destructor submits cancel |
+| `Runtime` | Owns `m_io_service`; calls `set_current_io_service` in `block_on` and worker thread startup |
 | All combinators, `spawn`, `JoinHandle` | Unchanged |
 
 ---
 
-## I/O Primitives (Follow-on Phase)
+## I/O Primitives
 
-Once the event loop is wired in, `include/coro/io/` gets async wrappers for libuv
-handles. Each wraps the corresponding `uv_handle_t`, stores a `Waker` in the libuv
-callback data, and calls `wake()` when the operation completes. From the user's
-perspective these are ordinary `Future`s and `Stream`s:
+`include/coro/io/` contains async wrappers built on `IoService`. Each follows the same
+pattern as `SleepFuture`: allocate a handle state struct, submit an `IoRequest`, store the
+`Waker`, and cancel in the destructor if the operation has not yet completed.
 
-```cpp
-coro::Coro<void> run() {
-    auto listener = co_await coro::TcpListener::bind("0.0.0.0", 8080);
-    while (auto conn = co_await coro::next(listener)) {
-        coro::spawn(handle_connection(std::move(*conn))).submit().detach();
-    }
-}
-```
+**Implemented:**
+- **`TcpStream`** — async TCP connection; `connect()`, `read()`, `write()`
+- **`WsStream`** — async WebSocket client; `connect()`, `send()`, `receive()`
+- **`WsListener`** — async WebSocket server; `bind()`, `accept()`
 
-Each I/O operation follows the same pattern as the timer: allocate a handle state struct,
-submit an `IoRequest` variant, store the `Waker`, and cancel in the destructor if the
-operation has not yet completed.
-
-Planned primitives (see `roadmap.md` for full details):
-
-- **`TcpListener` / `TcpStream`** — accept connections, read/write with backpressure
-- **`UdpSocket`** — async send/recv
-- **`File`** — async read/write via libuv's thread-pool file I/O
-- **DNS resolution** — `resolve(hostname)` returning `Future<IpAddress>`
-
-All live in `include/coro/io/`.
+**Planned** (see `roadmap.md`):
+- `TcpListener` — async TCP accept loop
+- `UdpSocket` — async send/recv
+- `File` — async read/write via libuv's thread-pool file I/O
+- DNS resolution
 
 ---
 
-## Race Conditions and Implementation Hazards
+## Race Conditions
 
-All known concurrency concerns are listed here so they are not overlooked during Phase 2
-and 3. **RESOLVED** items are handled by the design above. **CAUTION** items require care
-during implementation.
+Known concurrency concerns and how they are resolved:
 
-### RESOLVED — `TimerState::waker` concurrent read/write
-Worker thread writes `waker` on re-poll; I/O thread reads it in `timer_cb`. Resolved by
-`std::atomic<std::shared_ptr<Waker>>` in `TimerState`.
+**`State::waker` concurrent read/write** — worker thread writes `waker` on re-poll; I/O
+thread reads it in `timer_cb`. Resolved by `std::atomic<std::shared_ptr<Waker>>` in `State`.
 
-### RESOLVED — Double-close of `uv_timer_t`
-`timer_cb` and `CancelTimer::execute()` race to call `uv_close`. Resolved by
-`fired.exchange(true)` — the first caller owns the close, the other is a no-op.
+**Double-close of `uv_timer_t`** — `timer_cb` and `CancelRequest::execute()` both call
+`uv_close`. Resolved by `fired.exchange(true)` — the first caller owns the close, the other
+is a safe no-op.
 
-### RESOLVED — `TimerState` freed before `CancelTimer` executes
-If `SleepFuture` is destroyed before the I/O thread processes `CancelTimer`, the state
-must remain alive. Resolved by `CancelTimer` holding `shared_ptr<TimerState>`.
+**`State` freed before `CancelRequest` executes** — if `SleepFuture` is destroyed before
+the I/O thread processes `CancelRequest`, the state must remain alive. Resolved by
+`CancelRequest` holding `shared_ptr<State>`.
 
-### RESOLVED — `m_stopping` read without the lock
-`io_async_cb` reads `m_stopping` after releasing `m_io_queue_mutex`, while `stop()` writes
-it under the lock — a data race. Resolved by making `m_stopping` `std::atomic<bool>`.
+**`m_stopping` read/write race** — `io_async_cb` reads `m_stopping` outside the lock while
+`stop()` writes it. Resolved by `std::atomic<bool> m_stopping`.
 
-### CAUTION — `StartTimer` holds a raw `TimerState*`
-`StartTimer::execute()` accesses `state` via a raw pointer. This is safe because either:
-(a) `SleepFuture` is still alive and holds the `shared_ptr`, or (b) `SleepFuture` was
-destroyed and `CancelTimer` (holding the `shared_ptr`) is behind `StartTimer` in the same
-FIFO queue, keeping `TimerState` alive until after `StartTimer::execute()` returns.
-This relies on the queue being strictly FIFO and both requests being processed in the same
-`process_queue()` drain. Verify this holds during implementation — if the queue is ever
-reordered or split, this breaks.
+**`State` is not standard-layout** — `State` contains `std::atomic<std::shared_ptr<>>`,
+making first-field pointer casts UB. Resolved by storing a heap-allocated
+`shared_ptr<State>` wrapper in `handle->data` and recovering it in callbacks via
+`static_cast<std::shared_ptr<State>*>(handle->data)`. `close_cb` deletes the wrapper,
+decrementing the ref count.
 
-### CAUTION — `TimerState` is not standard-layout; do not use a first-field pointer cast
-`TimerState` contains `std::atomic<std::shared_ptr<>>`, which makes it non-standard-layout.
-Casting `uv_timer_t*` → `TimerState*` via a first-field pointer assumption is therefore
-undefined behaviour. Instead, store a raw `TimerState*` explicitly in `handle->data` inside
-`StartTimer::execute()` (immediately after `uv_timer_init`, before `uv_timer_start`), and
-recover it in `timer_cb` and `close_cb` via `static_cast<TimerState*>(handle->data)`.
+**`uv_async_send` after `uv_close(&m_async)`** — calling `submit()` after shutdown is UB.
+Prevented by the shutdown ordering: executor joins (no more `wake()` calls) before
+`IoService::stop()` is called.
 
-### CAUTION — `close_cb` must release `handle->data` or `TimerState` leaks
-`close_cb` is the only place the raw `TimerState*` stored in `handle->data` can be
-released back to the `shared_ptr`. If `close_cb` does not do this, the `shared_ptr`
-reference count never reaches zero and `TimerState` leaks. The implementation must be:
-```cpp
-void close_cb(uv_handle_t* handle) {
-    delete static_cast<TimerState*>(handle->data);
-}
-```
-
-### CAUTION — `set_current_io_service` must be called on every worker thread
-Every executor worker thread must call `set_current_io_service(&m_io_service)` at startup,
-just as they currently call `set_current_timer_service`. If a worker thread is added in the
-future without this call, any `SleepFuture` polled on that thread will throw from
-`current_io_service()`. Audit all executor worker thread startup paths during implementation.
-
-### CAUTION — Waker lifetime if task is cancelled before the timer fires
-`timer_cb` loads `state->waker` and calls `waker->wake()`. `Waker` is `shared_ptr`-managed
-so the reference count keeps it alive as long as `TimerState` holds it. The risk is if the
-executor destroys a task's `Waker` before the timer fires — e.g. a cancelled task that has
-been fully drained before the I/O thread processes its pending timer. Verify that the
-cancellation path (PollDropped drain) waits for the `CancelTimer` to be acknowledged before
-releasing the task's waker, or that `TimerState::waker` holding a `shared_ptr` is
-sufficient to keep it alive until `timer_cb` runs.
-
-### CAUTION — `uv_async_send` after `uv_close(&m_async)`
-Once `io_async_cb` calls `uv_close(&m_async)` during shutdown, any subsequent
-`uv_async_send(&m_async)` is UB. This is prevented by the shutdown ordering (executor
-joins before `stop()` is called), but any future code path that calls `submit()` outside
-of an executor worker thread must be audited against this constraint.
-
-### CAUTION — Stray in-flight handles at `uv_loop_close` time
-If any `uv_timer_t` handles are still open when `uv_loop_close` is called (e.g. a
-`CancelTimer` arrived after the final `process_queue()` drain), `uv_loop_close` returns
-`UV_EBUSY`. The design handles this by re-running `uv_run`. Ensure the re-run loop
-terminates: it should, because all remaining handles will close in that iteration. If
-somehow a close callback opens a new handle, the loop will never exit. Do not open new
-handles from close callbacks during shutdown.
+**Stray in-flight handles at `uv_loop_close` time** — if cancellation requests arrive
+after the final `process_queue()` drain, `uv_loop_close` returns `UV_EBUSY`. Handled by
+re-running `uv_run` one more time to flush remaining close callbacks.
 
 ---
 

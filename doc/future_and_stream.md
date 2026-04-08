@@ -2,125 +2,158 @@
 
 ## Overview
 
-Future and Stream are the foundation for polling the readiness of an asynchronous operation. They follow
-as close as possible the Future and Stream traits un Rust, but are instead implemented as C++ concepts
-
-## Requirements
-
-- Should follow as close as possible the interface of Rust's Future and Stream traits
-- Should be C++ concepts defining an interface and not require inheritence from a base class
-- A `PollResult<T>` template class similar to Rust's used to return the state of the future or stream
-     - Should be similar to std::optional and may even privatly inherit from it (though it doesn't have to)
-     - Conversion to/from std::optional should be explicit if it's allowed at all
-     - Unlike std::optional needs to handle void as the template types
-- Future class F requires a type F::OutputType defining the result type of the future
-- Main poll operation `PollResult<F::OutputType> f.poll(Context &ctx)`
-- Must properly handle exceptions thrown by `poll` (i.e. catch and save the exception in the `PollResult`)
-- Stream class S requires a type `S::ItemType` defining the element type of the stream
-- Main poll operation `PollResult<std::optional<S::ItemType>> s.poll_next(Context &ctx)`
-     - `Ready(some(T))` — next item is available
-     - `Ready(nullopt)` — stream is exhausted (no more items)
-     - `Pending` — no item ready yet, waker registered for later wake-up
-     - `Error` — stream faulted; exception captured in `PollResult`
-- A `.next()` helper adapts a `Stream` into a `Future<std::optional<T>>` so it can be `co_await`ed in a loop
+`Future` and `Stream` are the two foundational concepts of the library, mirroring Rust's
+`Future` and `Stream` traits. They are C++20 **concepts** — structural interfaces enforced
+at compile time — rather than base classes. Any type that satisfies the concept can be
+`co_await`ed or iterated without inheriting from anything.
 
 ## Future
 
-### Interface example
+A `Future<T>` represents a single asynchronous value of type `T`. It is driven to completion
+by the executor calling `poll()` repeatedly until the result is ready.
+
+### Concept requirements
 
 ```cpp
-template<typename T>
-class OneshotFuture
-{
-public:
-     using OutputType = T;
-     PollResult<T> poll(Context &ctx)
-     {
-          std::unique_lock lk(m_mutex);
-          if (m_value.has_value()) {
-               return std::move(m_value).value();
-          }
-          if (nullptr != m_except) {
-               return PollError(std::exchange(m_except, nullptr));
-          }
-          m_waker = ctx.getWaker();
-          return PollPending;
-     }
-     void set(T x)
-     {
-          std::unique_lock(m_mutex);
-          m_value.emplace(std::move(x));
-          if (nullptr != m_waker) {
-               std::exchange(m_waker, nullptr)->wake();
-          }
-     }
-     bool setError(std::exception_ptr e)
-     {
-          std::unique_lock(m_mutex);
-          m_error = PollError(e);
-          if (nullptr != m_waker) {
-               std::exchange(m_waker, nullptr)->wake();
-          }
-     }
-private:
-     std::mutex m_mutex;
-     std::optional<T> m_value;
-     std::exception_ptr m_except;
-     std::shared_ptr<Waker> m_waker;
+template<typename F>
+concept Future = requires(F f, detail::Context& ctx) {
+    typename F::OutputType;
+    { f.poll(ctx) } -> std::same_as<PollResult<typename F::OutputType>>;
 };
 ```
 
-### Usage Example
+- `F::OutputType` — the type produced on successful completion (`void` is allowed).
+- `poll(ctx)` — advances the future. Returns one of the `PollResult` states described below.
+  The future registers a waker via `ctx.getWaker()` when it returns `Pending` so the executor
+  knows to re-poll it later.
+
+### PollResult states
+
+`PollResult<T>` carries one of four states:
+
+| State | Meaning |
+|---|---|
+| `Pending` | Not ready. The waker from `ctx` has been stored; the executor will re-poll when it fires. |
+| `Ready(T)` | Completed successfully. The value is accessible via `.value()`. |
+| `Error` | Faulted. An exception was captured; accessible via `.error()` / `.rethrowIfError()`. |
+| `Dropped` | Cancelled and fully drained. Propagates upward through the coroutine stack. |
+
+Construct return values with the corresponding helpers:
 
 ```cpp
-Oneshot<int> value;
-
-Coroutine<void> foo()
-{
-     ...
-     try {
-          int value = co_await value;
-          std::cout << "bar sent value = " << v << "\n";
-     } catch (std::exception const &e) {
-          std::cerr << "bar threw exception " << e.what() << "\n";
-     }
-     ...
-}
-
-Coroutine<void> bar()
-{
-     ...
-     value.set(3);
-     // or 
-     try (
-          ...
-     ) catch (...) {
-          value.setError(std::current_exception());
-     }
-     ...
-}
+return PollPending;           // Pending
+return some_value;            // Ready — implicit conversion from T
+return PollError(eptr);       // Error — wraps a std::exception_ptr
+return PollDropped;           // Dropped
 ```
-## Stream
 
-A `Stream` is an asynchronous sequence of values, analogous to an async iterator. It mirrors
-Rust's `Stream` trait. Unlike a `Future` which resolves once, a `Stream` yields zero or more
-items before signaling exhaustion.
+### Writing a custom Future
 
-### Interface example
+The canonical pattern: check for a result, return it if ready, otherwise store the waker
+and return `Pending`. All shared state must be protected under a mutex.
 
 ```cpp
 template<typename T>
-class ChannelStream
-{
+class OneshotFuture {
+public:
+    using OutputType = T;
+
+    PollResult<T> poll(detail::Context& ctx) {
+        std::lock_guard lock(m_mutex);
+        if (m_result.has_value()) {
+            auto result = std::move(*m_result);
+            if (result.has_value())
+                return std::move(result.value());
+            else
+                return PollError(result.error());
+        }
+        m_waker = ctx.getWaker();
+        return PollPending;
+    }
+
+    void set(T value) {
+        std::shared_ptr<detail::Waker> w;
+        {
+            std::lock_guard lock(m_mutex);
+            m_result.emplace(std::move(value));
+            w = m_waker;
+        }
+        if (w) w->wake();
+    }
+
+    void set_error(std::exception_ptr e) {
+        std::shared_ptr<detail::Waker> w;
+        {
+            std::lock_guard lock(m_mutex);
+            m_result.emplace(std::unexpected(std::move(e)));
+            w = m_waker;
+        }
+        if (w) w->wake();
+    }
+
+private:
+    std::mutex m_mutex;
+    std::optional<std::expected<T, std::exception_ptr>> m_result;
+    std::shared_ptr<detail::Waker> m_waker;
+};
+```
+
+Notes:
+- The waker is read and cleared under the lock — this prevents a missed-wakeup race where
+  `set()` reads a null waker just before `poll()` stores a new one.
+- If the waker may be stored across threads (e.g. an I/O callback on the libuv thread),
+  use `std::atomic<std::shared_ptr<detail::Waker>>` instead.
+
+### Usage
+
+`co_await` drives the future automatically. Exceptions propagate as normal C++ exceptions:
+
+```cpp
+coro::Coro<void> example(OneshotFuture<int>& f) {
+    try {
+        int value = co_await f;
+        std::cout << "received: " << value << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << "\n";
+    }
+}
+```
+
+## Stream
+
+A `Stream<T>` is an asynchronous sequence of values, analogous to an async iterator. It
+yields zero or more items and then signals exhaustion. This mirrors Rust's `Stream` trait.
+
+### Concept requirements
+
+```cpp
+template<typename S>
+concept Stream = requires(S s, detail::Context& ctx) {
+    typename S::ItemType;
+    { s.poll_next(ctx) } -> std::same_as<PollResult<std::optional<typename S::ItemType>>>;
+};
+```
+
+- `S::ItemType` — the element type of the stream.
+- `poll_next(ctx)` — advances the stream by one item. Returns:
+  - `Ready(some(T))` — next item is available
+  - `Ready(nullopt)` — stream is exhausted (no more items will follow)
+  - `Pending` — no item ready yet; waker registered for later wake-up
+  - `Error` — stream faulted; exception captured in the `PollResult`
+  - `Dropped` — stream was cancelled
+
+### Writing a custom Stream
+
+```cpp
+template<typename T>
+class ChannelStream {
 public:
     using ItemType = T;
 
-    // Returns Ready(some(T)) for the next item, Ready(nullopt) when exhausted, or Pending
-    PollResult<std::optional<T>> poll_next(Context &ctx)
-    {
-        std::unique_lock lk(m_mutex);
-        if (m_except) {
-            return PollError(std::exchange(m_except, nullptr));
+    PollResult<std::optional<T>> poll_next(detail::Context& ctx) {
+        std::lock_guard lock(m_mutex);
+        if (m_error) {
+            return PollError(std::exchange(m_error, nullptr));
         }
         if (!m_queue.empty()) {
             T value = std::move(m_queue.front());
@@ -128,151 +161,80 @@ public:
             return std::optional<T>(std::move(value));
         }
         if (m_closed) {
-            return std::optional<T>(std::nullopt); // stream exhausted
+            return std::optional<T>(std::nullopt);  // exhausted
         }
         m_waker = ctx.getWaker();
         return PollPending;
     }
 
-    void send(T value)
-    {
-        std::unique_lock lk(m_mutex);
-        m_queue.push(std::move(value));
-        if (m_waker) {
-            std::exchange(m_waker, nullptr)->wake();
+    void send(T value) {
+        std::shared_ptr<detail::Waker> w;
+        {
+            std::lock_guard lock(m_mutex);
+            m_queue.push(std::move(value));
+            w = m_waker;
         }
+        if (w) w->wake();
     }
 
-    void close()
-    {
-        std::unique_lock lk(m_mutex);
-        m_closed = true;
-        if (m_waker) {
-            std::exchange(m_waker, nullptr)->wake();
+    void close() {
+        std::shared_ptr<detail::Waker> w;
+        {
+            std::lock_guard lock(m_mutex);
+            m_closed = true;
+            w = m_waker;
         }
-    }
-
-    void setError(std::exception_ptr e)
-    {
-        std::unique_lock lk(m_mutex);
-        m_except = e;
-        m_closed = true;
-        if (m_waker) {
-            std::exchange(m_waker, nullptr)->wake();
-        }
+        if (w) w->wake();
     }
 
 private:
     std::mutex m_mutex;
     std::queue<T> m_queue;
-    std::exception_ptr m_except;
-    std::shared_ptr<Waker> m_waker;
+    std::exception_ptr m_error;
+    std::shared_ptr<detail::Waker> m_waker;
     bool m_closed = false;
 };
 ```
 
-### Usage Example
+### Usage
 
-`poll_next` would not typically be called directly. Instead a `.next()` helper wraps `poll_next`
-into a `Future<std::optional<T>>`, which can be `co_await`ed in a loop:
+`poll_next` is not called directly. The `next()` helper wraps a `Stream` into a
+`Future<std::optional<T>>` that can be `co_await`ed in a loop:
 
 ```cpp
-ChannelStream<int> stream;
-
-Coroutine<void> consumer()
-{
-    ...
+coro::Coro<void> consumer(ChannelStream<int>& stream) {
     try {
-        while (auto item = co_await stream.next()) {
+        while (auto item = co_await coro::next(stream)) {
             std::cout << "received: " << *item << "\n";
         }
         // Ready(nullopt) — stream exhausted normally
-    } catch (std::exception const &e) {
+    } catch (const std::exception& e) {
         std::cerr << "stream error: " << e.what() << "\n";
     }
-    ...
-}
-
-Coroutine<void> producer()
-{
-    ...
-    stream.send(1);
-    stream.send(2);
-    stream.send(3);
-    stream.close();
-    ...
 }
 ```
 
-## Design Considerations
+## Design notes
 
-### Waker and Context separation
+### Context and Waker are separate types
 
-`Context` and `Waker` are kept as separate types for lifetime reasons. Futures that register
-callbacks (e.g. with libuv) need to *store* the waker so the I/O reactor can call `wake()` later,
-after `poll` has returned. `Context` is ephemeral — it lives on the call stack only for the
-duration of `poll` — so a future cannot safely hold a pointer to it beyond that call.
+`Context` is ephemeral — it lives on the call stack only for the duration of `poll()`.
+Futures that need to wake the executor after `poll()` returns (e.g. from an I/O callback)
+must extract and store the `Waker` via `ctx.getWaker()`. They cannot hold a pointer to
+`Context` itself.
 
-**Design:**
-- `Waker` is an abstract base class with `virtual void wake()` and `virtual shared_ptr<Waker> clone()`
-- `Context` holds a `shared_ptr<Waker>` plus any other per-poll state
-- Concrete executor contexts may subclass `Context` to add extra fields
-- Futures store a `shared_ptr<Waker>` when they need to defer waking (e.g. after async I/O)
+`Waker` is an abstract base with `virtual void wake()` and `virtual shared_ptr<Waker> clone()`.
+The executor provides a concrete implementation. Futures store a `shared_ptr<Waker>`.
 
-### PollResult states
+### Spurious wakes
 
-`PollResult<T>` has three states:
-- `Pending` — the future is not yet ready
-- `Ready(T)` — the future completed with a value (supports `void`)
-- `Error` — the future threw an exception; the exception is captured and can be re-thrown later
+The poll contract explicitly allows futures to call `waker->wake()` even when they are not
+yet ready. Executors must tolerate this by simply re-polling: a future that returns `Pending`
+again is always correct, though potentially wasteful.
 
-### Spurious wakes and co_await correctness
-
-The poll contract (inherited from Rust) explicitly allows futures to fire their waker even when
-they are not yet ready — a *spurious wake*. Executors must tolerate this: re-polling a future
-that returns `Pending` again is always correct, though potentially wasteful.
-
-Coroutines introduce a subtle asymmetry that makes spurious wakes dangerous if not handled
-explicitly. In Rust, the compiler lowers `expr.await` into a `loop { match poll(...) { Pending
-=> return Pending, Ready(v) => break v } }` — each time the outer future is polled, the inner
-future is polled from the top of that loop. In C++20, `co_await` is lowered differently:
-`await_ready` / `await_suspend` execute once at the suspension point; when the coroutine is
-later **resumed**, control jumps directly to `await_resume`. There is no automatic re-poll of
-the inner future on resume.
-
-**The failure mode:** without a guard, a spurious wake causes the executor to call
-`handle.resume()` on the outer coroutine, which lands in `FutureAwaitable::await_resume()`.
-If the inner future is still `Pending`, `await_resume()` has no valid value to return — calling
-`.value()` on a `Pending` `PollResult` is undefined behaviour, and the coroutine continues past
-the `co_await` with garbage data.
-
-**The fix — `m_poll_current` hook:** a `std::function<bool()>` field on the promise acts as a
-re-poll gate. `FutureAwaitable::await_suspend()` stores a lambda there that re-polls the inner
-future using the promise's current `Context*`. `Coro<T>::poll()` and `CoroStream::poll_next()`
-check this hook *before* calling `handle.resume()`:
-
-```
-Coro::poll(ctx):
-    promise.m_ctx = &ctx          // update Context for current tick
-
-    if m_poll_current:
-        if not m_poll_current():  // re-poll with fresh context
-            return Pending        // still not ready — absorb the spurious wake
-        m_poll_current = null     // ready — clear hook before resuming
-
-    handle.resume()               // safe: inner future is confirmed non-Pending
-    ...
-```
-
-Key properties of this design:
-
-- **No spurious resumes.** The coroutine is only resumed when the inner future is confirmed
-  non-Pending. `await_resume()` can always call `.value()` safely.
-- **Waker re-registration.** Each call to `m_poll_current()` passes the fresh `Context`,
-  so the inner future re-registers the waker for the current executor tick.
-- **Yield points are unaffected.** `m_poll_current` is only set by `await_suspend()`, which
-  is not called on `co_yield`. When the coroutine is suspended at a yield point, the hook is
-  null and `poll_next()` resumes directly.
-- **Cleared on each new `co_await`.** `await_transform()` sets `m_poll_current = nullptr`
-  before returning the new `FutureAwaitable`, so a stale hook from a previous suspension can
-  never interfere with a subsequent one.
+C++20 coroutines require special handling here. When a coroutine is resumed after a spurious
+wake, `await_resume()` would be called on a future that is still `Pending` — calling `.value()`
+on a `Pending` `PollResult` is undefined behaviour. The library handles this with an
+`m_poll_current` hook on the promise: before resuming the coroutine, `Coro<T>::poll()` re-polls
+the inner future. If it is still `Pending`, the resume is suppressed and `Pending` is returned
+to the executor instead. See [task_and_executor.md](task_and_executor.md) for details.

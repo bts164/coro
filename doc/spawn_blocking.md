@@ -26,19 +26,19 @@ scheduled on that thread. Without `spawn_blocking`, users must either:
 
 ---
 
-## Requirements
+## Behaviour
 
-- Accept any `std::invocable` callable with no arguments returning `T`.
-- Return a `BlockingHandle<T>` — a `Future<T>` that resolves when the callable returns.
+- Accepts any `std::invocable` callable with no arguments returning `T`.
+- Returns a `BlockingHandle<T>` — a `Future<T>` that resolves when the callable returns.
 - The calling coroutine suspends immediately; the executor worker is freed.
 - The callable runs on a **separate blocking thread pool** — never on an executor worker.
 - The pool is owned by `Runtime` and torn down when the runtime is destroyed.
-- `co_await`ing the handle after the callable has already finished must not block.
+- `co_await`ing the handle after the callable has already finished returns immediately.
 - If the handle is dropped before the callable returns, the callable still runs to
   completion (fire-and-forget semantics — the result is simply discarded).
 - Exceptions thrown by the callable are captured and re-thrown when the handle is awaited.
-- The callable may call `spawn_blocking` recursively (thread-pool re-entrancy is safe
-  because blocking pool threads are not executor threads and may block freely).
+- The callable may call `spawn_blocking` recursively — blocking pool threads are not
+  executor threads and may block freely.
 
 ---
 
@@ -268,12 +268,9 @@ Edge cases:
 ## Header layout
 
 ```
-include/coro/task/spawn_blocking.h   — BlockingHandle<T>, spawn_blocking() declaration
+include/coro/task/spawn_blocking.h   — BlockingHandle<T>, BlockingPool, spawn_blocking()
 src/blocking_pool.cpp                — BlockingPool implementation
 ```
-
-`BlockingPool` is an internal type; its header lives in `include/coro/runtime/` or as a
-private detail in `src/`.
 
 ---
 
@@ -456,7 +453,6 @@ call site rather than hidden behind a convenience wrapper.
 | libuv thread pool (`uv_queue_work`) | Reuses existing pool | Pool is shared with libuv internals; size capped at `UV_THREADPOOL_SIZE` (default 4) |
 | `co_await` blocking future inline | None | Blocks an executor worker — should never be done |
 
-The libuv thread pool is a viable implementation substrate for an initial version given
-it is already present in the dependency graph. Its size cap (default 4, max 128 via env
-var `UV_THREADPOOL_SIZE`) is a significant limitation for general-purpose blocking work,
-so a dedicated pool remains the preferred long-term design.
+The libuv thread pool (`uv_queue_work`) was considered but rejected: its default size cap
+of 4 threads (max 128 via `UV_THREADPOOL_SIZE`) is too restrictive for general-purpose
+blocking work, and sharing it with libuv internals creates unpredictable contention.

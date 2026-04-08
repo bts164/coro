@@ -84,7 +84,7 @@ coroutine. Awaiting the handle waits for completion and retrieves the result. Dr
 handle without awaiting it cancels the task.
 
 ```cpp
-JoinHandle<int> handle = coro::spawn(compute(42));
+auto handle = coro::spawn(compute(42)).submit();
 // ... do other work while compute() runs in the background
 int result = co_await handle;
 ```
@@ -127,6 +127,8 @@ auto winner = co_await coro::select(fetch("url1"), fetch("url2"));
 - **`select()`** — race futures; return the result of whichever completes first.
 - **`timeout()`** — race any future against a deadline.
 - **`sleep_for()`** — suspend a coroutine for a duration without blocking a thread.
+- **Channels** — `oneshot`, `mpsc`, and `watch` channels for inter-task communication.
+- **`spawn_blocking()`** — run blocking code on a dedicated thread pool without starving the executor.
 - **Multi-threaded work-stealing executor** — tasks are distributed across worker threads
   automatically; idle workers steal from busy workers before parking.
 
@@ -185,5 +187,4 @@ int main() {
 ## Where to go next
 
 - [Getting Started](getting_started.md) — step-by-step guide with examples for all major features.
-- [API Reference](coro/classes.md) — generated documentation for all public types.
 - [Internal Design Details](task_and_executor.md) — architecture and design documents.

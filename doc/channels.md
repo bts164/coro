@@ -1,6 +1,6 @@
 # Channels
 
-Async channels for inter-task communication. Three variants are planned; `broadcast` is
+Async channels for inter-task communication. Three variants are implemented; `broadcast` is
 deferred.
 
 | Variant | Producers | Consumers | Buffering |
@@ -9,13 +9,8 @@ deferred.
 | `mpsc` | N (cloneable sender) | 1 | bounded ring buffer |
 | `watch` | 1 | N (cloneable receiver) | 1 — last value only |
 
-All three live under `include/coro/sync/`. The interface and internal design should follow
+All three live under `include/coro/sync/`. The interface and internal design follows
 Tokio's implementation as closely as C++ allows.
-
-The library targets **C++23** for now. `std::expected<T, E>` is used for fallible
-operations instead of exceptions or `std::optional`. A future compatibility shim
-(`tl::expected` or a hand-rolled equivalent) will make this C++20-compatible — see the
-roadmap.
 
 ---
 
@@ -363,7 +358,7 @@ if (auto r = tx.send(42); !r)
 
 // Receiver:
 co_await rx.changed();        // suspends until a new value has been sent
-int current = rx.borrow();    // read current value (under a read lock)
+int current = *rx.borrow();   // read current value (shared lock released after this line)
 auto rx2 = rx.clone();        // independent cursor for another task
 ```
 
