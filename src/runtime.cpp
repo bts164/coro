@@ -9,7 +9,9 @@ namespace {
     thread_local Runtime* t_current_runtime = nullptr;
 } // namespace
 
-Runtime::Runtime(std::size_t num_threads) {
+Runtime::Runtime(std::size_t num_threads)
+    : m_blocking_pool(this)
+{
     if (num_threads <= 1)
         m_executor = std::make_unique<SingleThreadedExecutor>();
     else

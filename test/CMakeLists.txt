@@ -22,6 +22,7 @@ set(TEST_TARGETS
     test_oneshot
     test_mpsc
     test_watch
+    test_spawn_blocking
 )
 
 foreach(t ${TEST_TARGETS})

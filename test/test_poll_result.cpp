@@ -134,3 +134,52 @@ TEST(PollResultOptionalTest, DroppedState) {
     EXPECT_FALSE(r.isPending());
     EXPECT_FALSE(r.isReady());
 }
+
+// --- PollResult<std::exception_ptr> — T == error carrier type ---
+//
+// When T = std::exception_ptr, the old variant<PendingTag, T, exception_ptr, DroppedTag>
+// was ill-formed (duplicate types). These tests verify all four states work correctly.
+
+TEST(PollResultExceptionPtrTest, ReadyState) {
+    auto value_eptr = std::make_exception_ptr(std::runtime_error("value"));
+    PollResult<std::exception_ptr> r = value_eptr;
+    EXPECT_TRUE(r.isReady());
+    EXPECT_FALSE(r.isError());
+    EXPECT_FALSE(r.isPending());
+    EXPECT_EQ(r.value(), value_eptr);
+}
+
+TEST(PollResultExceptionPtrTest, ErrorState) {
+    auto error_eptr = std::make_exception_ptr(std::runtime_error("error"));
+    PollResult<std::exception_ptr> r = PollError(error_eptr);
+    EXPECT_TRUE(r.isError());
+    EXPECT_FALSE(r.isReady());
+    EXPECT_EQ(r.error(), error_eptr);
+}
+
+TEST(PollResultExceptionPtrTest, ReadyAndErrorAreDistinct) {
+    auto value_eptr = std::make_exception_ptr(std::runtime_error("value"));
+    auto error_eptr = std::make_exception_ptr(std::runtime_error("error"));
+    PollResult<std::exception_ptr> ready = value_eptr;
+    PollResult<std::exception_ptr> err   = PollError(error_eptr);
+    EXPECT_TRUE(ready.isReady());
+    EXPECT_FALSE(ready.isError());
+    EXPECT_TRUE(err.isError());
+    EXPECT_FALSE(err.isReady());
+    EXPECT_EQ(ready.value(), value_eptr);
+    EXPECT_EQ(err.error(), error_eptr);
+}
+
+TEST(PollResultExceptionPtrTest, PendingState) {
+    PollResult<std::exception_ptr> r = PollPending;
+    EXPECT_TRUE(r.isPending());
+    EXPECT_FALSE(r.isReady());
+    EXPECT_FALSE(r.isError());
+}
+
+TEST(PollResultExceptionPtrTest, DroppedState) {
+    PollResult<std::exception_ptr> r = PollDropped;
+    EXPECT_TRUE(r.isDropped());
+    EXPECT_FALSE(r.isReady());
+    EXPECT_FALSE(r.isError());
+}

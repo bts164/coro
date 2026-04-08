@@ -107,7 +107,7 @@ TEST(SleepFutureTest, PollReadyWhenDeadlinePassed) {
     IoService svc;
     set_current_io_service(&svc);
 
-    SleepFuture f(std::chrono::nanoseconds(-1));  // deadline in the past
+    SleepFuture f(std::chrono::milliseconds(-10));  // deadline clearly in the past after ms rounding
     auto waker = std::make_shared<MockWaker>();
     detail::Context ctx(waker);
     auto result = f.poll(ctx);

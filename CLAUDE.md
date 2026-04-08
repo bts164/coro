@@ -65,6 +65,24 @@ Use `Synchronize` instead when child tasks need to reference data owned by the p
 coroutines inherently act like a Synchronize scope eliminating the user from having to explicitly
 use `Synchronize`
 
+### Prefer mutexes over atomics
+
+Prefer `std::mutex` over `std::atomic` for synchronizing shared state between threads.
+Atomics are easy to get subtly wrong — missed-wakeup races, incorrect ordering
+annotations, and forgotten re-checks after storing a value are common failure modes that
+are hard to spot in review. A mutex makes the critical section explicit and the protocol
+obvious. This follows the same guidance in the Google C++ Style Guide: use atomics only
+when profiling demonstrates a real performance need and you can justify the added
+complexity. Low-level executor scheduling state (e.g. `SchedulingState` CAS transitions)
+is a justified exception — everything else should default to a mutex.
+
+### Prefer Mermaid diagrams over ASCII art
+
+Use Mermaid (`\`\`\`mermaid`) for diagrams in documentation. Mermaid is preferred for
+sequence diagrams, state machines, flowcharts, and class diagrams. Fall back to ASCII
+only when no Mermaid chart type fits naturally and ASCII would produce a simpler or
+clearer result.
+
 ### [[nodiscard]] on Future-returning functions
 
 All functions that return a `Future`, `Stream`, `JoinHandle`, `StreamHandle`, or builder

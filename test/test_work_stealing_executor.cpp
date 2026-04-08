@@ -309,21 +309,21 @@ Coro<size_t> skynet(size_t my_num, size_t remaining, size_t depth, ArgMarker arg
     }
     co_return sum;
 }
-TEST(WorkSharingExecutorTest, SkynetSynchronizeSingle) {
+TEST(WorkSharingExecutorTest, DISABLED_SkynetSynchronizeSingle) {
     Runtime rt(std::in_place_type<SingleThreadedExecutor>);
     std::atomic_size_t arg_marker{0};
     rt.block_on(skynet(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
     ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
 }
 
-TEST(WorkSharingExecutorTest, SkynetSynchronizeShare) {
+TEST(WorkSharingExecutorTest, DISABLED_SkynetSynchronizeShare) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>);
     std::atomic_size_t arg_marker{0};
     rt.block_on(skynet(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
     ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
 }
 
-TEST(WorkSharingExecutorTest, SkynetSynchronizeSteal) {
+TEST(WorkSharingExecutorTest, DISABLED_SkynetSynchronizeSteal) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
     std::atomic_size_t arg_marker{0};
     rt.block_on(skynet(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));

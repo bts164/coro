@@ -1,6 +1,7 @@
 #pragma once
 
 #include <exception>
+#include <expected>
 #include <variant>
 
 namespace coro {
@@ -51,40 +52,52 @@ struct PollError {
  */
 template<typename T>
 class PollResult {
+    // Use std::expected<T, std::exception_ptr> as a single variant arm to hold
+    // both the ready value and the error state. This avoids the ill-formed
+    // std::variant<..., T, std::exception_ptr, ...> when T = std::exception_ptr,
+    // which would introduce duplicate types and fail to compile.
+    using Result = std::expected<T, std::exception_ptr>;
+
 public:
     PollResult(PendingTag) noexcept
         : m_state(std::in_place_type<PendingTag>) {}
 
     PollResult(T value)
-        : m_state(std::in_place_type<T>, std::move(value)) {}
+        : m_state(std::in_place_type<Result>, std::move(value)) {}
 
     PollResult(PollError err) noexcept
-        : m_state(std::in_place_type<std::exception_ptr>, std::move(err.exception)) {}
+        : m_state(std::in_place_type<Result>, std::unexpected(std::move(err.exception))) {}
 
     PollResult(DroppedTag) noexcept
         : m_state(std::in_place_type<DroppedTag>) {}
 
     bool isPending() const noexcept { return std::holds_alternative<PendingTag>(m_state); }  ///< @brief True if the future is not yet ready.
-    bool isReady()   const noexcept { return std::holds_alternative<T>(m_state); }           ///< @brief True if the future completed successfully.
-    bool isError()   const noexcept { return std::holds_alternative<std::exception_ptr>(m_state); } ///< @brief True if the future faulted.
+    bool isReady()   const noexcept { ///< @brief True if the future completed successfully.
+        auto* r = std::get_if<Result>(&m_state);
+        return r && r->has_value();
+    }
+    bool isError()   const noexcept { ///< @brief True if the future faulted.
+        auto* r = std::get_if<Result>(&m_state);
+        return r && !r->has_value();
+    }
     bool isDropped() const noexcept { return std::holds_alternative<DroppedTag>(m_state); }  ///< @brief True if the future was cancelled and drained.
 
-    T&       value() &       { return std::get<T>(m_state); }            ///< @brief Returns the ready value (lvalue ref).
-    const T& value() const & { return std::get<T>(m_state); }            ///< @brief Returns the ready value (const lvalue ref).
-    T        value() &&      { return std::get<T>(std::move(m_state)); } ///< @brief Moves the ready value out.
+    T&       value() &       { return std::get<Result>(m_state).value(); }            ///< @brief Returns the ready value (lvalue ref).
+    const T& value() const & { return std::get<Result>(m_state).value(); }            ///< @brief Returns the ready value (const lvalue ref).
+    T        value() &&      { return std::move(std::get<Result>(m_state)).value(); } ///< @brief Moves the ready value out.
 
     /// @brief Returns the stored exception pointer. Only valid when `isError()` is true.
     std::exception_ptr error() const noexcept {
-        return std::get<std::exception_ptr>(m_state);
+        return std::get<Result>(m_state).error();
     }
 
     /// @brief Rethrows the stored exception if `isError()` is true. No-op otherwise.
     void rethrowIfError() const {
-        if (isError()) std::rethrow_exception(std::get<std::exception_ptr>(m_state));
+        if (isError()) std::rethrow_exception(std::get<Result>(m_state).error());
     }
 
 private:
-    std::variant<PendingTag, T, std::exception_ptr, DroppedTag> m_state;
+    std::variant<PendingTag, Result, DroppedTag> m_state;
 };
 
 /**
@@ -95,6 +108,10 @@ private:
  */
 template<>
 class PollResult<void> {
+    // Same approach as PollResult<T>: a single std::expected<void, exception_ptr>
+    // arm covers both ready and error states, avoiding any duplicate-type issues.
+    using Result = std::expected<void, std::exception_ptr>;
+
 public:
     /// @brief Tag type used to represent the Ready state for void futures.
     struct ReadyTag {};
@@ -103,31 +120,37 @@ public:
         : m_state(std::in_place_type<PendingTag>) {}
 
     PollResult(ReadyTag) noexcept
-        : m_state(std::in_place_type<ReadyTag>) {}
+        : m_state(std::in_place_type<Result>) {}
 
     PollResult(PollError err) noexcept
-        : m_state(std::in_place_type<std::exception_ptr>, std::move(err.exception)) {}
+        : m_state(std::in_place_type<Result>, std::unexpected(std::move(err.exception))) {}
 
     PollResult(DroppedTag) noexcept
         : m_state(std::in_place_type<DroppedTag>) {}
 
     bool isPending() const noexcept { return std::holds_alternative<PendingTag>(m_state); }
-    bool isReady()   const noexcept { return std::holds_alternative<ReadyTag>(m_state); }
-    bool isError()   const noexcept { return std::holds_alternative<std::exception_ptr>(m_state); }
+    bool isReady()   const noexcept {
+        auto* r = std::get_if<Result>(&m_state);
+        return r && r->has_value();
+    }
+    bool isError()   const noexcept {
+        auto* r = std::get_if<Result>(&m_state);
+        return r && !r->has_value();
+    }
     bool isDropped() const noexcept { return std::holds_alternative<DroppedTag>(m_state); }
 
     /// @brief Returns the stored exception pointer. Only valid when `isError()` is true.
     std::exception_ptr error() const noexcept {
-        return std::get<std::exception_ptr>(m_state);
+        return std::get<Result>(m_state).error();
     }
 
     /// @brief Rethrows the stored exception if `isError()` is true. No-op otherwise.
     void rethrowIfError() const {
-        if (isError()) std::rethrow_exception(std::get<std::exception_ptr>(m_state));
+        if (isError()) std::rethrow_exception(std::get<Result>(m_state).error());
     }
 
 private:
-    std::variant<PendingTag, ReadyTag, std::exception_ptr, DroppedTag> m_state;
+    std::variant<PendingTag, Result, DroppedTag> m_state;
 };
 
 /// @brief Sentinel for constructing a Ready void result: `return PollReady;`

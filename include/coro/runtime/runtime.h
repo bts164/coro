@@ -5,6 +5,7 @@
 #include <coro/future.h>
 #include <coro/detail/poll_result.h>
 #include <coro/task/spawn_builder.h>
+#include <coro/task/spawn_blocking.h>
 #include <coro/stream.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
@@ -49,7 +50,8 @@ public:
     /// @endcode
     template<typename ExecutorType, typename... Args>
     explicit Runtime(std::in_place_type_t<ExecutorType>, Args&&... args)
-        : m_executor(std::make_unique<ExecutorType>(this, std::forward<Args>(args)...))
+        : m_blocking_pool(this),
+          m_executor(std::make_unique<ExecutorType>(this, std::forward<Args>(args)...))
     {}
 
     ~Runtime();
@@ -122,11 +124,16 @@ public:
     /// @brief Returns the runtime's IoService. Used by worker threads to set their thread-local.
     IoService& io_service() { return m_io_service; }
 
+    /// @brief Returns the runtime's BlockingPool. Used by spawn_blocking().
+    BlockingPool& blocking_pool() { return m_blocking_pool; }
+
 private:
-    // m_io_service must be declared before m_executor so it is destroyed *after* the executor.
-    // Worker threads call set_current_io_service(&m_io_service); they must all have joined
-    // (executor destructor) before the IoService destructor fires its stop signal.
+    // Declaration order matters for destruction:
+    // m_io_service must outlive m_executor (worker threads reference it).
+    // m_blocking_pool must outlive m_executor so blocking threads can still
+    // call current_runtime() during their final work item.
     IoService                 m_io_service;
+    BlockingPool              m_blocking_pool;
     std::unique_ptr<Executor> m_executor;
 };
 

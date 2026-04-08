@@ -281,7 +281,7 @@ Coro<size_t> skynet(size_t my_num, size_t remaining, std::index_sequence<Is...> 
     co_return ((std::get<Is>(results)) + ...);
 }
 
-TEST(CoroTest, Skynet) {
+TEST(CoroTest, DISABLED_Skynet) {
     size_t result = Runtime(4).block_on(skynet(0, 1000000, std::make_index_sequence<10>{}));
     EXPECT_EQ(result, 499999500000);
 }

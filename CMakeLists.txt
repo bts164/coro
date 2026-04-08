@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(coro VERSION 0.1.0 LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -18,6 +20,7 @@ find_package(Libwebsockets REQUIRED)
 
 add_library(coro
     src/waker.cpp
+    src/blocking_pool.cpp
     src/cancellation_token.cpp
     src/context.cpp
     src/executor.cpp

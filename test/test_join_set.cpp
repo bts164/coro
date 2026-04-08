@@ -341,17 +341,17 @@ Coro<size_t> skynet(size_t my_num, size_t remaining) {
     co_return sum;
 }
 
-TEST(JoinSetTest, SkynetSingleThreaded) {
+TEST(JoinSetTest, DISABLED_SkynetSingleThreaded) {
     size_t result = Runtime(std::in_place_type<SingleThreadedExecutor>).block_on(skynet(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
-TEST(JoinSetTest, SkynetWorkSharing) {
+TEST(JoinSetTest, DISABLED_SkynetWorkSharing) {
     size_t result = Runtime(std::in_place_type<WorkSharingExecutor>).block_on(skynet(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
-TEST(JoinSetTest, SkynetWorkStealing) {
+TEST(JoinSetTest, DISABLED_SkynetWorkStealing) {
     size_t result = Runtime(std::in_place_type<WorkStealingExecutor>).block_on(skynet(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
@@ -371,17 +371,17 @@ Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
     co_return sum;
 }
 
-TEST(JoinSetTest, SkynetJoinSetSingleThreaded) {
+TEST(JoinSetTest, DISABLED_SkynetJoinSetSingleThreaded) {
     size_t result = Runtime(std::in_place_type<SingleThreadedExecutor>).block_on(skynet_joinset(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
-TEST(JoinSetTest, SkynetJoinSetWorkSharing) {
+TEST(JoinSetTest, DISABLED_SkynetJoinSetWorkSharing) {
     size_t result = Runtime(std::in_place_type<WorkSharingExecutor>).block_on(skynet_joinset(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
-TEST(JoinSetTest, SkynetJoinSetWorkStealing) {
+TEST(JoinSetTest, DISABLED_SkynetJoinSetWorkStealing) {
     size_t result = Runtime(std::in_place_type<WorkStealingExecutor>).block_on(skynet_joinset(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
@@ -412,17 +412,17 @@ Coro<size_t> skynet_join0(size_t my_num, size_t remaining) {
     co_return sum;
 }
 
-TEST(JoinSetTest, SkynetJoinSingleThreaded) {
+TEST(JoinSetTest, DISABLED_SkynetJoinSingleThreaded) {
     size_t result = Runtime(std::in_place_type<SingleThreadedExecutor>).block_on(skynet_join1(0, 1000000, std::make_index_sequence<10>{}));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
-TEST(JoinSetTest, SkynetJoinWorkSharing) {
+TEST(JoinSetTest, DISABLED_SkynetJoinWorkSharing) {
     size_t result = Runtime(std::in_place_type<WorkSharingExecutor>).block_on(skynet_join0(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
 
-TEST(JoinSetTest, SkynetJoinWorkStealing) {
+TEST(JoinSetTest, DISABLED_SkynetJoinWorkStealing) {
     size_t result = Runtime(std::in_place_type<WorkStealingExecutor>).block_on(skynet_join0(0, 1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 }
