@@ -21,6 +21,7 @@ plugins:
 nav:
   - Introduction: index.md
   - Getting Started Guide: getting_started.md
+  - Library Usage Guidelines: guidelines.md
   - API Reference:
     - Key Types:
       - Runtime & Executors:

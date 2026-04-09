@@ -1,9 +1,5 @@
 # CLAUDE.md
 
-This project is going to implement a C++ 20 coroutines library for multi-threaded asynchronous task synchronization and I/O.
-It should take inspiration from coroutines in python, goroutines in golang, but expecially it is going to mimick as close
-as possible rust's async model and Tokio implementation of it.
-
 ## Directory Structure
 
 ```
@@ -82,6 +78,14 @@ Use Mermaid (`\`\`\`mermaid`) for diagrams in documentation. Mermaid is preferre
 sequence diagrams, state machines, flowcharts, and class diagrams. Fall back to ASCII
 only when no Mermaid chart type fits naturally and ASCII would produce a simpler or
 clearer result.
+
+### Guidelines titles are actionable; descriptions may reference internals
+
+When adding or editing rules in `doc/guidelines.md`, the rule title must describe an
+actionable item from the end user's perspective — what to do or avoid, expressed in terms
+of the API they call, not the internal mechanism that makes it unsafe. The description
+body may go into internal implementation details (coroutine frame lifetime, `this` pointer
+capture, drain mechanics, etc.) where it helps the user understand *why* the rule exists.
 
 ### [[nodiscard]] on Future-returning functions
 

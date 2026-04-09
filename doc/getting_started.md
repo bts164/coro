@@ -5,24 +5,54 @@ minimal async function to spawning parallel tasks, async generators, and timeout
 
 ## Setup
 
-The library requires C++20 and uses [Conan](https://conan.io) for dependencies and CMake to build.
+The library requires C++20 and uses CMake. The recommended and supported
+method for managing dependencies is with [Conan](https://conan.io). Other
+package managers or manual installs should also work.
+
+CMake locates dependencies through `find_package()`, which searches standard platform
+locations automatically for common packages (e.g. GTest ships its own CMake config). For
+less common packages you can point CMake at a manually installed prefix via
+`CMAKE_PREFIX_PATH`, or write a
+[CMake package config file](https://cmake.org/cmake/help/latest/command/find_package.html).
+Conan is simply the most convenient way to generate these config files consistently across
+platforms.
+
+### Building with Conan
 
 ```bash
-conan install . --output-folder=build --build=missing
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
-cmake --build build
+conan install . --build=missing -s:h build_type=Release
+cmake --preset conan-release
+cd build/Release && make
 ```
 
-Add these headers to your source files as needed:
+**`--build=missing`** (shorthand: `-b=missing`) — optional. Instructs Conan to build any
+dependency that does not have a pre-built binary available, rather than exiting with an
+error.
+
+**`-s:h build_type=Release`** — optional. Selects the build type. Valid values are
+`Release`, `Debug`, and `RelWithDebInfo`. Defaults to `Release` if omitted. The CMake
+preset and build directory must match:
+
+| Build type | CMake preset | Build directory |
+|---|---|---|
+| `Release` | `conan-release` | `build/Release` |
+| `Debug` | `conan-debug` | `build/Debug` |
+| `RelWithDebInfo` | `conan-relwithdebinfo` | `build/RelWithDebInfo` |
+
+Common headers:
 
 ```cpp
 #include <coro/coro.h>               // Coro<T> — async function return type
 #include <coro/coro_stream.h>        // CoroStream<T> — async generator return type
 #include <coro/runtime/runtime.h>    // Runtime, spawn()
-#include <coro/sync/join.h>          // join()
 #include <coro/sync/select.h>        // select()
 #include <coro/sync/sleep.h>         // sleep_for()
 #include <coro/sync/timeout.h>       // timeout()
+#include <coro/task/join_set.h>      // JoinSet<T>
+#include <coro/task/spawn_blocking.h>// spawn_blocking()
+#include <coro/sync/oneshot.h>       // oneshot::channel<T>
+#include <coro/sync/mpsc.h>          // mpsc::channel<T>
+#include <coro/sync/watch.h>         // watch::channel<T>
 ```
 
 ---
