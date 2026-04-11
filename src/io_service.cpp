@@ -100,6 +100,13 @@ void IoService::io_thread_loop() {
     // If lws context creation fails, WebSocket operations will fail at connect time.
     // The loop still runs normally for other I/O (timers, TCP).
 
+    // Signal that lws context is ready (or failed to create)
+    {
+        std::lock_guard lk(m_lws_mutex);
+        m_lws_ready = true;
+    }
+    m_lws_ready_cv.notify_all();
+
     uv_run(&m_uv_loop, UV_RUN_DEFAULT);
     // Returns when all handles are closed (triggered by io_async_cb calling
     // uv_close(&m_async) after seeing m_stopping == true).
@@ -113,6 +120,13 @@ void IoService::process_queue() {
     }
     for (auto& req : local)
         req->execute(&m_uv_loop);
+}
+
+lws_context* IoService::lws_ctx() {
+    // Wait until the I/O thread has initialized the lws context
+    std::unique_lock lk(m_lws_mutex);
+    m_lws_ready_cv.wait(lk, [this] { return m_lws_ready; });
+    return m_lws_ctx;
 }
 
 // ---------------------------------------------------------------------------

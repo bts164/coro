@@ -41,7 +41,7 @@ public:
     using OutputType = void;
 
     explicit SleepFuture(std::chrono::nanoseconds duration)
-        : m_deadline(std::chrono::round<std::chrono::milliseconds>(
+        : m_deadline(std::chrono::ceil<std::chrono::milliseconds>(
               std::chrono::steady_clock::now() + duration)) {}
 
     ~SleepFuture() {

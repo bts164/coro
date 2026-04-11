@@ -247,8 +247,12 @@ namespace coro::detail::ws {
 // ---------------------------------------------------------------------------
 
 struct ConnectSubState {
+    // mutex guards waker, complete, and error.
+    // Both protocol_cb (I/O thread) and ConnectFuture::poll (worker thread) must hold
+    // it when reading or writing any of these fields to avoid race conditions.
+    std::mutex                                         mutex;
     std::atomic<std::shared_ptr<coro::detail::Waker>> waker;
-    std::atomic<bool>                                  complete{false};
+    bool                                               complete{false};
     std::atomic<bool>                                  cancelled{false};  // set by ConnectFuture dtor
     int                                                error = 0;         // set before complete=true
 };

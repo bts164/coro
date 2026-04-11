@@ -36,9 +36,14 @@ struct WsConnectRequest : coro::IoRequest {
 
     void execute(uv_loop_t* /*loop*/) override {
         if (!lws_ctx) {
-            state->connect.error = -1;
-            state->connect.complete.store(true, std::memory_order_release);
-            if (auto w = state->connect.waker.load()) w->wake();
+            std::shared_ptr<detail::Waker> waker_to_wake;
+            {
+                std::lock_guard lk(state->connect.mutex);
+                state->connect.error = ENOTCONN;  // "Transport endpoint is not connected"
+                state->connect.complete = true;
+                waker_to_wake = state->connect.waker.load();
+            }
+            if (waker_to_wake) waker_to_wake->wake();
             return;
         }
 
@@ -46,9 +51,14 @@ struct WsConnectRequest : coro::IoRequest {
         try {
             parsed = parse_ws_url(url);
         } catch (...) {
-            state->connect.error = -1;
-            state->connect.complete.store(true, std::memory_order_release);
-            if (auto w = state->connect.waker.load()) w->wake();
+            std::shared_ptr<detail::Waker> waker_to_wake;
+            {
+                std::lock_guard lk(state->connect.mutex);
+                state->connect.error = EINVAL;  // "Invalid argument" (bad URL)
+                state->connect.complete = true;
+                waker_to_wake = state->connect.waker.load();
+            }
+            if (waker_to_wake) waker_to_wake->wake();
             return;
         }
 
@@ -71,9 +81,14 @@ struct WsConnectRequest : coro::IoRequest {
         state->wsi = lws_client_connect_via_info(&ci);
         if (!state->wsi) {
             delete sp;
-            state->connect.error = -1;
-            state->connect.complete.store(true, std::memory_order_release);
-            if (auto w = state->connect.waker.load()) w->wake();
+            std::shared_ptr<detail::Waker> waker_to_wake;
+            {
+                std::lock_guard lk(state->connect.mutex);
+                state->connect.error = ECONNREFUSED;  // "Connection refused"
+                state->connect.complete = true;
+                waker_to_wake = state->connect.waker.load();
+            }
+            if (waker_to_wake) waker_to_wake->wake();
         }
     }
 };
@@ -147,18 +162,29 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
             lws_callback_on_writable(wsi);
             LOGSTDOUT("connection established but already cancelled\n");
         } else {
-            state.connect.complete.store(true, std::memory_order_release);
+            std::shared_ptr<detail::Waker> waker_to_wake;
+            {
+                std::lock_guard lk(state.connect.mutex);
+                state.connect.complete = true;
+                waker_to_wake = state.connect.waker.load();
+            }
             LOGSTDOUT("connection established\n");
-            if (auto w = state.connect.waker.load()) w->wake();
+            if (waker_to_wake) waker_to_wake->wake();
         }
         break;
 
-    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR: {
         LOGSTDOUT("connection error\n");
-        state.connect.error = -1;  // TODO: surface lws error string
-        state.connect.complete.store(true, std::memory_order_release);
-        if (auto w = state.connect.waker.load()) w->wake();
+        std::shared_ptr<detail::Waker> waker_to_wake;
+        {
+            std::lock_guard lk(state.connect.mutex);
+            state.connect.error = EHOSTUNREACH;  // "No route to host"
+            state.connect.complete = true;
+            waker_to_wake = state.connect.waker.load();
+        }
+        if (waker_to_wake) waker_to_wake->wake();
         break;
+    }
 
     case LWS_CALLBACK_CLIENT_RECEIVE: {
         // lws_is_final_fragment / lws_frame_is_binary must be called before the lock
@@ -392,8 +418,11 @@ WsStream::ConnectFuture::ConnectFuture(std::string url, FrameMode frame_mode,
     , m_io_service(io_service) {}
 
 WsStream::ConnectFuture::~ConnectFuture() {
-    if (m_state && !m_state->connect.complete.load(std::memory_order_acquire))
-        m_state->connect.cancelled.store(true, std::memory_order_release);
+    if (m_state) {
+        std::lock_guard lk(m_state->connect.mutex);
+        if (!m_state->connect.complete)
+            m_state->connect.cancelled.store(true, std::memory_order_release);
+    }
 }
 
 PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
@@ -401,7 +430,11 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
         // First poll: allocate connection state and submit the connect request.
         m_state = std::make_shared<detail::ws::ConnectionState>();
         m_state->frame_mode = m_frame_mode;
-        m_state->connect.waker.store(ctx.getWaker());
+
+        {
+            std::lock_guard lk(m_state->connect.mutex);
+            m_state->connect.waker.store(ctx.getWaker());
+        }
 
         // Build comma-separated subprotocol string; empty string = no header sent.
         std::string proto;
@@ -415,13 +448,15 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
         return PollPending;
     }
 
-    if (!m_state->connect.complete.load(std::memory_order_acquire)) {
+    std::lock_guard lk(m_state->connect.mutex);
+
+    if (!m_state->connect.complete) {
         m_state->connect.waker.store(ctx.getWaker());
         return PollPending;
     }
 
     if (m_state->connect.error != 0)
-        throw std::system_error(std::error_code(-m_state->connect.error,
+        throw std::system_error(std::error_code(m_state->connect.error,
                                                 std::system_category()),
                                 "WsStream::connect");
 

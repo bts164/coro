@@ -1,11 +1,12 @@
 #pragma once
 
 #include <uv.h>
+#include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <atomic>
 
 // Forward declaration — full type defined by <libwebsockets.h>, included only by
 // translation units that use lws directly. IoService holds the context by pointer
@@ -67,9 +68,18 @@ public:
     void stop();
 
     /// Returns the libwebsockets context owned by this IoService.
-    /// Non-null only after the I/O thread has started. Must only be used
-    /// from the I/O thread or before the first submit() call.
-    lws_context* lws_ctx() const noexcept { return m_lws_ctx; }
+    ///
+    /// This method blocks until the I/O thread has initialized the lws context
+    /// (which happens at the start of io_thread_loop()). This prevents race
+    /// conditions where WsStream::connect() might try to use a nullptr context.
+    ///
+    /// Thread-safe - can be called from any thread.
+    lws_context* lws_ctx();
+
+    /// Returns a pointer to the underlying uv_loop_t.
+    /// This is safe to call from any thread, but the loop itself must only be
+    /// accessed from the I/O thread (via submit()) or during initialization.
+    uv_loop_t* loop() noexcept { return &m_uv_loop; }
 
 private:
     static void io_async_cb(uv_async_t* handle);   // wakes the loop from any thread
@@ -79,6 +89,13 @@ private:
     uv_loop_t    m_uv_loop;
     lws_context* m_lws_ctx = nullptr;  // created at start of io_thread_loop(), destroyed in stop()
     uv_async_t   m_async;   // cross-thread doorbell — the only thread-safe libuv primitive
+
+    // Synchronization for lws context initialization.
+    // The I/O thread signals m_lws_ready_cv after creating m_lws_ctx.
+    // lws_ctx() waits on this condition before returning the context pointer.
+    std::mutex              m_lws_mutex;
+    std::condition_variable m_lws_ready_cv;
+    bool                    m_lws_ready = false;
 
     std::thread m_io_thread;
 

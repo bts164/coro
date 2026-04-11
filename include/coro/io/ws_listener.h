@@ -27,9 +27,17 @@ namespace coro::detail::ws {
 // ---------------------------------------------------------------------------
 struct ListenerState {
     lws_context*                                      ctx = nullptr;  // owned here, destroyed in WsDestroyListenerRequest
-    std::atomic<bool>                                 ready{false};   // set after bind succeeds
+    // bind_mutex guards ready, bind_error, and bind_waker.
+    // Both WsBindRequest (I/O thread) and BindFuture::poll (worker thread) must hold
+    // it when reading or writing any of these fields to avoid race conditions.
+    std::mutex                                        bind_mutex;
+    bool                                              ready{false};   // set after bind succeeds
     int                                               bind_error = 0; // set before ready=true on failure
-    std::mutex                                        mutex;
+    std::shared_ptr<coro::detail::Waker>              bind_waker;     // woken when bind completes
+    // accept_mutex guards pending and accept_waker.
+    // Both server_protocol_cb (I/O thread) and AcceptFuture::poll (worker thread) must hold
+    // it when reading or writing any of these fields.
+    std::mutex                                        accept_mutex;
     std::deque<std::shared_ptr<ConnectionState>>      pending;        // accepted, awaiting take by AcceptFuture
     std::shared_ptr<coro::detail::Waker>              accept_waker;   // woken when a connection arrives
     std::atomic<bool>                                 closed{false};

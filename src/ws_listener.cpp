@@ -68,13 +68,20 @@ struct WsBindRequest : coro::IoRequest {
         state->ctx = lws_create_context(&info);
         if (!state->ctx) {
             delete sp;
-            state->bind_error = -1;
         }
 
         // Wake the BindFuture regardless of success or failure.
-        state->ready.store(true, std::memory_order_release);
-        if (auto w = state->accept_waker)
-            w->wake();
+        std::shared_ptr<detail::Waker> waker_to_wake;
+        {
+            std::lock_guard lk(state->bind_mutex);
+            if (!state->ctx) {
+                state->bind_error = -1;
+            }
+            state->ready = true;
+            waker_to_wake = state->bind_waker;
+        }
+        if (waker_to_wake)
+            waker_to_wake->wake();
     }
 };
 
@@ -102,7 +109,7 @@ struct WsDestroyListenerRequest : coro::IoRequest {
         delete sp;
 
         // Wake any AcceptFuture blocked on this listener so it can return an error.
-        std::lock_guard lk(state->mutex);
+        std::lock_guard lk(state->accept_mutex);
         if (state->accept_waker)
             state->accept_waker->wake();
     }
@@ -157,7 +164,7 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
 
         // Enqueue the connection for the next accept() call.
         {
-            std::lock_guard lk(listener.mutex);
+            std::lock_guard lk(listener.accept_mutex);
             listener.pending.push_back(conn);
             if (listener.accept_waker)
                 listener.accept_waker->wake();
@@ -363,7 +370,11 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
     if (!m_state) {
         // First poll: allocate state and submit the bind request.
         m_state = std::make_shared<detail::ws::ListenerState>();
-        m_state->accept_waker = ctx.getWaker();
+
+        {
+            std::lock_guard lk(m_state->bind_mutex);
+            m_state->bind_waker = ctx.getWaker();
+        }
 
         // Build comma-separated subprotocol string; empty = accept any.
         std::string proto;
@@ -377,8 +388,10 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
         return PollPending;
     }
 
-    if (!m_state->ready.load(std::memory_order_acquire)) {
-        m_state->accept_waker = ctx.getWaker();
+    std::lock_guard lk(m_state->bind_mutex);
+
+    if (!m_state->ready) {
+        m_state->bind_waker = ctx.getWaker();
         return PollPending;
     }
 
@@ -403,7 +416,7 @@ PollResult<WsStream> WsListener::AcceptFuture::poll(detail::Context& ctx) {
     if (m_state->closed.load(std::memory_order_acquire))
         throw std::runtime_error("WsListener::accept: listener is closed");
 
-    std::lock_guard lk(m_state->mutex);
+    std::lock_guard lk(m_state->accept_mutex);
 
     if (!m_state->pending.empty()) {
         auto conn = std::move(m_state->pending.front());
