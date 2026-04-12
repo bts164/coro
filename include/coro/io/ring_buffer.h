@@ -37,13 +37,13 @@ public:
      * @param item Element to push (moved)
      * @return true if successful, false if buffer is full
      */
-    [[nodiscard]] bool push(T item);
+    bool push(T item);
 
     /**
      * @brief Pop an element from the front of the queue.
      * @return The element if available, nullopt if buffer is empty
      */
-    [[nodiscard]] std::optional<T> pop();
+    std::optional<T> pop();
 
     /**
      * @brief Check if the buffer is full.

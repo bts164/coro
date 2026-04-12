@@ -15,9 +15,9 @@ namespace coro {
 
 template<typename T, Decoder DecoderT>
 PollStream<T, DecoderT>::PollStream(int fd, DecoderT decoder,
-                                    std::size_t pkt_buf_cap, std::size_t byte_buf_cap,
+                                    PollStreamOptions options,
                                     IoService* io_service)
-    : m_state(std::make_shared<State>(fd, std::move(decoder), pkt_buf_cap, byte_buf_cap))
+    : m_state(std::make_shared<State>(fd, std::move(decoder), options))
     , m_io_service(io_service)
 {
     // Initialize uv_poll_t handle
@@ -57,15 +57,14 @@ template<typename T, Decoder DecoderT>
 PollStream<T, DecoderT> PollStream<T, DecoderT>::open(
     int fd,
     DecoderT decoder,
-    std::size_t packet_buffer_capacity,
-    std::size_t byte_buffer_capacity,
+    PollStreamOptions options,
     IoService* io_service)
 {
     // Use current thread's IoService if not specified
     if (!io_service) {
         io_service = &current_io_service();
     }
-    return PollStream(fd, std::move(decoder), packet_buffer_capacity, byte_buffer_capacity, io_service);
+    return PollStream(fd, std::move(decoder), options, io_service);
 }
 
 // ---------------------------------------------------------------------------
@@ -74,17 +73,25 @@ PollStream<T, DecoderT> PollStream<T, DecoderT>::open(
 
 template<typename T, Decoder DecoderT>
 PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context& ctx) {
-    // Check for errors first
-    if (m_state->error) {
-        return PollError(std::exchange(m_state->error, nullptr));
+    std::unique_lock lock(m_state->mutex);
+
+    // Overrun notification: delivered before the next surviving packet so the
+    // consumer knows N packets were dropped immediately before it.
+    if (m_state->backpressure_mode == BackpressureMode::Overrun &&
+        m_state->overrun_count > 0) {
+        return PollError(std::make_exception_ptr(
+            PollStreamOverrunError{std::exchange(m_state->overrun_count, 0)}
+        ));
     }
 
-    // HOT PATH: try to pop from packet buffer without suspending
+    // HOT PATH: deliver buffered packets before errors. Any packets decoded from
+    // bytes that arrived before an error are returned to the consumer first; the
+    // error surfaces only once the packet buffer is empty.
     if (auto packet = m_state->packet_buffer.pop()) {
-        // Got a buffered packet - return immediately
-
-        // Re-enable polling if we were in backpressure
-        if (!m_state->polling && !m_state->eof) {
+        // In Block mode, re-enable polling now that there is space in the buffer.
+        // In Overrun mode polling is never stopped, so no action needed.
+        if (m_state->backpressure_mode == BackpressureMode::Block &&
+            !m_state->polling && !m_state->eof) {
             int result = uv_poll_start(&m_state->poll_handle, UV_READABLE, poll_cb);
             if (result == 0) {
                 m_state->polling = true;
@@ -94,18 +101,19 @@ PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context&
         return std::move(packet);
     }
 
-    // Packet buffer empty - check if stream is done
+    // Packet buffer drained — now surface any pending error or EOF.
+    if (m_state->error) {
+        return PollError(std::exchange(m_state->error, nullptr));
+    }
+
     if (m_state->eof && m_state->byte_buffer.readable_bytes() == 0) {
         return std::optional<T>(std::nullopt); // Stream exhausted
     }
 
-    // Packet buffer empty but more data may arrive - register waker and suspend
-    m_state->waker.store(
-        ctx.getWaker(),
-        std::memory_order_release
-    );
+    // Packet buffer empty but more data may arrive - register waker and suspend.
+    m_state->waker = ctx.getWaker();
 
-    // Ensure polling is active
+    // Ensure polling is active (may have been stopped by Block backpressure).
     if (!m_state->polling && !m_state->eof) {
         int result = uv_poll_start(&m_state->poll_handle, UV_READABLE, poll_cb);
         if (result == 0) {
@@ -138,19 +146,24 @@ template<typename T, Decoder DecoderT>
 void PollStream<T, DecoderT>::poll_cb(uv_poll_t* handle, int status, int events) {
     auto* state = static_cast<State*>(handle->data);
 
-    // uv_poll error (e.g., fd closed externally)
+    std::shared_ptr<detail::Waker> waker_to_wake;
+
+    // uv_poll error (e.g., fd closed externally) — brief lock to update shared state
     if (status < 0) {
+        std::lock_guard lock(state->mutex);
         state->error = std::make_exception_ptr(
             std::system_error(-status, std::system_category(), "uv_poll error")
         );
         uv_poll_stop(&state->poll_handle);
         state->polling = false;
-        wake_consumer(state);
-        return;
+        waker_to_wake = std::exchange(state->waker, nullptr);
     }
+    else if (events & UV_READABLE) {
+        bool should_wake = false;
 
-    if (events & UV_READABLE) {
-        // PHASE 1: GREEDY READ - fill byte buffer with raw data
+        // PHASE 1: GREEDY READ — no lock needed.
+        // byte_buffer is only ever touched by poll_cb; poll_next never accesses it.
+        // EOF and error paths take a brief lock to update the shared flags.
         while (state->byte_buffer.writable_bytes() > 0) {
             auto writable_span = state->byte_buffer.writable_span();
             if (writable_span.empty()) break;
@@ -158,81 +171,116 @@ void PollStream<T, DecoderT>::poll_cb(uv_poll_t* handle, int status, int events)
             ssize_t n = ::read(state->fd, writable_span.data(), writable_span.size());
 
             if (n > 0) {
-                // Got data - advance byte buffer write pointer
                 state->byte_buffer.commit_write(n);
             }
             else if (n == 0) {
-                // EOF - stream exhausted
+                std::lock_guard lock(state->mutex);
                 state->eof = true;
                 uv_poll_stop(&state->poll_handle);
                 state->polling = false;
+                should_wake = true;
                 break;
             }
-            else if (n == -1) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // No more data available right now - normal exit
-                    break;
-                }
-                // Real error
+            else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                std::lock_guard lock(state->mutex);
                 state->error = std::make_exception_ptr(
                     std::system_error(errno, std::system_category(), "read failed")
                 );
                 uv_poll_stop(&state->poll_handle);
                 state->polling = false;
+                should_wake = true;
                 break;
+            }
+            else {
+                break; // EAGAIN — no more data right now
             }
         }
 
-        // PHASE 2: GREEDY DECODE - extract complete packets from byte buffer
+        // PHASE 2: GREEDY DECODE — always runs, including after a Phase 1 error.
+        // Any bytes already read into byte_buffer before the error are decoded into
+        // packets and queued. poll_next delivers those packets to the consumer before
+        // surfacing the error, so the consumer observes every packet whose bytes
+        // arrived on the fd before the fault.
+        //
+        // byte_buffer is private to poll_cb — no lock needed for reads or consumes.
+        // decoder.decode() may do large memcpy's — must not hold the lock during it.
+        //
+        // The lock is taken in two targeted spots per iteration:
+        //   Block mode:   (1) pre-check full() before decode to avoid wasting work
+        //                 (2) push() after decode
+        //   Overrun mode: (1) pop() + ++overrun_count + push() as one atomic update
+        //
+        // In Block mode the pre-check is safe: poll_next only pops, so the buffer
+        // can only gain room between the check and the push — never lose it.
+        bool decode_error = false;
         try {
-            while (!state->packet_buffer.full()) {
+            while (true) {
+                // Block mode: verify room exists before committing to a decode.
+                if (state->backpressure_mode == BackpressureMode::Block) {
+                    std::lock_guard lock(state->mutex);
+                    if (state->packet_buffer.full()) break;
+                }
+
                 auto readable_span = state->byte_buffer.readable_span();
                 if (readable_span.empty()) break;
 
                 std::size_t consumed = 0;
+                // No lock — decode may involve expensive memcpy of large payloads.
                 auto packet = state->decoder.decode(readable_span, consumed);
 
-                // ALWAYS consume bytes that were read, even if packet incomplete
-                // This handles wrap-around in circular buffer correctly
+                // ALWAYS consume decoded bytes, even on incomplete packet.
+                // Handles wrap-around in the circular buffer correctly.
                 if (consumed > 0) {
                     state->byte_buffer.consume(consumed);
                 }
 
                 if (packet) {
-                    // Got a complete packet - move to packet buffer
-                    (void)state->packet_buffer.push(std::move(*packet));
-                } else {
-                    // Need more bytes - continue if decoder made progress
-                    // (handles wrap-around case where packet spans multiple readable_span() calls)
-                    if (consumed == 0) {
-                        break;  // No progress, need more data from fd
+                    std::lock_guard lock(state->mutex);
+                    if (state->backpressure_mode == BackpressureMode::Overrun) {
+                        if (state->packet_buffer.full()) {
+                            state->packet_buffer.pop(); // drop oldest
+                            ++state->overrun_count;
+                        }
                     }
-                    // else: decoder consumed some bytes, try again (might have more data after wrap)
+                    state->packet_buffer.push(std::move(*packet));
+                    should_wake = true;
+                } else {
+                    // Incomplete packet — continue only if decoder made progress
+                    // (handles circular-buffer wrap where a packet spans two spans).
+                    if (consumed == 0) break;
                 }
             }
-        } catch (const std::exception& e) {
-            // Decoder threw - framing error (e.g., invalid footer magic)
+        } catch (...) {
+            // Decoder threw — framing error (e.g. invalid footer magic).
+            // Already-decoded packets remain in packet_buffer and will be delivered
+            // to the consumer before this error, consistent with the Phase 1 policy.
+            std::lock_guard lock(state->mutex);
             state->error = std::current_exception();
             uv_poll_stop(&state->poll_handle);
             state->polling = false;
-            wake_consumer(state);
-            return;
+            decode_error = true;
+            should_wake = true;
         }
 
-        // Apply backpressure if packet buffer full
-        if (state->packet_buffer.full() && state->polling) {
-            uv_poll_stop(&state->poll_handle);
-            state->polling = false;
+        // Final lock: apply Block-mode backpressure gate and extract waker only
+        // if there is something new for the consumer to observe.
+        if (should_wake) {
+            std::lock_guard lock(state->mutex);
+            if (!decode_error && state->backpressure_mode == BackpressureMode::Block) {
+                if ((state->packet_buffer.full() ||
+                     state->byte_buffer.writable_bytes() == 0) && state->polling) {
+                    uv_poll_stop(&state->poll_handle);
+                    state->polling = false;
+                }
+            }
+            waker_to_wake = std::exchange(state->waker, nullptr);
         }
+    }
 
-        // Also apply backpressure if byte buffer full (can't read more until decoded)
-        if (state->byte_buffer.writable_bytes() == 0 && state->polling) {
-            uv_poll_stop(&state->poll_handle);
-            state->polling = false;
-        }
-
-        // Wake the consumer task (SINGLE wake for potentially many packets)
-        wake_consumer(state);
+    // Wake the consumer outside the mutex. On a multi-threaded executor the resumed
+    // task may call poll_next immediately; releasing first prevents deadlock.
+    if (waker_to_wake) {
+        waker_to_wake->wake();
     }
 }
 
@@ -243,13 +291,6 @@ void PollStream<T, DecoderT>::close_cb(uv_handle_t* handle) {
     // Nothing to do here
 }
 
-template<typename T, Decoder DecoderT>
-void PollStream<T, DecoderT>::wake_consumer(State* state) {
-    auto waker = state->waker.exchange(nullptr, std::memory_order_acq_rel);
-    if (waker) {
-        waker->wake();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Explicit Template Instantiations

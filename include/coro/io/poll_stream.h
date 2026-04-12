@@ -8,13 +8,66 @@
 #include <coro/io/ring_buffer.h>
 #include <coro/runtime/io_service.h>
 #include <uv.h>
-#include <atomic>
 #include <cstddef>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace coro {
+
+// ---------------------------------------------------------------------------
+// Backpressure policy
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Controls what PollStream does when its packet buffer is full.
+ */
+enum class BackpressureMode {
+    /**
+     * Stop reading from the fd (uv_poll_stop) until the consumer drains some
+     * packets. This lets kernel socket/pipe buffers fill, which applies
+     * backpressure to the producer. Default behaviour.
+     */
+    Block,
+
+    /**
+     * Keep reading from the fd unconditionally. When the packet buffer is full,
+     * the oldest buffered packet is silently dropped and the new packet takes its
+     * place. The number of dropped packets is accumulated and delivered to the
+     * consumer as a non-fatal PollStreamOverrunError between successive packets.
+     *
+     * Use this when the fd source cannot tolerate backpressure (e.g. a DMA-backed
+     * character device where buffer stall causes a hardware fault) and occasional
+     * data loss is acceptable.
+     */
+    Overrun,
+};
+
+/**
+ * @brief Delivered to the consumer (as a non-fatal PollError) when one or more
+ * packets were dropped due to Overrun backpressure mode.
+ *
+ * The stream remains open after this error. The consumer may catch it and
+ * continue calling next() to receive subsequent packets.
+ */
+struct PollStreamOverrunError {
+    std::size_t missed; ///< Number of packets dropped since the last delivery
+};
+
+/**
+ * @brief Construction options for PollStream.
+ */
+struct PollStreamOptions {
+    /// Number of decoded packets to hold in the packet ring buffer (default 64).
+    std::size_t packet_buffer_capacity = 64;
+
+    /// Raw byte buffer capacity in bytes (default 256 KB).
+    std::size_t byte_buffer_capacity = 256 * 1024;
+
+    /// What to do when the packet buffer fills up.
+    BackpressureMode backpressure = BackpressureMode::Block;
+};
 
 /**
  * @brief Event-driven Stream for pollable file descriptors with framed protocols.
@@ -28,7 +81,7 @@ namespace coro {
  * - Event-driven via uv_poll_t (epoll notification when data ready)
  * - Two-level buffering (byte buffer + packet buffer)
  * - Pluggable Decoder for any framing protocol
- * - Automatic backpressure when buffers fill
+ * - Configurable backpressure policy (Block or Overrun) via PollStreamOptions
  * - Zero-copy payload support (for decoders implementing ZeroCopyDecoder)
  *
  * Thread safety: Not thread-safe. One consumer task per stream.
@@ -44,11 +97,10 @@ public:
     /**
      * @brief Open a pollable file descriptor as a Stream.
      *
-     * @param fd Open file descriptor (must support poll/epoll semantics)
-     * @param decoder Decoder instance (moved into stream)
-     * @param packet_buffer_capacity Number of decoded packets to buffer (default 64)
-     * @param byte_buffer_capacity Raw byte buffer size in bytes (default 256KB)
-     * @param io_service IoService managing the uv_loop (defaults to current)
+     * @param fd          Open file descriptor (must support poll/epoll semantics)
+     * @param decoder     Decoder instance (moved into stream)
+     * @param options     Buffer sizes and backpressure policy (default: Block, 64 pkts, 256 KB)
+     * @param io_service  IoService managing the uv_loop (defaults to current thread's)
      * @return PollStream instance
      *
      * The caller retains ownership of the fd. Close it after the stream is destroyed.
@@ -56,18 +108,19 @@ public:
     [[nodiscard]] static PollStream open(
         int fd,
         DecoderT decoder,
-        std::size_t packet_buffer_capacity = 64,
-        std::size_t byte_buffer_capacity = 256 * 1024,
+        PollStreamOptions options = {},
         IoService* io_service = nullptr
     );
 
     /**
      * @brief Stream concept interface — poll for the next packet.
      *
-     * @return Ready(some(T)) - next packet available
-     *         Ready(nullopt) - stream exhausted (EOF)
-     *         Pending        - no packet ready; waker registered
-     *         Error          - I/O error or framing error
+     * @return Ready(some(T))  - next packet available
+     *         Ready(nullopt)  - stream exhausted (EOF)
+     *         Pending         - no packet ready; waker registered
+     *         Error(fatal)    - I/O error or framing error; stream is faulted
+     *         Error(non-fatal)- PollStreamOverrunError (Overrun mode only); stream
+     *                           remains open, continue calling next() for subsequent packets
      */
     PollResult<std::optional<T>> poll_next(detail::Context& ctx);
 
@@ -91,15 +144,12 @@ private:
     IoService*             m_io_service;
 
     explicit PollStream(int fd, DecoderT decoder,
-                       std::size_t pkt_buf_cap, std::size_t byte_buf_cap,
+                       PollStreamOptions options,
                        IoService* io_service);
 
     // libuv callbacks (run on I/O thread)
     static void poll_cb(uv_poll_t* handle, int status, int events);
     static void close_cb(uv_handle_t* handle);
-
-    // Helper to wake consumer task
-    static void wake_consumer(State* state);
 };
 
 // ---------------------------------------------------------------------------
@@ -117,17 +167,26 @@ struct PollStream<T, DecoderT>::State {
 
     DecoderT                                    decoder;          // Stateful frame decoder
 
-    std::atomic<std::shared_ptr<detail::Waker>> waker{nullptr};  // Stored waker for wake()
-    std::exception_ptr                          error;            // Captured error
-    bool                                        eof = false;      // EOF seen on fd
-    bool                                        polling = false;  // uv_poll_start active?
+    BackpressureMode                     backpressure_mode;
 
-    State(int fd_, DecoderT decoder_,
-          std::size_t pkt_cap, std::size_t byte_cap)
+    // mutex protects all mutable state shared between poll_cb (libuv I/O thread)
+    // and poll_next (executor thread): packet_buffer, overrun_count, error, eof,
+    // polling, and waker. This eliminates TOCTOU races between overrun_count checks
+    // and packet_buffer pops in poll_next. waker->wake() must be called AFTER
+    // releasing the mutex to avoid deadlock with multi-threaded executors.
+    std::mutex                           mutex;
+    std::size_t                          overrun_count{0};
+    std::shared_ptr<detail::Waker>       waker;
+    std::exception_ptr                   error;            // fatal error
+    bool                                 eof     = false;  // EOF seen on fd
+    bool                                 polling = false;  // uv_poll_start active?
+
+    State(int fd_, DecoderT decoder_, PollStreamOptions opts)
         : fd(fd_)
-        , byte_buffer(byte_cap)
-        , packet_buffer(pkt_cap)
+        , byte_buffer(opts.byte_buffer_capacity)
+        , packet_buffer(opts.packet_buffer_capacity)
         , decoder(std::move(decoder_))
+        , backpressure_mode(opts.backpressure)
     {
         poll_handle.data = this;
     }

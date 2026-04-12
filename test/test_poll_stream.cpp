@@ -121,7 +121,7 @@ TEST(PollStreamTest, ReadEOF) {
 }
 
 // ---------------------------------------------------------------------------
-// Backpressure
+// Backpressure — Block mode (default)
 // ---------------------------------------------------------------------------
 
 TEST(PollStreamTest, Backpressure_PacketBufferFull) {
@@ -131,6 +131,35 @@ TEST(PollStreamTest, Backpressure_PacketBufferFull) {
     // - Verify polling stops when buffer fills
     // - Consume some packets
     // - Verify polling resumes
+}
+
+// ---------------------------------------------------------------------------
+// Backpressure — Overrun mode
+// ---------------------------------------------------------------------------
+
+TEST(PollStreamTest, Overrun_DropsOldestAndCountsMissed) {
+    // TODO: Phase 3 - Implement test
+    // - Create stream with packet buffer capacity 4, BackpressureMode::Overrun
+    // - Write 8 messages before consumer runs
+    // - First poll_next call should return PollStreamOverrunError{4} (4 oldest dropped)
+    // - Subsequent poll_next calls should return the 4 surviving (newest) messages
+    // - Verify stream remains open and readable after the overrun error
+}
+
+TEST(PollStreamTest, Overrun_NoErrorWhenNoMisses) {
+    // TODO: Phase 3 - Implement test
+    // - Create stream with BackpressureMode::Overrun
+    // - Write messages slowly enough that the consumer keeps up
+    // - Verify no PollStreamOverrunError is delivered
+    // - Verify all messages arrive correctly
+}
+
+TEST(PollStreamTest, Overrun_ContinuesAfterError) {
+    // TODO: Phase 3 - Implement test
+    // - Trigger one overrun
+    // - Consumer catches PollStreamOverrunError and continues
+    // - Write more messages
+    // - Verify subsequent messages arrive correctly (stream not faulted)
 }
 
 // ---------------------------------------------------------------------------
