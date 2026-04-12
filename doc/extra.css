@@ -1,0 +1,4 @@
+/* Custom styling for wider content area */
+.wy-nav-content {
+    max-width: 1920px !important;
+}

@@ -4,6 +4,8 @@ watch:
   - include/
 theme:
   name: readthedocs
+extra_css:
+  - extra.css
 plugins:
   - search
   - mermaid2:
@@ -64,6 +66,7 @@ nav:
     - I/O Integration:
       - libuv Integration: libuv_integration.md
       - WebSocket Stream: websocket_stream.md
+      - PollStreams: poll_streams.md
     - Synchronization:
       - Coroutine Scope: coroutine_scope.md
       - JoinSet: join_set.md

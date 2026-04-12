@@ -13,11 +13,15 @@ if(ENABLE_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
-find_package(gperftools REQUIRED)
-find_package(GTest REQUIRED)
+option(BUILD_TESTING "Build unit tests" OFF)
+option(BUILD_EXAMPLES "Build examples" OFF)
+
+#find_package(gperftools REQUIRED)
 find_package(libuv REQUIRED)
 find_package(Libwebsockets REQUIRED)
 
+file(GLOB_RECURSE CORO_PUBLIC_HEADERS "include/coro/*.h" "include/coro/*.hpp")
+message(STATUS ${CORO_PUBLIC_HEADERS})
 add_library(coro
     src/waker.cpp
     src/blocking_pool.cpp
@@ -32,10 +36,24 @@ add_library(coro
     src/tcp_stream.cpp
     src/ws_stream.cpp
     src/ws_listener.cpp
+    src/file.cpp
+    src/circular_byte_buffer.cpp
 )
 target_include_directories(coro PUBLIC include)
-target_link_libraries(coro PUBLIC gperftools::gperftools libuv::uv_a websockets cap)
+target_link_libraries(coro PUBLIC libuv::uv_a websockets cap)
 
-enable_testing()
-add_subdirectory(examples/io)
-add_subdirectory(test)
+if(BUILD_TESTING)
+    find_package(GTest REQUIRED)
+    enable_testing()
+    add_subdirectory(test)
+endif()
+
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples/io)
+endif()
+
+install(TARGETS coro PUBLIC_HEADER DESTINATION include/coro)
+install(DIRECTORY include/coro                                                                                                          
+    DESTINATION include                                                                                                                 
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"                                                                                        
+)

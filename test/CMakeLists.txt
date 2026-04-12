@@ -22,6 +22,7 @@ set(TEST_TARGETS
     test_oneshot
     test_mpsc
     test_watch
+    test_file
     test_spawn_blocking
 )
 
@@ -31,3 +32,22 @@ foreach(t ${TEST_TARGETS})
     target_link_libraries(${t} PRIVATE coro GTest::gtest GTest::gtest_main GTest::gmock)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# PCIe character device PollStream example — decoder, tests, and usage example
+add_library(pcie_decoder pcie_decoder.cpp)
+target_include_directories(pcie_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pcie_decoder PUBLIC coro)
+
+add_executable(test_pcie_decoder test_pcie_decoder.cpp)
+target_include_directories(test_pcie_decoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_pcie_decoder PRIVATE coro pcie_decoder GTest::gtest GTest::gtest_main)
+add_test(NAME PcieDecoderTest COMMAND test_pcie_decoder)
+
+add_executable(test_pcie_stream_integration test_pcie_stream_integration.cpp)
+target_include_directories(test_pcie_stream_integration PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_pcie_stream_integration PRIVATE coro pcie_decoder GTest::gtest GTest::gtest_main)
+add_test(NAME PcieStreamIntegrationTest COMMAND test_pcie_stream_integration)
+
+add_executable(pcie_reader pcie_reader.cpp)
+target_include_directories(pcie_reader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pcie_reader PRIVATE coro pcie_decoder)

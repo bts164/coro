@@ -70,6 +70,15 @@ int main(int argc, char* argv[]) {
     return rt.block_on(async_main(argc, argv));
 }
 ```
+### Tasks
+
+A **task** is a coroutine scheduled on the executor — the async equivalent of an OS
+thread. Work within a single task is always sequential: each `co_await` completes before
+the next line runs. Work in *different* tasks can run in parallel: on a multi-threaded
+executor, two tasks may execute simultaneously on different worker threads, just as two OS
+threads would. Spawning a task is therefore how you introduce true parallelism, not just
+concurrency.
+
 ### Structured concurrency
 
 Spawning background tasks without tracking them leads to the same problems as
@@ -182,6 +191,20 @@ int main() {
     coro::Runtime rt;
     rt.block_on(run());  // runs the coroutine to completion on the runtime
 }
+```
+
+Output:
+```
+0,1,2,3
+1,2,3,4
+1,3,5,7
+2,5,8,11
+3,8,13,18
+5,13,21,29
+8,21,34,47
+13,34,55,76
+21,55,89,123
+34,89,144,199
 ```
 
 ## Where to go next
