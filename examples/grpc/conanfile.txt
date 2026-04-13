@@ -1,0 +1,10 @@
+[requires]
+coro/[>=0.1]
+grpc/[>=1.78]
+
+[layout]
+cmake_layout
+
+[generators]
+CMakeDeps
+CMakeToolchain
