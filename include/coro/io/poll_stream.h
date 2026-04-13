@@ -139,7 +139,10 @@ public:
     ~PollStream();
 
 private:
-    struct State; // forward declaration
+    struct State;                // forward declaration
+    struct EnsurePollingRequest; // IoRequest: init + start poll on I/O thread
+    struct CloseRequest;         // IoRequest: stop + close handle on I/O thread
+
     std::shared_ptr<State> m_state;
     IoService*             m_io_service;
 
@@ -171,15 +174,19 @@ struct PollStream<T, DecoderT>::State {
 
     // mutex protects all mutable state shared between poll_cb (libuv I/O thread)
     // and poll_next (executor thread): packet_buffer, overrun_count, error, eof,
-    // polling, and waker. This eliminates TOCTOU races between overrun_count checks
-    // and packet_buffer pops in poll_next. waker->wake() must be called AFTER
+    // polling, closing, and waker. This eliminates TOCTOU races between overrun_count
+    // checks and packet_buffer pops in poll_next. waker->wake() must be called AFTER
     // releasing the mutex to avoid deadlock with multi-threaded executors.
     std::mutex                           mutex;
     std::size_t                          overrun_count{0};
     std::shared_ptr<detail::Waker>       waker;
-    std::exception_ptr                   error;            // fatal error
-    bool                                 eof     = false;  // EOF seen on fd
-    bool                                 polling = false;  // uv_poll_start active?
+    std::exception_ptr                   error;               // fatal error
+    bool                                 eof         = false; // EOF seen on fd
+    bool                                 polling     = false; // uv_poll_start active?
+    bool                                 closing     = false; // CloseRequest submitted
+    // initialized is only ever read/written on the I/O thread (inside IoRequest::execute),
+    // so it does not need mutex protection.
+    bool                                 initialized = false; // uv_poll_init done
 
     State(int fd_, DecoderT decoder_, PollStreamOptions opts)
         : fd(fd_)
@@ -190,6 +197,33 @@ struct PollStream<T, DecoderT>::State {
     {
         poll_handle.data = this;
     }
+};
+
+// ---------------------------------------------------------------------------
+// IoRequest types — execute() runs on the libuv I/O thread
+// ---------------------------------------------------------------------------
+
+/**
+ * Submitted by poll_next() when polling needs to start or resume.
+ * Calls uv_poll_init (first time) and uv_poll_start on the I/O thread,
+ * keeping all libuv API calls off the executor thread.
+ */
+template<typename T, Decoder DecoderT>
+struct PollStream<T, DecoderT>::EnsurePollingRequest : IoRequest {
+    std::shared_ptr<State> state;
+    explicit EnsurePollingRequest(std::shared_ptr<State> s) : state(std::move(s)) {}
+    void execute(uv_loop_t* loop) override;
+};
+
+/**
+ * Submitted by close() to stop polling and close the handle on the I/O thread.
+ * Holds a shared_ptr<State> to keep State alive until close_cb fires.
+ */
+template<typename T, Decoder DecoderT>
+struct PollStream<T, DecoderT>::CloseRequest : IoRequest {
+    std::shared_ptr<State> state;
+    explicit CloseRequest(std::shared_ptr<State> s) : state(std::move(s)) {}
+    void execute(uv_loop_t* loop) override;
 };
 
 } // namespace coro

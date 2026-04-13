@@ -20,11 +20,8 @@ PollStream<T, DecoderT>::PollStream(int fd, DecoderT decoder,
     : m_state(std::make_shared<State>(fd, std::move(decoder), options))
     , m_io_service(io_service)
 {
-    // Initialize uv_poll_t handle
-    int result = uv_poll_init(io_service->loop(), &m_state->poll_handle, fd);
-    if (result < 0) {
-        throw std::system_error(-result, std::system_category(), "uv_poll_init failed");
-    }
+    // uv_poll_init is deferred to EnsurePollingRequest::execute(), which runs on
+    // the I/O thread. Calling uv_poll_init here would race with the event loop.
 }
 
 template<typename T, Decoder DecoderT>
@@ -88,14 +85,12 @@ PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context&
     // bytes that arrived before an error are returned to the consumer first; the
     // error surfaces only once the packet buffer is empty.
     if (auto packet = m_state->packet_buffer.pop()) {
-        // In Block mode, re-enable polling now that there is space in the buffer.
+        // In Block mode, request polling restart on the I/O thread now that
+        // space has opened in the packet buffer.
         // In Overrun mode polling is never stopped, so no action needed.
         if (m_state->backpressure_mode == BackpressureMode::Block &&
-            !m_state->polling && !m_state->eof) {
-            int result = uv_poll_start(&m_state->poll_handle, UV_READABLE, poll_cb);
-            if (result == 0) {
-                m_state->polling = true;
-            }
+            !m_state->polling && !m_state->closing) {
+            m_io_service->submit(std::make_unique<EnsurePollingRequest>(m_state));
         }
 
         return std::move(packet);
@@ -113,12 +108,10 @@ PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context&
     // Packet buffer empty but more data may arrive - register waker and suspend.
     m_state->waker = ctx.getWaker();
 
-    // Ensure polling is active (may have been stopped by Block backpressure).
-    if (!m_state->polling && !m_state->eof) {
-        int result = uv_poll_start(&m_state->poll_handle, UV_READABLE, poll_cb);
-        if (result == 0) {
-            m_state->polling = true;
-        }
+    // Ensure polling is active. The request is executed on the I/O thread;
+    // uv_poll_start (and uv_poll_init on the first call) happen there safely.
+    if (!m_state->polling && !m_state->closing) {
+        m_io_service->submit(std::make_unique<EnsurePollingRequest>(m_state));
     }
 
     return PollPending;
@@ -126,16 +119,19 @@ PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context&
 
 template<typename T, Decoder DecoderT>
 void PollStream<T, DecoderT>::close() {
-    if (!m_state) return;
+    if (!m_state || !m_io_service) return;
 
-    // Stop polling
-    if (m_state->polling) {
-        uv_poll_stop(&m_state->poll_handle);
-        m_state->polling = false;
+    {
+        std::lock_guard lock(m_state->mutex);
+        if (m_state->closing) return; // already submitted
+        m_state->closing = true;
     }
 
-    // Close handle (async)
-    uv_close(reinterpret_cast<uv_handle_t*>(&m_state->poll_handle), close_cb);
+    // Submit CloseRequest to the I/O thread. It holds a shared_ptr<State> so
+    // State (which contains the embedded poll_handle) stays alive until after
+    // uv_close fires close_cb — no use-after-free even if ~PollStream() drops
+    // m_state before the callback fires.
+    m_io_service->submit(std::make_unique<CloseRequest>(m_state));
 }
 
 // ---------------------------------------------------------------------------
@@ -286,20 +282,134 @@ void PollStream<T, DecoderT>::poll_cb(uv_poll_t* handle, int status, int events)
 
 template<typename T, Decoder DecoderT>
 void PollStream<T, DecoderT>::close_cb(uv_handle_t* handle) {
-    // Cleanup after handle closed
-    // The State is held by shared_ptr, so it will be destroyed when last ref drops
-    // Nothing to do here
+    // Release the shared_ptr that close() parked in handle->data. When this
+    // drops the last reference to State, State (and the embedded poll_handle)
+    // are freed — safely, now that libuv is done with the handle.
+    delete static_cast<std::shared_ptr<State>*>(handle->data);
 }
 
 
 // ---------------------------------------------------------------------------
-// Explicit Template Instantiations
+// IoRequest implementations (execute() runs on the libuv I/O thread)
 // ---------------------------------------------------------------------------
-//
+
+template<typename T, Decoder DecoderT>
+void PollStream<T, DecoderT>::EnsurePollingRequest::execute(uv_loop_t* loop) {
+    // Guard: bail out if the stream is closing, already polling, or has a fatal error.
+    {
+        std::lock_guard lock(state->mutex);
+        if (state->closing || state->polling || state->error) return;
+    }
+
+    // EOF path: no more bytes can arrive from the fd, but byte_buffer may still hold
+    // undecoded bytes (e.g. Block mode filled the packet buffer before all bytes were
+    // decoded — the consumer drained a packet slot and re-submitted this request).
+    // Run Phase 2 decode here to drain byte_buffer into packet_buffer, then wake.
+    if (state->eof) {
+        bool should_wake = false;
+        try {
+            while (true) {
+                {
+                    std::lock_guard lock(state->mutex);
+                    if (state->packet_buffer.full()) break;
+                }
+
+                auto readable_span = state->byte_buffer.readable_span();
+                if (readable_span.empty()) {
+                    should_wake = true; // byte_buffer fully drained — signal EOF to consumer
+                    break;
+                }
+
+                std::size_t consumed = 0;
+                auto packet = state->decoder.decode(readable_span, consumed);
+
+                if (consumed > 0) {
+                    state->byte_buffer.consume(consumed);
+                }
+
+                if (packet) {
+                    std::lock_guard lock(state->mutex);
+                    state->packet_buffer.push(std::move(*packet));
+                    should_wake = true;
+                } else {
+                    if (consumed == 0) {
+                        // Incomplete packet at EOF — remaining bytes can never form a
+                        // complete packet. Surface EOF to the consumer now.
+                        should_wake = true;
+                        break;
+                    }
+                }
+            }
+        } catch (...) {
+            std::lock_guard lock(state->mutex);
+            state->error = std::current_exception();
+            should_wake = true;
+        }
+
+        if (should_wake) {
+            std::shared_ptr<detail::Waker> w;
+            {
+                std::lock_guard lock(state->mutex);
+                w = std::exchange(state->waker, nullptr);
+            }
+            if (w) w->wake();
+        }
+        return;
+    }
+
+    // First-time initialisation — uv_poll_init must run on the I/O thread.
+    if (!state->initialized) {
+        int r = uv_poll_init(loop, &state->poll_handle, state->fd);
+        if (r < 0) {
+            std::lock_guard lock(state->mutex);
+            state->error = std::make_exception_ptr(
+                std::system_error(-r, std::system_category(), "uv_poll_init failed"));
+            if (auto w = std::exchange(state->waker, nullptr)) w->wake();
+            return;
+        }
+        // poll_handle.data was already set to state.get() in the State constructor
+        // and is preserved by uv_poll_init (libuv does not touch the data field).
+        state->initialized = true;
+    }
+
+    int r = uv_poll_start(&state->poll_handle, UV_READABLE, poll_cb);
+    {
+        std::lock_guard lock(state->mutex);
+        if (r == 0) {
+            state->polling = true;
+        } else {
+            state->error = std::make_exception_ptr(
+                std::system_error(-r, std::system_category(), "uv_poll_start failed"));
+            if (auto w = std::exchange(state->waker, nullptr)) w->wake();
+        }
+    }
+}
+
+template<typename T, Decoder DecoderT>
+void PollStream<T, DecoderT>::CloseRequest::execute(uv_loop_t*) {
+    if (!state->initialized) {
+        // uv_poll_init was never called — nothing for libuv to close.
+        return;
+    }
+
+    if (state->polling) {
+        uv_poll_stop(&state->poll_handle);
+        state->polling = false;
+    }
+
+    // Park a shared_ptr in handle->data to keep State alive until close_cb fires.
+    // uv_poll_stop above prevents any further poll_cb dispatches that read handle->data
+    // as State*; it is safe to overwrite it here.
+    auto* handle = reinterpret_cast<uv_handle_t*>(&state->poll_handle);
+    handle->data  = new std::shared_ptr<State>(std::move(state));
+    uv_close(handle, close_cb);
+    // state is now moved-from (null); CloseRequest destruction is a no-op.
+}
+
+// ---------------------------------------------------------------------------
 // Note: PollStream is a template and will be instantiated in user code
 // when they provide their own Decoder. No explicit instantiations needed
 // here in the library.
-//
-// For examples of concrete decoders, see test/pcie_decoder.h
+// ---------------------------------------------------------------------------
 
 } // namespace coro
