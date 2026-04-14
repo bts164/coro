@@ -11,6 +11,7 @@ using namespace coro;
 // --- Concept checks ---
 static_assert(Future<oneshot::OneshotReceiver<int>>);
 static_assert(Future<oneshot::OneshotReceiver<std::unique_ptr<int>>>);
+static_assert(Future<oneshot::OneshotReceiver<void>>);
 
 // --- Construction ---
 
@@ -111,5 +112,61 @@ TEST(OneshotTest, ReceiverSuspendsUntilSend) {
         auto result = co_await rx;
         EXPECT_TRUE(result.has_value());
         EXPECT_EQ(*result, 7);
+    }());
+}
+
+// --- void specialisation ---
+
+TEST(OneshotVoidTest, ChannelReturnsLinkedPair) {
+    auto [tx, rx] = oneshot::channel<void>();
+    (void)tx; (void)rx;
+}
+
+TEST(OneshotVoidTest, SendReturnsSuccessWhenReceiverAlive) {
+    auto [tx, rx] = oneshot::channel<void>();
+    auto result = tx.send();
+    EXPECT_TRUE(result.has_value());
+    (void)rx;
+}
+
+TEST(OneshotVoidTest, SendReturnsClosedWhenReceiverDropped) {
+    auto [tx, rx] = oneshot::channel<void>();
+    { auto dropped = std::move(rx); }
+    auto result = tx.send();
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ChannelError::Closed);
+}
+
+TEST(OneshotVoidTest, ReceiverGetsSignalAfterSend) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = oneshot::channel<void>();
+        tx.send();
+        auto result = co_await rx;
+        EXPECT_TRUE(result.has_value());
+    }());
+}
+
+TEST(OneshotVoidTest, ReceiverErrorWhenSenderDropped) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = oneshot::channel<void>();
+        { auto dropped = std::move(tx); }
+        auto result = co_await rx;
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ChannelError::Closed);
+    }());
+}
+
+TEST(OneshotVoidTest, ReceiverSuspendsUntilSend) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = oneshot::channel<void>();
+        co_await coro::spawn([tx = std::move(tx)]() mutable -> Coro<void> {
+            tx.send();
+            co_return;
+        }()).submit();
+        auto result = co_await rx;
+        EXPECT_TRUE(result.has_value());
     }());
 }

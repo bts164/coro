@@ -9,16 +9,34 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(coro CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
-
-add_executable(hello_server helloserver.cpp helloworld.proto)
-target_link_libraries(hello_server PRIVATE coro::coro gRPC::grpc++)
-target_include_directories(hello_server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-
 get_target_property(grpc_cpp_plugin_location gRPC::grpc_cpp_plugin LOCATION)
+
+add_executable(hello_server src/helloserver.cpp src/helloworld.proto)
+target_link_libraries(hello_server PRIVATE coro::coro gRPC::grpc++ absl::log absl::log_initialize)
+target_include_directories(hello_server PRIVATE include ${CMAKE_CURRENT_BINARY_DIR})
 protobuf_generate(TARGET hello_server
-    LANGUAGE cpp)
+    LANGUAGE cpp
+    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
+    PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
 protobuf_generate(
     TARGET hello_server
     LANGUAGE grpc
     GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
-    PLUGIN "protoc-gen-grpc=${grpc_cpp_plugin_location}")
+    PLUGIN "protoc-gen-grpc=${grpc_cpp_plugin_location}"
+    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
+    PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
+
+add_executable(signal_server src/signalserver.cpp src/plotsignal.proto)
+target_link_libraries(signal_server PRIVATE coro::coro gRPC::grpc++ absl::log absl::log_initialize)
+target_include_directories(signal_server PRIVATE include ${CMAKE_CURRENT_BINARY_DIR})
+protobuf_generate(TARGET signal_server
+    LANGUAGE cpp
+    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
+    PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
+protobuf_generate(
+    TARGET signal_server
+    LANGUAGE grpc
+    GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
+    PLUGIN "protoc-gen-grpc=${grpc_cpp_plugin_location}"
+    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
+    PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR})

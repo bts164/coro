@@ -87,6 +87,24 @@ of the API they call, not the internal mechanism that makes it unsafe. The descr
 body may go into internal implementation details (coroutine frame lifetime, `this` pointer
 capture, drain mechanics, etc.) where it helps the user understand *why* the rule exists.
 
+### Wrap capturing lambdas in `co_invoke` before passing to `coro::spawn`
+
+`coro::spawn` expects a `Future` or `Stream`, not a callable. A plain lambda is not a
+`Future` — passing one directly compiles but produces undefined behaviour at runtime
+(the lambda is treated as an already-constructed future object, causing a crash).
+
+Always invoke the lambda first so that `spawn` receives the resulting coroutine:
+
+```cpp
+// WRONG — passes the lambda itself as if it were a Future:
+coro::spawn([&foo]() -> coro::Coro<void> { ... }).submit();
+
+// CORRECT — call the lambda (or use co_invoke) to produce the Coro:
+coro::spawn(co_invoke([&foo]() -> coro::Coro<void> { ... })).submit();
+// or equivalently:
+coro::spawn([&foo]() -> coro::Coro<void> { ... }()).submit();
+```
+
 ### [[nodiscard]] on Future-returning functions
 
 All functions that return a `Future`, `Stream`, `JoinHandle`, `StreamHandle`, or builder

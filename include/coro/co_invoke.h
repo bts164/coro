@@ -43,7 +43,19 @@ public:
 
     /// @brief Advances the inner coroutine. Delegates directly to `Coro<T>::poll()`.
     PollResult<OutputType> poll(detail::Context& ctx) {
-        return m_coro->poll(ctx);
+        auto result = m_coro->poll(ctx);
+        if (!result.isPending()) {
+            // Coroutine is done (ready, error, or dropped). Release captures immediately
+            // so that values captured by the lambda are destroyed as soon as the coroutine
+            // completes, not when this wrapper is eventually destroyed. Without this reset,
+            // captured values (e.g. shared_ptr, RAII guards) can outlive the coroutine
+            // scope — violating the invariant that child tasks must fully clean up before
+            // the parent scope can observe their completion.
+            // m_coro is destroyed first because the coroutine frame may reference m_lambda.
+            m_coro.reset();
+            m_lambda.reset();
+        }
+        return result;
     }
 
     /// @brief Propagates cancellation to the inner coroutine.
@@ -84,7 +96,19 @@ public:
 
     /// @brief Advances the inner stream. Delegates directly to `CoroStream<T>::poll_next()`.
     PollResult<std::optional<ItemType>> poll_next(detail::Context& ctx) {
-        return m_stream->poll_next(ctx);
+        auto result = m_stream->poll_next(ctx);
+        if (!result.isPending()) {
+            // Stream is done when exhausted (Ready(nullopt)), errored, or dropped.
+            // If it yielded an item (Ready(some)), more polls may follow — keep alive.
+            const bool has_item = result.isReady() && result.value().has_value();
+            if (!has_item) {
+                // Same reasoning as CoInvokeFuture: release captures immediately on
+                // completion so that captured values don't outlive the stream scope.
+                m_stream.reset();
+                m_lambda.reset();
+            }
+        }
+        return result;
     }
 
     /// @brief Propagates cancellation to the inner stream.

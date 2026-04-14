@@ -145,3 +145,50 @@ TEST(CoInvokeStreamTest, ValueCaptureInStream) {
 
     EXPECT_EQ(items, (std::vector<int>{11, 12, 13}));
 }
+
+// --- Capture lifetime: ensures captures are released on completion, not on wrapper destruction ---
+//
+// The wrapper (CoInvokeFuture / CoInvokeStream) may outlive the coroutine if it is
+// stored as a local variable. Without the fix, captured values (e.g. RAII guards,
+// shared_ptr) would be held until the wrapper itself is destroyed, violating the
+// coroutine scope invariant. These tests keep the wrapper alive in scope AFTER the
+// coroutine/stream completes and verify the captures are already released.
+
+TEST(CoInvokeTest, ReleasesCaptures_OnCompletion) {
+    Runtime rt(1);
+    auto resource = std::make_shared<int>(0);
+    std::weak_ptr<int> weak = resource;
+    bool still_held_after_await = true;
+
+    rt.block_on([&]() -> Coro<void> {
+        // Move resource into the lambda — it becomes the sole owner (refcount = 1).
+        auto child = co_invoke([r = std::move(resource)]() -> Coro<void> {
+            co_return;
+        });
+        co_await child;
+        // 'child' (the CoInvokeFuture) is still in scope here. Without the fix,
+        // m_lambda has not been reset, so 'r' is still alive (weak not expired).
+        still_held_after_await = !weak.expired();
+    }());
+
+    EXPECT_FALSE(still_held_after_await); // captures must be released on completion
+}
+
+TEST(CoInvokeStreamTest, ReleasesCaptures_WhenExhausted) {
+    Runtime rt(1);
+    auto resource = std::make_shared<int>(0);
+    std::weak_ptr<int> weak = resource;
+    bool still_held_after_drain = true;
+
+    rt.block_on([&]() -> Coro<void> {
+        auto s = co_invoke([r = std::move(resource)]() -> CoroStream<int> {
+            co_yield 1;
+        });
+        while (auto item = co_await next(s)) {}
+        // 's' (the CoInvokeStream) is still in scope. Without the fix, m_lambda
+        // has not been reset, so 'r' is still alive (weak not expired).
+        still_held_after_drain = !weak.expired();
+    }());
+
+    EXPECT_FALSE(still_held_after_drain); // captures must be released on exhaustion
+}

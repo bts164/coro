@@ -15,12 +15,16 @@ namespace coro::oneshot {
 
 namespace detail {
 
+/// `std::optional<void>` is ill-formed, so map void → monostate for the slot.
+template<typename T>
+using SlotType = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+
 template<typename T>
 struct OneshotShared {
-    std::mutex                        mutex;
-    std::optional<T>                  slot;           ///< Filled by send().
-    bool                              sender_alive   = true;
-    bool                              receiver_alive = true;
+    std::mutex                           mutex;
+    std::optional<SlotType<T>>           slot;           ///< Filled by send().
+    bool                                 sender_alive   = true;
+    bool                                 receiver_alive = true;
     std::shared_ptr<coro::detail::Waker> receiver_waker; ///< Set when receiver suspends.
 };
 
@@ -62,27 +66,53 @@ public:
     }
 
     /**
-     * @brief Sends @p value to the receiver.
+     * @brief Sends @p value to the receiver (non-void T).
      *
      * Synchronous and non-blocking. Returns `std::unexpected(value)` if the
      * receiver has already been dropped, giving the caller ownership of the
      * unsent value back.
      *
      * @param value The value to send.
-     * @return `{}` on success; `std::unexpected(std::move(value))` if the receiver is gone.
+     * @return `{}` on success; `std::unexpected<U>(std::forward<U>(value))` if the receiver is gone.
+     * @note This is a template primarily because this overload needs to be removed using SFINAE when
+     * `T` is `void`. Allowing perfect forwarding and avoiding unnecessary moves is just an added bonus.
      */
-    std::expected<void, T> send(T value) {
+    template<typename U> requires (
+        !std::is_void_v<T> && std::convertible_to<U, T>
+    )
+    std::expected<void, std::decay_t<U>> send(U &&value) {
         std::shared_ptr<coro::detail::Waker> waker;
         {
             std::lock_guard lock(m_shared->mutex);
             if (!m_shared->receiver_alive) {
-                return std::unexpected(std::move(value));
+                return std::unexpected<std::decay_t<U>>(std::forward<U>(value));
             }
-            m_shared->slot = std::move(value);
+            m_shared->slot = std::forward<std::decay_t<U>>(value);
             waker = std::move(m_shared->receiver_waker);
             m_shared->sender_alive = false; // consumed
         }
         m_shared = nullptr; // release before waking to avoid lock contention
+        if (waker) waker->wake();
+        return {};
+    }
+
+    /**
+     * @brief Signals the receiver (void T). Takes no arguments.
+     *
+     * Returns `{}` on success; `std::unexpected(ChannelError::Closed)` if the
+     * receiver has already been dropped.
+     */
+    std::expected<void, ChannelError> send() requires std::is_void_v<T> {
+        std::shared_ptr<coro::detail::Waker> waker;
+        {
+            std::lock_guard lock(m_shared->mutex);
+            if (!m_shared->receiver_alive)
+                return std::unexpected(ChannelError::Closed);
+            m_shared->slot = std::monostate{};
+            waker = std::move(m_shared->receiver_waker);
+            m_shared->sender_alive = false;
+        }
+        m_shared = nullptr;
         if (waker) waker->wake();
         return {};
     }
@@ -99,7 +129,7 @@ private:
  *
  * **Thread safety:** each instance must be used by at most one thread at a time.
  *
- * @tparam T The value type to receive.
+ * @tparam T The value type to receive. Use `void` for pure signalling with no value.
  */
 template<typename T>
 class OneshotReceiver {
@@ -132,7 +162,11 @@ public:
         std::lock_guard lock(m_shared->mutex);
 
         if (m_shared->slot.has_value()) {
-            return OutputType(std::move(*m_shared->slot));
+            if constexpr (std::is_void_v<T>) {
+                return OutputType{};
+            } else {
+                return OutputType(std::move(*m_shared->slot));
+            }
         }
         if (!m_shared->sender_alive) {
             return OutputType(std::unexpected(ChannelError::Closed));

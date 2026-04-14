@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package plotsignal;
+
+// Describes the fixed x-axis so the client can reconstruct it.
+// Sent once before the stream starts.
+message SignalInfo {
+    float x_start      = 1;   // e.g. 0.0
+    float x_end        = 2;   // e.g. 4*pi
+    uint32 num_samples = 3;   // e.g. 2000
+}
+
+// A single frame of signal data.
+message DataFrame {
+    repeated float y  = 1 [packed = true];  // num_samples y-values
+    double timestamp  = 2;                  // seconds since server epoch
+}
+
+// Subscription request — the client can ask for a target frame rate.
+// The server may deliver faster or slower depending on load.
+message SubscribeRequest {
+    float target_fps = 1;   // 0 = as fast as the server produces
+}
+
+// Response to a Subscribe call: axis metadata followed by a stream of frames.
+message SubscribeResponse {
+    oneof payload {
+        SignalInfo info  = 1;   // first message only
+        DataFrame  frame = 2;  // subsequent messages
+    }
+}
+
+service SignalService {
+    // Client subscribes once; server streams frames until disconnect.
+    rpc Subscribe (SubscribeRequest) returns (stream SubscribeResponse) {}
+}
