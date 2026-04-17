@@ -64,6 +64,7 @@ nav:
       - Overview: executor_design.md
       - Work-Stealing Scheduler: work_stealing_executor.md
     - I/O Integration:
+      - I/O Coroutines: io_coroutine.md
       - libuv Integration: libuv_integration.md
       - WebSocket Stream: websocket_stream.md
       - PollStreams: poll_streams.md

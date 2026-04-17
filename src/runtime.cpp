@@ -19,11 +19,11 @@ Runtime::Runtime(std::size_t num_threads)
 }
 
 Runtime::~Runtime() {
-    // m_executor is declared after m_io_service, so it is destroyed first (reverse
-    // declaration order). The executor destructor joins all worker threads, ensuring
-    // no further waker->wake() calls arrive before IoService shuts down.
-    // IoService::~IoService() then stops the I/O thread and closes the loop.
-    // No explicit action needed here.
+    // Destruction order (reverse declaration order):
+    //   1. m_executor — joins all worker threads; no more waker->wake() calls after this.
+    //   2. m_blocking_pool — joins blocking pool threads.
+    //   3. m_uv_executor — stops the uv thread and closes the loop last.
+    // No explicit action needed here; member destructors fire in the right order.
 }
 
 void set_current_runtime(Runtime* rt) {

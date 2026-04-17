@@ -20,6 +20,7 @@ message DataFrame {
 // The server may deliver faster or slower depending on load.
 message SubscribeRequest {
     float target_fps = 1;   // 0 = as fast as the server produces
+    float noise_std  = 2;   // std of the normal ditributed noise
 }
 
 // Response to a Subscribe call: axis metadata followed by a stream of frames.

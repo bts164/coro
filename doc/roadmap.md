@@ -2,6 +2,38 @@
 
 Planned work not yet implemented, in rough priority order.
 
+## Single-thread mode: `block_on` drives the uv loop directly
+
+Allow the `Runtime` to run libuv, libwebsockets, and all user coroutine tasks on a
+single thread — including the calling thread in `block_on` — with no background uv
+thread at all.
+
+**Motivation:** embedded targets, deterministic testing, and applications where the OS
+scheduler overhead of a second thread is undesirable. Matches the `tokio::runtime::Builder::new_current_thread()` model.
+
+**Design sketch:**
+
+- `SingleThreadedUvExecutor` gains a "no-thread" construction mode. The uv loop and
+  lws context are initialized on first call to `run_until()` rather than in a spawned
+  thread.
+- A `run_until(predicate)` method (or equivalent) drives `io_thread_loop` on the
+  calling thread, stopping when `predicate()` returns true (e.g. `state.terminated`).
+- `Runtime::block_on` in this mode calls `run_until(state.terminated)` directly instead
+  of scheduling a task and calling `wait_for_completion` (which would deadlock — the
+  loop is not running).
+- The `uv_async_t` doorbell is retained but becomes a no-op wake source since all
+  enqueue calls now originate on the same thread.
+- A new `Runtime` constructor overload (or factory) opts into this mode:
+  ```cpp
+  auto rt = Runtime::single_threaded(); // no background thread
+  rt.block_on([](auto...) -> Coro<void> { ... }());
+  ```
+
+**Key invariant:** `SingleThreadedUvExecutor` must detect whether it owns the calling
+thread (i.e. `run_until` is on the stack) and short-circuit `enqueue` to push directly
+to `m_ready` without the `uv_async_send` cross-thread wake, avoiding a redundant
+doorbell interrupt on every task wake.
+
 ## Migrate error-returning futures to `std::expected`
 
 The library's error handling policy is `std::expected<T, E>` as the default, with
@@ -117,6 +149,40 @@ while (auto item = co_await coro::next(rx))
 - Use case: event buses, log fanout, pub/sub within a single runtime.
 
 Lives in `include/coro/sync/channel.h`.
+
+## Channel — `Event`
+
+A simple set/wait primitive for pure signalling with no value transfer — analogous to
+`asyncio.Event` in Python or a manual-reset event in Win32.
+
+```cpp
+coro::Event ev;
+
+// Waiting side (coroutine):
+co_await ev.wait();  // suspends until set() is called
+
+// Signalling side (any thread, including callbacks):
+ev.set();
+
+// Optional reset for reuse:
+ev.clear();
+```
+
+- `set()` is synchronous and thread-safe — callable from callbacks, I/O threads, or
+  any other non-async context. If a task is already waiting, its waker is called
+  immediately. If no task is waiting yet, the "set" state is latched so the next
+  `wait()` resolves immediately.
+- `wait()` returns a `Future<void>` that resolves as soon as the event is set. If the
+  event is already set when `wait()` is first polled, it returns `Ready` immediately.
+- `clear()` resets the event so it can be waited on again.
+- Single-waiter: at most one task may be suspended on `wait()` at a time (same
+  constraint as `oneshot`). A multi-waiter variant can be built on top of `broadcast`
+  if needed.
+
+Use case: any place where a callback needs to wake a coroutine with no value to
+transfer — timer fires, I/O completion notifications, inter-task signals.
+
+Lives in `include/coro/sync/event.h`.
 
 ## Async `Mutex<T>`
 

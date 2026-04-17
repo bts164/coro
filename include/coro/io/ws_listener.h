@@ -4,7 +4,7 @@
 #include <coro/detail/poll_result.h>
 #include <coro/detail/waker.h>
 #include <coro/io/ws_stream.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <libwebsockets.h>
 #include <atomic>
 #include <deque>
@@ -75,7 +75,7 @@ namespace coro {
  *
  * Binds a TCP port and performs the WebSocket handshake for each incoming
  * connection. Built on libwebsockets using a dedicated server-side lws context
- * that shares the same libuv event loop as @ref IoService.
+ * that shares the same libuv event loop as the uv executor.
  *
  * Obtain a `WsListener` via `co_await WsListener::bind(host, port)`.
  * Call `co_await listener.accept()` in a loop to receive connections as
@@ -86,7 +86,6 @@ namespace coro {
  * handed off are unaffected.
  *
  * All lws handles and callbacks are private implementation details.
- * @ref IoService has no knowledge of listener internals.
  */
 class WsListener {
 public:
@@ -97,8 +96,8 @@ public:
     /**
      * @brief Future<WsListener> returned by @ref WsListener::bind().
      *
-     * On first poll, submits a `WsBindRequest` to @ref IoService, which creates
-     * a server-side lws context on the I/O thread and registers it on the shared
+     * On first poll, submits a `WsBindRequest` to the uv executor, which creates
+     * a server-side lws context on the uv thread and registers it on the shared
      * uv_loop. Woken when the context is ready (or fails).
      */
     class BindFuture {
@@ -106,7 +105,7 @@ public:
         using OutputType = WsListener;
 
         BindFuture(std::string host, uint16_t port,
-                   std::vector<std::string> subprotocols, IoService* io_service);
+                   std::vector<std::string> subprotocols, SingleThreadedUvExecutor* uv_exec);
 
         BindFuture(BindFuture&&) noexcept            = default;
         BindFuture& operator=(BindFuture&&) noexcept = default;
@@ -119,7 +118,7 @@ public:
         std::string                                  m_host;
         uint16_t                                     m_port;
         std::vector<std::string>                     m_subprotocols;
-        IoService*                                   m_io_service;
+        SingleThreadedUvExecutor*                                   m_uv_exec;
         std::shared_ptr<detail::ws::ListenerState>   m_state;  // null until first poll
     };
 
@@ -134,7 +133,7 @@ public:
         using OutputType = WsStream;
 
         AcceptFuture(std::shared_ptr<detail::ws::ListenerState> state,
-                     IoService*                                  io_service);
+                     SingleThreadedUvExecutor*                                  uv_exec);
 
         AcceptFuture(AcceptFuture&&) noexcept            = default;
         AcceptFuture& operator=(AcceptFuture&&) noexcept = default;
@@ -145,7 +144,7 @@ public:
 
     private:
         std::shared_ptr<detail::ws::ListenerState>   m_state;
-        IoService*                                   m_io_service;
+        SingleThreadedUvExecutor*                                   m_uv_exec;
     };
 
     // -----------------------------------------------------------------------
@@ -157,7 +156,7 @@ public:
     WsListener(const WsListener&)            = delete;
     WsListener& operator=(const WsListener&) = delete;
 
-    /// Destroys the server lws context via IoService. Does not block.
+    /// Destroys the server lws context on the uv executor. Does not block.
     ~WsListener();
 
     /**
@@ -179,10 +178,10 @@ public:
 
 private:
     explicit WsListener(std::shared_ptr<detail::ws::ListenerState> state,
-                        IoService*                                  io_service);
+                        SingleThreadedUvExecutor*                                  uv_exec);
 
     std::shared_ptr<detail::ws::ListenerState>   m_state;
-    IoService*                                   m_io_service = nullptr;
+    SingleThreadedUvExecutor*                                   m_uv_exec = nullptr;
 };
 
 } // namespace coro

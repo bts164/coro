@@ -4,6 +4,7 @@
 #include <coro/coro.h>
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <cstddef>
 
@@ -14,7 +15,7 @@ namespace fs = std::filesystem;
 // Concept checks
 // ---------------------------------------------------------------------------
 
-static_assert(Future<File::OpenFuture>);
+static_assert(Future<JoinHandle<File>>);
 static_assert(Future<File::ReadFuture>);
 static_assert(Future<File::WriteFuture>);
 
@@ -26,7 +27,6 @@ class TempFile {
 public:
     explicit TempFile(std::string name)
         : m_path(fs::temp_directory_path() / name) {
-        // Remove if already exists
         fs::remove(m_path);
     }
 
@@ -42,37 +42,26 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Basic open/read/write/close
+// Basic open / write / read / close
 // ---------------------------------------------------------------------------
 
 TEST(FileTest, BasicOpenWriteReadClose) {
-    TempFile temp("test_basic.txt");
-
+    TempFile temp("coro_test_basic.txt");
     Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        // TODO: uncomment when implementation is complete
-        // Write data to a new file
-        // auto file = co_await File::open(temp.path_string(),
-        //     FileMode::Write | FileMode::Create | FileMode::Truncate);
-        //
-        // std::string data = "Hello, File I/O!";
-        // auto data_bytes = std::as_bytes(std::span(data));
-        // std::size_t written = co_await file.write(data_bytes);
-        // EXPECT_EQ(written, data.size());
-        //
-        // // Drop file to trigger close
-
-        // Re-open read-only and read back
-        // auto file_read = co_await File::open(temp.path_string(), FileMode::Read);
-        // std::array<std::byte, 128> buf;
-        // std::size_t n = co_await file_read.read(std::span(buf));
-        // EXPECT_EQ(n, data.size());
-        //
-        // std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
-        // EXPECT_EQ(read_back, data);
-
-        co_return;
-    }());
+    rt.block_on([](std::string path) -> Coro<void> {
+        // Write
+        auto file = co_await File::open(path, FileMode::Write | FileMode::Create | FileMode::Truncate);
+        std::string data = "Hello, File I/O!";
+        std::size_t written = co_await file.write(std::as_bytes(std::span(data)));
+        EXPECT_EQ(written, data.size());
+        // Drop file to close, then re-open read-only
+        file = co_await File::open(path, FileMode::Read);  // assignment closes previous fd
+        std::array<std::byte, 128> buf;
+        std::size_t n = co_await file.read(std::span(buf));
+        EXPECT_EQ(n, data.size());
+        std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
+        EXPECT_EQ(read_back, data);
+    }(temp.path_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -80,233 +69,121 @@ TEST(FileTest, BasicOpenWriteReadClose) {
 // ---------------------------------------------------------------------------
 
 TEST(FileTest, ReadEOF) {
-    TempFile temp("test_eof.txt");
+    TempFile temp("coro_test_eof.txt");
+    // Create an empty file synchronously so there is no async-close race.
+    { std::ofstream ofs(temp.path_string()); }
 
     Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        // TODO: uncomment when implementation is complete
-        // Create an empty file
-        // auto file = co_await File::open(temp.path_string(),
-        //     FileMode::Write | FileMode::Create);
-        // // Drop file to close
-        //
-        // // Re-open and try to read
-        // auto file_read = co_await File::open(temp.path_string(), FileMode::Read);
-        // std::array<std::byte, 16> buf;
-        // std::size_t n = co_await file_read.read(std::span(buf));
-        // EXPECT_EQ(n, 0);  // EOF
-
-        co_return;
-    }());
+    rt.block_on([](std::string path) -> Coro<void> {
+        auto file = co_await File::open(path, FileMode::Read);
+        std::array<std::byte, 16> buf;
+        std::size_t n = co_await file.read(std::span(buf));
+        EXPECT_EQ(n, 0);  // EOF
+    }(temp.path_string()));
 }
 
 // ---------------------------------------------------------------------------
-// Write to non-existent file without Create flag
+// Open non-existent file without Create flag throws
 // ---------------------------------------------------------------------------
 
 TEST(FileTest, OpenNonExistentFileForWrite) {
-    TempFile temp("test_nonexistent.txt");
-    // Ensure it doesn't exist
+    TempFile temp("coro_test_nonexistent.txt");
     fs::remove(temp.path());
 
     Runtime rt;
     bool threw = false;
     try {
-        rt.block_on([]() -> Coro<void> {
-            // TODO: uncomment when implementation is complete
-            // Should throw because file doesn't exist and Create is not set
-            // auto file = co_await File::open(temp.path_string(), FileMode::Write);
-
-            co_return;
-        }());
+        rt.block_on([](std::string path) -> Coro<void> {
+            auto file = co_await File::open(path, FileMode::Write);  // no Create
+        }(temp.path_string()));
     } catch (const std::system_error&) {
         threw = true;
     }
-
-    // EXPECT_TRUE(threw);  // TODO: uncomment when implementation is complete
-    (void)threw;  // suppress unused variable warning
+    EXPECT_TRUE(threw);
 }
 
 // ---------------------------------------------------------------------------
-// Read from write-only file
-// ---------------------------------------------------------------------------
-
-TEST(FileTest, ReadFromWriteOnlyFile) {
-    TempFile temp("test_write_only.txt");
-
-    Runtime rt;
-    bool threw = false;
-    try {
-        rt.block_on([]() -> Coro<void> {
-            // TODO: uncomment when implementation is complete
-            // auto file = co_await File::open(temp.path_string(),
-            //     FileMode::Write | FileMode::Create);
-            //
-            // std::array<std::byte, 16> buf;
-            // std::size_t n = co_await file.read(std::span(buf));  // should fail
-
-            co_return;
-        }());
-    } catch (const std::system_error&) {
-        threw = true;
-    }
-
-    // EXPECT_TRUE(threw);  // TODO: uncomment when implementation is complete
-    (void)threw;
-}
-
-// ---------------------------------------------------------------------------
-// Positional I/O (pread/pwrite style)
+// Positional I/O (pread / pwrite style)
 // ---------------------------------------------------------------------------
 
 TEST(FileTest, PositionalIO) {
-    TempFile temp("test_positional.txt");
-
+    TempFile temp("coro_test_positional.txt");
     Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        // TODO: uncomment when implementation is complete
-        // Open file for read/write
-        // auto file = co_await File::open(temp.path_string(),
-        //     FileMode::ReadWrite | FileMode::Create | FileMode::Truncate);
-        //
-        // // Write "AAAA" at offset 0
-        // std::string data_a = "AAAA";
-        // auto bytes_a = std::as_bytes(std::span(data_a));
-        // co_await file.write_at(bytes_a, 0);
-        //
-        // // Write "BBBB" at offset 100 (leaves a hole)
-        // std::string data_b = "BBBB";
-        // auto bytes_b = std::as_bytes(std::span(data_b));
-        // co_await file.write_at(bytes_b, 100);
-        //
-        // // Read at offset 100
-        // std::array<std::byte, 4> buf;
-        // std::size_t n = co_await file.read_at(std::span(buf), 100);
-        // EXPECT_EQ(n, 4);
-        //
-        // std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
-        // EXPECT_EQ(read_back, "BBBB");
+    rt.block_on([](std::string path) -> Coro<void> {
+        auto file = co_await File::open(
+            path, FileMode::ReadWrite | FileMode::Create | FileMode::Truncate);
 
-        co_return;
-    }());
+        std::string data_a = "AAAA";
+        co_await file.write_at(std::as_bytes(std::span(data_a)), 0);
+
+        std::string data_b = "BBBB";
+        co_await file.write_at(std::as_bytes(std::span(data_b)), 100);
+
+        std::array<std::byte, 4> buf;
+        std::size_t n = co_await file.read_at(std::span(buf), 100);
+        EXPECT_EQ(n, 4);
+        std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
+        EXPECT_EQ(read_back, "BBBB");
+    }(temp.path_string()));
 }
 
 // ---------------------------------------------------------------------------
-// Large file (stress test)
+// Multiple sequential reads
 // ---------------------------------------------------------------------------
 
-TEST(FileTest, LargeFile) {
-    TempFile temp("test_large.txt");
-
+TEST(FileTest, MultipleSequentialReads) {
+    TempFile temp("coro_test_sequential.txt");
     Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        // TODO: uncomment when implementation is complete
-        // Write 10 MB in 1KB chunks
-        // constexpr std::size_t chunk_size = 1024;
-        // constexpr std::size_t total_chunks = 10 * 1024;  // 10 MB
-        //
-        // auto file = co_await File::open(temp.path_string(),
-        //     FileMode::Write | FileMode::Create | FileMode::Truncate);
-        //
-        // std::array<std::byte, chunk_size> chunk;
-        // std::fill(chunk.begin(), chunk.end(), std::byte{'X'});
-        //
-        // for (std::size_t i = 0; i < total_chunks; ++i) {
-        //     std::size_t written = co_await file.write(std::span(chunk));
-        //     EXPECT_EQ(written, chunk_size);
-        // }
-        //
-        // // Drop file to close
-        //
-        // // Re-open and verify size
-        // auto file_read = co_await File::open(temp.path_string(), FileMode::Read);
-        // std::size_t total_read = 0;
-        // std::array<std::byte, chunk_size> read_buf;
-        //
-        // while (true) {
-        //     std::size_t n = co_await file_read.read(std::span(read_buf));
-        //     if (n == 0) break;
-        //     total_read += n;
-        // }
-        //
-        // EXPECT_EQ(total_read, chunk_size * total_chunks);
-
-        co_return;
-    }());
+    rt.block_on([](std::string path) -> Coro<void> {
+        // Write phase: keep file open for reads (no async-close race).
+        auto file = co_await File::open(
+            path, FileMode::ReadWrite | FileMode::Create | FileMode::Truncate);
+        std::string chunk(64, 'X');
+        co_await file.write(std::as_bytes(std::span(chunk)));
+        co_await file.write(std::as_bytes(std::span(chunk)));
+        // Rewind and read back.
+        file = co_await File::open(path, FileMode::Read);  // closes write fd, opens read
+        std::array<std::byte, 64> buf;
+        std::size_t total = 0;
+        while (true) {
+            std::size_t n = co_await file.read(std::span(buf));
+            if (n == 0) break;
+            total += n;
+        }
+        EXPECT_EQ(total, 128u);
+    }(temp.path_string()));
 }
 
 // ---------------------------------------------------------------------------
-// Cancellation (drop future mid-flight)
-// ---------------------------------------------------------------------------
-
-TEST(FileTest, Cancellation) {
-    TempFile temp("test_cancel.txt");
-
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        // TODO: uncomment when implementation is complete
-        // Create a large file
-        // auto file_write = co_await File::open(temp.path_string(),
-        //     FileMode::Write | FileMode::Create);
-        // std::array<std::byte, 1024 * 1024> large_buf;  // 1 MB
-        // std::fill(large_buf.begin(), large_buf.end(), std::byte{'X'});
-        // co_await file_write.write(std::span(large_buf));
-        //
-        // // Drop file to close
-        //
-        // // Open for reading
-        // auto file_read = co_await File::open(temp.path_string(), FileMode::Read);
-        //
-        // // Start a read but drop the future before it completes
-        // std::atomic<bool> callback_fired{false};
-        // {
-        //     std::array<std::byte, 1024 * 1024> read_buf;
-        //     auto read_future = file_read.read(std::span(read_buf));
-        //     // Drop read_future here — should trigger cancellation
-        // }
-        //
-        // // Verify no crash occurred
-        // // (callback_fired would be set by a canary in the state if it fired after cancel)
-
-        co_return;
-    }());
-}
-
-// ---------------------------------------------------------------------------
-// Multiple files concurrently
+// Multiple concurrent files
 // ---------------------------------------------------------------------------
 
 TEST(FileTest, MultipleConcurrentFiles) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        // TODO: uncomment when implementation is complete
-        // Open 10 temp files, write different data to each, read back and verify
-        // constexpr int num_files = 10;
-        // std::vector<TempFile> temps;
-        // for (int i = 0; i < num_files; ++i) {
-        //     temps.emplace_back(std::string("test_concurrent_") + std::to_string(i) + ".txt");
-        // }
-        //
-        // // Write phase
-        // for (int i = 0; i < num_files; ++i) {
-        //     auto file = co_await File::open(temps[i].path_string(),
-        //         FileMode::Write | FileMode::Create);
-        //     std::string data = "File " + std::to_string(i);
-        //     auto bytes = std::as_bytes(std::span(data));
-        //     co_await file.write(bytes);
-        // }
-        //
-        // // Read phase
-        // for (int i = 0; i < num_files; ++i) {
-        //     auto file = co_await File::open(temps[i].path_string(), FileMode::Read);
-        //     std::array<std::byte, 128> buf;
-        //     std::size_t n = co_await file.read(std::span(buf));
-        //
-        //     std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
-        //     std::string expected = "File " + std::to_string(i);
-        //     EXPECT_EQ(read_back, expected);
-        // }
+    constexpr int N = 5;
+    std::vector<TempFile> temps;
+    for (int i = 0; i < N; ++i)
+        temps.emplace_back("coro_test_concurrent_" + std::to_string(i) + ".txt");
 
-        co_return;
-    }());
+    Runtime rt;
+    rt.block_on([](int n, std::vector<std::string> paths) -> Coro<void> {
+        // Write phase
+        for (int i = 0; i < n; ++i) {
+            auto file = co_await File::open(
+                paths[i], FileMode::Write | FileMode::Create | FileMode::Truncate);
+            std::string data = "File" + std::to_string(i);
+            co_await file.write(std::as_bytes(std::span(data)));
+        }
+        // Read phase
+        for (int i = 0; i < n; ++i) {
+            auto file = co_await File::open(paths[i], FileMode::Read);
+            std::array<std::byte, 32> buf;
+            std::size_t bytes = co_await file.read(std::span(buf));
+            std::string got(reinterpret_cast<const char*>(buf.data()), bytes);
+            EXPECT_EQ(got, "File" + std::to_string(i));
+        }
+    }(N, [&] {
+        std::vector<std::string> p;
+        for (auto& t : temps) p.push_back(t.path_string());
+        return p;
+    }()));
 }

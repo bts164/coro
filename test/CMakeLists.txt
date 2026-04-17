@@ -18,7 +18,7 @@ set(TEST_TARGETS
     test_work_sharing_executor
     test_work_stealing_executor
     test_sleep
-    test_io_service
+    test_single_threaded_uv_executor
     test_oneshot
     test_mpsc
     test_watch
@@ -26,6 +26,9 @@ set(TEST_TARGETS
     test_spawn_blocking
     test_poll_stream
     test_circular_byte_buffer
+    test_spawn_on
+    test_uv_future
+    test_event
 )
 
 foreach(t ${TEST_TARGETS})

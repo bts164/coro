@@ -16,9 +16,9 @@ namespace coro {
 template<typename T, Decoder DecoderT>
 PollStream<T, DecoderT>::PollStream(int fd, DecoderT decoder,
                                     PollStreamOptions options,
-                                    IoService* io_service)
+                                    SingleThreadedUvExecutor* uv_exec)
     : m_state(std::make_shared<State>(fd, std::move(decoder), options))
-    , m_io_service(io_service)
+    , m_uv_exec(uv_exec)
 {
     // uv_poll_init is deferred to EnsurePollingRequest::execute(), which runs on
     // the I/O thread. Calling uv_poll_init here would race with the event loop.
@@ -27,7 +27,7 @@ PollStream<T, DecoderT>::PollStream(int fd, DecoderT decoder,
 template<typename T, Decoder DecoderT>
 PollStream<T, DecoderT>::PollStream(PollStream&& other) noexcept
     : m_state(std::move(other.m_state))
-    , m_io_service(other.m_io_service)
+    , m_uv_exec(other.m_uv_exec)
 {
 }
 
@@ -35,8 +35,8 @@ template<typename T, Decoder DecoderT>
 PollStream<T, DecoderT>& PollStream<T, DecoderT>::operator=(PollStream&& other) noexcept {
     if (this != &other) {
         close();
-        m_state = std::move(other.m_state);
-        m_io_service = other.m_io_service;
+        m_state    = std::move(other.m_state);
+        m_uv_exec  = other.m_uv_exec;
     }
     return *this;
 }
@@ -55,13 +55,12 @@ PollStream<T, DecoderT> PollStream<T, DecoderT>::open(
     int fd,
     DecoderT decoder,
     PollStreamOptions options,
-    IoService* io_service)
+    SingleThreadedUvExecutor* uv_exec)
 {
-    // Use current thread's IoService if not specified
-    if (!io_service) {
-        io_service = &current_io_service();
+    if (!uv_exec) {
+        uv_exec = &current_uv_executor();
     }
-    return PollStream(fd, std::move(decoder), options, io_service);
+    return PollStream(fd, std::move(decoder), options, uv_exec);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,7 +89,7 @@ PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context&
         // In Overrun mode polling is never stopped, so no action needed.
         if (m_state->backpressure_mode == BackpressureMode::Block &&
             !m_state->polling && !m_state->closing) {
-            m_io_service->submit(std::make_unique<EnsurePollingRequest>(m_state));
+            m_uv_exec->submit(std::make_unique<EnsurePollingRequest>(m_state));
         }
 
         return std::move(packet);
@@ -111,7 +110,7 @@ PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context&
     // Ensure polling is active. The request is executed on the I/O thread;
     // uv_poll_start (and uv_poll_init on the first call) happen there safely.
     if (!m_state->polling && !m_state->closing) {
-        m_io_service->submit(std::make_unique<EnsurePollingRequest>(m_state));
+        m_uv_exec->submit(std::make_unique<EnsurePollingRequest>(m_state));
     }
 
     return PollPending;
@@ -119,7 +118,7 @@ PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context&
 
 template<typename T, Decoder DecoderT>
 void PollStream<T, DecoderT>::close() {
-    if (!m_state || !m_io_service) return;
+    if (!m_state || !m_uv_exec) return;
 
     {
         std::lock_guard lock(m_state->mutex);
@@ -131,7 +130,7 @@ void PollStream<T, DecoderT>::close() {
     // State (which contains the embedded poll_handle) stays alive until after
     // uv_close fires close_cb — no use-after-free even if ~PollStream() drops
     // m_state before the callback fires.
-    m_io_service->submit(std::make_unique<CloseRequest>(m_state));
+    m_uv_exec->submit(std::make_unique<CloseRequest>(m_state));
 }
 
 // ---------------------------------------------------------------------------

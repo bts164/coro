@@ -119,6 +119,6 @@ coro::Coro<int> async_main(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
-    Runtime rt;
+    Runtime rt(1);
     return rt.block_on(async_main(argc, argv));
 }

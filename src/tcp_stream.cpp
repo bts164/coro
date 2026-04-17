@@ -1,4 +1,5 @@
 #include <coro/io/tcp_stream.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <stdexcept>
 #include <system_error>
 
@@ -218,46 +219,46 @@ void TcpStream::close_cb(uv_handle_t* handle) {
 // TcpStream
 // ---------------------------------------------------------------------------
 
-TcpStream::TcpStream(std::shared_ptr<Handle> handle, IoService* io_service)
+TcpStream::TcpStream(std::shared_ptr<Handle> handle, SingleThreadedUvExecutor* uv_exec)
     : m_handle(std::move(handle))
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 TcpStream::TcpStream(TcpStream&&) noexcept = default;
 TcpStream& TcpStream::operator=(TcpStream&&) noexcept = default;
 
 TcpStream::~TcpStream() {
     if (m_handle)
-        m_io_service->submit(std::make_unique<CloseRequest>(std::move(m_handle)));
+        m_uv_exec->submit(std::make_unique<CloseRequest>(std::move(m_handle)));
 }
 
 TcpStream::ConnectFuture TcpStream::connect(std::string host, uint16_t port) {
-    return ConnectFuture(std::move(host), port, &current_io_service());
+    return ConnectFuture(std::move(host), port, &current_uv_executor());
 }
 
 TcpStream::ReadFuture TcpStream::read(std::span<std::byte> buf) {
-    return ReadFuture(m_handle, buf, m_io_service);
+    return ReadFuture(m_handle, buf, m_uv_exec);
 }
 
 TcpStream::WriteFuture TcpStream::write(std::span<const std::byte> data) {
-    return WriteFuture(m_handle, data, m_io_service);
+    return WriteFuture(m_handle, data, m_uv_exec);
 }
 
 // ---------------------------------------------------------------------------
 // ConnectFuture
 // ---------------------------------------------------------------------------
 
-TcpStream::ConnectFuture::ConnectFuture(std::string host, uint16_t port, IoService* io_service)
+TcpStream::ConnectFuture::ConnectFuture(std::string host, uint16_t port, SingleThreadedUvExecutor* uv_exec)
     : m_host(std::move(host))
     , m_port(port)
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 PollResult<TcpStream> TcpStream::ConnectFuture::poll(detail::Context& ctx) {
     if (!m_state) {
-        // First poll: allocate state, submit ConnectRequest to IoService.
+        // First poll: allocate state, submit ConnectRequest to the uv executor.
         m_state = std::make_shared<ConnectState>();
         m_state->tcp = std::make_shared<Handle>();
         m_state->waker.store(ctx.getWaker());
-        m_io_service->submit(
+        m_uv_exec->submit(
             std::make_unique<ConnectRequest>(m_state, m_host, m_port));
         return PollPending;
     }
@@ -273,7 +274,7 @@ PollResult<TcpStream> TcpStream::ConnectFuture::poll(detail::Context& ctx) {
         throw_uv_error(status, "TcpStream::connect");
 
     // Connect succeeded — hand ownership of the Handle to a new TcpStream.
-    return TcpStream(std::move(m_state->tcp), m_io_service);
+    return TcpStream(std::move(m_state->tcp), m_uv_exec);
 }
 
 // ---------------------------------------------------------------------------
@@ -282,8 +283,8 @@ PollResult<TcpStream> TcpStream::ConnectFuture::poll(detail::Context& ctx) {
 
 TcpStream::ReadFuture::ReadFuture(std::shared_ptr<Handle> handle,
                                    std::span<std::byte>   buf,
-                                   IoService*             io_service)
-    : m_io_service(io_service) {
+                                   SingleThreadedUvExecutor* uv_exec)
+    : m_uv_exec(uv_exec) {
     m_state = std::make_shared<ReadState>();
     m_state->tcp = std::move(handle);
     m_state->buf = buf;
@@ -299,7 +300,7 @@ PollResult<std::size_t> TcpStream::ReadFuture::poll(detail::Context& ctx) {
     m_state->waker.store(ctx.getWaker());
     if (!m_state->started) {
         m_state->started = true;
-        m_io_service->submit(std::make_unique<ReadRequest>(m_state));
+        m_uv_exec->submit(std::make_unique<ReadRequest>(m_state));
     }
     return PollPending;
 }
@@ -310,8 +311,8 @@ PollResult<std::size_t> TcpStream::ReadFuture::poll(detail::Context& ctx) {
 
 TcpStream::WriteFuture::WriteFuture(std::shared_ptr<Handle>    handle,
                                      std::span<const std::byte> data,
-                                     IoService*                 io_service)
-    : m_io_service(io_service) {
+                                     SingleThreadedUvExecutor*  uv_exec)
+    : m_uv_exec(uv_exec) {
     m_state = std::make_shared<WriteState>();
     m_state->tcp = std::move(handle);
     // buf_desc points into the caller's data — caller must keep it alive.
@@ -330,7 +331,7 @@ PollResult<void> TcpStream::WriteFuture::poll(detail::Context& ctx) {
     m_state->waker.store(ctx.getWaker());
     if (!m_state->started) {
         m_state->started = true;
-        m_io_service->submit(std::make_unique<WriteRequest>(m_state));
+        m_uv_exec->submit(std::make_unique<WriteRequest>(m_state));
     }
     return PollPending;
 }

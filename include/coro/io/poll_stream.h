@@ -6,7 +6,7 @@
 #include <coro/io/circular_byte_buffer.h>
 #include <coro/io/decoder_concept.h>
 #include <coro/io/ring_buffer.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <uv.h>
 #include <cstddef>
 #include <exception>
@@ -100,7 +100,7 @@ public:
      * @param fd          Open file descriptor (must support poll/epoll semantics)
      * @param decoder     Decoder instance (moved into stream)
      * @param options     Buffer sizes and backpressure policy (default: Block, 64 pkts, 256 KB)
-     * @param io_service  IoService managing the uv_loop (defaults to current thread's)
+     * @param uv_exec     uv executor owning the loop (defaults to current thread's)
      * @return PollStream instance
      *
      * The caller retains ownership of the fd. Close it after the stream is destroyed.
@@ -109,7 +109,7 @@ public:
         int fd,
         DecoderT decoder,
         PollStreamOptions options = {},
-        IoService* io_service = nullptr
+        SingleThreadedUvExecutor* uv_exec = nullptr
     );
 
     /**
@@ -143,12 +143,12 @@ private:
     struct EnsurePollingRequest; // IoRequest: init + start poll on I/O thread
     struct CloseRequest;         // IoRequest: stop + close handle on I/O thread
 
-    std::shared_ptr<State> m_state;
-    IoService*             m_io_service;
+    std::shared_ptr<State>    m_state;
+    SingleThreadedUvExecutor* m_uv_exec;
 
     explicit PollStream(int fd, DecoderT decoder,
                        PollStreamOptions options,
-                       IoService* io_service);
+                       SingleThreadedUvExecutor* uv_exec);
 
     // libuv callbacks (run on I/O thread)
     static void poll_cb(uv_poll_t* handle, int status, int events);

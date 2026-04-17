@@ -1,7 +1,9 @@
 #pragma once
 
 #include <coro/runtime/executor.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
+#include <coro/task/spawn_on.h>
+#include <coro/runtime/uv_future.h>
 #include <coro/future.h>
 #include <coro/detail/poll_result.h>
 #include <coro/task/spawn_builder.h>
@@ -73,7 +75,7 @@ public:
     template<Future F>
     typename F::OutputType block_on(F future) {
         set_current_runtime(this);
-        set_current_io_service(&m_io_service);
+        set_current_uv_executor(&m_uv_executor);
 
         auto state = std::make_shared<detail::TaskState<typename F::OutputType>>();
         m_executor->schedule(
@@ -82,7 +84,7 @@ public:
         m_executor->wait_for_completion(*state);
 
         set_current_runtime(nullptr);
-        set_current_io_service(nullptr);
+        set_current_uv_executor(nullptr);
 
         if (state->exception)
             std::rethrow_exception(state->exception);
@@ -121,18 +123,21 @@ public:
         return StreamSpawnBuilder<S>(std::move(stream), m_executor.get());
     }
 
-    /// @brief Returns the runtime's IoService. Used by worker threads to set their thread-local.
-    IoService& io_service() { return m_io_service; }
+    /// @brief Returns the runtime's SingleThreadedUvExecutor.
+    SingleThreadedUvExecutor& uv_executor() { return m_uv_executor; }
 
     /// @brief Returns the runtime's BlockingPool. Used by spawn_blocking().
     BlockingPool& blocking_pool() { return m_blocking_pool; }
 
 private:
-    // Declaration order matters for destruction:
-    // m_io_service must outlive m_executor (worker threads reference it).
-    // m_blocking_pool must outlive m_executor so blocking threads can still
-    // call current_runtime() during their final work item.
-    IoService                 m_io_service;
+    // Declaration order matters for destruction (members destroyed in reverse order):
+    //   m_uv_executor — owns the uv thread and loop; must outlive everything else.
+    //   m_blocking_pool — must outlive m_executor so blocking threads can still
+    //                     call current_runtime() during their final work item.
+    //   m_executor    — worker threads may call waker->wake() which routes through
+    //                   m_uv_executor; destroyed first so all wakes land before
+    //                   m_uv_executor shuts down.
+    SingleThreadedUvExecutor  m_uv_executor;
     BlockingPool              m_blocking_pool;
     std::unique_ptr<Executor> m_executor;
 };

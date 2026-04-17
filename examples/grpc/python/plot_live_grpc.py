@@ -8,6 +8,7 @@ Generate the gRPC stubs first:
 """
 
 import asyncio
+import argparse
 import threading
 import numpy as np
 import grpc
@@ -27,13 +28,13 @@ _placeholder_y = np.zeros(2, dtype=np.float32)
 line = pw.plot((_placeholder_x, _placeholder_y), color="steelblue", width=4, marker_size=0)
 
 
-async def read_stream(host: str = "localhost", port: int = 50051) -> None:
+async def read_stream(args) -> None:
     """Connect to the signal server and update the plot on each incoming frame."""
     x: np.ndarray | None = None
 
-    async with grpc.aio.insecure_channel(f"{host}:{port}") as channel:
+    async with grpc.aio.insecure_channel(f"{args.host}:{args.port}") as channel:
         stub = plotsignal_pb2_grpc.SignalServiceStub(channel)
-        request = plotsignal_pb2.SubscribeRequest(target_fps=60)
+        request = plotsignal_pb2.SubscribeRequest(target_fps=60, noise_std = args.noise_std)
 
         async for response in stub.Subscribe(request):
             if response.HasField("info"):
@@ -49,10 +50,15 @@ async def read_stream(host: str = "localhost", port: int = 50051) -> None:
 
 
 # ── Run both event loops ──────────────────────────────────────────────────────
-def _start_grpc():
-    threading.Thread(target=asyncio.run, args=(read_stream(),), daemon=True).start()
+def _start_grpc(args):
+    threading.Thread(target=asyncio.run, args=(read_stream(args),), daemon=True).start()
 
 
 if __name__ == "__main__":
-    _start_grpc()
+    parser = argparse.ArgumentParser(description="Live plot fed from a gRPC signal stream.")
+    parser.add_argument("--host", default="localhost", help="Signal server host")
+    parser.add_argument("--port", type=int, default=50051, help="Signal server port")
+    parser.add_argument("--noise-std", type=float, default=0.1, help="Standard deviation of noise")
+    args = parser.parse_args()
+    _start_grpc(args)
     fig.show(run=True)

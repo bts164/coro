@@ -48,18 +48,36 @@ The `Executor` should be designed around a pluggable scheduling model. The inter
 Briefly point out potential or known race conditions inline in the code with comments. Even if you're not 100% sure, err on the side of caution and add
 a comment pointing out the potential race condition.
 
-### Care must be taken if spawned futures are not self-contained
+### Never use capturing lambda coroutines; pass all data as explicit arguments
 
-`runtime.spawn()` and the free `spawn()` function accept any `Future` or `Stream`, but the
-C++ type system cannot enforce that the submitted future does not borrow from the spawning
-context (unlike Rust's `'static` bound).
-**Spawned futures can still capture references or pointers as arguments, but with some restrictions**,
-Otherwise the spawning coroutine may be destroyed while the task is still running resulting
-in a use-after-free memory error.
+A capturing lambda coroutine — one with any non-empty capture list — is always unsafe, even
+with value captures (`[=]`). The C++ compiler lowers a lambda to a struct whose `operator()()`
+is a member function. Calling `lambda()` to produce the `Coro` does not move the captured data
+into the coroutine frame; it calls `operator()` on `this` (the lambda object). The coroutine
+frame therefore holds an implicit pointer to the lambda closure. When the lambda is a temporary
+(the common case: `block_on([]{ ... }())`), the closure is destroyed at the end of the
+full expression — long before the first `co_await` resumes — leaving the frame with a dangling
+`this` pointer and undefined behaviour at the first suspension point.
 
-Use `Synchronize` instead when child tasks need to reference data owned by the parent. All
-coroutines inherently act like a Synchronize scope eliminating the user from having to explicitly
-use `Synchronize`
+This applies equally to `[&]`, `[=]`, and named captures. The only safe pattern is an empty
+capture list `[]` with all external data passed as explicit parameters:
+
+```cpp
+// WRONG — closure destroyed before first co_await; UB even with [=]:
+rt.block_on([&foo, bar]() -> Coro<void> {
+    co_await something();   // foo, bar are dangled
+    use(foo, bar);
+}());
+
+// CORRECT — foo and bar are parameters; they live in the coroutine frame:
+rt.block_on([](Foo& foo, Bar bar) -> Coro<void> {
+    co_await something();   // safe
+    use(foo, bar);
+}(foo, bar));
+```
+
+The same rule applies to `spawn()`, `with_context()`, and any other site that accepts a
+`Future` produced by a lambda coroutine.
 
 ### Prefer mutexes over atomics
 

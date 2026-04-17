@@ -6,7 +6,7 @@
 namespace coro {
 
 // =============================================================================
-// IoRequest subtypes — anonymous namespace; IoService has no knowledge of these.
+// IoRequest subtypes — anonymous namespace; internal to WsListener.
 // =============================================================================
 
 namespace {
@@ -332,26 +332,26 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
 // =============================================================================
 
 WsListener::WsListener(std::shared_ptr<detail::ws::ListenerState> state,
-                        IoService* io_service)
+                        SingleThreadedUvExecutor* uv_exec)
     : m_state(std::move(state))
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 WsListener::WsListener(WsListener&&) noexcept = default;
 WsListener& WsListener::operator=(WsListener&&) noexcept = default;
 
 WsListener::~WsListener() {
     if (m_state)
-        m_io_service->submit(
+        m_uv_exec->submit(
             std::make_unique<WsDestroyListenerRequest>(std::move(m_state)));
 }
 
 WsListener::BindFuture WsListener::bind(std::string host, uint16_t port,
                                           std::vector<std::string> subprotocols) {
-    return BindFuture(std::move(host), port, std::move(subprotocols), &current_io_service());
+    return BindFuture(std::move(host), port, std::move(subprotocols), &current_uv_executor());
 }
 
 WsListener::AcceptFuture WsListener::accept() {
-    return AcceptFuture(m_state, m_io_service);
+    return AcceptFuture(m_state, m_uv_exec);
 }
 
 // =============================================================================
@@ -360,11 +360,11 @@ WsListener::AcceptFuture WsListener::accept() {
 
 WsListener::BindFuture::BindFuture(std::string host, uint16_t port,
                                      std::vector<std::string> subprotocols,
-                                     IoService* io_service)
+                                     SingleThreadedUvExecutor* uv_exec)
     : m_host(std::move(host))
     , m_port(port)
     , m_subprotocols(std::move(subprotocols))
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
     if (!m_state) {
@@ -383,7 +383,7 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
             proto += m_subprotocols[i];
         }
 
-        m_io_service->submit(
+        m_uv_exec->submit(
             std::make_unique<WsBindRequest>(m_state, m_host, m_port, std::move(proto)));
         return PollPending;
     }
@@ -400,7 +400,7 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
             std::error_code(-m_state->bind_error, std::system_category()),
             "WsListener::bind");
 
-    return WsListener(std::move(m_state), m_io_service);
+    return WsListener(std::move(m_state), m_uv_exec);
 }
 
 // =============================================================================
@@ -408,9 +408,9 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
 // =============================================================================
 
 WsListener::AcceptFuture::AcceptFuture(std::shared_ptr<detail::ws::ListenerState> state,
-                                         IoService* io_service)
+                                         SingleThreadedUvExecutor* uv_exec)
     : m_state(std::move(state))
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 PollResult<WsStream> WsListener::AcceptFuture::poll(detail::Context& ctx) {
     if (m_state->closed.load(std::memory_order_acquire))
@@ -424,7 +424,7 @@ PollResult<WsStream> WsListener::AcceptFuture::poll(detail::Context& ctx) {
         // Construct WsStream from the accepted ConnectionState.
         // WsStream's private constructor is accessible here because AcceptFuture
         // is a nested class of WsListener, and WsStream grants access via friend.
-        return WsStream(std::move(conn), m_io_service);
+        return WsStream(std::move(conn), m_uv_exec);
     }
 
     m_state->accept_waker = ctx.getWaker();

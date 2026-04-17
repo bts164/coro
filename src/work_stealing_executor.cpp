@@ -1,6 +1,6 @@
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
 #include <bit>
@@ -98,7 +98,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     t_wse_owning_executor = this;
     t_wse_worker_index    = worker_index;
     set_current_runtime(m_runtime);
-    set_current_io_service(&m_runtime->io_service());
+    set_current_uv_executor(&m_runtime->uv_executor());
 
     const int    n            = static_cast<int>(m_workers.size());
     const int    max_search   = std::max(1, n / 2);
@@ -258,7 +258,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     }
 
     set_current_runtime(nullptr);
-    set_current_io_service(nullptr);
+    set_current_uv_executor(nullptr);
     t_wse_owning_executor = nullptr;
     t_wse_worker_index    = -1;
 }

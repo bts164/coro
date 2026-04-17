@@ -3,7 +3,7 @@
 #include <coro/detail/poll_result.h>
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/task/join_set.h>
 #include <uv.h>
 #include <atomic>
@@ -16,7 +16,7 @@ namespace coro {
  * @brief Future that completes once a wall-clock deadline has passed.
  *
  * Satisfies @ref Future<void>. On the first `poll()` call after the deadline
- * has not yet passed, registers a one-shot libuv timer via @ref IoService.
+ * has not yet passed, registers a one-shot libuv timer via the uv executor.
  * The I/O thread fires the timer at the deadline and calls `waker->wake()`,
  * which re-enqueues the task. The next `poll()` then sees `fired == true`
  * and returns `PollReady`.
@@ -31,8 +31,7 @@ namespace coro {
  *       live inside a coroutine frame and be polled by a single executor thread.
  *
  * All libuv state, request types, and callbacks are private implementation
- * details of this class. Nothing in `IoService` or any other header needs to
- * know about timer internals.
+ * details of this class.
  *
  * Prefer the @ref sleep_for factory function over constructing this directly.
  */
@@ -50,9 +49,9 @@ public:
             // to avoid a double-close if the timer already fired before we get there.
             // Pass m_state as a shared_ptr so State stays alive until the I/O thread
             // processes the request, even after we release our own reference.
-            // Use the cached m_io_service rather than current_io_service() because
+            // Use the cached m_uv_exec rather than current_uv_executor() because
             // the thread-local may have been cleared by the time the destructor runs.
-            m_io_service->submit(std::make_unique<CancelRequest>(m_state));
+            m_uv_exec->submit(std::make_unique<CancelRequest>(m_state));
         }
     }
 
@@ -83,12 +82,12 @@ public:
 
         if (!m_state) {
             // First poll: allocate shared state and register the timer.
-            // Cache the IoService pointer so the destructor can cancel the timer
+            // Cache the uv executor pointer so the destructor can cancel the timer
             // even if the thread-local has been cleared before this future is destroyed.
-            m_io_service = &current_io_service();
+            m_uv_exec = &current_uv_executor();
             m_state = std::make_shared<State>();
             m_state->waker.store(ctx.getWaker());
-            m_io_service->submit(std::make_unique<StartRequest>(m_state, m_deadline));
+            m_uv_exec->submit(std::make_unique<StartRequest>(m_state, m_deadline));
         } else {
             // Re-polled before timer fired (e.g. woken by a select branch).
             // Atomically update the waker — timer_cb may read it concurrently on the I/O thread.
@@ -199,7 +198,7 @@ private:
     std::chrono::time_point<std::chrono::steady_clock,
                             std::chrono::milliseconds> m_deadline;
     std::shared_ptr<State>                m_state;       // null until first poll()
-    IoService*                            m_io_service = nullptr;  // cached on first poll()
+    SingleThreadedUvExecutor*             m_uv_exec = nullptr;  // cached on first poll()
 };
 
 

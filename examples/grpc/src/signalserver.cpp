@@ -31,27 +31,34 @@ public:
     {}
 
     coro::CoroStream<SubscribeResponse> Generate(SubscribeRequest const& request) {
-        struct Defer { ~Defer() { LOG(INFO) << "Client disconnected"; } } defer;
         using namespace std::chrono;
         using namespace std::chrono_literals;
+        struct Defer { ~Defer() { LOG(INFO) << "Client disconnected"; } } defer;
         LOG(INFO) << "New connection with target FPS: " << request.target_fps();
+        size_t N = 0x1<<18;
         SignalInfo info;
         info.set_x_start(0);
         info.set_x_end(4*M_PI);
-        info.set_num_samples(2000);
+        info.set_num_samples(N);
         SubscribeResponse info_response;
         info_response.mutable_info()->CopyFrom(info);
         co_yield info_response;
+
         auto start_time = system_clock::now();
         auto last_log_time = start_time;
         std::size_t frame_count = 0;
-        std::vector<float> y(2000);
+        std::vector<float> y(N);
+
+        std::random_device r;
+        std::default_random_engine e1(r());
+        LOG(INFO) << "Using noise stddev: " << request.noise_std();
+        std::normal_distribution<float> dist(0, request.noise_std());
         while (true) {
             auto frame_time = system_clock::now();
             double phase = duration_cast<milliseconds>(frame_time - start_time).count() / 1000.0;
             for (size_t i = 0; i < y.size(); ++i) {
-                float x = (info.x_end() - info.x_start()) * i / (2000 - 1) + info.x_start();
-                y[i] = std::sin(x + phase);
+                float x = (info.x_end() - info.x_start()) * i / (y.size() - 1) + info.x_start();
+                y[i] = std::sin(x + phase) + dist(e1);
             }
             DataFrame frame;
             frame.mutable_y()->Assign(y.begin(), y.end());

@@ -1,6 +1,6 @@
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
 #include <cstdlib>
@@ -67,7 +67,7 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     t_owning_executor = this;
     t_worker_index    = worker_index;
     set_current_runtime(m_runtime);
-    set_current_io_service(&m_runtime->io_service());
+    set_current_uv_executor(&m_runtime->uv_executor());
 
     while (true) {
         std::shared_ptr<detail::Task> task;
@@ -157,7 +157,7 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     }
 
     set_current_runtime(nullptr);
-    set_current_io_service(nullptr);
+    set_current_uv_executor(nullptr);
     t_owning_executor = nullptr;
     t_worker_index    = -1;
 }

@@ -31,7 +31,7 @@ add_library(coro
     src/single_threaded_executor.cpp
     src/work_sharing_executor.cpp
     src/work_stealing_executor.cpp
-    src/io_service.cpp
+    src/single_threaded_uv_executor.cpp
     src/runtime.cpp
     src/tcp_stream.cpp
     src/ws_stream.cpp

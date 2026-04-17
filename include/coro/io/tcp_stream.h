@@ -3,7 +3,7 @@
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/waker.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <uv.h>
 #include <atomic>
 #include <cstddef>
@@ -18,7 +18,7 @@ namespace coro {
  *
  * Obtain a `TcpStream` via `co_await TcpStream::connect(host, port)`.
  * Once connected, use `read()` and `write()` to transfer data. The destructor
- * closes the socket asynchronously via @ref IoService.
+ * closes the socket asynchronously on the uv executor.
  *
  * **Concurrency:** a `TcpStream` must not be shared across tasks. Only one
  * `read()` or `write()` future may be in flight at a time.
@@ -29,7 +29,7 @@ namespace coro {
  * TODO: implement safe cancellation via a cancel flag + uv_read_stop/uv_cancel.
  *
  * All libuv handles, request structs, and callbacks are private implementation
- * details of this class — @ref IoService has no knowledge of TCP internals.
+ * details of this class.
  */
 class TcpStream {
 private:
@@ -97,8 +97,8 @@ private:
     };
 
     // -----------------------------------------------------------------------
-    // IoRequest subtypes — submitted via IoService::submit(), executed on
-    // the I/O thread. Each holds a shared_ptr to its operation's state so
+    // IoRequest subtypes — submitted via SingleThreadedUvExecutor::submit(),
+    // executed on the uv thread. Each holds a shared_ptr to its operation's state so
     // the state outlives the submitting future if the future is destroyed
     // before the request is processed.
     // -----------------------------------------------------------------------
@@ -163,8 +163,8 @@ public:
     /**
      * @brief Future<TcpStream> returned by @ref TcpStream::connect().
      *
-     * On first poll, submits a `ConnectRequest` to the @ref IoService which
-     * calls `uv_tcp_connect()` on the I/O thread. When the OS completes the
+     * On first poll, submits a `ConnectRequest` to the uv executor which
+     * calls `uv_tcp_connect()` on the uv thread. When the OS completes the
      * handshake, `connect_cb` wakes this future. The next poll constructs and
      * returns the `TcpStream`.
      *
@@ -174,7 +174,7 @@ public:
     public:
         using OutputType = TcpStream;
 
-        ConnectFuture(std::string host, uint16_t port, IoService* io_service);
+        ConnectFuture(std::string host, uint16_t port, SingleThreadedUvExecutor* uv_exec);
 
         ConnectFuture(ConnectFuture&&) noexcept            = default;
         ConnectFuture& operator=(ConnectFuture&&) noexcept = default;
@@ -184,9 +184,9 @@ public:
         PollResult<TcpStream> poll(detail::Context& ctx);
 
     private:
-        std::string m_host;
-        uint16_t    m_port;
-        IoService*  m_io_service;
+        std::string               m_host;
+        uint16_t                  m_port;
+        SingleThreadedUvExecutor* m_uv_exec;
         std::shared_ptr<ConnectState> m_state;  // null until first poll
     };
 
@@ -207,7 +207,7 @@ public:
 
         ReadFuture(std::shared_ptr<Handle> handle,
                    std::span<std::byte>   buf,
-                   IoService*             io_service);
+                   SingleThreadedUvExecutor* uv_exec);
 
         ReadFuture(ReadFuture&&) noexcept            = default;
         ReadFuture& operator=(ReadFuture&&) noexcept = default;
@@ -217,7 +217,7 @@ public:
         PollResult<std::size_t> poll(detail::Context& ctx);
 
     private:
-        IoService*                 m_io_service;
+        SingleThreadedUvExecutor*  m_uv_exec;
         std::shared_ptr<ReadState> m_state;
     };
 
@@ -239,7 +239,7 @@ public:
 
         WriteFuture(std::shared_ptr<Handle>    handle,
                     std::span<const std::byte> data,
-                    IoService*                 io_service);
+                    SingleThreadedUvExecutor*  uv_exec);
 
         WriteFuture(WriteFuture&&) noexcept            = default;
         WriteFuture& operator=(WriteFuture&&) noexcept = default;
@@ -249,7 +249,7 @@ public:
         PollResult<void> poll(detail::Context& ctx);
 
     private:
-        IoService*                  m_io_service;
+        SingleThreadedUvExecutor*   m_uv_exec;
         std::shared_ptr<WriteState> m_state;
     };
 
@@ -262,7 +262,7 @@ public:
     TcpStream(const TcpStream&)            = delete;
     TcpStream& operator=(const TcpStream&) = delete;
 
-    /// Closes the socket asynchronously via IoService. Does not block.
+    /// Closes the socket asynchronously on the uv executor. Does not block.
     ~TcpStream();
 
     /**
@@ -287,10 +287,10 @@ private:
     // -----------------------------------------------------------------------
     // TcpStream data members
     // -----------------------------------------------------------------------
-    explicit TcpStream(std::shared_ptr<Handle> handle, IoService* io_service);
+    explicit TcpStream(std::shared_ptr<Handle> handle, SingleThreadedUvExecutor* uv_exec);
 
-    std::shared_ptr<Handle> m_handle;
-    IoService*              m_io_service = nullptr;
+    std::shared_ptr<Handle>   m_handle;
+    SingleThreadedUvExecutor* m_uv_exec = nullptr;
 };
 
 } // namespace coro

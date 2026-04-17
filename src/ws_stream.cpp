@@ -7,7 +7,7 @@ namespace coro {
 
 // =============================================================================
 // IoRequest subtypes — defined here (not in the header) because they are purely
-// internal. IoService has no knowledge of these types.
+// internal to WsStream.
 // =============================================================================
 
 namespace {
@@ -375,30 +375,30 @@ ParsedUrl parse_ws_url(std::string_view url) {
 // WsStream
 // =============================================================================
 
-WsStream::WsStream(std::shared_ptr<detail::ws::ConnectionState> state, IoService* io_service)
+WsStream::WsStream(std::shared_ptr<detail::ws::ConnectionState> state, SingleThreadedUvExecutor* uv_exec)
     : m_state(std::move(state))
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 WsStream::WsStream(WsStream&&) noexcept = default;
 WsStream& WsStream::operator=(WsStream&&) noexcept = default;
 
 WsStream::~WsStream() {
     if (m_state)
-        m_io_service->submit(std::make_unique<WsCloseRequest>(std::move(m_state)));
+        m_uv_exec->submit(std::make_unique<WsCloseRequest>(std::move(m_state)));
 }
 
 WsStream::ConnectFuture WsStream::connect(std::string url, FrameMode frame_mode,
                                            std::vector<std::string> subprotocols) {
     return ConnectFuture(std::move(url), frame_mode, std::move(subprotocols),
-                         &current_io_service());
+                         &current_uv_executor());
 }
 
 WsStream::ReceiveFuture WsStream::receive() {
-    return ReceiveFuture(m_state, m_io_service);
+    return ReceiveFuture(m_state, m_uv_exec);
 }
 
 WsStream::SendFuture WsStream::send(std::span<const std::byte> data, OpCode opcode) {
-    return SendFuture(m_state, data, opcode, m_io_service);
+    return SendFuture(m_state, data, opcode, m_uv_exec);
 }
 
 WsStream::SendFuture WsStream::send(std::string_view text) {
@@ -411,11 +411,11 @@ WsStream::SendFuture WsStream::send(std::string_view text) {
 
 WsStream::ConnectFuture::ConnectFuture(std::string url, FrameMode frame_mode,
                                         std::vector<std::string> subprotocols,
-                                        IoService* io_service)
+                                        SingleThreadedUvExecutor* uv_exec)
     : m_url(std::move(url))
     , m_frame_mode(frame_mode)
     , m_subprotocols(std::move(subprotocols))
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 WsStream::ConnectFuture::~ConnectFuture() {
     if (m_state) {
@@ -443,8 +443,8 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
             proto += m_subprotocols[i];
         }
 
-        m_io_service->submit(std::make_unique<WsConnectRequest>(
-            m_state, m_url, std::move(proto), m_io_service->lws_ctx()));
+        m_uv_exec->submit(std::make_unique<WsConnectRequest>(
+            m_state, m_url, std::move(proto), m_uv_exec->lws_ctx()));
         return PollPending;
     }
 
@@ -460,7 +460,7 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
                                                 std::system_category()),
                                 "WsStream::connect");
 
-    return WsStream(std::move(m_state), m_io_service);
+    return WsStream(std::move(m_state), m_uv_exec);
 }
 
 // =============================================================================
@@ -468,9 +468,9 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
 // =============================================================================
 
 WsStream::ReceiveFuture::ReceiveFuture(std::shared_ptr<detail::ws::ConnectionState> state,
-                                        IoService* io_service)
+                                        SingleThreadedUvExecutor* uv_exec)
     : m_state(std::move(state))
-    , m_io_service(io_service) {}
+    , m_uv_exec(uv_exec) {}
 
 WsStream::ReceiveFuture::~ReceiveFuture() {
     // Only cancel if this future was never consumed. poll() resets complete=false
@@ -518,9 +518,9 @@ PollResult<WsStream::Message> WsStream::ReceiveFuture::poll(detail::Context& ctx
 WsStream::SendFuture::SendFuture(std::shared_ptr<detail::ws::ConnectionState> state,
                                    std::span<const std::byte>                    data,
                                    OpCode                                        opcode,
-                                   IoService*                                    io_service)
+                                   SingleThreadedUvExecutor*                     uv_exec)
     : m_state(std::move(state))
-    , m_io_service(io_service) {
+    , m_uv_exec(uv_exec) {
     m_sub_state = std::make_shared<detail::ws::SendSubState>();
     m_sub_state->data   = data;
     m_sub_state->opcode = opcode;
@@ -557,7 +557,7 @@ PollResult<void> WsStream::SendFuture::poll(detail::Context& ctx) {
             std::lock_guard lk2(m_state->send_queue_mutex);
             m_state->send_queue.push_back(m_sub_state);
         }
-        m_io_service->submit(std::make_unique<WsWritableRequest>(m_state));
+        m_uv_exec->submit(std::make_unique<WsWritableRequest>(m_state));
     }
 
     return PollPending;

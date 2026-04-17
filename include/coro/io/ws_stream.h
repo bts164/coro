@@ -3,7 +3,7 @@
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/waker.h>
-#include <coro/runtime/io_service.h>
+#include <coro/runtime/single_threaded_uv_executor.h>
 #include <libwebsockets.h>
 #include <atomic>
 #include <cstddef>
@@ -27,7 +27,7 @@ namespace coro {
 /**
  * @brief Async WebSocket client stream.
  *
- * Built on libwebsockets using the shared libuv event loop owned by @ref IoService.
+ * Built on libwebsockets using the shared libuv event loop owned by the uv executor.
  * Obtain a `WsStream` via `co_await WsStream::connect(url)`.
  *
  * **Frame modes:**
@@ -39,7 +39,6 @@ namespace coro {
  * across tasks.
  *
  * All lws handles, protocol callbacks, and request types are private implementation details.
- * @ref IoService has no knowledge of WebSocket internals.
  *
  * See doc/websocket_stream.md for the full design.
  */
@@ -73,8 +72,8 @@ public:
     /**
      * @brief Future<WsStream> returned by @ref WsStream::connect().
      *
-     * On first poll, submits a `WsConnectRequest` to @ref IoService, which calls
-     * `lws_client_connect_via_info()` on the I/O thread. When lws fires
+     * On first poll, submits a `WsConnectRequest` to the uv executor, which calls
+     * `lws_client_connect_via_info()` on the uv thread. When lws fires
      * `LWS_CALLBACK_CLIENT_ESTABLISHED` (or `_CONNECTION_ERROR`), the future is woken.
      *
      * Dropping this future before it completes sets `cancelled` on the connect sub-state;
@@ -85,7 +84,7 @@ public:
         using OutputType = WsStream;
 
         ConnectFuture(std::string url, FrameMode frame_mode,
-                      std::vector<std::string> subprotocols, IoService* io_service);
+                      std::vector<std::string> subprotocols, SingleThreadedUvExecutor* uv_exec);
         ~ConnectFuture();
 
         ConnectFuture(ConnectFuture&&) noexcept            = default;
@@ -99,7 +98,7 @@ public:
         std::string                                  m_url;
         FrameMode                                    m_frame_mode;
         std::vector<std::string>                     m_subprotocols;
-        IoService*                                   m_io_service;
+        SingleThreadedUvExecutor*                                   m_uv_exec;
         std::shared_ptr<detail::ws::ConnectionState> m_state;  // null until first poll
     };
 
@@ -117,7 +116,7 @@ public:
         using OutputType = Message;
 
         ReceiveFuture(std::shared_ptr<detail::ws::ConnectionState> state,
-                      IoService*                                    io_service);
+                      SingleThreadedUvExecutor*                                    uv_exec);
         ~ReceiveFuture();
 
         ReceiveFuture(ReceiveFuture&&) noexcept            = default;
@@ -129,7 +128,7 @@ public:
 
     private:
         std::shared_ptr<detail::ws::ConnectionState> m_state;
-        IoService*                                   m_io_service;
+        SingleThreadedUvExecutor*                                   m_uv_exec;
         // Set to true when poll() returns PollReady so the destructor knows the
         // future was already consumed and must not set cancelled on the shared state.
         bool                                         m_done = false;
@@ -155,7 +154,7 @@ public:
         SendFuture(std::shared_ptr<detail::ws::ConnectionState> state,
                    std::span<const std::byte>                    data,
                    OpCode                                        opcode,
-                   IoService*                                    io_service);
+                   SingleThreadedUvExecutor*                                    uv_exec);
         ~SendFuture();
 
         SendFuture(SendFuture&&) noexcept            = default;
@@ -168,7 +167,7 @@ public:
     private:
         std::shared_ptr<detail::ws::ConnectionState> m_state;
         std::shared_ptr<detail::ws::SendSubState>    m_sub_state;
-        IoService*                                   m_io_service;
+        SingleThreadedUvExecutor*                                   m_uv_exec;
         bool                                         m_started = false;
     };
 
@@ -181,7 +180,7 @@ public:
     WsStream(const WsStream&)            = delete;
     WsStream& operator=(const WsStream&) = delete;
 
-    /// Submits a graceful close (Close frame + echo) via IoService. Does not block.
+    /// Submits a graceful close (Close frame + echo) on the uv executor. Does not block.
     ~WsStream();
 
     /**
@@ -217,13 +216,13 @@ public:
 
 private:
     explicit WsStream(std::shared_ptr<detail::ws::ConnectionState> state,
-                      IoService*                                    io_service);
+                      SingleThreadedUvExecutor*                                    uv_exec);
 
     // WsListener::AcceptFuture constructs WsStream from server-accepted connections.
     friend class WsListener;
 
     std::shared_ptr<detail::ws::ConnectionState> m_state;
-    IoService*                                   m_io_service = nullptr;
+    SingleThreadedUvExecutor*                                   m_uv_exec = nullptr;
 };
 
 } // namespace coro
