@@ -32,23 +32,6 @@ int translate_flags(FileMode mode) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// CloseRequest
-//
-// Heap-allocates uv_fs_t so the struct outlives execute() until close_cb fires.
-// The callback frees both the request internals and the uv_fs_t itself.
-// ---------------------------------------------------------------------------
-
-void File::CloseRequest::execute(uv_loop_t* loop) {
-    auto* req = new uv_fs_t;
-    uv_fs_close(loop, req, fd, File::close_cb);
-}
-
-void File::close_cb(uv_fs_t* req) {
-    uv_fs_req_cleanup(req);
-    delete req;
-}
-
-// ---------------------------------------------------------------------------
 // File — construction / move / destruction
 // ---------------------------------------------------------------------------
 
@@ -62,8 +45,18 @@ File::File(File&& other) noexcept
 
 File& File::operator=(File&& other) noexcept {
     if (this != &other) {
-        if (m_fd >= 0 && m_exec)
-            m_exec->submit(std::make_unique<CloseRequest>(m_fd));
+        if (m_fd >= 0 && m_exec) {
+            with_context(*m_exec, [](SingleThreadedUvExecutor& exec, uv_file fd) -> Coro<void> {
+                uv_fs_t req;
+                UvCallbackResult<uv_fs_t*> result;
+                req.data = &result;
+                uv_fs_close(exec.loop(), &req, fd, [](uv_fs_t *req) {
+                    reinterpret_cast<decltype(result)*>(req->data)->complete(req);
+                });
+                co_await wait(result);
+                uv_fs_req_cleanup(&req);
+            }(*m_exec, m_fd)).detach();
+        }
         m_fd   = other.m_fd;
         m_exec = other.m_exec;
         other.m_fd = -1;
@@ -72,8 +65,18 @@ File& File::operator=(File&& other) noexcept {
 }
 
 File::~File() {
-    if (m_fd >= 0 && m_exec)
-        m_exec->submit(std::make_unique<CloseRequest>(m_fd));
+    if (m_fd >= 0 && m_exec) {
+        with_context(*m_exec, [](SingleThreadedUvExecutor& exec, uv_file fd) -> Coro<void> {
+            uv_fs_t req;
+            UvCallbackResult<uv_fs_t*> result;
+            req.data = &result;
+            uv_fs_close(exec.loop(), &req, fd, [](uv_fs_t *req) {
+                reinterpret_cast<decltype(result)*>(req->data)->complete(req);
+            });
+            co_await wait(result);
+            uv_fs_req_cleanup(&req);
+        }(*m_exec, m_fd)).detach();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -87,20 +90,20 @@ File::OpenFuture File::open(std::string path, FileMode mode) {
             [](SingleThreadedUvExecutor& exec,
                std::string path, int flags) -> Coro<File> {
 
-                auto result = std::make_shared<UvCallbackResult<uv_file>>();
+                UvCallbackResult<uv_file> result;
                 uv_fs_t req;
-                req.data = result.get();
+                req.data = &result;
 
                 int r = uv_fs_open(exec.loop(), &req, path.c_str(), flags, 0644,
                     [](uv_fs_t* r) {
-                        static_cast<UvCallbackResult<uv_file>*>(r->data)
+                        static_cast<decltype(result)*>(r->data)
                             ->complete(static_cast<uv_file>(r->result));
                         uv_fs_req_cleanup(r);
                     });
                 if (r < 0)
                     throw_uv_error(r, "uv_fs_open");
 
-                auto [fd] = co_await UvFuture<uv_file>(result);
+                auto [fd] = co_await wait(result);
                 if (fd < 0)
                     throw_uv_error(static_cast<int>(fd), "uv_fs_open");
 
@@ -119,22 +122,22 @@ File::ReadFuture File::read_at(std::span<std::byte> buf, int64_t offset) {
            std::span<std::byte> buf,
            int64_t offset) -> Coro<std::size_t> {
 
-            auto result = std::make_shared<UvCallbackResult<ssize_t>>();
+            UvCallbackResult<ssize_t> result;
             uv_fs_t req;
             uv_buf_t bdesc = uv_buf_init(reinterpret_cast<char*>(buf.data()),
                                           static_cast<unsigned>(buf.size()));
-            req.data = result.get();
+            req.data = &result;
 
             int r = uv_fs_read(current_uv_executor().loop(), &req,
                                fd, &bdesc, 1, offset,
                 [](uv_fs_t* r) {
-                    static_cast<UvCallbackResult<ssize_t>*>(r->data)->complete(r->result);
+                    static_cast<decltype(result)*>(r->data)->complete(r->result);
                     uv_fs_req_cleanup(r);
                 });
             if (r < 0)
                 throw_uv_error(r, "uv_fs_read");
 
-            auto [nbytes] = co_await UvFuture<ssize_t>(result);
+            auto [nbytes] = co_await wait(result);
             if (nbytes < 0)
                 throw_uv_error(static_cast<int>(nbytes), "uv_fs_read");
 
@@ -157,24 +160,24 @@ File::WriteFuture File::write_at(std::span<const std::byte> data, int64_t offset
            std::span<const std::byte> data,
            int64_t offset) -> Coro<std::size_t> {
 
-            auto result = std::make_shared<UvCallbackResult<ssize_t>>();
+            UvCallbackResult<ssize_t> result;
             uv_fs_t req;
             uv_buf_t bdesc = uv_buf_init(
                 // libuv write takes non-const char* but does not modify it
                 const_cast<char*>(reinterpret_cast<const char*>(data.data())),
                 static_cast<unsigned>(data.size()));
-            req.data = result.get();
+            req.data = &result;
 
             int r = uv_fs_write(current_uv_executor().loop(), &req,
                                 fd, &bdesc, 1, offset,
                 [](uv_fs_t* r) {
-                    static_cast<UvCallbackResult<ssize_t>*>(r->data)->complete(r->result);
+                    static_cast<decltype(result)*>(r->data)->complete(r->result);
                     uv_fs_req_cleanup(r);
                 });
             if (r < 0)
                 throw_uv_error(r, "uv_fs_write");
 
-            auto [nbytes] = co_await UvFuture<ssize_t>(result);
+            auto [nbytes] = co_await wait(result);
             if (nbytes < 0)
                 throw_uv_error(static_cast<int>(nbytes), "uv_fs_write");
 

@@ -18,19 +18,6 @@ struct lws_context;
 
 namespace coro {
 
-// ---------------------------------------------------------------------------
-// IoRequest — polymorphic command submitted to the uv thread.
-//
-// Each concrete subclass encapsulates one libuv operation and is defined
-// privately by the Future that needs it. SingleThreadedUvExecutor::submit()
-// calls execute() on the uv thread without knowing the concrete type.
-// ---------------------------------------------------------------------------
-struct IoRequest {
-    virtual ~IoRequest() = default;
-    /// Called on the uv thread with exclusive access to the uv_loop.
-    virtual void execute(uv_loop_t* loop) = 0;
-};
-
 //! Forward declaration to avoid circular dependency with Runtime.
 class Runtime;
 
@@ -44,27 +31,26 @@ class Runtime;
  * @code
  * loop:
  *   drain_incoming_wakes()      // remote enqueue() calls → m_ready
- *   process_io_queue()          // IoRequest submissions
  *   drain_ready_tasks()         // poll all ready coroutine tasks
  *   uv_run(UV_RUN_ONCE)         // process I/O events; blocks when idle
  * @endcode
  *
  * The `uv_async_t` doorbell wakes a blocking `uv_run()` whenever a remote
- * enqueue() or submit() arrives, or when a uv callback wakes a task that needs
- * re-polling.
+ * `enqueue()` arrives, or when a uv callback wakes a task that needs re-polling.
  *
  * ### Coroutine tasks
  * Submit tasks via `schedule()` (initial dispatch) or `enqueue()` (re-wakeup via
  * @ref TaskWaker). Tasks polled here receive a @ref TaskWaker whose `executor`
  * pointer targets this executor, so `wake()` routes back through `enqueue()`.
  *
- * ### IoRequest submissions
- * `submit(unique_ptr<IoRequest>)` enqueues a request to be executed on the uv
- * thread. `req->execute(loop)` is called with exclusive access to the uv_loop.
+ * ### I/O operations
+ * Use `with_context(*uv_exec, coro)` to run a coroutine on the uv thread.
+ * Inside that coroutine, libuv API calls are safe and `UvCallbackResult` provides
+ * one-shot awaitable bridges to libuv callbacks.
  *
  * ### Thread safety
- * All libuv API calls happen on the uv thread. `enqueue()` and `submit()` are
- * safe to call from any thread.
+ * All libuv API calls happen on the uv thread. `enqueue()` is safe to call from
+ * any thread.
  */
 class SingleThreadedUvExecutor : public Executor {
 public:
@@ -92,9 +78,6 @@ public:
     /// The uv thread drives all polling; the caller just waits on `state.cv`.
     void wait_for_completion(detail::TaskStateBase& state) override;
 
-    /// Submits an IoRequest to be executed on the uv thread.
-    void submit(std::unique_ptr<IoRequest> req);
-
     /// Signals the uv thread to stop and joins it. Idempotent.
     void stop();
 
@@ -113,9 +96,6 @@ private:
     /// Moves all tasks from m_incoming_wakes into m_ready.
     /// Called on the uv thread only.
     void drain_incoming_wakes();
-
-    /// Drains and executes the IoRequest queue on the uv thread.
-    void process_io_queue();
 
     /// Polls all tasks currently in m_ready through the normal CAS state machine.
     /// Called on the uv thread only (inside io_async_cb).
@@ -143,12 +123,6 @@ private:
     // Remote injection queue — written from any thread, drained on uv thread.
     std::deque<std::shared_ptr<detail::Task>> m_incoming_wakes;
     std::mutex                                m_remote_mutex;
-
-    // -----------------------------------------------------------------------
-    // IoRequest queue
-    // -----------------------------------------------------------------------
-    std::mutex                             m_io_queue_mutex;
-    std::deque<std::unique_ptr<IoRequest>> m_io_queue;
 
     // -----------------------------------------------------------------------
     // Thread management

@@ -1,121 +1,12 @@
 #include <coro/io/ws_listener.h>
+#include <coro/task/spawn_on.h>
+#include <coro/coro.h>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
 
 namespace coro {
 
-// =============================================================================
-// IoRequest subtypes — anonymous namespace; internal to WsListener.
-// =============================================================================
-
-namespace {
-
-using namespace coro::detail::ws;
-
-// ---------------------------------------------------------------------------
-// WsBindRequest
-//
-// Submitted by BindFuture on first poll. Runs on the I/O thread: creates a
-// server-side lws context that listens on the given port and registers its
-// handles on the shared uv_loop. Stores a heap-allocated shared_ptr<ListenerState>
-// as the lws context user data so server_protocol_cb can find the ListenerState
-// from any callback via lws_context_user(lws_get_context(wsi)).
-// ---------------------------------------------------------------------------
-struct WsBindRequest : coro::IoRequest {
-    std::shared_ptr<ListenerState> state;
-    std::string                    host;
-    uint16_t                       port;
-    std::string                    subprotocol_str;  // empty = accept any subprotocol
-
-    WsBindRequest(std::shared_ptr<ListenerState> s, std::string h, uint16_t p, std::string proto)
-        : state(std::move(s)), host(std::move(h)), port(p), subprotocol_str(std::move(proto)) {}
-
-    void execute(uv_loop_t* loop) override {
-        // Populate the protocols array on ListenerState rather than on the stack.
-        // lws_context stores a raw pointer into this array — it does NOT copy it —
-        // so the array must outlive the context (i.e. until WsDestroyListenerRequest).
-        //
-        // The name field controls Sec-WebSocket-Protocol negotiation.
-        // "coro-ws" is used as the default name (nullptr would be misread as the
-        // terminator entry by lws and silently disable the protocol).
-        // A client sending no Sec-WebSocket-Protocol header still matches the first
-        // registered protocol, so the default name is never exposed to the peer.
-        state->subprotocol_str = std::move(subprotocol_str);
-        // Use "coro-ws" as the default name when no subprotocol is specified.
-        // nullptr would be mistaken for the terminator entry by lws.
-        const char* proto_name = state->subprotocol_str.empty()
-                                     ? "coro-ws" : state->subprotocol_str.c_str();
-        state->protocols[0] = { proto_name, server_protocol_cb,
-                                 sizeof(void*), 4096, 0, nullptr, 0 };
-        state->protocols[1] = { nullptr, nullptr, 0, 0, 0, nullptr, 0 };
-        const lws_protocols* protocols = state->protocols;
-
-        // Heap-allocate a shared_ptr wrapper as context user data.
-        // server_protocol_cb recovers it via lws_context_user(); it is deleted
-        // by WsDestroyListenerRequest after lws_context_destroy().
-        auto* sp = new std::shared_ptr<ListenerState>(state);
-
-        lws_context_creation_info info{};
-        info.port            = port;
-        info.iface           = host.empty() ? nullptr : host.c_str();
-        info.protocols       = protocols;
-        info.options        |= LWS_SERVER_OPTION_LIBUV;
-        void *loop_ptr = loop;  // loop is already uv_loop_t*; don't take its address again
-        info.foreign_loops = &loop_ptr;
-        info.user            = sp;  // recovered via lws_context_user()
-
-        state->ctx = lws_create_context(&info);
-        if (!state->ctx) {
-            delete sp;
-        }
-
-        // Wake the BindFuture regardless of success or failure.
-        std::shared_ptr<detail::Waker> waker_to_wake;
-        {
-            std::lock_guard lk(state->bind_mutex);
-            if (!state->ctx) {
-                state->bind_error = -1;
-            }
-            state->ready = true;
-            waker_to_wake = state->bind_waker;
-        }
-        if (waker_to_wake)
-            waker_to_wake->wake();
-    }
-};
-
-// ---------------------------------------------------------------------------
-// WsDestroyListenerRequest
-//
-// Submitted by WsListener::~WsListener(). Destroys the server lws context on
-// the I/O thread (required — lws is not thread-safe), then deletes the
-// heap-allocated shared_ptr<ListenerState> stored as context user data.
-// ---------------------------------------------------------------------------
-struct WsDestroyListenerRequest : coro::IoRequest {
-    std::shared_ptr<ListenerState> state;
-    explicit WsDestroyListenerRequest(std::shared_ptr<ListenerState> s)
-        : state(std::move(s)) {}
-
-    void execute(uv_loop_t* /*loop*/) override {
-        if (!state->ctx) return;
-        // Recover and delete the shared_ptr<ListenerState> wrapper stored as
-        // context user data before calling lws_context_destroy().
-        auto* sp = static_cast<std::shared_ptr<ListenerState>*>(
-                       lws_context_user(state->ctx));
-        lws_context_destroy(state->ctx);
-        state->ctx = nullptr;
-        state->closed.store(true, std::memory_order_release);
-        delete sp;
-
-        // Wake any AcceptFuture blocked on this listener so it can return an error.
-        std::lock_guard lk(state->accept_mutex);
-        if (state->accept_waker)
-            state->accept_waker->wake();
-    }
-};
-
-} // anonymous namespace
 
 // =============================================================================
 // coro::detail::ws — server_protocol_cb
@@ -340,9 +231,24 @@ WsListener::WsListener(WsListener&&) noexcept = default;
 WsListener& WsListener::operator=(WsListener&&) noexcept = default;
 
 WsListener::~WsListener() {
-    if (m_state)
-        m_uv_exec->submit(
-            std::make_unique<WsDestroyListenerRequest>(std::move(m_state)));
+    if (!m_state) return;
+    with_context(*m_uv_exec,
+        [](std::shared_ptr<detail::ws::ListenerState> state) -> Coro<void> {
+            using namespace coro::detail::ws;
+            if (!state->ctx) co_return;
+            // Recover and delete the shared_ptr<ListenerState> wrapper stored as
+            // lws context user data, then destroy the context.
+            auto* sp = static_cast<std::shared_ptr<ListenerState>*>(
+                           lws_context_user(state->ctx));
+            lws_context_destroy(state->ctx);
+            state->ctx = nullptr;
+            state->closed.store(true, std::memory_order_release);
+            delete sp;
+            std::lock_guard lk(state->accept_mutex);
+            if (state->accept_waker)
+                state->accept_waker->wake();
+        }(std::move(m_state))
+    ).detach();
 }
 
 WsListener::BindFuture WsListener::bind(std::string host, uint16_t port,
@@ -383,8 +289,46 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
             proto += m_subprotocols[i];
         }
 
-        m_uv_exec->submit(
-            std::make_unique<WsBindRequest>(m_state, m_host, m_port, std::move(proto)));
+        uv_loop_t* loop = m_uv_exec->loop();
+        with_context(*m_uv_exec,
+            [](std::shared_ptr<detail::ws::ListenerState> state,
+               std::string host, uint16_t port, std::string proto,
+               uv_loop_t* loop) -> Coro<void> {
+                using namespace coro::detail::ws;
+                // lws_context stores a raw pointer into the protocols array, so it
+                // must live in ListenerState (not on this frame).
+                state->subprotocol_str = std::move(proto);
+                const char* proto_name = state->subprotocol_str.empty()
+                                             ? "coro-ws" : state->subprotocol_str.c_str();
+                state->protocols[0] = { proto_name, server_protocol_cb,
+                                         sizeof(void*), 4096, 0, nullptr, 0 };
+                state->protocols[1] = { nullptr, nullptr, 0, 0, 0, nullptr, 0 };
+
+                auto* sp = new std::shared_ptr<ListenerState>(state);
+
+                lws_context_creation_info info{};
+                info.port         = port;
+                info.iface        = host.empty() ? nullptr : host.c_str();
+                info.protocols    = state->protocols;
+                info.options     |= LWS_SERVER_OPTION_LIBUV;
+                void* loop_ptr    = loop;
+                info.foreign_loops = &loop_ptr;
+                info.user         = sp;
+
+                state->ctx = lws_create_context(&info);
+                if (!state->ctx) delete sp;
+
+                std::shared_ptr<detail::Waker> w;
+                {
+                    std::lock_guard lk(state->bind_mutex);
+                    if (!state->ctx) state->bind_error = -1;
+                    state->ready = true;
+                    w = state->bind_waker;
+                }
+                if (w) w->wake();
+                co_return;
+            }(m_state, m_host, m_port, std::move(proto), loop)
+        ).detach();
         return PollPending;
     }
 

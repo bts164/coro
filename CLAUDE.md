@@ -123,6 +123,43 @@ coro::spawn(co_invoke([&foo]() -> coro::Coro<void> { ... })).submit();
 coro::spawn([&foo]() -> coro::Coro<void> { ... }()).submit();
 ```
 
+### Never pass non-owning buffers (spans, raw pointers) across a suspension point to async I/O
+
+Async I/O functions like `File::read(std::span<std::byte>)` and `File::write(std::span<const std::byte>)`
+take non-owning views of caller-managed memory. The type system cannot enforce that the buffer
+outlives the `co_await` — if the owner of the buffer is destroyed before the I/O completes,
+the libuv callback will write into freed memory.
+
+The three common failure modes:
+
+```cpp
+// WRONG 1 — buffer freed when JoinHandle is detached:
+auto buf = std::vector<std::byte>(4096);
+spawn([](File& f, std::span<std::byte> b) -> Coro<void> {
+    co_await f.read(b);          // b points into buf on the outer stack
+}(file, buf)).submit().detach(); // JoinHandle dropped → buf may be freed before read completes
+
+// WRONG 2 — buffer and JoinHandle in the same scope (buf freed when scope exits,
+// before the JoinHandle destructor has a chance to drain the task):
+{
+    auto buf = std::vector<std::byte>(4096);
+    auto handle = spawn([](File& f, std::span<std::byte> b) -> Coro<void> {
+        co_await f.read(b);
+    }(file, buf)).submit();
+} // buf destroyed before handle — handle destructor runs after buf is gone
+
+// CORRECT — buffer owned by the coroutine frame performing the I/O:
+spawn([](File& f) -> Coro<void> {
+    std::vector<std::byte> buf(4096);   // lives on this coroutine's frame
+    co_await f.read(buf);               // safe — buf outlives the co_await
+}(file)).submit();
+```
+
+**Rule:** the buffer passed to an async I/O function must be owned by the coroutine
+frame that issues the `co_await`, not by any caller that could be destroyed or
+detached before the operation completes. Move ownership into the coroutine (by value
+parameter or local variable) rather than borrowing from an outer scope.
+
 ### [[nodiscard]] on Future-returning functions
 
 All functions that return a `Future`, `Stream`, `JoinHandle`, `StreamHandle`, or builder

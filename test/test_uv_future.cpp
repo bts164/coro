@@ -66,12 +66,11 @@ TEST(UvCallbackResultTest, CompleteMultipleArgs) {
 
 // A UvFuture whose result is already set returns Ready on first poll.
 TEST(UvFutureTest, PollReadyWhenResultAlreadySet) {
-    auto res = std::make_shared<UvCallbackResult<int>>();
-    res->complete(10);
+    UvCallbackResult<int> res;
+    res.complete(10);
 
     UvFuture<int> fut(res);
 
-    // We need a Context to poll; create a minimal do-nothing waker.
     struct NoopWaker : detail::Waker {
         void wake() override {}
         std::shared_ptr<detail::Waker> clone() override {
@@ -89,7 +88,7 @@ TEST(UvFutureTest, PollReadyWhenResultAlreadySet) {
 
 // A UvFuture whose result is not yet set returns Pending and stores the waker.
 TEST(UvFutureTest, PollPendingWhenResultNotSet) {
-    auto res = std::make_shared<UvCallbackResult<int>>();
+    UvCallbackResult<int> res;
     UvFuture<int> fut(res);
 
     bool woken = false;
@@ -107,8 +106,7 @@ TEST(UvFutureTest, PollPendingWhenResultNotSet) {
     auto result = fut.poll(ctx);
     EXPECT_TRUE(result.isPending());
 
-    // Completing the result should wake the registered waker.
-    res->complete(99);
+    res.complete(99);
     EXPECT_TRUE(woken);
 }
 
@@ -118,7 +116,7 @@ TEST(UvFutureTest, PollPendingWhenResultNotSet) {
 
 // The cancel fn is called when the UvFuture is destroyed before the result arrives.
 TEST(UvFutureTest, CancelFnCalledOnDestructionBeforeComplete) {
-    auto res = std::make_shared<UvCallbackResult<int>>();
+    UvCallbackResult<int> res;
 
     bool cancelled = false;
     {
@@ -130,8 +128,8 @@ TEST(UvFutureTest, CancelFnCalledOnDestructionBeforeComplete) {
 
 // The cancel fn is NOT called if the result has already arrived.
 TEST(UvFutureTest, CancelFnNotCalledIfAlreadyComplete) {
-    auto res = std::make_shared<UvCallbackResult<int>>();
-    res->complete(5);
+    UvCallbackResult<int> res;
+    res.complete(5);
 
     bool cancelled = false;
     {
@@ -144,8 +142,10 @@ TEST(UvFutureTest, CancelFnNotCalledIfAlreadyComplete) {
 // UvFuture — integration via uv timer
 // ---------------------------------------------------------------------------
 
-// A coroutine running on the uv executor awaits a UvFuture that is completed
-// by a one-shot uv timer.
+// A coroutine running on the uv executor awaits a UvFuture completed by a
+// one-shot uv timer. UvCallbackResult lives on the coroutine frame; the timer
+// callback captures a raw pointer to it — safe because co_await keeps the
+// frame alive until complete() fires.
 TEST(UvFutureTest, TimerCompletesUvFuture) {
     Runtime rt(1);
 
@@ -155,13 +155,13 @@ TEST(UvFutureTest, TimerCompletesUvFuture) {
             out = co_await with_context(rt_ref.uv_executor(),
                 []() -> Coro<int> {
                     auto& exec = current_uv_executor();
-                    auto result = std::make_shared<UvCallbackResult<int>>();
+                    UvCallbackResult<int> result;
 
-                    OneShotTimer::start(exec.loop(), 10, [result] {
-                        result->complete(42);
+                    OneShotTimer::start(exec.loop(), 10, [&result] {
+                        result.complete(42);
                     });
 
-                    auto [value] = co_await UvFuture<int>(result);
+                    auto [value] = co_await wait(result);
                     co_return value;
                 }()
             );
@@ -182,14 +182,14 @@ TEST(UvFutureTest, SequentialTimersCompleteInOrder) {
                 [](int& x, int& y) -> Coro<void> {
                     auto& exec = current_uv_executor();
 
-                    auto r1 = std::make_shared<UvCallbackResult<int>>();
-                    OneShotTimer::start(exec.loop(), 5, [r1] { r1->complete(1); });
-                    auto [v1] = co_await UvFuture<int>(r1);
+                    UvCallbackResult<int> r1;
+                    OneShotTimer::start(exec.loop(), 5, [&r1] { r1.complete(1); });
+                    auto [v1] = co_await wait(r1);
                     x = v1;
 
-                    auto r2 = std::make_shared<UvCallbackResult<int>>();
-                    OneShotTimer::start(exec.loop(), 5, [r2] { r2->complete(2); });
-                    auto [v2] = co_await UvFuture<int>(r2);
+                    UvCallbackResult<int> r2;
+                    OneShotTimer::start(exec.loop(), 5, [&r2] { r2.complete(2); });
+                    auto [v2] = co_await wait(r2);
                     y = v2;
                 }(a, b)
             );

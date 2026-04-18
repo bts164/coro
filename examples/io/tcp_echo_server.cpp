@@ -1,10 +1,6 @@
 // tcp_echo_server.cpp
 //
-// Exposition example — TcpStream is not yet implemented. This file shows what
-// the API is intended to look like once the I/O layer is complete. It does not
-// compile today.
-//
-// Starts a TCP echo server on localhost:8080. For each incoming connection a
+// TCPt echo server on localhost:8080. For each incoming connection a
 // task is spawned that reads bytes and writes them straight back until the
 // client disconnects or the server is shut down.
 //
@@ -15,12 +11,41 @@
 #include <coro/coro.h>
 #include <coro/runtime/runtime.h>
 #include <coro/task/join_set.h>
-#include <coro/io/tcp_listener.h>   // not yet implemented
-#include <coro/io/tcp_stream.h>     // not yet implemented
-#include <array>
+#include <coro/io/tcp_listener.h>
+#include <coro/io/tcp_stream.h>
+#include <coro/sync/timeout.h>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <string>
+#include <filesystem>
+
+// Returns the current system time as an ISO 8601 string with milliseconds,
+// e.g. "2026-04-06T21:34:56.123Z".
+static std::string iso8601_now() {
+    auto now = std::chrono::system_clock::now();
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch()) % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", std::gmtime(&t));
+    char result[40];
+    std::snprintf(result, sizeof(result), "%s.%03dZ", buf, (int)ms.count());
+    return result;
+}
 
 using namespace coro;
+
+#define LOG(__ID__, __MSG__, ...) \
+    std::printf("[%s] %s:%d %d - " __MSG__ "\n", \
+        iso8601_now().c_str(), \
+        std::filesystem::path(__FILE__).filename().string().c_str(), \
+        __LINE__, __ID__, ##__VA_ARGS__)
+
+std::string_view as_text(std::span<std::byte const> data)
+{
+    return std::string_view(reinterpret_cast<const char*>(data.data()), data.size());
+}
 
 // ---------------------------------------------------------------------------
 // handle_connection
@@ -28,19 +53,37 @@ using namespace coro;
 // Owns one TcpStream for the lifetime of a single client connection.
 // Reads up to 4 KiB at a time and echoes it back until EOF or error.
 // ---------------------------------------------------------------------------
-static Coro<void> handle_connection(TcpStream stream) {
-    std::array<std::byte, 4096> buf;
-
+static Coro<void> handle_connection(TcpStream stream, int id) {
+    using namespace std::chrono_literals;
+    struct Defer {
+        Defer(int id) : id_(id) {}
+        ~Defer() { LOG(id_, "Connection closed"); }
+        int id_;
+    } defer(id);
     for (;;) {
-        // co_await stream.read() returns the number of bytes read, or 0 on EOF.
-        std::size_t n = co_await stream.read(buf);
-        if (n == 0)
-            break;  // clean EOF — client disconnected
-
-        // Echo the same bytes back. write() guarantees a full write or throws.
-        co_await stream.write(std::span<const std::byte>(buf.data(), n));
+        std::array<std::byte, 4096> buf;
+        auto receiveResult = co_await coro::timeout(20s, stream.read(buf));
+        if (0 != receiveResult.index()) {
+            LOG(id, "Receive timeout");
+            co_return;
+        }
+        size_t n = std::get<0>(receiveResult).value;
+        if (n == 0) {
+            LOG(id, "EOF");
+            co_return;  // clean close from client
+        }
+        std::span<const std::byte> msg(buf.data(), n);
+        LOG(id, "Received message \"%s\"", std::string(as_text(msg)).c_str());
+        auto sendResult = co_await coro::timeout(
+            2s, stream.write(msg)
+        );
+        if (0 != sendResult.index()) {
+            LOG(id, "Send timeout");
+            co_return;  // client stopped responding
+        }
+        LOG(id, "Echoed message \"%s\"", std::string(as_text(msg)).c_str());
     }
-    // TcpStream destructor closes the socket when the coroutine returns.
+    // TcpStream destructor sends a Close frame when the coroutine returns.
 }
 
 // ---------------------------------------------------------------------------
@@ -51,32 +94,26 @@ static Coro<void> handle_connection(TcpStream stream) {
 // active sessions are cancelled cleanly when run_server itself is cancelled.
 // ---------------------------------------------------------------------------
 static Coro<void> run_server() {
-    // TcpListener::bind() resolves the address and calls bind()/listen()
-    // via the IoService — no blocking calls on the executor thread.
+    LOG(-1, "Starting TCP echo server...");
     TcpListener listener = co_await TcpListener::bind("127.0.0.1", 8080);
-    std::printf("Listening on 127.0.0.1:8080\n");
+    LOG(-1, "TCP echo server listening on 127.0.0.1:8080");
 
-    // JoinSet<void> tracks all active connection tasks. Dropping the JoinSet
-    // (when run_server exits) cancels every in-flight session and waits for
-    // them to drain before the coroutine completes.
+    // JoinSet tracks all active sessions. Dropping it (on cancellation) cancels
+    // every in-flight session and waits for them to drain.
     JoinSet<void> sessions;
 
-    for (;;) {
-        // co_await listener.accept() suspends until a new TCP connection
-        // arrives; the I/O thread wakes this task via the Waker mechanism.
+    for (int i = 0;; ++i) {
         TcpStream stream = co_await listener.accept();
-        sessions.spawn(handle_connection(std::move(stream)));
+        LOG(-1, "Accepted new connection %d", i);
+        sessions.spawn(handle_connection(std::move(stream), i));
     }
-
-    // Unreachable in normal operation — the loop runs until the task is
-    // cancelled (e.g. on SIGINT). The JoinSet destructor handles cleanup.
 }
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
-    // WorkStealingExecutor with one thread per core.
-    Runtime rt;
+    Runtime rt(1);
+    LOG(-1, "Starting runtime...");
     rt.block_on(run_server());
 }

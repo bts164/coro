@@ -46,10 +46,10 @@ constexpr FileMode operator&(FileMode a, FileMode b) {
  * destructor closes the file asynchronously on the uv executor.
  *
  * All I/O operations internally use `with_context` to run on the
- * @ref SingleThreadedUvExecutor, wrapping libuv callbacks as @ref UvFuture
- * awaitables. The coroutine that calls `read()` or `write()` need not be
- * on the uv executor — the future transparently migrates work there and
- * back.
+ * @ref SingleThreadedUvExecutor, using stack-allocated @ref UvCallbackResult
+ * objects awaited via @ref wait(). The coroutine that calls `read()` or
+ * `write()` need not be on the uv executor — the future transparently
+ * migrates work there and back.
  *
  * **Concurrency:** a `File` must not be shared across tasks. Only one read
  * or write future may be in flight at a time per file descriptor.
@@ -59,20 +59,6 @@ constexpr FileMode operator&(FileMode a, FileMode b) {
  * close completes.
  */
 class File {
-private:
-    // -----------------------------------------------------------------------
-    // CloseRequest — submitted to the uv executor from the destructor.
-    // Heap-allocates the uv_fs_t so it outlives execute() until close_cb fires.
-    // -----------------------------------------------------------------------
-
-    struct CloseRequest : IoRequest {
-        uv_file fd;
-        explicit CloseRequest(uv_file f) : fd(f) {}
-        void execute(uv_loop_t* loop) override;
-    };
-
-    static void close_cb(uv_fs_t* req);
-
 public:
     // -----------------------------------------------------------------------
     // Future types

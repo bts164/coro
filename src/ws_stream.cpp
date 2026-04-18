@@ -1,137 +1,12 @@
 #include <coro/io/ws_stream.h>
+#include <coro/task/spawn_on.h>
+#include <coro/coro.h>
 #include <stdexcept>
 #include <system_error>
 #include <climits>
 
 namespace coro {
 
-// =============================================================================
-// IoRequest subtypes — defined here (not in the header) because they are purely
-// internal to WsStream.
-// =============================================================================
-
-namespace {
-
-using namespace coro::detail::ws;
-
-// ---------------------------------------------------------------------------
-// WsConnectRequest
-//
-// Submitted by ConnectFuture on first poll. Runs on the I/O thread: parses the
-// URL, stores a heap-allocated shared_ptr<ConnectionState> as lws per-session
-// user data, then calls lws_client_connect_via_info(). From that point on,
-// protocol_cb recovers the ConnectionState via lws_wsi_user().
-// ---------------------------------------------------------------------------
-struct WsConnectRequest : coro::IoRequest {
-    std::shared_ptr<ConnectionState> state;
-    std::string                      url;
-    std::string                      subprotocol_str;  // comma-joined; empty = no subprotocol header
-    lws_context*                     lws_ctx;
-
-    WsConnectRequest(std::shared_ptr<ConnectionState> s,
-                     std::string                      u,
-                     std::string                      proto,
-                     lws_context*                     ctx)
-        : state(std::move(s)), url(std::move(u)), subprotocol_str(std::move(proto)), lws_ctx(ctx) {}
-
-    void execute(uv_loop_t* /*loop*/) override {
-        if (!lws_ctx) {
-            std::shared_ptr<detail::Waker> waker_to_wake;
-            {
-                std::lock_guard lk(state->connect.mutex);
-                state->connect.error = ENOTCONN;  // "Transport endpoint is not connected"
-                state->connect.complete = true;
-                waker_to_wake = state->connect.waker.load();
-            }
-            if (waker_to_wake) waker_to_wake->wake();
-            return;
-        }
-
-        ParsedUrl parsed;
-        try {
-            parsed = parse_ws_url(url);
-        } catch (...) {
-            std::shared_ptr<detail::Waker> waker_to_wake;
-            {
-                std::lock_guard lk(state->connect.mutex);
-                state->connect.error = EINVAL;  // "Invalid argument" (bad URL)
-                state->connect.complete = true;
-                waker_to_wake = state->connect.waker.load();
-            }
-            if (waker_to_wake) waker_to_wake->wake();
-            return;
-        }
-
-        // Heap-allocate a shared_ptr wrapper stored as lws per-session user data.
-        // protocol_cb recovers it via lws_wsi_user(); LWS_CALLBACK_CLIENT_CLOSED
-        // deletes the wrapper, decrementing the ref count.
-        auto* sp = new std::shared_ptr<ConnectionState>(state);
-
-        lws_client_connect_info ci{};
-        ci.context        = lws_ctx;
-        ci.address        = parsed.host.c_str();
-        ci.port           = parsed.port;
-        ci.path           = parsed.path.c_str();
-        ci.ssl_connection = parsed.tls ? LCCSCF_USE_SSL : 0;
-        ci.userdata       = sp;
-        // nullptr omits the Sec-WebSocket-Protocol request header entirely,
-        // making WsStream connect to any server regardless of subprotocol.
-        ci.protocol       = subprotocol_str.empty() ? nullptr : subprotocol_str.c_str();
-
-        state->wsi = lws_client_connect_via_info(&ci);
-        if (!state->wsi) {
-            delete sp;
-            std::shared_ptr<detail::Waker> waker_to_wake;
-            {
-                std::lock_guard lk(state->connect.mutex);
-                state->connect.error = ECONNREFUSED;  // "Connection refused"
-                state->connect.complete = true;
-                waker_to_wake = state->connect.waker.load();
-            }
-            if (waker_to_wake) waker_to_wake->wake();
-        }
-    }
-};
-
-// ---------------------------------------------------------------------------
-// WsWritableRequest
-//
-// Submitted by SendFuture after enqueuing its SendSubState. Calls
-// lws_callback_on_writable() on the I/O thread so lws schedules a
-// LWS_CALLBACK_CLIENT_WRITEABLE event.
-// ---------------------------------------------------------------------------
-struct WsWritableRequest : coro::IoRequest {
-    std::shared_ptr<ConnectionState> state;
-    explicit WsWritableRequest(std::shared_ptr<ConnectionState> s) : state(std::move(s)) {}
-
-    void execute(uv_loop_t* /*loop*/) override {
-        if (state->wsi && !state->closed.load())
-            lws_callback_on_writable(state->wsi);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// WsCloseRequest
-//
-// Submitted by WsStream::~WsStream(). Initiates a graceful WebSocket close
-// (sends a Close frame) from the I/O thread.
-// ---------------------------------------------------------------------------
-struct WsCloseRequest : coro::IoRequest {
-    std::shared_ptr<ConnectionState> state;
-    explicit WsCloseRequest(std::shared_ptr<ConnectionState> s) : state(std::move(s)) {}
-
-    void execute(uv_loop_t* /*loop*/) override {
-        if (state->wsi && !state->closed.load()) {
-            // Set the flag so the WRITEABLE callback knows to close rather than send.
-            // lws_close_reason() outside a protocol callback is a no-op; the close
-            // must be initiated by returning -1 from within the callback itself.
-            state->closing.store(true, std::memory_order_release);
-            lws_callback_on_writable(state->wsi);
-        }
-    }
-};
-
-} // anonymous namespace
 
 // =============================================================================
 // coro::detail::ws — protocol_cb and URL parser
@@ -383,8 +258,16 @@ WsStream::WsStream(WsStream&&) noexcept = default;
 WsStream& WsStream::operator=(WsStream&&) noexcept = default;
 
 WsStream::~WsStream() {
-    if (m_state)
-        m_uv_exec->submit(std::make_unique<WsCloseRequest>(std::move(m_state)));
+    if (!m_state) return;
+    with_context(*m_uv_exec,
+        [](std::shared_ptr<detail::ws::ConnectionState> state) -> Coro<void> {
+            if (state->wsi && !state->closed.load()) {
+                state->closing.store(true, std::memory_order_release);
+                lws_callback_on_writable(state->wsi);
+            }
+            co_return;
+        }(std::move(m_state))
+    ).detach();
 }
 
 WsStream::ConnectFuture WsStream::connect(std::string url, FrameMode frame_mode,
@@ -443,8 +326,61 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
             proto += m_subprotocols[i];
         }
 
-        m_uv_exec->submit(std::make_unique<WsConnectRequest>(
-            m_state, m_url, std::move(proto), m_uv_exec->lws_ctx()));
+        lws_context* lws_ctx = m_uv_exec->lws_ctx();
+        with_context(*m_uv_exec,
+            [](std::shared_ptr<detail::ws::ConnectionState> state,
+               std::string url, std::string proto,
+               lws_context* lws_ctx) -> Coro<void> {
+                using namespace coro::detail::ws;
+                if (!lws_ctx) {
+                    std::shared_ptr<detail::Waker> w;
+                    {
+                        std::lock_guard lk(state->connect.mutex);
+                        state->connect.error    = ENOTCONN;
+                        state->connect.complete = true;
+                        w = state->connect.waker.load();
+                    }
+                    if (w) w->wake();
+                    co_return;
+                }
+                ParsedUrl parsed;
+                try {
+                    parsed = parse_ws_url(url);
+                } catch (...) {
+                    std::shared_ptr<detail::Waker> w;
+                    {
+                        std::lock_guard lk(state->connect.mutex);
+                        state->connect.error    = EINVAL;
+                        state->connect.complete = true;
+                        w = state->connect.waker.load();
+                    }
+                    if (w) w->wake();
+                    co_return;
+                }
+                auto* sp = new std::shared_ptr<ConnectionState>(state);
+                lws_client_connect_info ci{};
+                ci.context        = lws_ctx;
+                ci.address        = parsed.host.c_str();
+                ci.port           = parsed.port;
+                ci.path           = parsed.path.c_str();
+                ci.ssl_connection = parsed.tls ? LCCSCF_USE_SSL : 0;
+                ci.userdata       = sp;
+                ci.protocol       = proto.empty() ? nullptr : proto.c_str();
+                state->wsi = lws_client_connect_via_info(&ci);
+                if (!state->wsi) {
+                    delete sp;
+                    std::shared_ptr<detail::Waker> w;
+                    {
+                        std::lock_guard lk(state->connect.mutex);
+                        state->connect.error    = ECONNREFUSED;
+                        state->connect.complete = true;
+                        w = state->connect.waker.load();
+                    }
+                    if (w) w->wake();
+                }
+                co_return;
+            }(m_state, m_url, std::move(proto), lws_ctx)
+        ).detach();
         return PollPending;
     }
 
@@ -557,7 +493,13 @@ PollResult<void> WsStream::SendFuture::poll(detail::Context& ctx) {
             std::lock_guard lk2(m_state->send_queue_mutex);
             m_state->send_queue.push_back(m_sub_state);
         }
-        m_uv_exec->submit(std::make_unique<WsWritableRequest>(m_state));
+        with_context(*m_uv_exec,
+            [](std::shared_ptr<detail::ws::ConnectionState> state) -> Coro<void> {
+                if (state->wsi && !state->closed.load())
+                    lws_callback_on_writable(state->wsi);
+                co_return;
+            }(m_state)
+        ).detach();
     }
 
     return PollPending;

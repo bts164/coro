@@ -2,6 +2,40 @@
 
 Planned work not yet implemented, in rough priority order.
 
+## Owned-buffer async I/O API
+
+`File::read(std::span<std::byte>)` and `File::write(std::span<const std::byte>)` take
+non-owning views. The type system cannot prevent a caller from passing a buffer that is
+freed before the libuv callback fires — a silent use-after-free that will not crash
+deterministically and will not be caught by address sanitizers in most configurations.
+
+The three concrete failure patterns:
+- Caller **detaches** the `JoinHandle`: the task outlives the buffer owner.
+- Caller places the buffer and `JoinHandle` in the **same scope**: the buffer is
+  destroyed when the scope exits, before the handle destructor drains the task.
+- Caller passes a **span of a temporary** through a wrapper that introduces an
+  intermediate suspension.
+
+**Proposed fix:** add owning overloads that take `std::vector<std::byte>` (or a
+`std::unique_ptr<std::byte[]>` + length) by value, execute the I/O, and return the
+buffer together with the byte count. The span overloads are kept for callers that
+already guarantee lifetime (coroutine-local buffers), but the owned variants become
+the recommended default in documentation and guidelines.
+
+```cpp
+// Proposed owned API:
+auto [buf, nbytes] = co_await file.read(std::vector<std::byte>(4096));
+auto [buf2, nw]    = co_await file.write(std::move(owned_buf));
+```
+
+This mirrors how Rust's `tokio::fs::File` works: `read_buf` / `write_all` take
+owned or `BufMut`-bounded arguments so the borrow checker enforces lifetime at
+compile time. C++ cannot enforce this statically, but moving ownership into the
+`Future` achieves the same runtime guarantee.
+
+Tracked as a core API design issue — resolve before the library reaches a stable
+public API.
+
 ## Single-thread mode: `block_on` drives the uv loop directly
 
 Allow the `Runtime` to run libuv, libwebsockets, and all user coroutine tasks on a

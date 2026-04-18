@@ -15,6 +15,8 @@
 #include <coro/io/ws_stream.h>
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
+#include <coro/task/join_set.h>
+
 #include <chrono>
 #include <cstdio>
 #include <ctime>

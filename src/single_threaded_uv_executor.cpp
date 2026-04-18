@@ -68,18 +68,6 @@ void SingleThreadedUvExecutor::wait_for_completion(detail::TaskStateBase& state)
     state.wait_until_done();
 }
 
-// ---------------------------------------------------------------------------
-// IoRequest submission
-// ---------------------------------------------------------------------------
-
-void SingleThreadedUvExecutor::submit(std::unique_ptr<IoRequest> req) {
-    {
-        std::lock_guard lk(m_io_queue_mutex);
-        m_io_queue.push_back(std::move(req));
-    }
-    uv_async_send(&m_async);
-}
-
 void SingleThreadedUvExecutor::stop() {
     if (m_stopping.exchange(true))
         return;  // idempotent
@@ -109,7 +97,6 @@ void SingleThreadedUvExecutor::io_async_cb(uv_async_t* handle) {
     auto* self = static_cast<SingleThreadedUvExecutor*>(handle->data);
 
     self->drain_incoming_wakes();
-    self->process_io_queue();
     self->drain_ready_tasks();
 
     if (self->m_stopping.load()) {
@@ -166,16 +153,6 @@ void SingleThreadedUvExecutor::drain_incoming_wakes() {
     }
     for (auto& t : local)
         m_ready.push(std::move(t));
-}
-
-void SingleThreadedUvExecutor::process_io_queue() {
-    std::deque<std::unique_ptr<IoRequest>> local;
-    {
-        std::lock_guard lk(m_io_queue_mutex);
-        std::swap(local, m_io_queue);
-    }
-    for (auto& req : local)
-        req->execute(&m_uv_loop);
 }
 
 void SingleThreadedUvExecutor::drain_ready_tasks() {

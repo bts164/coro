@@ -4,7 +4,9 @@
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/task/join_set.h>
+#include <coro/runtime/uv_future.h>
+#include <coro/task/spawn_on.h>
+#include <coro/coro.h>
 #include <uv.h>
 #include <atomic>
 #include <chrono>
@@ -45,13 +47,18 @@ public:
 
     ~SleepFuture() {
         if (m_state) {
-            // Always submit CancelRequest — its execute() uses fired.exchange(true)
-            // to avoid a double-close if the timer already fired before we get there.
-            // Pass m_state as a shared_ptr so State stays alive until the I/O thread
-            // processes the request, even after we release our own reference.
             // Use the cached m_uv_exec rather than current_uv_executor() because
             // the thread-local may have been cleared by the time the destructor runs.
-            m_uv_exec->submit(std::make_unique<CancelRequest>(m_state));
+            with_context(*m_uv_exec,
+                [](std::shared_ptr<State> state) -> Coro<void> {
+                    // fired.exchange(true) avoids double-close if timer_cb already won.
+                    if (!state->fired.exchange(true)) {
+                        uv_timer_stop(&state->handle);
+                        uv_close(reinterpret_cast<uv_handle_t*>(&state->handle), close_cb);
+                    }
+                    co_return;
+                }(std::move(m_state))
+            ).detach();
         }
     }
 
@@ -87,7 +94,20 @@ public:
             m_uv_exec = &current_uv_executor();
             m_state = std::make_shared<State>();
             m_state->waker.store(ctx.getWaker());
-            m_uv_exec->submit(std::make_unique<StartRequest>(m_state, m_deadline));
+            using TimePoint = std::chrono::time_point<std::chrono::steady_clock,
+                                                      std::chrono::milliseconds>;
+            with_context(*m_uv_exec,
+                [](std::shared_ptr<State> state, TimePoint deadline) -> Coro<void> {
+                    uv_timer_init(current_uv_executor().loop(), &state->handle);
+                    state->handle.data = new std::shared_ptr<State>(state);
+                    auto now_ms = std::chrono::floor<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now());
+                    auto ms = (deadline - now_ms).count();
+                    uv_timer_start(&state->handle, timer_cb,
+                                   static_cast<uint64_t>(std::max<int64_t>(0, ms)), 0);
+                    co_return;
+                }(m_state, m_deadline)
+            ).detach();
         } else {
             // Re-polled before timer fired (e.g. woken by a select branch).
             // Atomically update the waker — timer_cb may read it concurrently on the I/O thread.
@@ -110,60 +130,6 @@ private:
         uv_timer_t                                  handle;  // must remain first field
         std::atomic<std::shared_ptr<detail::Waker>> waker;
         std::atomic<bool>                           fired{false};
-    };
-
-    // -----------------------------------------------------------------------
-    // StartRequest — arms the one-shot libuv timer on the I/O thread.
-    //
-    // Holds a shared_ptr<State> so State stays alive from submission until
-    // close_cb fires, regardless of when SleepFuture is destroyed.
-    // handle.data stores a heap-allocated shared_ptr<State> wrapper so that
-    // close_cb (which only receives a void*) can decrement the ref count.
-    // -----------------------------------------------------------------------
-    struct StartRequest : IoRequest {
-        std::shared_ptr<State>                                              state;
-        std::chrono::time_point<std::chrono::steady_clock,
-                                std::chrono::milliseconds>                  deadline;
-
-        StartRequest(std::shared_ptr<State> s,
-                     std::chrono::time_point<std::chrono::steady_clock,
-                                             std::chrono::milliseconds> d)
-            : state(std::move(s)), deadline(d) {}
-
-        void execute(uv_loop_t* loop) override {
-            uv_timer_init(loop, &state->handle);
-            // Store a heap-allocated shared_ptr wrapper in handle->data.
-            // close_cb deletes this wrapper, decrementing the ref count.
-            state->handle.data = new std::shared_ptr<State>(state);
-            // m_deadline is already in whole milliseconds (ceiled at construction),
-            // so this subtraction is exact — no rounding needed here.
-            auto now_ms = std::chrono::floor<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now());
-            auto ms = (deadline - now_ms).count();
-            uv_timer_start(&state->handle, timer_cb,
-                           static_cast<uint64_t>(std::max<int64_t>(0, ms)), 0);
-        }
-    };
-
-    // -----------------------------------------------------------------------
-    // CancelRequest — stops and closes the timer handle on the I/O thread.
-    //
-    // Holds a shared_ptr<State> so State stays alive until this request is
-    // processed, even if SleepFuture has already been destroyed.
-    // -----------------------------------------------------------------------
-    struct CancelRequest : IoRequest {
-        std::shared_ptr<State> state;
-
-        explicit CancelRequest(std::shared_ptr<State> s) : state(std::move(s)) {}
-
-        void execute(uv_loop_t* /*loop*/) override {
-            // Atomically claim the uv_close. If timer_cb already won the exchange
-            // (fired==true), it owns the close — this is a safe no-op.
-            if (!state->fired.exchange(true)) {
-                uv_timer_stop(&state->handle);
-                uv_close(reinterpret_cast<uv_handle_t*>(&state->handle), close_cb);
-            }
-        }
     };
 
     // -----------------------------------------------------------------------

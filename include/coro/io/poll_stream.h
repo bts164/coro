@@ -7,6 +7,9 @@
 #include <coro/io/decoder_concept.h>
 #include <coro/io/ring_buffer.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
+#include <coro/runtime/uv_future.h>
+#include <coro/task/spawn_on.h>
+#include <coro/coro.h>
 #include <uv.h>
 #include <cstddef>
 #include <exception>
@@ -139,9 +142,7 @@ public:
     ~PollStream();
 
 private:
-    struct State;                // forward declaration
-    struct EnsurePollingRequest; // IoRequest: init + start poll on I/O thread
-    struct CloseRequest;         // IoRequest: stop + close handle on I/O thread
+    struct State; // forward declaration
 
     std::shared_ptr<State>    m_state;
     SingleThreadedUvExecutor* m_uv_exec;
@@ -150,9 +151,12 @@ private:
                        PollStreamOptions options,
                        SingleThreadedUvExecutor* uv_exec);
 
-    // libuv callbacks (run on I/O thread)
+    // libuv callback (runs on I/O thread)
     static void poll_cb(uv_poll_t* handle, int status, int events);
-    static void close_cb(uv_handle_t* handle);
+
+    // Coroutine helpers dispatched to the I/O thread via with_context
+    static Coro<void> ensure_polling_impl(std::shared_ptr<State> state);
+    static Coro<void> close_impl(std::shared_ptr<State> state);
 };
 
 // ---------------------------------------------------------------------------
@@ -184,7 +188,7 @@ struct PollStream<T, DecoderT>::State {
     bool                                 eof         = false; // EOF seen on fd
     bool                                 polling     = false; // uv_poll_start active?
     bool                                 closing     = false; // CloseRequest submitted
-    // initialized is only ever read/written on the I/O thread (inside IoRequest::execute),
+    // initialized is only ever read/written on the I/O thread (inside ensure_polling_impl),
     // so it does not need mutex protection.
     bool                                 initialized = false; // uv_poll_init done
 
@@ -197,33 +201,6 @@ struct PollStream<T, DecoderT>::State {
     {
         poll_handle.data = this;
     }
-};
-
-// ---------------------------------------------------------------------------
-// IoRequest types — execute() runs on the libuv I/O thread
-// ---------------------------------------------------------------------------
-
-/**
- * Submitted by poll_next() when polling needs to start or resume.
- * Calls uv_poll_init (first time) and uv_poll_start on the I/O thread,
- * keeping all libuv API calls off the executor thread.
- */
-template<typename T, Decoder DecoderT>
-struct PollStream<T, DecoderT>::EnsurePollingRequest : IoRequest {
-    std::shared_ptr<State> state;
-    explicit EnsurePollingRequest(std::shared_ptr<State> s) : state(std::move(s)) {}
-    void execute(uv_loop_t* loop) override;
-};
-
-/**
- * Submitted by close() to stop polling and close the handle on the I/O thread.
- * Holds a shared_ptr<State> to keep State alive until close_cb fires.
- */
-template<typename T, Decoder DecoderT>
-struct PollStream<T, DecoderT>::CloseRequest : IoRequest {
-    std::shared_ptr<State> state;
-    explicit CloseRequest(std::shared_ptr<State> s) : state(std::move(s)) {}
-    void execute(uv_loop_t* loop) override;
 };
 
 } // namespace coro
