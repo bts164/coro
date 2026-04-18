@@ -16,8 +16,6 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 
 static_assert(Future<JoinHandle<File>>);
-static_assert(Future<File::ReadFuture>);
-static_assert(Future<File::WriteFuture>);
 
 // ---------------------------------------------------------------------------
 // Helper: temporary file RAII wrapper
@@ -51,13 +49,11 @@ TEST(FileTest, BasicOpenWriteReadClose) {
     rt.block_on([](std::string path) -> Coro<void> {
         // Write
         auto file = co_await File::open(path, FileMode::Write | FileMode::Create | FileMode::Truncate);
-        std::string data = "Hello, File I/O!";
-        std::size_t written = co_await file.write(std::as_bytes(std::span(data)));
+        auto [written, data] = co_await file.write(std::string("Hello, File I/O!"));
         EXPECT_EQ(written, data.size());
         // Drop file to close, then re-open read-only
         file = co_await File::open(path, FileMode::Read);  // assignment closes previous fd
-        std::array<std::byte, 128> buf;
-        std::size_t n = co_await file.read(std::span(buf));
+        auto [n, buf] = co_await file.read(std::array<std::byte, 128>{});
         EXPECT_EQ(n, data.size());
         std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
         EXPECT_EQ(read_back, data);
@@ -76,8 +72,7 @@ TEST(FileTest, ReadEOF) {
     Runtime rt;
     rt.block_on([](std::string path) -> Coro<void> {
         auto file = co_await File::open(path, FileMode::Read);
-        std::array<std::byte, 16> buf;
-        std::size_t n = co_await file.read(std::span(buf));
+        auto [n, _] = co_await file.read(std::array<std::byte, 16>{});
         EXPECT_EQ(n, 0);  // EOF
     }(temp.path_string()));
 }
@@ -113,14 +108,10 @@ TEST(FileTest, PositionalIO) {
         auto file = co_await File::open(
             path, FileMode::ReadWrite | FileMode::Create | FileMode::Truncate);
 
-        std::string data_a = "AAAA";
-        co_await file.write_at(std::as_bytes(std::span(data_a)), 0);
+        co_await file.write_at(std::string("AAAA"), 0);
+        co_await file.write_at(std::string("BBBB"), 100);
 
-        std::string data_b = "BBBB";
-        co_await file.write_at(std::as_bytes(std::span(data_b)), 100);
-
-        std::array<std::byte, 4> buf;
-        std::size_t n = co_await file.read_at(std::span(buf), 100);
+        auto [n, buf] = co_await file.read_at(std::array<std::byte, 4>{}, 100);
         EXPECT_EQ(n, 4);
         std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
         EXPECT_EQ(read_back, "BBBB");
@@ -138,15 +129,13 @@ TEST(FileTest, MultipleSequentialReads) {
         // Write phase: keep file open for reads (no async-close race).
         auto file = co_await File::open(
             path, FileMode::ReadWrite | FileMode::Create | FileMode::Truncate);
-        std::string chunk(64, 'X');
-        co_await file.write(std::as_bytes(std::span(chunk)));
-        co_await file.write(std::as_bytes(std::span(chunk)));
+        co_await file.write(std::string(64, 'X'));
+        co_await file.write(std::string(64, 'X'));
         // Rewind and read back.
         file = co_await File::open(path, FileMode::Read);  // closes write fd, opens read
-        std::array<std::byte, 64> buf;
         std::size_t total = 0;
         while (true) {
-            std::size_t n = co_await file.read(std::span(buf));
+            auto [n, _] = co_await file.read(std::array<std::byte, 64>{});
             if (n == 0) break;
             total += n;
         }
@@ -170,14 +159,12 @@ TEST(FileTest, MultipleConcurrentFiles) {
         for (int i = 0; i < n; ++i) {
             auto file = co_await File::open(
                 paths[i], FileMode::Write | FileMode::Create | FileMode::Truncate);
-            std::string data = "File" + std::to_string(i);
-            co_await file.write(std::as_bytes(std::span(data)));
+            co_await file.write("File" + std::to_string(i));
         }
         // Read phase
         for (int i = 0; i < n; ++i) {
             auto file = co_await File::open(paths[i], FileMode::Read);
-            std::array<std::byte, 32> buf;
-            std::size_t bytes = co_await file.read(std::span(buf));
+            auto [bytes, buf] = co_await file.read(std::array<std::byte, 32>{});
             std::string got(reinterpret_cast<const char*>(buf.data()), bytes);
             EXPECT_EQ(got, "File" + std::to_string(i));
         }

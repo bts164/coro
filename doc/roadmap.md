@@ -2,40 +2,6 @@
 
 Planned work not yet implemented, in rough priority order.
 
-## Owned-buffer async I/O API
-
-`File::read(std::span<std::byte>)` and `File::write(std::span<const std::byte>)` take
-non-owning views. The type system cannot prevent a caller from passing a buffer that is
-freed before the libuv callback fires — a silent use-after-free that will not crash
-deterministically and will not be caught by address sanitizers in most configurations.
-
-The three concrete failure patterns:
-- Caller **detaches** the `JoinHandle`: the task outlives the buffer owner.
-- Caller places the buffer and `JoinHandle` in the **same scope**: the buffer is
-  destroyed when the scope exits, before the handle destructor drains the task.
-- Caller passes a **span of a temporary** through a wrapper that introduces an
-  intermediate suspension.
-
-**Proposed fix:** add owning overloads that take `std::vector<std::byte>` (or a
-`std::unique_ptr<std::byte[]>` + length) by value, execute the I/O, and return the
-buffer together with the byte count. The span overloads are kept for callers that
-already guarantee lifetime (coroutine-local buffers), but the owned variants become
-the recommended default in documentation and guidelines.
-
-```cpp
-// Proposed owned API:
-auto [buf, nbytes] = co_await file.read(std::vector<std::byte>(4096));
-auto [buf2, nw]    = co_await file.write(std::move(owned_buf));
-```
-
-This mirrors how Rust's `tokio::fs::File` works: `read_buf` / `write_all` take
-owned or `BufMut`-bounded arguments so the borrow checker enforces lifetime at
-compile time. C++ cannot enforce this statically, but moving ownership into the
-`Future` achieves the same runtime guarantee.
-
-Tracked as a core API design issue — resolve before the library reaches a stable
-public API.
-
 ## Single-thread mode: `block_on` drives the uv loop directly
 
 Allow the `Runtime` to run libuv, libwebsockets, and all user coroutine tasks on a
@@ -184,40 +150,6 @@ while (auto item = co_await coro::next(rx))
 
 Lives in `include/coro/sync/channel.h`.
 
-## Channel — `Event`
-
-A simple set/wait primitive for pure signalling with no value transfer — analogous to
-`asyncio.Event` in Python or a manual-reset event in Win32.
-
-```cpp
-coro::Event ev;
-
-// Waiting side (coroutine):
-co_await ev.wait();  // suspends until set() is called
-
-// Signalling side (any thread, including callbacks):
-ev.set();
-
-// Optional reset for reuse:
-ev.clear();
-```
-
-- `set()` is synchronous and thread-safe — callable from callbacks, I/O threads, or
-  any other non-async context. If a task is already waiting, its waker is called
-  immediately. If no task is waiting yet, the "set" state is latched so the next
-  `wait()` resolves immediately.
-- `wait()` returns a `Future<void>` that resolves as soon as the event is set. If the
-  event is already set when `wait()` is first polled, it returns `Ready` immediately.
-- `clear()` resets the event so it can be waited on again.
-- Single-waiter: at most one task may be suspended on `wait()` at a time (same
-  constraint as `oneshot`). A multi-waiter variant can be built on top of `broadcast`
-  if needed.
-
-Use case: any place where a callback needs to wake a coroutine with no value to
-transfer — timer fires, I/O completion notifications, inter-task signals.
-
-Lives in `include/coro/sync/event.h`.
-
 ## Async `Mutex<T>`
 
 `std::mutex` blocks the OS thread, starving the executor. `Mutex<T>` suspends the *task*
@@ -275,12 +207,11 @@ Lives in `include/coro/task/abort_handle.h`.
 
 ## libuv I/O primitives
 
-`TcpStream` and `WsStream`/`WsListener` are implemented in `include/coro/io/`. Remaining:
+`TcpStream`/`TcpListener`, `WsStream`/`WsListener`, and `File` are implemented in `include/coro/io/`. Remaining:
 
-- **`TcpListener`** — accept loop for incoming TCP connections.
 - **`UdpSocket`** — async send/recv.
-- **`File`** — async read/write using libuv's thread-pool file I/O.
 - **DNS resolution** — `resolve(hostname)` returning `Future<IpAddress>`.
+- **Process** — Child process management including support for signals, child process I/O, and parent-child IPC
 
 Each wraps the corresponding libuv handle, storing a `Waker` in the callback and waking
 the task when the operation completes.

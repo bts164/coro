@@ -2,13 +2,14 @@
 
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
+#include <coro/io/byte_buffer.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/task/join_handle.h>
 #include <uv.h>
 #include <cstddef>
 #include <memory>
-#include <span>
 #include <string>
+#include <utility>
 
 namespace coro {
 
@@ -60,20 +61,7 @@ constexpr FileMode operator&(FileMode a, FileMode b) {
  */
 class File {
 public:
-    // -----------------------------------------------------------------------
-    // Future types
-    //
-    // ReadFuture and WriteFuture are JoinHandle<std::size_t> aliases — safe
-    // to declare here since std::size_t is always complete.
-    //
-    // OpenFuture wraps JoinHandle<File>. Because File is incomplete inside
-    // its own class body, OpenFuture is forward-declared here and defined
-    // below after the closing brace.
-    // -----------------------------------------------------------------------
-
-    using OpenFuture  = JoinHandle<File>;
-    using ReadFuture  = JoinHandle<std::size_t>;
-    using WriteFuture = JoinHandle<std::size_t>;
+    using OpenFuture = JoinHandle<File>;
 
     // -----------------------------------------------------------------------
     // File public API
@@ -96,31 +84,45 @@ public:
 
     /**
      * @brief Reads up to `buf.size()` bytes from the current file position.
-     * @return A `ReadFuture` that resolves to the number of bytes read, or 0 on EOF.
-     * The buffer must remain valid until the future resolves.
+     *
+     * Takes ownership of `buf`; returns `{bytes_read, buf}`. Returns 0 bytes on EOF.
+     *
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
-    [[nodiscard]] ReadFuture read(std::span<std::byte> buf);
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read(Buf buf);
 
     /**
-     * @brief Reads up to `buf.size()` bytes starting at `offset` in the file.
-     * Does not modify the file's current position (pread-style).
-     * The buffer must remain valid until the future resolves.
+     * @brief Reads up to `buf.size()` bytes starting at `offset` (pread-style).
+     *
+     * Does not modify the file's current position. Takes ownership of `buf`;
+     * returns `{bytes_read, buf}`.
+     *
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
-    [[nodiscard]] ReadFuture read_at(std::span<std::byte> buf, int64_t offset);
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read_at(Buf buf, int64_t offset);
 
     /**
-     * @brief Writes all of `data` to the current file position.
-     * @return A `WriteFuture` that resolves to the number of bytes written.
-     * The data buffer must remain valid until the future resolves.
+     * @brief Writes all bytes in `buf` to the current file position.
+     *
+     * Takes ownership of `buf`; returns `{bytes_written, buf}`.
+     *
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
-    [[nodiscard]] WriteFuture write(std::span<const std::byte> data);
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write(Buf buf);
 
     /**
-     * @brief Writes all of `data` starting at `offset` in the file.
-     * Does not modify the file's current position (pwrite-style).
-     * The data buffer must remain valid until the future resolves.
+     * @brief Writes all bytes in `buf` starting at `offset` (pwrite-style).
+     *
+     * Does not modify the file's current position. Takes ownership of `buf`;
+     * returns `{bytes_written, buf}`.
+     *
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
-    [[nodiscard]] WriteFuture write_at(std::span<const std::byte> data, int64_t offset);
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write_at(Buf buf, int64_t offset);
 
 private:
     explicit File(uv_file fd, SingleThreadedUvExecutor* exec);
@@ -130,3 +132,5 @@ private:
 };
 
 } // namespace coro
+
+#include <coro/io/file.hpp>

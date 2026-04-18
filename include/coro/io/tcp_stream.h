@@ -2,13 +2,14 @@
 
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
+#include <coro/io/byte_buffer.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/task/join_handle.h>
 #include <uv.h>
 #include <cstddef>
 #include <memory>
-#include <span>
 #include <string>
+#include <utility>
 
 namespace coro {
 
@@ -25,14 +26,13 @@ namespace coro {
  * **Concurrency:** a `TcpStream` must not be shared across tasks. Only one
  * `read()` or `write()` future may be in flight at a time.
  *
- * **Buffer lifetime:** the caller's buffer must remain valid until the future
- * resolves. See CLAUDE.md § non-owning buffer guideline.
+ * **Buffer ownership:** `read()` and `write()` take ownership of the buffer and
+ * return it with the result. This eliminates dangling-pointer bugs at the type
+ * system level — no span or raw pointer ever escapes the I/O operation.
  */
 class TcpStream {
 public:
     using ConnectFuture = JoinHandle<TcpStream>;
-    using ReadFuture    = JoinHandle<std::size_t>;
-    using WriteFuture   = JoinHandle<void>;
 
     TcpStream(TcpStream&&) noexcept;
     TcpStream& operator=(TcpStream&&) noexcept;
@@ -50,19 +50,27 @@ public:
     [[nodiscard]] static ConnectFuture connect(std::string host, uint16_t port);
 
     /**
-     * @brief Reads up to `buf.size()` bytes from the stream.
-     * @return A `ReadFuture` resolving to bytes read, or 0 on EOF.
-     * The buffer must remain valid until the future resolves.
+     * @brief Reads up to `buf.size()` bytes into `buf` and returns `{bytes_read, buf}`.
+     *
+     * Takes ownership of `buf`; returns it alongside the byte count so the caller can
+     * reuse or inspect the filled portion. Returns 0 bytes on EOF.
+     *
+     * @tparam Buf Any type satisfying @ref ByteBuffer (e.g. `std::string`, `std::vector<std::byte>`).
      */
-    [[nodiscard]] ReadFuture read(std::span<std::byte> buf);
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read(Buf buf);
 
     /**
-     * @brief Writes all of `data` to the stream.
-     * @return A `WriteFuture` resolving when the write is handed to the OS.
-     * The data buffer must remain valid until the future resolves.
+     * @brief Writes all bytes in `buf` to the stream and returns `buf`.
+     *
+     * Takes ownership of `buf`; returns it after the write completes so the caller can
+     * reuse the allocation.
+     *
+     * @tparam Buf Any type satisfying @ref ByteBuffer (e.g. `std::string`, `std::vector<std::byte>`).
      * @throws std::system_error on write failure.
      */
-    [[nodiscard]] WriteFuture write(std::span<const std::byte> data);
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<Buf> write(Buf buf);
 
 private:
     friend class TcpListener;
@@ -79,3 +87,5 @@ private:
 };
 
 } // namespace coro
+
+#include <coro/io/tcp_stream.hpp>

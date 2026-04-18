@@ -42,11 +42,6 @@ using namespace coro;
         std::filesystem::path(__FILE__).filename().string().c_str(), \
         __LINE__, __ID__, ##__VA_ARGS__)
 
-std::string_view as_text(std::span<std::byte const> data)
-{
-    return std::string_view(reinterpret_cast<const char*>(data.data()), data.size());
-}
-
 // ---------------------------------------------------------------------------
 // handle_connection
 //
@@ -61,29 +56,25 @@ static Coro<void> handle_connection(TcpStream stream, int id) {
         int id_;
     } defer(id);
     for (;;) {
-        std::array<std::byte, 4096> buf;
-        auto receiveResult = co_await coro::timeout(20s, stream.read(buf));
+        auto receiveResult = co_await coro::timeout(20s, stream.read(std::string(4096, '\0')));
         if (0 != receiveResult.index()) {
             LOG(id, "Receive timeout");
             co_return;
         }
-        size_t n = std::get<0>(receiveResult).value;
+        auto [n, buf] = std::move(std::get<0>(receiveResult).value);
         if (n == 0) {
             LOG(id, "EOF");
             co_return;  // clean close from client
         }
-        std::span<const std::byte> msg(buf.data(), n);
-        LOG(id, "Received message \"%s\"", std::string(as_text(msg)).c_str());
-        auto sendResult = co_await coro::timeout(
-            2s, stream.write(msg)
-        );
+        buf.resize(n);
+        LOG(id, "Received message \"%s\"", buf.c_str());
+        auto sendResult = co_await coro::timeout(2s, stream.write(std::move(buf)));
         if (0 != sendResult.index()) {
             LOG(id, "Send timeout");
             co_return;  // client stopped responding
         }
-        LOG(id, "Echoed message \"%s\"", std::string(as_text(msg)).c_str());
+        LOG(id, "Echoed message \"%s\"", std::get<0>(sendResult).value.c_str());
     }
-    // TcpStream destructor sends a Close frame when the coroutine returns.
 }
 
 // ---------------------------------------------------------------------------

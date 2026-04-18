@@ -20,13 +20,10 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
-#include <random>
-#include <string_view>
-#include <vector>
-#include <span>
-#include <string_view>
 #include <format>
 #include <filesystem>
+#include <random>
+#include <string>
 
 // Returns the current system time as an ISO 8601 string with milliseconds,
 // e.g. "2026-04-06T21:34:56.123Z".
@@ -80,25 +77,22 @@ static Coro<void> run_client(int id, std::string message) {
 
         std::string msg = std::format("{} from {} iteration {}", message, id, i);
         LOG(id, "Sending: %s", msg.c_str());
-        // write() suspends until all bytes have been handed to the OS.
-        std::span<const std::byte> msg_bytes(
-            reinterpret_cast<const std::byte*>(msg.data()), msg.size());
-        auto sendResult = co_await coro::timeout(2s, stream.write(msg_bytes));
+        // write() takes ownership of the buffer; returns it on completion.
+        auto sendResult = co_await coro::timeout(2s, stream.write(std::move(msg)));
         if (0 != sendResult.index()) {
             LOG(id, "Send timeout");
             co_return;
         }
 
-        std::array<std::byte, 4096> buf;
-        auto receiveResult = co_await coro::timeout(2s, stream.read(buf));
+        // read() takes ownership of the buffer; returns {bytes_read, buffer}.
+        auto receiveResult = co_await coro::timeout(2s, stream.read(std::string(4096, '\0')));
         if (0 != receiveResult.index()) {
             LOG(id, "Receive timeout");
             co_return;
         }
-        std::size_t n = std::get<0>(receiveResult).value;
-
-        std::string_view text(reinterpret_cast<const char*>(buf.data()), n);
-        LOG(id, "Echo: %s", std::string(text).c_str());
+        auto [n, reply] = std::move(std::get<0>(receiveResult).value);
+        reply.resize(n);
+        LOG(id, "Echo: %s", reply.c_str());
     }
 
     // TcpStream destructor closes the socket asynchronously.
