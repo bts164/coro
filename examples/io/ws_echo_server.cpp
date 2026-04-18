@@ -109,7 +109,7 @@ static Coro<void> run_server() {
 // main
 // ---------------------------------------------------------------------------
 int main() {
-    Runtime rt(1);
+    Runtime rt;
     LOG(-1, "Starting runtime...");
     rt.block_on(run_server());
 }

@@ -8,10 +8,54 @@
 #include <libwebsockets.h>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
+
+namespace coro {
+
+/**
+ * @brief Returned by a `process_request` hook to reject an upgrade request.
+ *
+ * Note: libwebsockets closes the TCP connection when a request is rejected at
+ * the filter stage; the status code is informational only and is not sent to
+ * the client as an HTTP response.
+ */
+struct WsUpgradeRejection {
+    uint16_t    status_code = 403;
+    std::string reason;
+};
+
+/**
+ * @brief Read-only view of an incoming WebSocket upgrade request.
+ *
+ * Passed to the `process_request` hook in `WsListener::Options`. Only valid
+ * for the duration of the hook call — do not store a copy.
+ */
+class WsUpgradeRequest {
+public:
+    explicit WsUpgradeRequest(lws* wsi) : m_wsi(wsi) {}
+
+    /// Returns the request path (e.g. "/chat").
+    std::string path() const;
+
+    /// Returns the value of an HTTP request header, or empty string if absent.
+    /// Header name is case-insensitive (e.g. "Authorization", "x-api-key").
+    std::string header(std::string_view name) const;
+
+    /// Returns the subprotocols offered by the client via Sec-WebSocket-Protocol.
+    std::vector<std::string> offered_subprotocols() const;
+
+private:
+    lws* m_wsi;
+};
+
+} // namespace coro
 
 namespace coro::detail::ws {
 
@@ -46,6 +90,15 @@ struct ListenerState {
     // Both must outlive the context (i.e. stay alive until WsDestroyListenerRequest runs).
     std::string         subprotocol_str;        // storage for the protocol name c_str()
     lws_protocols       protocols[2]{};         // [0] = real entry, [1] = null terminator
+
+    // Options copied from WsListener::Options at bind time.
+    coro::WsStream::FrameMode frame_mode       = coro::WsStream::FrameMode::Full;
+    std::size_t               max_frame_size   = 4096;
+    std::size_t               max_message_size = 0;
+    std::function<std::optional<coro::WsUpgradeRejection>(const coro::WsUpgradeRequest&)>
+        process_request;
+    std::function<std::string(std::span<const std::string_view>)>
+        select_subprotocol;
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +142,38 @@ namespace coro {
  */
 class WsListener {
 public:
+    /**
+     * @brief Server-wide options for WsListener::bind().
+     *
+     * All fields have sensible defaults. Use designated initializers:
+     * @code
+     *   co_await WsListener::bind("localhost", 8080, {
+     *       .max_frame_size = 65536,
+     *       .process_request = [](const WsUpgradeRequest& req) {
+     *           if (!req.header("Authorization").starts_with("Bearer "))
+     *               return std::optional{WsUpgradeRejection{401, "Unauthorized"}};
+     *           return std::optional<WsUpgradeRejection>{};
+     *       },
+     *   });
+     * @endcode
+     */
+    struct Options {
+        WsStream::FrameMode  frame_mode       = WsStream::FrameMode::Full;
+        std::size_t          max_frame_size   = 4096;   ///< lws rx_buffer_size per connection.
+        std::size_t          max_message_size = 0;      ///< 0 = unlimited; enforced in receive callback.
+        std::vector<std::string> subprotocols = {};     ///< Subprotocols advertised in the server handshake.
+
+        /// Called before the WebSocket upgrade is accepted. Return a
+        /// WsUpgradeRejection to reject, or std::nullopt to accept.
+        std::function<std::optional<WsUpgradeRejection>(const WsUpgradeRequest&)>
+            process_request;
+
+        /// Called with the subprotocols offered by the client. Return the
+        /// chosen subprotocol name, or empty string to reject the connection.
+        std::function<std::string(std::span<const std::string_view>)>
+            select_subprotocol;
+    };
+
     // -----------------------------------------------------------------------
     // Nested Future types
     // -----------------------------------------------------------------------
@@ -105,7 +190,7 @@ public:
         using OutputType = WsListener;
 
         BindFuture(std::string host, uint16_t port,
-                   std::vector<std::string> subprotocols, SingleThreadedUvExecutor* uv_exec);
+                   Options options, SingleThreadedUvExecutor* uv_exec);
 
         BindFuture(BindFuture&&) noexcept            = default;
         BindFuture& operator=(BindFuture&&) noexcept = default;
@@ -117,8 +202,8 @@ public:
     private:
         std::string                                  m_host;
         uint16_t                                     m_port;
-        std::vector<std::string>                     m_subprotocols;
-        SingleThreadedUvExecutor*                                   m_uv_exec;
+        Options                                      m_options;
+        SingleThreadedUvExecutor*                    m_uv_exec;
         std::shared_ptr<detail::ws::ListenerState>   m_state;  // null until first poll
     };
 
@@ -167,8 +252,8 @@ public:
      * @return A `BindFuture` that resolves to a bound `WsListener`.
      * @throws std::system_error if the port cannot be bound.
      */
-    [[nodiscard]] static BindFuture bind(std::string host, uint16_t port,
-                                         std::vector<std::string> subprotocols = {});
+    [[nodiscard]] static BindFuture bind(std::string host, uint16_t port);
+    [[nodiscard]] static BindFuture bind(std::string host, uint16_t port, Options options);
 
     /**
      * @brief Accepts the next incoming WebSocket connection.

@@ -1,12 +1,74 @@
 #include <coro/io/ws_listener.h>
 #include <coro/task/spawn_on.h>
 #include <coro/coro.h>
+#include <cctype>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
 namespace coro {
 
+// =============================================================================
+// WsUpgradeRequest
+// =============================================================================
+
+std::string WsUpgradeRequest::path() const {
+    char buf[1024] = {};
+    int n = lws_hdr_copy(m_wsi, buf, static_cast<int>(sizeof(buf)) - 1, WSI_TOKEN_GET_URI);
+    return (n > 0) ? std::string(buf, static_cast<std::size_t>(n)) : std::string{};
+}
+
+std::string WsUpgradeRequest::header(std::string_view name) const {
+    // Map well-known header names (lowercase) to lws token IDs.
+    static const struct { const char* name; lws_token_indexes token; } known[] = {
+        {"authorization",    WSI_TOKEN_HTTP_AUTHORIZATION},
+        {"content-type",     WSI_TOKEN_HTTP_CONTENT_TYPE},
+        {"host",             WSI_TOKEN_HOST},
+        {"origin",           WSI_TOKEN_ORIGIN},
+        {"user-agent",       WSI_TOKEN_HTTP_USER_AGENT},
+        {"cookie",           WSI_TOKEN_HTTP_COOKIE},
+        {"sec-websocket-protocol", WSI_TOKEN_PROTOCOL},
+    };
+    std::string lower(name);
+    for (auto& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    char buf[4096] = {};
+    for (auto& e : known) {
+        if (lower == e.name) {
+            int n = lws_hdr_copy(m_wsi, buf, static_cast<int>(sizeof(buf)) - 1, e.token);
+            return (n > 0) ? std::string(buf, static_cast<std::size_t>(n)) : std::string{};
+        }
+    }
+    // Fall back to custom (non-standard) header lookup.
+    // lws_hdr_custom_copy expects the name with a trailing colon.
+    std::string name_colon(name);
+    if (name_colon.empty() || name_colon.back() != ':')
+        name_colon += ':';
+    int n = lws_hdr_custom_copy(m_wsi, buf, static_cast<int>(sizeof(buf)) - 1,
+                                 name_colon.c_str(), static_cast<int>(name_colon.size()));
+    return (n > 0) ? std::string(buf, static_cast<std::size_t>(n)) : std::string{};
+}
+
+std::vector<std::string> WsUpgradeRequest::offered_subprotocols() const {
+    char buf[1024] = {};
+    int n = lws_hdr_copy(m_wsi, buf, static_cast<int>(sizeof(buf)) - 1, WSI_TOKEN_PROTOCOL);
+    if (n <= 0) return {};
+    std::vector<std::string> result;
+    std::string_view sv(buf, static_cast<std::size_t>(n));
+    while (!sv.empty()) {
+        auto comma = sv.find(',');
+        auto tok   = (comma == std::string_view::npos) ? sv : sv.substr(0, comma);
+        auto start = tok.find_first_not_of(" \t");
+        auto end   = tok.find_last_not_of(" \t");
+        if (start != std::string_view::npos)
+            result.emplace_back(tok.substr(start, end - start + 1));
+        if (comma == std::string_view::npos) break;
+        sv = sv.substr(comma + 1);
+    }
+    return result;
+}
 
 // =============================================================================
 // coro::detail::ws — server_protocol_cb
@@ -32,6 +94,41 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
     switch (reason) {
 
     // -----------------------------------------------------------------------
+    // Pre-upgrade filter — runs before the 101 response is sent.
+    // Return -1 to reject; 0 to accept.
+    // -----------------------------------------------------------------------
+    case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION: {
+        auto* listener_sp = static_cast<std::shared_ptr<ListenerState>*>(
+                                lws_context_user(lws_get_context(wsi)));
+        if (!listener_sp) return -1;
+        auto& listener = **listener_sp;
+
+        if (listener.process_request) {
+            coro::WsUpgradeRequest req(wsi);
+            auto rejection = listener.process_request(req);
+            if (rejection.has_value()) {
+                LOGSTDOUT("connection rejected by process_request hook\n");
+                return -1;
+            }
+        }
+
+        if (listener.select_subprotocol) {
+            coro::WsUpgradeRequest req(wsi);
+            auto offered = req.offered_subprotocols();
+            std::vector<std::string_view> views;
+            views.reserve(offered.size());
+            for (auto& s : offered) views.emplace_back(s);
+            auto selected = listener.select_subprotocol(
+                std::span<const std::string_view>(views));
+            if (selected.empty() && !offered.empty()) {
+                LOGSTDOUT("connection rejected by select_subprotocol hook\n");
+                return -1;
+            }
+        }
+        break;
+    }
+
+    // -----------------------------------------------------------------------
     // New client completed the WebSocket handshake.
     // -----------------------------------------------------------------------
     case LWS_CALLBACK_ESTABLISHED: {
@@ -48,8 +145,9 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
         // Create a ConnectionState for this connection and store it in the
         // per-session slot so subsequent callbacks can find it.
         auto conn = std::make_shared<ConnectionState>();
-        conn->wsi        = wsi;
-        conn->frame_mode = WsStream::FrameMode::Full;  // server always uses Full for now
+        conn->wsi              = wsi;
+        conn->frame_mode       = listener.frame_mode;
+        conn->max_message_size = listener.max_message_size;
         auto* conn_sp = new std::shared_ptr<ConnectionState>(conn);
         *slot = conn_sp;  // write into lws-managed per-session storage
 
@@ -86,7 +184,14 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
             }
             state.receive.buffer.insert(state.receive.buffer.end(), bytes, bytes + len);
 
-            if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
+            if (state.max_message_size > 0 &&
+                    state.receive.buffer.size() > state.max_message_size) {
+                LOGSTDOUT("message too large (%zu > %zu), waking with error\n",
+                          state.receive.buffer.size(), state.max_message_size);
+                state.receive.error    = EMSGSIZE;
+                state.receive.complete = true;
+                waker_to_wake = state.receive.waker.load();
+            } else if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
                 LOGSTDOUT("message complete, waking receiver\n");
                 state.receive.is_text  = is_text;
                 state.receive.is_final = final_fragment;
@@ -251,9 +356,12 @@ WsListener::~WsListener() {
     ).detach();
 }
 
-WsListener::BindFuture WsListener::bind(std::string host, uint16_t port,
-                                          std::vector<std::string> subprotocols) {
-    return BindFuture(std::move(host), port, std::move(subprotocols), &current_uv_executor());
+WsListener::BindFuture WsListener::bind(std::string host, uint16_t port) {
+    return bind(std::move(host), port, Options{});
+}
+
+WsListener::BindFuture WsListener::bind(std::string host, uint16_t port, Options options) {
+    return BindFuture(std::move(host), port, std::move(options), &current_uv_executor());
 }
 
 WsListener::AcceptFuture WsListener::accept() {
@@ -265,11 +373,11 @@ WsListener::AcceptFuture WsListener::accept() {
 // =============================================================================
 
 WsListener::BindFuture::BindFuture(std::string host, uint16_t port,
-                                     std::vector<std::string> subprotocols,
+                                     Options options,
                                      SingleThreadedUvExecutor* uv_exec)
     : m_host(std::move(host))
     , m_port(port)
-    , m_subprotocols(std::move(subprotocols))
+    , m_options(std::move(options))
     , m_uv_exec(uv_exec) {}
 
 PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
@@ -282,11 +390,18 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
             m_state->bind_waker = ctx.getWaker();
         }
 
+        // Copy options into state (hooks must outlive the context).
+        m_state->frame_mode         = m_options.frame_mode;
+        m_state->max_frame_size     = m_options.max_frame_size;
+        m_state->max_message_size   = m_options.max_message_size;
+        m_state->process_request    = std::move(m_options.process_request);
+        m_state->select_subprotocol = std::move(m_options.select_subprotocol);
+
         // Build comma-separated subprotocol string; empty = accept any.
         std::string proto;
-        for (std::size_t i = 0; i < m_subprotocols.size(); ++i) {
+        for (std::size_t i = 0; i < m_options.subprotocols.size(); ++i) {
             if (i) proto += ',';
-            proto += m_subprotocols[i];
+            proto += m_options.subprotocols[i];
         }
 
         uv_loop_t* loop = m_uv_exec->loop();
@@ -301,7 +416,9 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
                 const char* proto_name = state->subprotocol_str.empty()
                                              ? "coro-ws" : state->subprotocol_str.c_str();
                 state->protocols[0] = { proto_name, server_protocol_cb,
-                                         sizeof(void*), 4096, 0, nullptr, 0 };
+                                         sizeof(void*),
+                                         static_cast<unsigned int>(state->max_frame_size),
+                                         0, nullptr, 0 };
                 state->protocols[1] = { nullptr, nullptr, 0, 0, 0, nullptr, 0 };
 
                 auto* sp = new std::shared_ptr<ListenerState>(state);

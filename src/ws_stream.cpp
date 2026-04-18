@@ -79,7 +79,16 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
             }
             state.receive.buffer.insert(state.receive.buffer.end(), bytes, bytes + len);
 
-            if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
+            // Enforce max_message_size: if the assembled buffer exceeds the limit,
+            // surface an EMSGSIZE error to the waiting ReceiveFuture.
+            if (state.max_message_size > 0 &&
+                    state.receive.buffer.size() > state.max_message_size) {
+                LOGSTDOUT("message too large (%zu > %zu), waking with error\n",
+                          state.receive.buffer.size(), state.max_message_size);
+                state.receive.error    = EMSGSIZE;
+                state.receive.complete = true;
+                waker_to_wake = state.receive.waker.load();
+            } else if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
                 LOGSTDOUT("message complete, waking receiver\n");
                 state.receive.is_text  = is_text;
                 state.receive.is_final = final_fragment;
@@ -270,10 +279,12 @@ WsStream::~WsStream() {
     ).detach();
 }
 
-WsStream::ConnectFuture WsStream::connect(std::string url, FrameMode frame_mode,
-                                           std::vector<std::string> subprotocols) {
-    return ConnectFuture(std::move(url), frame_mode, std::move(subprotocols),
-                         &current_uv_executor());
+WsStream::ConnectFuture WsStream::connect(std::string url) {
+    return connect(std::move(url), Options{});
+}
+
+WsStream::ConnectFuture WsStream::connect(std::string url, Options options) {
+    return ConnectFuture(std::move(url), std::move(options), &current_uv_executor());
 }
 
 WsStream::ReceiveFuture WsStream::receive() {
@@ -292,12 +303,10 @@ WsStream::SendFuture WsStream::send(std::string_view text) {
 // ConnectFuture
 // =============================================================================
 
-WsStream::ConnectFuture::ConnectFuture(std::string url, FrameMode frame_mode,
-                                        std::vector<std::string> subprotocols,
+WsStream::ConnectFuture::ConnectFuture(std::string url, Options options,
                                         SingleThreadedUvExecutor* uv_exec)
     : m_url(std::move(url))
-    , m_frame_mode(frame_mode)
-    , m_subprotocols(std::move(subprotocols))
+    , m_options(std::move(options))
     , m_uv_exec(uv_exec) {}
 
 WsStream::ConnectFuture::~ConnectFuture() {
@@ -312,7 +321,8 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
     if (!m_state) {
         // First poll: allocate connection state and submit the connect request.
         m_state = std::make_shared<detail::ws::ConnectionState>();
-        m_state->frame_mode = m_frame_mode;
+        m_state->frame_mode       = m_options.frame_mode;
+        m_state->max_message_size = m_options.max_message_size;
 
         {
             std::lock_guard lk(m_state->connect.mutex);
@@ -321,9 +331,9 @@ PollResult<WsStream> WsStream::ConnectFuture::poll(detail::Context& ctx) {
 
         // Build comma-separated subprotocol string; empty string = no header sent.
         std::string proto;
-        for (std::size_t i = 0; i < m_subprotocols.size(); ++i) {
+        for (std::size_t i = 0; i < m_options.subprotocols.size(); ++i) {
             if (i) proto += ',';
-            proto += m_subprotocols[i];
+            proto += m_options.subprotocols[i];
         }
 
         lws_context* lws_ctx = m_uv_exec->lws_ctx();
@@ -425,19 +435,25 @@ PollResult<WsStream::Message> WsStream::ReceiveFuture::poll(detail::Context& ctx
     std::lock_guard lk(m_state->receive.mutex);
 
     if (m_state->receive.complete) {
-        Message msg;
-        msg.data     = std::move(m_state->receive.buffer);
-        msg.is_text  = m_state->receive.is_text;
-        msg.is_final = m_state->receive.is_final;
+        int    error    = m_state->receive.error;
+        auto   buf      = std::move(m_state->receive.buffer);
+        bool   is_text  = m_state->receive.is_text;
+        bool   is_final = m_state->receive.is_final;
 
         // Reset sub-state atomically under the lock so protocol_cb cannot
         // append to the buffer or set complete again until we're done.
         m_state->receive.buffer    = {};
         m_state->receive.complete  = false;
         m_state->receive.cancelled = false;
+        m_state->receive.error     = 0;
 
         m_done = true;
-        return msg;
+
+        if (error != 0)
+            throw std::system_error(std::error_code(error, std::system_category()),
+                                    "WsStream::receive");
+
+        return Message{std::move(buf), is_text, is_final};
     }
 
     if (m_state->closed.load(std::memory_order_acquire))

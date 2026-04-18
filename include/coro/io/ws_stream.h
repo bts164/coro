@@ -52,6 +52,21 @@ public:
     enum class FrameMode { Full, Partial };
 
     /**
+     * @brief Per-connection options for WsStream::connect().
+     *
+     * All fields have sensible defaults; use designated initializers to set
+     * only what you need:
+     * @code
+     *   co_await WsStream::connect(url, { .max_message_size = 1 << 20 });
+     * @endcode
+     */
+    struct Options {
+        FrameMode                frame_mode       = FrameMode::Full;
+        std::vector<std::string> subprotocols     = {};   ///< Sec-WebSocket-Protocol to advertise.
+        std::size_t              max_message_size = 0;    ///< 0 = unlimited.
+    };
+
+    /**
      * @brief A received WebSocket message (or fragment in Partial mode).
      */
     struct Message {
@@ -83,8 +98,7 @@ public:
     public:
         using OutputType = WsStream;
 
-        ConnectFuture(std::string url, FrameMode frame_mode,
-                      std::vector<std::string> subprotocols, SingleThreadedUvExecutor* uv_exec);
+        ConnectFuture(std::string url, Options options, SingleThreadedUvExecutor* uv_exec);
         ~ConnectFuture();
 
         ConnectFuture(ConnectFuture&&) noexcept            = default;
@@ -96,9 +110,8 @@ public:
 
     private:
         std::string                                  m_url;
-        FrameMode                                    m_frame_mode;
-        std::vector<std::string>                     m_subprotocols;
-        SingleThreadedUvExecutor*                                   m_uv_exec;
+        Options                                      m_options;
+        SingleThreadedUvExecutor*                    m_uv_exec;
         std::shared_ptr<detail::ws::ConnectionState> m_state;  // null until first poll
     };
 
@@ -194,9 +207,8 @@ public:
      * @throws std::invalid_argument if the URL cannot be parsed.
      * @throws std::system_error on connection failure.
      */
-    [[nodiscard]] static ConnectFuture connect(std::string url,
-                                               FrameMode   frame_mode = FrameMode::Full,
-                                               std::vector<std::string> subprotocols = {});
+    [[nodiscard]] static ConnectFuture connect(std::string url);
+    [[nodiscard]] static ConnectFuture connect(std::string url, Options options);
 
     /**
      * @brief Receives the next message (or fragment in Partial mode).
@@ -257,13 +269,14 @@ struct ConnectSubState {
 };
 
 struct ReceiveSubState {
-    // mutex guards buffer, is_text, is_final, complete, and cancelled.
+    // mutex guards buffer, is_text, is_final, complete, cancelled, and error.
     // Both protocol_cb (I/O thread) and ReceiveFuture::poll (worker thread) must hold
     // it when reading or writing any of these fields.
     std::mutex                                         mutex;
     std::atomic<std::shared_ptr<coro::detail::Waker>> waker;
     bool                                               complete{false};
     bool                                               cancelled{false};  // set by ReceiveFuture dtor
+    int                                                error    = 0;      // e.g. EMSGSIZE
     std::vector<std::byte>                             buffer;    // assembled on I/O thread
     bool                                               is_text  = false;
     bool                                               is_final = false;
@@ -291,8 +304,9 @@ struct SendSubState {
 // ---------------------------------------------------------------------------
 
 struct ConnectionState {
-    lws*                         wsi        = nullptr;  // owned by lws context — never freed here
-    coro::WsStream::FrameMode    frame_mode = coro::WsStream::FrameMode::Full;
+    lws*                         wsi              = nullptr;  // owned by lws context — never freed here
+    coro::WsStream::FrameMode    frame_mode       = coro::WsStream::FrameMode::Full;
+    std::size_t                  max_message_size = 0;  // 0 = unlimited; enforced in receive callbacks
     ConnectSubState              connect;
     ReceiveSubState              receive;
     std::mutex                   send_queue_mutex;
