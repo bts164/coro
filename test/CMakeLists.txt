@@ -29,6 +29,7 @@ set(TEST_TARGETS
     test_spawn_on
     test_uv_future
     test_event
+    test_skynet
 )
 
 foreach(t ${TEST_TARGETS})
