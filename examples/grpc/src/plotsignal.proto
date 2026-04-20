@@ -7,20 +7,18 @@ package plotsignal;
 message SignalInfo {
     float x_start      = 1;   // e.g. 0.0
     float x_end        = 2;   // e.g. 4*pi
-    uint32 num_samples = 3;   // e.g. 2000
 }
 
 // A single frame of signal data.
 message DataFrame {
-    repeated float y  = 1 [packed = true];  // num_samples y-values
-    double timestamp  = 2;                  // seconds since server epoch
+    bytes y  = 1 ;         // int16 packed y-values
+    double timestamp  = 2; // seconds since server epoch
 }
 
 // Subscription request — the client can ask for a target frame rate.
 // The server may deliver faster or slower depending on load.
 message SubscribeRequest {
-    float target_fps = 1;   // 0 = as fast as the server produces
-    float noise_std  = 2;   // std of the normal ditributed noise
+    string pipePath = 1;
 }
 
 // Response to a Subscribe call: axis metadata followed by a stream of frames.

@@ -1,3 +1,5 @@
+#pragma once
+
 // Template implementation for PollStream
 // This file is included by poll_stream.h and should not be compiled separately
 

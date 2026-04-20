@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(coro CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
+find_package(xtensor CONFIG REQUIRED)
+
 get_target_property(grpc_cpp_plugin_location gRPC::grpc_cpp_plugin LOCATION)
 
 add_executable(hello_server src/helloserver.cpp src/helloworld.proto)
@@ -26,8 +28,12 @@ protobuf_generate(
     IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
     PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
 
+add_executable(gendata src/gendata.cpp)
+target_link_libraries(gendata PRIVATE coro::coro absl::log absl::log_initialize xtensor)
+target_include_directories(gendata PRIVATE include)
+
 add_executable(signal_server src/signalserver.cpp src/plotsignal.proto)
-target_link_libraries(signal_server PRIVATE coro::coro gRPC::grpc++ absl::log absl::log_initialize)
+target_link_libraries(signal_server PRIVATE coro::coro gRPC::grpc++ absl::log absl::log_initialize xtensor)
 target_include_directories(signal_server PRIVATE include ${CMAKE_CURRENT_BINARY_DIR})
 protobuf_generate(TARGET signal_server
     LANGUAGE cpp

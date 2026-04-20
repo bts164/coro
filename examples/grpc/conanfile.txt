@@ -1,6 +1,7 @@
 [requires]
 coro/[>=0.1]
 grpc/[>=1.78]
+xtensor/[>=0.26]
 
 [layout]
 cmake_layout

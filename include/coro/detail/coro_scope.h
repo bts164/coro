@@ -82,10 +82,25 @@ public:
      * 3. Sweep again — a child may have completed between steps 1 and 2.
      *
      * @return `true` if at least one child is still pending after the double-sweep.
+     *
+     * MEMORY CYCLE WARNING — do NOT store `waker` as a member of this class.
+     *
+     * `waker` is a TaskWaker that holds a `shared_ptr<Task>` for the parent coroutine.
+     * That Task owns (via unique_ptr) the Coro<T>, which owns (via unique_ptr) this
+     * CoroutineScope.  Storing `waker` here would create the cycle:
+     *
+     *   Task → Coro<T> → CoroutineScope → TaskWaker → Task
+     *
+     * When the Task completes and the executor drops its last local shared_ptr<Task>,
+     * the stored TaskWaker would be the only remaining owner, so the Task's ref count
+     * never reaches zero and the entire chain leaks permanently.
+     *
+     * Each pending child already holds its own clone of the waker via
+     * TaskState::scope_waker, which is sufficient to re-enqueue the parent when the
+     * child finishes.  No member storage of the waker is needed.
      */
     bool set_drain_waker(std::shared_ptr<Waker> waker) {
         std::lock_guard lock(m_mutex);
-        m_drain_waker = waker;
         m_pending.erase(
             std::remove_if(m_pending.begin(), m_pending.end(),
                 [](const PendingChild& c) { return c.is_done(); }),
@@ -103,7 +118,6 @@ public:
 private:
     std::mutex                m_mutex;
     std::vector<PendingChild> m_pending;
-    std::shared_ptr<Waker>    m_drain_waker;
 };
 
 /**

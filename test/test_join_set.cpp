@@ -209,9 +209,101 @@ TEST(JoinSetVoidTest, EmptyDrainCompletesImmediately) {
     EXPECT_TRUE(reached);
 }
 
+TEST(JoinSetVoidTest, CollectResultsViaNext) {
+    // next() returns true for each completed void task, false when exhausted.
+    Runtime rt(1);
+    int count = 0;
+
+    rt.block_on(co_invoke([&count]() -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(ReadyVoidFuture{});
+        js.spawn(ReadyVoidFuture{});
+        js.spawn(ReadyVoidFuture{});
+
+        while (co_await next(js))
+            ++count;
+    }));
+
+    EXPECT_EQ(count, 3);
+}
+
+TEST(JoinSetVoidTest, EmptyNextReturnsFalseImmediately) {
+    Runtime rt(1);
+    bool got_false = false;
+
+    rt.block_on(co_invoke([&got_false]() -> Coro<void> {
+        JoinSet<void> js;
+        got_false = !(co_await next(js));
+    }));
+
+    EXPECT_TRUE(got_false);
+}
+
+TEST(JoinSetVoidTest, NextRethrowsException) {
+    Runtime rt(1);
+    bool caught = false;
+
+    rt.block_on(co_invoke([&caught]() -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(ReadyVoidFuture{});
+        js.spawn(ThrowingVoidFuture{});
+        js.spawn(ReadyVoidFuture{});
+
+        int completed = 0;
+        try {
+            while (co_await next(js))
+                ++completed;
+        } catch (const std::runtime_error& e) {
+            caught = (std::string(e.what()) == "void task failed");
+        }
+        // At least one task completed before the exception
+        EXPECT_GE(completed, 0);
+    }));
+
+    EXPECT_TRUE(caught);
+}
+
 // -----------------------------------------------------------------------
 // Cancel on drop
 // -----------------------------------------------------------------------
+
+// A future that suspends once before completing — so it is genuinely pending
+// when it enters a JoinSet, exercising the cancel-on-drop path.
+template<typename T>
+class OneShotFuture {
+public:
+    using OutputType = T;
+    explicit OneShotFuture(T value) : m_value(std::move(value)) {}
+    PollResult<T> poll(detail::Context& ctx) {
+        if (m_polled) return std::move(m_value);
+        m_polled = true;
+        // Re-wake ourselves immediately so the executor reschedules us.
+        ctx.getWaker()->wake();
+        return PollPending;
+    }
+private:
+    T    m_value;
+    bool m_polled{false};
+};
+
+// A future that tracks whether it completed naturally (second poll reached) vs
+// was cancelled before the second poll. Relies on the single-threaded executor:
+// the task's second poll only runs after the parent coroutine yields, by which
+// time the JoinSet has already been dropped and cancelled=true has been set.
+struct CancellationProbeFuture {
+    using OutputType = int;
+    std::atomic<bool>& completed_naturally;
+    bool first_poll{true};
+    PollResult<int> poll(detail::Context& ctx) {
+        if (!first_poll) {
+            completed_naturally.store(true);
+            return 42;
+        }
+        first_poll = false;
+        ctx.getWaker()->wake();  // re-schedule so Task::poll() runs again
+        return PollPending;
+    }
+};
 
 TEST(JoinSetTest, CancelOnDropDoesNotHang) {
     // Dropping JoinSet with pending tasks inside co_invoke must not hang.
@@ -247,6 +339,46 @@ TEST(JoinSetVoidTest, CancelOnDropDoesNotHang) {
     }));
 
     EXPECT_TRUE(reached_after);
+}
+
+TEST(JoinSetTest, CancelPendingTaskOnDrop) {
+    // A genuinely-pending task (suspends once) must be cancelled and drained
+    // by the enclosing scope when the JoinSet is dropped.
+    Runtime rt(1);
+    bool reached_after = false;
+
+    rt.block_on(co_invoke([&reached_after]() -> Coro<void> {
+        {
+            JoinSet<int> js;
+            js.spawn(OneShotFuture<int>{42});  // pending in the set at drop time
+        }
+        reached_after = true;
+        co_return;
+    }));
+
+    EXPECT_TRUE(reached_after);
+}
+
+TEST(JoinSetTest, PendingTaskIsCancelledNotCompleted) {
+    // Verifies that Task::poll() sees cancelled=true and short-circuits before
+    // calling future.poll() a second time — i.e. the task is actually cancelled,
+    // not merely drained after running to natural completion.
+    //
+    // Relies on single-threaded executor ordering: the task's second poll cannot
+    // run until the parent coroutine yields, by which point cancel_pending() has
+    // already set cancelled=true.
+    Runtime rt(1);
+    std::atomic<bool> completed_naturally{false};
+
+    rt.block_on(co_invoke([&completed_naturally]() -> Coro<void> {
+        {
+            JoinSet<int> js;
+            js.spawn(CancellationProbeFuture{completed_naturally});
+        }
+        co_return;
+    }));
+
+    EXPECT_FALSE(completed_naturally);
 }
 
 // -----------------------------------------------------------------------

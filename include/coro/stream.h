@@ -2,28 +2,44 @@
 
 #include <coro/future.h>
 #include <optional>
+#include <type_traits>
 
 namespace coro {
+
+namespace detail {
+
+/**
+ * Maps a stream's ItemType to its exhaustion-sentinel type:
+ *   void  → bool          (true = item completed, false = exhausted)
+ *   T     → std::optional<T>
+ *
+ * std::optional<void> is ill-formed, so void streams use bool instead.
+ */
+template<typename T>
+using StreamItem = std::conditional_t<std::is_void_v<T>, bool, std::optional<T>>;
+
+} // namespace detail
 
 /**
  * @brief C++20 concept modelling an asynchronous sequence of values.
  *
  * Mirrors Rust's `Stream` trait. A type `S` satisfies `Stream` if it exposes:
  * - `S::ItemType` — the element type yielded by the stream.
- * - `PollResult<std::optional<S::ItemType>> S::poll_next(Context&)` — advances the stream.
+ * - `PollResult<detail::StreamItem<S::ItemType>> S::poll_next(Context&)` — advances the stream.
  *
- * `poll_next()` return values:
- * - `Ready(some(T))` — next item is available.
- * - `Ready(nullopt)`  — stream is exhausted; no more items will be produced.
- * - `Pending`         — no item is ready yet; the waker in `ctx` has been registered.
- * - `Error`           — stream faulted; an exception is embedded in the return value.
+ * `poll_next()` return values for non-void streams:
+ * - `Ready(optional<T>)` — next item available, or `nullopt` when exhausted.
+ * - `Pending`            — no item ready; waker in `ctx` has been registered.
+ * - `Error`              — stream faulted; exception embedded in the return value.
+ *
+ * For `void` streams, `optional<T>` is replaced by `bool` (`true` = item, `false` = exhausted).
  *
  * @tparam S The candidate type to check.
  */
 template<typename S>
 concept Stream = requires(S& s, detail::Context& ctx) {
     typename S::ItemType;
-    { s.poll_next(ctx) } -> std::same_as<PollResult<std::optional<typename S::ItemType>>>;
+    { s.poll_next(ctx) } -> std::same_as<PollResult<detail::StreamItem<typename S::ItemType>>>;
 };
 
 /**
@@ -33,7 +49,8 @@ concept Stream = requires(S& s, detail::Context& ctx) {
  *
  * Typical usage:
  * @code
- * while (auto item = co_await next(stream)) { ... }
+ * while (auto item = co_await next(stream)) { ... }   // non-void: optional<T>
+ * while (co_await next(void_stream)) { ... }          // void: bool
  * @endcode
  *
  * @tparam S A type satisfying @ref Stream.
@@ -41,7 +58,7 @@ concept Stream = requires(S& s, detail::Context& ctx) {
 template<Stream S>
 class NextFuture {
 public:
-    using OutputType = std::optional<typename S::ItemType>;
+    using OutputType = detail::StreamItem<typename S::ItemType>;
 
     explicit NextFuture(S& stream) : m_stream(stream) {}
 

@@ -54,8 +54,17 @@ enum class BackpressureMode {
  * The stream remains open after this error. The consumer may catch it and
  * continue calling next() to receive subsequent packets.
  */
-struct PollStreamOverrunError {
-    std::size_t missed; ///< Number of packets dropped since the last delivery
+class PollStreamOverrunError : public std::exception {
+public:
+    PollStreamOverrunError(std::size_t m) :
+        m_what(std::format("PollStreamOverrunError({})", m)),
+        m_missed(m)
+    {}
+    inline std::size_t missed() const noexcept { return m_missed; }
+    char const *what() const noexcept override { return m_what.c_str(); }
+private:
+    std::string m_what;    
+    std::size_t m_missed; ///< Number of packets dropped since the last delivery
 };
 
 /**

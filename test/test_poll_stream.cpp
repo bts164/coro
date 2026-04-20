@@ -246,7 +246,7 @@ TEST(PollStreamTest, Overrun_DropsOldestAndCountsMissed) {
             co_await next(stream);
         } catch (const PollStreamOverrunError& e) {
             got_overrun = true;
-            missed      = e.missed;
+            missed      = e.missed();
         }
 
         while (auto item = co_await next(stream)) ids.push_back(item->id);

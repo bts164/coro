@@ -47,7 +47,7 @@ public:
     ~JoinHandle() {
         if (!m_state) return;  // detached via detach()
         m_state->cancelled.store(true, std::memory_order_relaxed);
-        if (detail::t_current_coro) {
+        if (detail::t_current_coro && !m_state->is_complete()) {
             auto state = m_state;  // capture shared_ptr by value
             detail::t_current_coro->add_child(
                 [state]() { return state->is_complete(); },

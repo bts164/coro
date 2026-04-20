@@ -28,6 +28,19 @@ private:
     std::size_t m_index = 0;
 };
 
+// Void stream: yields N completions then false (exhausted).
+class VoidStream {
+public:
+    using ItemType = void;
+    explicit VoidStream(int count) : m_remaining(count) {}
+    PollResult<bool> poll_next(detail::Context&) {
+        if (m_remaining > 0) { --m_remaining; return true; }
+        return false;
+    }
+private:
+    int m_remaining;
+};
+
 // Stub: should yield one item then an error — body stubbed until Phase 3.
 template<typename T>
 class ErrorStream {
@@ -52,7 +65,9 @@ private:
 
 static_assert(Stream<FiniteStream<int>>);
 static_assert(Stream<ErrorStream<double>>);
+static_assert(Stream<VoidStream>);
 static_assert(Future<NextFuture<FiniteStream<int>>>);
+static_assert(Future<NextFuture<VoidStream>>);
 
 struct NoItemType {
     PollResult<std::optional<int>> poll_next(detail::Context&) { return PollPending; }
@@ -122,6 +137,36 @@ TEST(FiniteStreamTest, YieldsAllItems) {
         results.push_back(*r.value());
     }
     EXPECT_EQ(results, (std::vector<int>{1, 2, 3}));
+}
+
+TEST(VoidStreamTest, YieldsCountThenFalse) {
+    auto waker = std::make_shared<MockWaker>();
+    detail::Context ctx(waker);
+    VoidStream s(3);
+
+    for (int i = 0; i < 3; ++i) {
+        auto r = s.poll_next(ctx);
+        ASSERT_TRUE(r.isReady());
+        EXPECT_TRUE(r.value());
+    }
+    auto last = s.poll_next(ctx);
+    ASSERT_TRUE(last.isReady());
+    EXPECT_FALSE(last.value());
+}
+
+TEST(VoidStreamTest, NextFutureOutputTypeIsBool) {
+    VoidStream s(0);
+    auto n = next(s);
+    static_assert(std::same_as<decltype(n)::OutputType, bool>);
+}
+
+TEST(VoidStreamTest, EmptyYieldsFalseImmediately) {
+    auto waker = std::make_shared<MockWaker>();
+    detail::Context ctx(waker);
+    VoidStream s(0);
+    auto r = next(s).poll(ctx);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_FALSE(r.value());
 }
 
 TEST(ErrorStreamTest, PropagatesError) {

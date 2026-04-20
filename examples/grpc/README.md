@@ -66,7 +66,7 @@ Install dependencies and generate stubs from the proto file, from the `python` d
 
 ```bash
 pip install grpcio grpcio-tools vispy
-python -m grpc_tools.protoc -I../src --python_out=. --grpc_python_out=. signal.proto
+python -m grpc_tools.protoc -I../src --python_out=. --grpc_python_out=. plotsignal.proto
 ```
 
 Then run the client:

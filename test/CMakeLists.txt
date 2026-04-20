@@ -23,6 +23,7 @@ set(TEST_TARGETS
     test_mpsc
     test_watch
     test_file
+    #test_pipe
     test_spawn_blocking
     test_poll_stream
     test_circular_byte_buffer
