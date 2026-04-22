@@ -53,6 +53,21 @@ struct CoroPromiseBase {
     std::function<bool()> m_poll_current;
 };
 
+template<typename T>
+struct CoroPromiseResult : CoroPromiseBase
+{
+    template<std::convertible_to<T> U> requires (!std::is_void_v<T>)
+    void return_value(U &&value) { m_value = std::forward<U>(value); }
+    std::optional<T> m_value;
+};
+
+template<>
+struct CoroPromiseResult<void> : CoroPromiseBase
+{
+    void return_void() { m_value = true; }
+    bool m_value = false;
+};
+
 } // namespace detail
 
 
@@ -73,13 +88,10 @@ class Coro {
 public:
     using OutputType = T;
 
-    struct promise_type : detail::CoroPromiseBase {
+    struct promise_type : detail::CoroPromiseResult<T> {
         Coro get_return_object() {
             return Coro(std::coroutine_handle<promise_type>::from_promise(*this));
         }
-        void return_value(T value) { m_value = std::move(value); }
-
-        std::optional<T> m_value;
     };
 
     explicit Coro(std::coroutine_handle<promise_type> handle)
@@ -153,7 +165,12 @@ public:
              auto& p = m_handle.promise();
             if (p.m_exception)
                 return PollError(p.m_exception);
-            return std::move(*p.m_value);
+            if constexpr (std::is_void_v<T>) {
+                p.m_value = false;
+                return PollReady;
+            } else {
+                return std::move(*p.m_value);
+            }
         }
 
         auto& promise = m_handle.promise();
@@ -183,129 +200,16 @@ public:
 
             if (promise.m_exception)
                 return PollError(promise.m_exception);
-            return std::move(*promise.m_value);
+            if constexpr (std::is_void_v<T>) {
+                promise.m_value = false;
+                return PollReady;
+            } else {
+                return std::move(*promise.m_value);
+            }
         }
 
         // Coroutine suspended — check if pending children need the waker updated.
         // (Children drain in parallel with the coroutine's own suspension.)
-        if (m_scope->has_pending())
-            m_scope->set_drain_waker(ctx.getWaker()->clone());
-
-        return PollPending;
-    }
-
-private:
-    std::coroutine_handle<promise_type>      m_handle;
-    std::unique_ptr<detail::CoroutineScope>  m_scope;
-    bool                                     m_cancelled = false;
-};
-
-
-/**
- * @brief Coroutine return type for async functions that produce no value.
- *
- * Specialization of @ref Coro for `void`. Satisfies `Future<void>`.
- * Cancellation and implicit scope drain behave identically to the primary template.
- */
-template<>
-class Coro<void> {
-public:
-    using OutputType = void;
-
-    struct promise_type : detail::CoroPromiseBase {
-        Coro get_return_object() {
-            return Coro(std::coroutine_handle<promise_type>::from_promise(*this));
-        }
-        void return_void() noexcept {}
-    };
-
-    explicit Coro(std::coroutine_handle<promise_type> handle)
-        : m_handle(handle)
-        , m_scope(std::make_unique<detail::CoroutineScope>()) {}
-
-    Coro(const Coro&)            = delete;
-    Coro& operator=(const Coro&) = delete;
-
-    Coro(Coro&& other) noexcept
-        : m_handle(std::exchange(other.m_handle, {}))
-        , m_scope(std::move(other.m_scope))
-        , m_cancelled(other.m_cancelled) {}
-
-    Coro& operator=(Coro&& other) noexcept {
-        if (this != &other) {
-            if (m_handle) {
-                detail::CurrentCoroGuard guard(m_scope.get());
-                m_handle.destroy();
-            }
-            m_handle    = std::exchange(other.m_handle, {});
-            m_scope     = std::move(other.m_scope);
-            m_cancelled = other.m_cancelled;
-        }
-        return *this;
-    }
-
-    ~Coro() {
-        if (m_handle) {
-            // Set t_current_coro so any JoinHandle destructors in the frame register
-            // their children with this scope before the frame memory is freed.
-            detail::CurrentCoroGuard guard(m_scope.get());
-            m_handle.destroy();
-        }
-    }
-
-    /// @brief Marks this coroutine for cancellation. Takes effect on the next `poll()` call.
-    void cancel() noexcept { m_cancelled = true; }
-
-    /// @brief Advances the coroutine toward completion.
-    /// @param ctx Carries the waker used to reschedule this task when it is ready to progress.
-    /// @return `PollPending`, `PollReady`, `PollError`, or `PollDropped` (if cancelled and drained).
-    PollResult<void> poll(detail::Context& ctx) {
-        if (m_cancelled) {
-            if (m_handle && !m_handle.done()) {
-                detail::CurrentCoroGuard guard(m_scope.get());
-                m_handle.destroy();
-                m_handle = {};
-            }
-            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
-                return PollPending;
-            return PollDropped;
-        }
-
-        if (!m_handle)
-            return PollPending;
-
-        // Frame already ran to completion but children were still draining — re-check now.
-        if (m_handle.done()) {
-            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
-                return PollPending;
-            auto& p = m_handle.promise();
-            if (p.m_exception)
-                return PollError(p.m_exception);
-            return PollReady;
-        }
-
-        auto& promise = m_handle.promise();
-        promise.m_ctx = &ctx;
-
-        if (promise.m_poll_current) {
-            if (!promise.m_poll_current())
-                return PollPending;
-            promise.m_poll_current = nullptr;
-        }
-
-        {
-            detail::CurrentCoroGuard guard(m_scope.get());
-            m_handle.resume();
-        }
-
-        if (m_handle.done()) {
-            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
-                return PollPending;
-            if (promise.m_exception)
-                return PollError(promise.m_exception);
-            return PollReady;
-        }
-
         if (m_scope->has_pending())
             m_scope->set_drain_waker(ctx.getWaker()->clone());
 

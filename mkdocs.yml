@@ -13,7 +13,7 @@ plugins:
   - mkdoxy:
       projects:
         coro:
-          src-dirs: include/coro
+          src-dirs: include/coro src
           doxygen-bin-path: doxygen
           full-doc: true
           doxygen-params:
@@ -26,9 +26,13 @@ nav:
   - Library Usage Guidelines: guidelines.md
   - API Reference:
     - Key Types:
+      - Concepts:
+        - Future (concept): coro/future_8h.md
+        - Stream (concept): coro/stream_8h.md
       - Runtime & Executors:
         - Runtime: coro/classcoro_1_1Runtime.md
         - SingleThreadedExecutor: coro/classcoro_1_1SingleThreadedExecutor.md
+        - SingleThreadedUvExecutor: coro/classcoro_1_1SingleThreadedUvExecutor.md
         - WorkStealingExecutor: coro/classcoro_1_1WorkStealingExecutor.md
         - WorkSharingExecutor: coro/classcoro_1_1WorkSharingExecutor.md
       - Coroutine Types:
@@ -36,23 +40,20 @@ nav:
         - CoroStream: coro/classcoro_1_1CoroStream.md
       - Task Handles:
         - JoinHandle: coro/classcoro_1_1JoinHandle.md
+        - StreamHandle: coro/classcoro_1_1StreamHandle.md
         - SpawnBuilder: coro/classcoro_1_1SpawnBuilder.md
         - StreamSpawnBuilder: coro/classcoro_1_1StreamSpawnBuilder.md
-        - StreamHandle: coro/classcoro_1_1StreamHandle.md
-      - Combinators:
+        - spawn: coro/namespacecoro/#function-spawn
+        - spawn_on: coro/namespacecoro/#function-spawn_on
+        - spawn_blocking: coro/namespacecoro/#function-spawn_blocking
         - JoinSet: coro/classcoro_1_1JoinSet.md
-        - JoinFuture: coro/classcoro_1_1JoinFuture.md
-        - SelectFuture: coro/classcoro_1_1SelectFuture.md
+      - Combinators:
+        - join: coro/namespacecoro/#function-join
+        - select: coro/namespacecoro/#function-select
       - Timers:
+        - timeout: coro/namespacecoro/#function-timeout
+        - sleep_for: coro/namespacecoro/#function-sleep_for
         - SleepFuture: coro/structcoro_1_1SleepFuture.md
-    - Concepts & Free Functions:
-      - Future (concept): coro/future_8h.md
-      - Stream (concept): coro/stream_8h.md
-      - join(): coro/join_8h.md
-      - select(): coro/select_8h.md
-      - sleep_for(): coro/sleep_8h.md
-      - timeout(): coro/timeout_8h.md
-      - spawn(): coro/runtime_8h.md
     - All Classes: coro/classes.md
     - Namespaces: coro/namespaces.md
     - Files: coro/files.md

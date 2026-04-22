@@ -93,11 +93,19 @@ struct TaskStateBase {
  */
 template<typename T>
 struct TaskState : TaskStateBase {
-    std::atomic<bool>      cancelled{false};    ///< Set by `JoinHandle` destructor; checked by `Task::poll()`.
-    std::shared_ptr<Waker> join_waker;          ///< Wakes the `JoinHandle` awaiter on completion.
-    std::shared_ptr<Waker> scope_waker;         ///< Wakes the parent `CoroutineScope` on completion.
-    std::optional<T>       result;              ///< Set by `setResult()` on successful completion.
-    std::exception_ptr     exception;           ///< Set by `setException()` on fault.
+    using ResultType = std::conditional_t<std::is_void_v<T>, bool, std::optional<T>>;
+    static constexpr ResultType init_result() {
+        if constexpr (std::is_void_v<T>) {
+            return false;
+        } else {
+            return std::nullopt;
+        }
+    }    
+    std::atomic<bool>      cancelled{false};        ///< Set by `JoinHandle` destructor; checked by `Task::poll()`.
+    std::shared_ptr<Waker> join_waker;              ///< Wakes the `JoinHandle` awaiter on completion.
+    std::shared_ptr<Waker> scope_waker;             ///< Wakes the parent `CoroutineScope` on completion.
+    ResultType             result = init_result();  ///< Set by `setResult()` on successful completion.
+    std::exception_ptr     exception;               ///< Set by `setException()` on fault.
 
     /// @brief Returns `true` if the task has reached a terminal state (success, error, or cancelled).
     bool is_complete() const {
@@ -121,11 +129,11 @@ struct TaskState : TaskStateBase {
     }
 
     /// @brief Stores the successful result and signals completion. Fires both wakers.
-    void setResult(T value) {
+    void setResult() requires std::is_void_v<T> {
         std::shared_ptr<Waker> join_wk, scope_wk;
         {
             std::lock_guard lock(mutex);
-            result = std::move(value);
+            result = true;
             terminated = true;
             cv.notify_all();
             join_wk = std::move(join_waker);
@@ -135,62 +143,13 @@ struct TaskState : TaskStateBase {
         if (scope_wk) scope_wk->wake();
     }
 
-    /// @brief Stores an unhandled exception and signals completion. Fires both wakers.
-    void setException(std::exception_ptr e) {
+    /// @brief Stores the successful result and signals completion. Fires both wakers.
+    template<std::convertible_to<T> U> requires (!std::is_void_v<T>)
+    void setResult(U &&value) {
         std::shared_ptr<Waker> join_wk, scope_wk;
         {
             std::lock_guard lock(mutex);
-            exception = std::move(e);
-            terminated = true;
-            cv.notify_all();
-            join_wk = std::move(join_waker);
-            scope_wk = std::move(scope_waker);
-        }
-        if (join_wk)  join_wk->wake();
-        if (scope_wk) scope_wk->wake();
-    }
-};
-
-/**
- * @brief `TaskState` specialization for tasks with no return value (`void`).
- *
- * Identical to the primary template except `result` is replaced by a `done` flag,
- * and `setDone()` replaces `setResult()`.
- */
-template<>
-struct TaskState<void> : TaskStateBase {
-    std::atomic<bool>      cancelled{false};
-    std::shared_ptr<Waker> join_waker;
-    std::shared_ptr<Waker> scope_waker;
-    bool                   done{false};         ///< Set by `setDone()` on successful completion.
-    std::exception_ptr     exception;
-
-    /// @brief Returns `true` if the task has reached a terminal state.
-    bool is_complete() const {
-        std::lock_guard lock(mutex);
-        return terminated;
-    }
-
-    /// @brief Signals terminal state without a result. Used by `Task` on cancellation.
-    void mark_done() {
-        std::shared_ptr<Waker> join_wk, scope_wk;
-        {
-            std::lock_guard lock(mutex);
-            terminated = true;
-            cv.notify_all();
-            join_wk = std::move(join_waker);
-            scope_wk = std::move(scope_waker);
-        }
-        if (join_wk)  join_wk->wake();
-        if (scope_wk) scope_wk->wake();
-    }
-
-    /// @brief Signals successful completion. Fires both wakers.
-    void setDone() {
-        std::shared_ptr<Waker> join_wk, scope_wk;
-        {
-            std::lock_guard lock(mutex);
-            done = true;
+            result = std::forward<U>(value);
             terminated = true;
             cv.notify_all();
             join_wk = std::move(join_waker);

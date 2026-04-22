@@ -120,7 +120,7 @@ TEST(JoinHandleTest, VoidPollReturnsReadyAfterSetDone) {
     auto waker = std::make_shared<MockWaker>();
     detail::Context ctx(waker);
     auto state = make_void_state();
-    state->setDone();
+    state->setResult();
     JoinHandle<void> h(state);
     EXPECT_TRUE(h.poll(ctx).isReady());
 }

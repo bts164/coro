@@ -145,7 +145,7 @@ private:
                 m_state->setException(result.error());
             } else {
                 if constexpr (std::is_void_v<OutputType>)
-                    m_state->setDone();
+                    m_state->setResult();
                 else
                     m_state->setResult(std::move(result).value());
             }
