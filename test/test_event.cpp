@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <coro/sync/event.h>
+#include <coro/sync/select.h>
 #include <coro/runtime/runtime.h>
 #include <coro/task/spawn_blocking.h>
 #include <coro/coro.h>
@@ -53,6 +54,44 @@ TEST(EventTest, WaitsUntilSet) {
     }(ev, reached));
 
     EXPECT_TRUE(reached);
+}
+
+// ---------------------------------------------------------------------------
+// WaitFuture dropped by a cancelled select() branch clears its waker so no
+// spurious wake reaches the task after it has moved on.
+// ---------------------------------------------------------------------------
+
+TEST(EventTest, WaitFutureDroppedInSelectClearsWaker) {
+    Event ev;
+    int spurious_wakes = 0;
+
+    struct ImmediateVoid {
+        using OutputType = void;
+        PollResult<void> poll(detail::Context&) { return PollReady; }
+    };
+
+    Runtime rt;
+    rt.block_on([](auto& ev, auto& spurious_wakes) -> Coro<void> {
+        // ImmediateVoid wins; ev.wait() branch is cancelled and its WaitFuture
+        // is dropped — the waker must be cleared from the event.
+        co_await select(ev.wait(), ImmediateVoid{});
+
+        EXPECT_FALSE(ev.is_set());
+
+        // set() with no registered waker should not schedule a spurious wake.
+        ev.set();
+
+        // Count how many times this future is polled. Without the waker fix
+        // a spurious extra poll would push count to 2.
+        struct Counter {
+            using OutputType = void;
+            int& count;
+            PollResult<void> poll(detail::Context&) { ++count; return PollReady; }
+        };
+        co_await Counter{spurious_wakes};
+    }(ev, spurious_wakes));
+
+    EXPECT_EQ(spurious_wakes, 1);
 }
 
 // ---------------------------------------------------------------------------

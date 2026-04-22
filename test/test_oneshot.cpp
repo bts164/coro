@@ -2,6 +2,7 @@
 
 #include <coro/coro.h>
 #include <coro/sync/oneshot.h>
+#include <coro/sync/select.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
 #include <memory>
@@ -9,9 +10,9 @@
 using namespace coro;
 
 // --- Concept checks ---
-static_assert(Future<oneshot::OneshotReceiver<int>>);
-static_assert(Future<oneshot::OneshotReceiver<std::unique_ptr<int>>>);
-static_assert(Future<oneshot::OneshotReceiver<void>>);
+static_assert(Future<oneshot::OneshotRecvFuture<int>>);
+static_assert(Future<oneshot::OneshotRecvFuture<std::unique_ptr<int>>>);
+static_assert(Future<oneshot::OneshotRecvFuture<void>>);
 
 // --- Construction ---
 
@@ -82,7 +83,7 @@ TEST(OneshotTest, ReceiverGetsValueAfterSend) {
     rt.block_on([&]() -> Coro<void> {
         auto [tx, rx] = oneshot::channel<int>();
         tx.send(42);
-        auto result = co_await rx;
+        auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
         received = *result;
     }());
@@ -94,7 +95,7 @@ TEST(OneshotTest, ReceiverErrorWhenSenderDropped) {
     rt.block_on([&]() -> Coro<void> {
         auto [tx, rx] = oneshot::channel<int>();
         { auto dropped = std::move(tx); }
-        auto result = co_await rx;
+        auto result = co_await rx.recv();
         EXPECT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ChannelError::Closed);
     }());
@@ -109,7 +110,7 @@ TEST(OneshotTest, ReceiverSuspendsUntilSend) {
             tx.send(7);
             co_return;
         }()).submit();
-        auto result = co_await rx;
+        auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
         EXPECT_EQ(*result, 7);
     }());
@@ -142,7 +143,7 @@ TEST(OneshotVoidTest, ReceiverGetsSignalAfterSend) {
     rt.block_on([&]() -> Coro<void> {
         auto [tx, rx] = oneshot::channel<void>();
         tx.send();
-        auto result = co_await rx;
+        auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
     }());
 }
@@ -152,7 +153,7 @@ TEST(OneshotVoidTest, ReceiverErrorWhenSenderDropped) {
     rt.block_on([&]() -> Coro<void> {
         auto [tx, rx] = oneshot::channel<void>();
         { auto dropped = std::move(tx); }
-        auto result = co_await rx;
+        auto result = co_await rx.recv();
         EXPECT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ChannelError::Closed);
     }());
@@ -166,7 +167,32 @@ TEST(OneshotVoidTest, ReceiverSuspendsUntilSend) {
             tx.send();
             co_return;
         }()).submit();
-        auto result = co_await rx;
+        auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
+    }());
+}
+
+// --- recv() survives a cancelled select() branch ---
+
+TEST(OneshotTest, RecvCanBeReusedAfterCancelledSelect) {
+    // recv() returns a separate future each time; the receiver is not consumed
+    // by select(), so it can be awaited again if the other branch won.
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = oneshot::channel<int>();
+
+        struct ImmediateInt {
+            using OutputType = int;
+            PollResult<int> poll(detail::Context&) { return 99; }
+        };
+        // ImmediateInt wins; recv() branch is cancelled but rx is still alive.
+        auto r = co_await select(rx.recv(), ImmediateInt{});
+        EXPECT_EQ(r.index(), 1u);
+
+        // Now actually send and receive.
+        tx.send(42);
+        auto result = co_await rx.recv();
+        EXPECT_TRUE(result.has_value());
+        EXPECT_EQ(*result, 42);
     }());
 }

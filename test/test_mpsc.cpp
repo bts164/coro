@@ -2,6 +2,7 @@
 #include <coro/coro.h>
 #include <coro/co_invoke.h>
 #include <coro/sync/mpsc.h>
+#include <coro/sync/select.h>
 #include <coro/future.h>
 #include <coro/stream.h>
 #include <coro/runtime/runtime.h>
@@ -14,6 +15,8 @@ using namespace coro;
 static_assert(Stream<mpsc::Receiver<int>>);
 static_assert(Future<mpsc::SendFuture<int>>);
 static_assert(Future<mpsc::SendFuture<std::unique_ptr<int>>>);
+static_assert(Future<mpsc::RecvFuture<int>>);
+static_assert(Future<mpsc::RecvFuture<std::unique_ptr<int>>>);
 
 // --- Construction ---
 
@@ -110,7 +113,7 @@ TEST(MpscTest, TryRecvFifoOrder) {
     for (int i = 0; i < 5; ++i) tx.trySend(i);
     for (int i = 0; i < 5; ++i) {
         auto r = rx.tryRecv();
-        ASSERT_TRUE(r.has_value());
+        EXPECT_TRUE(r.has_value());
         EXPECT_EQ(*r, i);
     }
 }
@@ -210,5 +213,44 @@ TEST(MpscTest, ErrorChannelPattern) {
         EXPECT_TRUE(r2.has_value());
         EXPECT_FALSE(r2->has_value());
         EXPECT_EQ(r2->error(), "oops");
+    }());
+}
+
+// --- recv() API ---
+
+TEST(MpscTest, RecvReceivesValue) {
+    Runtime rt(1);
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = mpsc::channel<int>(4);
+        co_await tx.send(42);
+        { auto dropped = std::move(tx); }
+        auto v = co_await rx.recv();
+        EXPECT_TRUE(v.has_value());
+        EXPECT_EQ(*v, 42);
+        auto end = co_await rx.recv();
+        EXPECT_FALSE(end.has_value()); // exhausted
+    }());
+}
+
+TEST(MpscTest, RecvCanBeReusedAfterCancelledSelect) {
+    // recv() returns a separate future each time, so the receiver survives a
+    // select() branch that did not win.
+    Runtime rt(1);
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = mpsc::channel<int>(4);
+
+        // First select: ImmediateInt wins, recv() branch is cancelled.
+        struct ImmediateInt {
+            using OutputType = int;
+            PollResult<int> poll(detail::Context&) { return 99; }
+        };
+        auto r1 = co_await select(rx.recv(), ImmediateInt{});
+        EXPECT_EQ(r1.index(), 1u);
+
+        // Receiver is still usable — send a value and recv it.
+        tx.trySend(7);
+        auto v = co_await rx.recv();
+        EXPECT_TRUE(v.has_value());
+        EXPECT_EQ(*v, 7);
     }());
 }

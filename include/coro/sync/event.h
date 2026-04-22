@@ -53,10 +53,28 @@ public:
 
         explicit WaitFuture(Event* event) noexcept : m_event(event) {}
 
-        WaitFuture(WaitFuture&&) noexcept            = default;
-        WaitFuture& operator=(WaitFuture&&) noexcept = default;
-        WaitFuture(const WaitFuture&)                = delete;
-        WaitFuture& operator=(const WaitFuture&)     = delete;
+        WaitFuture(WaitFuture&& other) noexcept
+            : m_event(other.m_event)
+        {
+            other.m_event = nullptr;
+        }
+
+        WaitFuture& operator=(WaitFuture&& other) noexcept {
+            if (this != &other) {
+                _clearWaker();
+                m_event = other.m_event;
+                other.m_event = nullptr;
+            }
+            return *this;
+        }
+
+        WaitFuture(const WaitFuture&)            = delete;
+        WaitFuture& operator=(const WaitFuture&) = delete;
+
+        // Clears the registered waker so a later set() does not spuriously
+        // wake a task that is no longer interested in this event (e.g. because
+        // a select() branch was cancelled).
+        ~WaitFuture() { _clearWaker(); }
 
         PollResult<void> poll(detail::Context& ctx) {
             std::lock_guard lock(m_event->m_mutex);
@@ -72,6 +90,12 @@ public:
 
     private:
         Event* m_event;
+
+        void _clearWaker() noexcept {
+            if (!m_event) return;
+            std::lock_guard lock(m_event->m_mutex);
+            m_event->m_waker = nullptr;
+        }
     };
 
     Event()                        = default;

@@ -172,6 +172,89 @@ private:
 };
 
 /**
+ * @brief Future returned by `Receiver<T>::recv()`.
+ *
+ * Satisfies `Future<std::optional<T>>`. Resolves with the next value from the
+ * channel, or `nullopt` when all senders have been dropped and the buffer is
+ * empty. Holding a shared_ptr to the channel state keeps it alive without
+ * consuming the `Receiver`, so the receiver can produce further futures after
+ * a `select()` branch is cancelled.
+ *
+ * Dropping this future while suspended clears the receiver waiter so no
+ * spurious wake reaches a dead coroutine.
+ *
+ * @tparam T The value type to receive.
+ */
+template<typename T>
+class RecvFuture {
+public:
+    using OutputType = std::optional<T>;
+
+    explicit RecvFuture(std::shared_ptr<detail::MpscShared<T>> shared)
+        : m_shared(std::move(shared)) {}
+
+    RecvFuture(const RecvFuture&)            = delete;
+    RecvFuture& operator=(const RecvFuture&) = delete;
+    RecvFuture(RecvFuture&&)                 = default;
+    RecvFuture& operator=(RecvFuture&&)      = default;
+
+    ~RecvFuture() {
+        if (!m_shared) return;
+        std::lock_guard lock(m_shared->mutex);
+        m_shared->receiver_waiter.reset();
+    }
+
+    /**
+     * @brief Advances the receive operation.
+     *
+     * - Returns `Ready(some(T))` — item available.
+     * - Returns `Ready(nullopt)`  — all senders dropped and buffer drained.
+     * - Returns `Pending`         — nothing available yet; waker registered.
+     */
+    PollResult<OutputType> poll(coro::detail::Context& ctx) {
+        std::unique_lock lock(m_shared->mutex);
+
+        if (!m_shared->buffer.empty()) {
+            T val = std::move(m_shared->buffer.front());
+            m_shared->buffer.pop_front();
+            auto waker = _tryPromoteSender();
+            lock.unlock();
+            if (waker) waker->wake();
+            return std::optional<T>(std::move(val));
+        }
+
+        if (auto* raw = m_shared->sender_waiters.pop_front()) {
+            auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
+            T val = std::move(*node->value);
+            auto waker = std::move(node->waker);
+            lock.unlock();
+            if (waker) waker->wake();
+            return std::optional<T>(std::move(val));
+        }
+
+        if (m_shared->sender_count == 0)
+            return std::optional<T>(std::nullopt);
+
+        m_shared->receiver_waiter = detail::MpscReceiverNode{ctx.getWaker()};
+        return PollPending;
+    }
+
+private:
+    std::shared_ptr<detail::MpscShared<T>> m_shared;
+
+    // Moves the head waiting sender's value into the buffer and returns its waker.
+    // Assumes the mutex is held.
+    std::shared_ptr<coro::detail::Waker> _tryPromoteSender() {
+        if (auto* raw = m_shared->sender_waiters.pop_front()) {
+            auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
+            m_shared->buffer.push_back(std::move(*node->value));
+            return std::move(node->waker);
+        }
+        return nullptr;
+    }
+};
+
+/**
  * @brief Producer handle for an mpsc channel. Cloneable; each clone is independent.
  *
  * **Thread safety:** each `Sender` instance must be used by at most one thread at a
@@ -294,6 +377,20 @@ public:
             }
         }
         for (auto& w : wakers) w->wake();
+    }
+
+    /**
+     * @brief Returns a future that resolves to the next value from the channel.
+     *
+     * The returned `RecvFuture<T>` can be `co_await`-ed directly or passed to
+     * `select()`. The receiver remains valid after the future completes or is
+     * cancelled, so you can call `recv()` again in the next loop iteration.
+     *
+     * Resolves with `nullopt` when all senders have been dropped and the buffer
+     * is drained (stream exhausted).
+     */
+    [[nodiscard]] RecvFuture<T> recv() {
+        return RecvFuture<T>(m_shared);
     }
 
     /**

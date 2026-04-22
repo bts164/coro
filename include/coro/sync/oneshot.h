@@ -30,7 +30,66 @@ struct OneshotShared {
 
 } // namespace detail
 
-template<typename T> class OneshotReceiver;
+/**
+ * @brief Future returned by `OneshotReceiver<T>::recv()`.
+ *
+ * Satisfies `Future<std::expected<T, ChannelError>>`. Holds a reference to the
+ * channel's shared state but does **not** own the receiver; the originating
+ * `OneshotReceiver` must remain alive (or at least not destroyed) while this
+ * future is live. Dropping this future while suspended clears the registered
+ * waker so no spurious wake reaches a dead coroutine.
+ *
+ * @tparam T The value type to receive.
+ */
+template<typename T>
+class OneshotRecvFuture {
+public:
+    using OutputType = std::expected<T, ChannelError>;
+
+    explicit OneshotRecvFuture(std::shared_ptr<detail::OneshotShared<T>> shared)
+        : m_shared(std::move(shared)) {}
+
+    OneshotRecvFuture(const OneshotRecvFuture&)            = delete;
+    OneshotRecvFuture& operator=(const OneshotRecvFuture&) = delete;
+    OneshotRecvFuture(OneshotRecvFuture&&)                 = default;
+    OneshotRecvFuture& operator=(OneshotRecvFuture&&)      = default;
+
+    ~OneshotRecvFuture() {
+        if (!m_shared) return;
+        // Clear any waker we may have registered so a late sender wake doesn't
+        // reach a dead coroutine frame.
+        std::lock_guard lock(m_shared->mutex);
+        m_shared->receiver_waker = nullptr;
+    }
+
+    /**
+     * @brief Advances the receive operation.
+     *
+     * - Returns `Ready(value)` if the value has been sent.
+     * - Returns `Ready(unexpected(Closed))` if the sender was dropped without sending.
+     * - Returns `Pending` and registers the waker if nothing has happened yet.
+     */
+    PollResult<OutputType> poll(coro::detail::Context& ctx) {
+        std::lock_guard lock(m_shared->mutex);
+
+        if (m_shared->slot.has_value()) {
+            if constexpr (std::is_void_v<T>) {
+                return OutputType{};
+            } else {
+                return OutputType(std::move(*m_shared->slot));
+            }
+        }
+        if (!m_shared->sender_alive) {
+            return OutputType(std::unexpected(ChannelError::Closed));
+        }
+
+        m_shared->receiver_waker = ctx.getWaker();
+        return PollPending;
+    }
+
+private:
+    std::shared_ptr<detail::OneshotShared<T>> m_shared;
+};
 
 /**
  * @brief Synchronous sender half of a oneshot channel.
@@ -122,10 +181,12 @@ private:
 };
 
 /**
- * @brief Async receiver half of a oneshot channel. Satisfies `Future<std::expected<T, ChannelError>>`.
+ * @brief Receiver half of a oneshot channel.
  *
- * Awaiting the receiver suspends until `send()` is called or the sender is dropped.
- * On sender drop without a send, resolves with `std::unexpected(ChannelError::Closed)`.
+ * Call `recv()` to obtain an `OneshotRecvFuture<T>` that can be `co_await`-ed
+ * or passed to `select()`. The receiver is move-only; creating a new future
+ * each time via `recv()` keeps the receiver alive so it can be reused after a
+ * cancelled `select()` branch.
  *
  * **Thread safety:** each instance must be used by at most one thread at a time.
  *
@@ -134,8 +195,6 @@ private:
 template<typename T>
 class OneshotReceiver {
 public:
-    using OutputType = std::expected<T, ChannelError>;
-
     explicit OneshotReceiver(std::shared_ptr<detail::OneshotShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
@@ -148,32 +207,18 @@ public:
         if (!m_shared) return;
         std::lock_guard lock(m_shared->mutex);
         m_shared->receiver_alive = false;
-        m_shared->receiver_waker = nullptr; // clear stale waker
+        m_shared->receiver_waker = nullptr;
     }
 
     /**
-     * @brief Advances the receiver toward completion.
+     * @brief Returns a future that resolves when the sender sends a value or is dropped.
      *
-     * - Returns `Ready(value)` if the value has been sent.
-     * - Returns `Ready(unexpected(Closed))` if the sender was dropped without sending.
-     * - Returns `Pending` and registers the waker if nothing has happened yet.
+     * The returned `OneshotRecvFuture<T>` can be `co_await`-ed directly or passed
+     * to `select()`. The receiver remains valid after the future completes or is
+     * cancelled, though a oneshot channel can only be received once.
      */
-    PollResult<OutputType> poll(coro::detail::Context& ctx) {
-        std::lock_guard lock(m_shared->mutex);
-
-        if (m_shared->slot.has_value()) {
-            if constexpr (std::is_void_v<T>) {
-                return OutputType{};
-            } else {
-                return OutputType(std::move(*m_shared->slot));
-            }
-        }
-        if (!m_shared->sender_alive) {
-            return OutputType(std::unexpected(ChannelError::Closed));
-        }
-
-        m_shared->receiver_waker = ctx.getWaker();
-        return PollPending;
+    [[nodiscard]] OneshotRecvFuture<T> recv() {
+        return OneshotRecvFuture<T>(m_shared);
     }
 
 private:
