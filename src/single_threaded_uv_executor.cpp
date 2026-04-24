@@ -105,6 +105,13 @@ void SingleThreadedUvExecutor::io_async_cb(uv_async_t* handle) {
             self->m_lws_ctx = nullptr;
         }
         uv_close(reinterpret_cast<uv_handle_t*>(handle), nullptr);
+        // Close any remaining open handles (e.g. handles owned by global objects
+        // that outlive the Runtime). Without this, uv_run() hangs if the caller
+        // forgot to clean up a handle before the runtime shuts down.
+        uv_walk(&self->m_uv_loop, [](uv_handle_t* h, void*) {
+            if (!uv_is_closing(h))
+                uv_close(h, nullptr);
+        }, nullptr);
         return;
     }
 
