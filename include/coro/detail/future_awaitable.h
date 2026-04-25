@@ -29,8 +29,16 @@ template<typename F>
 class FutureAwaitable {
     using BaseF = std::remove_cvref_t<F>;
 public:
-    explicit FutureAwaitable(F future, detail::Context** ctx_ptr, std::function<bool()>* poll_hook)
-        : m_future(std::forward<F>(future)), m_ctx_ptr(ctx_ptr), m_poll_hook(poll_hook) {}
+    // cancel_hook is optional (null for non-Cancellable futures). When provided,
+    // await_suspend() installs a cancel callback so the outer Coro/CoroStream can
+    // cooperatively cancel the awaited future before destroying the frame.
+    explicit FutureAwaitable(F future, detail::Context** ctx_ptr,
+                             std::function<bool()>* poll_hook,
+                             std::function<void()>* cancel_hook = nullptr)
+        : m_future(std::forward<F>(future))
+        , m_ctx_ptr(ctx_ptr)
+        , m_poll_hook(poll_hook)
+        , m_cancel_hook(cancel_hook) {}
 
     // Poll once eagerly. If the future completes synchronously, skip suspension entirely.
     bool await_ready() noexcept{
@@ -45,6 +53,7 @@ public:
     // Called only when await_ready() returned false.
     // Registers the re-poll hook with the promise so that the outer poll()
     // can verify the future is ready before resuming this coroutine.
+    // Also registers the cancel hook if the awaited future satisfies Cancellable.
     void await_suspend(std::coroutine_handle<>) noexcept{
         *m_poll_hook = [this]() noexcept -> bool {
             try {
@@ -54,6 +63,11 @@ public:
             }
             return !m_result.isPending();
         };
+        if (m_cancel_hook) {
+            if constexpr (Cancellable<BaseF>) {
+                *m_cancel_hook = [this]() noexcept { m_future.cancel(); };
+            }
+        }
     }
 
     // Called only after the outer poll() confirmed the inner future is non-Pending:
@@ -70,6 +84,7 @@ private:
     F                                       m_future;   // reference for lvalue path, value for rvalue path
     detail::Context**                       m_ctx_ptr;
     std::function<bool()>*                  m_poll_hook;
+    std::function<void()>*                  m_cancel_hook;
     PollResult<typename BaseF::OutputType>  m_result{PollPending};
 };
 

@@ -30,10 +30,22 @@ concept Future = requires(F& f, detail::Context& ctx) {
 };
 
 /**
- * @brief Concept satisfied by futures that support cooperative cancellation via `cancel()`.
+ * @brief Concept satisfied by futures that own an internal execution tree and must be
+ * drained before they can be safely destroyed.
  *
- * Currently satisfied by @ref Coro and @ref CoroStream. Non-cancellable branches
- * are dropped immediately (not drained) when another branch wins a `select()`.
+ * A type satisfying `Cancellable` declares: "I cannot simply be dropped mid-execution.
+ * Call `cancel()` on me, then poll me until I return `PollDropped`."  The canonical
+ * implementations are @ref Coro and @ref CoroStream, which may be awaiting nested
+ * children that hold references to the caller's frame locals.
+ *
+ * A future that does **not** satisfy `Cancellable` is a leaf future: it does not await
+ * children, holds no references to the caller's locals, and can be destroyed at any time
+ * (its destructor handles immediate cleanup such as removing a stored waker). Examples:
+ * channel send/receive futures, `EventFuture`, timer futures.
+ *
+ * The cancellation protocol in `Coro<T>::poll()` uses this distinction: Cancellable
+ * awaited futures are drained before `handle.destroy()` is called; non-Cancellable ones
+ * are dropped as part of the LIFO teardown in `handle.destroy()`.
  *
  * @tparam F A type satisfying @ref Future.
  */

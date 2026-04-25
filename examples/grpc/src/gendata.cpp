@@ -5,7 +5,7 @@
 #include <absl/log/initialize.h>
 
 #include <coro/coro.h>
-#include <coro/io/pipe.hpp>
+#include <coro/io/file.h>
 #include <coro/runtime/runtime.h>
 #include <coro/sync/sleep.h>
 
@@ -25,9 +25,11 @@ coro::Coro<int> async_main(int argc, char *argv[])
         co_return -1;
     }
     auto path = std::filesystem::absolute(argv[1]);
-    LOG(INFO) << "Opening pipe " << path;
-    auto pipe = co_await coro::Pipe::open(path, coro::PipeMode::Write);
-    
+    LOG(INFO) << "Opening file " << path;
+    auto file = co_await coro::File::open(
+        path.string(),
+        coro::FileMode::Write | coro::FileMode::Create | coro::FileMode::Truncate);
+
     Packet packet;
     std::vector<std::size_t> shape = {0x1<<20, 2};
     size_t N = sizeof(int16_t) * shape[0] * shape[1];
@@ -44,20 +46,20 @@ coro::Coro<int> async_main(int argc, char *argv[])
         header.magic = PacketHeader::MAGIC;
         header.counter = i;
         header.packet_size_bytes = N;
-        
+
         data = xt::random::rand<float>(shape, -100, 100);
 
-        auto x = xt::linspace<float>(0, 4*M_PI, shape[0]);
+        auto x = xt::linspace<float>(0, 3.5*M_PI, shape[0]);
         float phase = 2.0 * M_PI * duration_cast<milliseconds>(t-t0).count() / 2000.0;
         xt::view(data, xt::all(), 0) += 1000 * xt::sin(x+phase);
         xt::view(data, xt::all(), 1) += 1000 * xt::cos(x+phase);
-        
+
         footer[0] = PacketFooter::MAGIC[0];
         footer[1] = PacketFooter::MAGIC[1];
-        
-        // Queue the write immediately (no suspension), then sleep while it's in flight.
-        auto wh = pipe.write(std::move(buffer));
-        buffer.resize(sizeof(PacketHeader) + N + sizeof(PacketFooter));
+
+        // Start the write (buffer moved in); sleep while it's in flight.
+        std::size_t expected_n = buffer.size();
+        auto wh = file.write(std::move(buffer), true);
 
         if (49 == (i%50)) {
             auto t = system_clock::now();
@@ -69,7 +71,14 @@ coro::Coro<int> async_main(int argc, char *argv[])
         if (auto now = system_clock::now(); now < next) {
             co_await coro::sleep_for(next - now);
         }
-        co_await wh;
+
+        // Reclaim the buffer from the write result for reuse next iteration.
+        auto [n, returned_buf] = co_await std::move(wh);
+        if (n != expected_n) {
+            LOG(FATAL) <<std::format("Only wrote {}/{} bytes", n, expected_n);
+            co_return 1;
+        }
+        buffer = std::move(returned_buf);
     }
     co_return 0;
 }

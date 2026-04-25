@@ -104,6 +104,10 @@ struct TaskState : TaskStateBase {
     std::atomic<bool>      cancelled{false};        ///< Set by `JoinHandle` destructor; checked by `Task::poll()`.
     std::shared_ptr<Waker> join_waker;              ///< Wakes the `JoinHandle` awaiter on completion.
     std::shared_ptr<Waker> scope_waker;             ///< Wakes the parent `CoroutineScope` on completion.
+    // Holds a clone of the task's own TaskWaker so the JoinHandle destructor can re-enqueue
+    // the task when it sets cancelled=true on a sleeping task. Updated at the start of each
+    // poll; cleared by all terminal methods to break the Task→TaskState→TaskWaker→Task cycle.
+    std::shared_ptr<Waker> self_waker;
     ResultType             result = init_result();  ///< Set by `setResult()` on successful completion.
     std::exception_ptr     exception;               ///< Set by `setException()` on fault.
 
@@ -114,15 +118,16 @@ struct TaskState : TaskStateBase {
     }
 
     /// @brief Signals terminal state without a result. Used by `Task` on cancellation.
-    /// Fires both `join_waker` and `scope_waker`.
+    /// Fires both `join_waker` and `scope_waker`. Clears `self_waker` to break the cycle.
     void mark_done() {
         std::shared_ptr<Waker> join_wk, scope_wk;
         {
             std::lock_guard lock(mutex);
             terminated = true;
             cv.notify_all();
-            join_wk = std::move(join_waker);
-            scope_wk = std::move(scope_waker);
+            join_wk   = std::move(join_waker);
+            scope_wk  = std::move(scope_waker);
+            self_waker.reset();
         }
         if (join_wk)  join_wk->wake();
         if (scope_wk) scope_wk->wake();
@@ -136,8 +141,9 @@ struct TaskState : TaskStateBase {
             result = true;
             terminated = true;
             cv.notify_all();
-            join_wk = std::move(join_waker);
-            scope_wk = std::move(scope_waker);
+            join_wk   = std::move(join_waker);
+            scope_wk  = std::move(scope_waker);
+            self_waker.reset();
         }
         if (join_wk)  join_wk->wake();
         if (scope_wk) scope_wk->wake();
@@ -152,8 +158,9 @@ struct TaskState : TaskStateBase {
             result = std::forward<U>(value);
             terminated = true;
             cv.notify_all();
-            join_wk = std::move(join_waker);
-            scope_wk = std::move(scope_waker);
+            join_wk   = std::move(join_waker);
+            scope_wk  = std::move(scope_waker);
+            self_waker.reset();
         }
         if (join_wk)  join_wk->wake();
         if (scope_wk) scope_wk->wake();
@@ -167,8 +174,9 @@ struct TaskState : TaskStateBase {
             exception = std::move(e);
             terminated = true;
             cv.notify_all();
-            join_wk = std::move(join_waker);
-            scope_wk = std::move(scope_waker);
+            join_wk   = std::move(join_waker);
+            scope_wk  = std::move(scope_waker);
+            self_waker.reset();
         }
         if (join_wk)  join_wk->wake();
         if (scope_wk) scope_wk->wake();

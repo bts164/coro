@@ -60,43 +60,46 @@ Coro<void> fragile() {
     // h dropped here → drain begins, but local_data already destroyed
 }
 
-// GOOD — await the handle before locals go out of scope
-Coro<void> good(Config config) {
-    auto h = spawn(use_config(&config)).submit();
-    co_await h;  // task finished; config still alive
+// BAD — looks safe but is not: any exception thrown between js.add() and
+// co_await js.drain() bypasses the drain and destroys local_data while
+// children are still running.
+Coro<void> deceptive() {
+    int local_data = 42;
+    JoinSet<void> js;
+    js.add(spawn(worker(&local_data)).submit());
+    co_await js.drain();  // NOT reached if anything above this line throws
 }
 
-// GOOD — use co_invoke + JoinSet for a guaranteed drain point while
-// local_data is still in scope.
-Coro<void> safe() {
-    int local_data = 42;
-    co_await co_invoke([&]() -> Coro<void> {
+// GOOD — use co_invoke to push spawning into an inner coroutine. The outer
+// frame (and local_data) stays suspended at co_await co_invoke() for the
+// entire inner lifetime, including through exceptions in the inner body.
+Coro<void> safe(int local_data) {
+    co_await co_invoke([](int& data) -> Coro<void> {
         JoinSet<void> js;
-        js.spawn(worker(&local_data));
-        co_await js.drain();  // guaranteed drain point while local_data is alive
-    });
+        js.add(spawn(worker(&data)).submit());
+        co_await js.drain();
+    }(local_data));
 }
 ```
 
 ### CS.2 — Use `co_invoke` + `JoinSet` to safely spawn tasks that reference local data
 
-**Reason:** `co_invoke` keeps the lambda object — and therefore all its captures — alive
-for the entire duration of the coroutine it wraps. `JoinSet::drain()` inside the lambda
-provides an explicit suspension point while the captures are still in scope. Together they
-replicate the `std::thread::scope` guarantee for async tasks: the scope does not exit until
-all children have finished, and all data the children reference is guaranteed to be alive
-for that duration.
+**Reason:** The outer frame that owns the referenced data stays suspended at
+`co_await co_invoke(...)` for the entire inner coroutine lifetime, including through
+exceptions thrown inside the inner body. This guarantees the referenced data is alive
+for as long as any child spawned inside runs. Placing `JoinSet::drain()` in the same
+frame as the referenced local is not safe — exceptions bypass the drain and destroy
+the local while children are still running.
 
 ```cpp
-// GOOD
+// GOOD — items lives in the outer frame; safe through exceptions in the inner body
 Coro<void> process(std::vector<Item>& items) {
-    co_await co_invoke([&]() -> Coro<void> {
+    co_await co_invoke([](std::vector<Item>& items) -> Coro<void> {
         JoinSet<void> js;
         for (auto& item : items)
-            js.spawn(process_item(item));  // captures reference to item
+            js.add(spawn(process_item(item)).submit());
         co_await js.drain();
-        // All tasks finished; references to items are safe to release
-    });
+    }(items));
 }
 ```
 
@@ -285,13 +288,15 @@ auto h = spawn(serve_connection(conn))
 
 ### CA.1 — Do not assume cancelled futures stop immediately; they drain before completing
 
-**Reason:** C++ coroutine frames cannot be freed without running destructors, and
-destructors only run when the coroutine is resumed. Cancellation therefore works by
-signalling the task to stop at its next suspension point, then polling it until it returns
-`PollDropped` — meaning all its children have also drained. This differs fundamentally
-from Rust, where dropping a future instantly frees its memory. Code that assumes
-cancellation is instant may observe resources living longer than expected, or may try to
-reuse a resource while the drain is still in progress.
+**Reason:** Cancellation is cooperative and asynchronous, not instantaneous. When a future
+is cancelled, it must first drain its currently-awaited sub-future (waiting for it to return
+`PollDropped` if it is itself `Cancellable`, or to complete normally if it is not), then
+`handle.destroy()` is called to free the frame (running local destructors in LIFO order),
+and finally any child tasks registered with the coroutine scope must drain before
+`PollDropped` is returned. This differs fundamentally from Rust, where dropping a future
+instantly frees its memory. Code that assumes cancellation is instant may observe resources
+living longer than expected, or may try to reuse a resource while the drain is still in
+progress.
 
 ```cpp
 // The timeout future holds the winning result internally until

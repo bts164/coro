@@ -120,7 +120,7 @@ private:
             auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
             (self->m_service.*method)(&ctx, &request, &responder,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
-            auto start_rx_result = co_await start_rx;
+            auto start_rx_result = co_await start_rx.recv();
                 if (!start_rx_result.has_value() || !start_rx_result.value()) co_return; // Failed to start (server shutting down)
         }
 
@@ -132,7 +132,7 @@ private:
 
         auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
         responder.Finish(reply, grpc::Status::OK, &finish_tx);
-        co_await finish_rx;
+        co_await finish_rx.recv();
     }
 
     // -------------------------------------------------------------------------
@@ -167,7 +167,7 @@ private:
             auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
             (self->m_service.*method)(&ctx, &reader,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
-            auto start_rx_result = co_await start_rx;
+            auto start_rx_result = co_await start_rx.recv();
             if (!start_rx_result.has_value() || !start_rx_result.value()) co_return; // Failed to start (server shutting down)
         }
 
@@ -187,7 +187,7 @@ private:
             RequestType request;
             auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
             reader.Read(&request, &read_tx);
-            auto read_rx_result = co_await read_rx;
+            auto read_rx_result = co_await read_rx.recv();
             if (!read_rx_result.has_value() || !read_rx_result.value()) break; // ok=false: client done sending (half-close)
             co_await req_tx.send(std::move(request));
         }
@@ -202,7 +202,7 @@ private:
         // Send the single reply and wait for delivery.
         auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
         reader.Finish(reply, grpc::Status::OK, &finish_tx);
-        co_await finish_rx;
+        co_await finish_rx.recv();
     }
 
     // -------------------------------------------------------------------------
@@ -239,7 +239,7 @@ private:
             auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
             (self->m_service.*method)(&ctx, &request, &writer,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
-            auto start_rx_result = co_await start_rx;
+            auto start_rx_result = co_await start_rx.recv();
             if (!start_rx_result.has_value() || !start_rx_result.value()) co_return;
         }
 
@@ -253,14 +253,14 @@ private:
         while (auto item = co_await coro::next(reply_stream)) {
             auto [write_tx, write_rx] = coro::oneshot::channel<bool>();
             writer.Write(*item, &write_tx);
-            auto write_result = co_await write_rx;
+            auto write_result = co_await write_rx.recv();
             if (!write_result.has_value() || !write_result.value()) co_return; // client disconnected
         }
 
         // All replies sent; close the stream.
         auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
         writer.Finish(grpc::Status::OK, &finish_tx);
-        co_await finish_rx;
+        co_await finish_rx.recv();
     }
 
     // -------------------------------------------------------------------------
@@ -305,7 +305,7 @@ private:
             auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
             (self->m_service.*method)(&ctx, &stream,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
-            auto start_rx_result = co_await start_rx;
+            auto start_rx_result = co_await start_rx.recv();
             if (!start_rx_result.has_value() || !start_rx_result.value()) co_return;
         }
 
@@ -323,7 +323,7 @@ private:
                     RequestType request;
                     auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
                     stream.Read(&request, &read_tx);
-                    auto read_result = co_await read_rx;
+                    auto read_result = co_await read_rx.recv();
                     if (!read_result.has_value() || !read_result.value()) co_return; // client half-closed
                     co_await req_tx.send(std::move(request));
                 }
@@ -335,7 +335,7 @@ private:
         while (auto item = co_await coro::next(reply_stream)) {
             auto [write_tx, write_rx] = coro::oneshot::channel<bool>();
             stream.Write(*item, &write_tx);
-            auto write_result = co_await write_rx;
+            auto write_result = co_await write_rx.recv();
              if (!write_result.has_value() || !write_result.value()) {
                 write_ok = false;
                 break; // client disconnected
@@ -352,7 +352,7 @@ private:
         // All replies sent; close the stream.
         auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
         stream.Finish(grpc::Status::OK, &finish_tx);
-        co_await finish_rx;
+        co_await finish_rx.recv();
     }
 
 protected:

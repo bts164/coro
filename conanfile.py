@@ -11,11 +11,13 @@ class CoroRecipe(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     options = {
         "shared": [True, False],
-        "fPIC": [True, False]
+        "fPIC": [True, False],
+        "with_gperftools": [True, False]
     }
     default_options = {
         "shared": True,
-        "fPIC": True
+        "fPIC": True,
+        "with_gperftools": True
     }
     exports_sources = "include/*.h","include/*.hpp", "src/*.cpp", "CMakeLists.txt"
     
@@ -28,6 +30,10 @@ class CoroRecipe(ConanFile):
             self.options.rm_safe("fPIC")
 
     def requirements(self):
+        if self.options.with_gperftools:
+            self.requires("gperftools/2.17.2",
+                transitive_headers = True,
+                transitive_libs = True)
         self.requires("libuv/1.47.0",
             transitive_headers = True,
             transitive_libs = True)
@@ -43,6 +49,7 @@ class CoroRecipe(ConanFile):
         deps = CMakeDeps(self)
         deps.generate()
         tc = CMakeToolchain(self)
+        tc.cache_variables["WITH_GPERFTOOLS"] = self.options.with_gperftools
         tc.generate()
 
     def build(self):
@@ -56,6 +63,8 @@ class CoroRecipe(ConanFile):
 
     def package_info(self):
         self.cpp_info.libs = ["coro"]
+        if self.options.with_gperftools:
+            self.cpp_info.requires.append("gperftools::gperftools")
         self.cpp_info.requires.append("libuv::libuv")
         self.cpp_info.requires.append("libwebsockets::libwebsockets")
         

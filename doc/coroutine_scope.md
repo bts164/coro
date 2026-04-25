@@ -23,59 +23,218 @@ references.
 
 ## Guarantee
 
-Regardless of how a coroutine stops executing — normal completion (`co_return`), exception,
-or cancellation — the following ordering must be guaranteed:
+The scope mechanism provides one guarantee, applied uniformly across all termination paths:
 
-1. **Drain children before destroying the frame.** The coroutine must wait for all spawned
-   child tasks that were not explicitly `co_await`ed to completion (and not explicitly
-   detached) to finish before its coroutine frame is freed. This is the coroutine scope
-   guarantee: no child task may outlive the frame that owns the data it references.
+> **A coroutine frame is not freed while any future it is currently awaiting, or any
+> previously-registered pending child, could still hold a reference to frame-local data.**
 
-2. **Destroy the state machine only after the drain.** The C++ coroutine frame — which holds
-   all local variables, function arguments captured at the initial suspend point, and any
-   intermediate awaitable state — must not be freed (i.e. `handle.destroy()` must not have
-   been called, or its effects must not be visible to running children) until the drain in
-   step 1 is complete. Once the drain is complete, the frame is destroyed, running all
-   remaining local destructors in LIFO order exactly as the language guarantees for ordinary
-   stack frames.
+This prevents the frame allocation from being reclaimed out from under running futures.
+It does **not** guarantee that the logical values of local variables remain valid after
+their own destructors have run — that is a separate concern addressed by explicit drain
+points (`JoinSet::drain()`), described below.
 
-These two steps apply uniformly across all termination paths:
+| Termination path | Awaited future drained first? | Pre-existing children drained first? | Frame freed after? |
+|---|---|---|---|
+| `co_return` (normal) | N/A — body already ran past it | Yes | Yes |
+| Uncaught exception | N/A — body already ran past it | Yes | Yes |
+| Cancellation | Yes | Yes | Yes |
 
-| Termination path | Children drained? | Frame destroyed after? |
-|---|---|---|
-| `co_return` (normal) | Yes | Yes |
-| Uncaught exception | Yes | Yes |
-| Cancellation (cancelled flag set) | Yes | Yes |
-| Coroutine dropped without awaiting | Yes | Yes |
+Detached tasks (`JoinHandle::detach()`) are explicitly opted out of the tracking guarantee
+and are not tracked by the scope.
 
-Detached tasks (`JoinHandle::detach()`) are explicitly opted out of this guarantee and are
-not tracked.
+## Frame Lifetime Invariant
 
-## Design — Every Coroutine Is an Implicit Scope
+The single rule governing frame destruction:
+
+> **A coroutine frame must not be destroyed while it is suspended waiting on an awaited
+> future, or while any of its previously-registered pending children are still running.**
+
+Once both of those conditions clear, `handle.destroy()` may be called immediately — the
+coroutine body does not need to be resumed. `handle.destroy()` runs all in-scope local
+variable destructors in LIFO order, exactly as normal C++ stack unwinding does. Any
+`JoinHandle` destructors that fire during this teardown cancel their children and register
+them as new pending children in the scope; those are then drained in turn before
+`PollDropped` is returned.
+
+The state diagram for a `Coro<T>` frame:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running : first poll()
+    Running --> Suspended : co_await (future pending)
+    Suspended --> Running : future ready, resumed
+    Running --> AtFinalSuspend : co_return / exception
+    AtFinalSuspend --> Draining : pending children exist
+    AtFinalSuspend --> Freed : no pending children
+    Draining --> Freed : all children drained
+    Suspended --> AwaitDraining : cancel() received
+    AwaitDraining --> Freed : awaited future done AND\npre-existing children drained\n→ handle.destroy() + drain new children
+    Freed --> [*]
+```
+
+`handle.destroy()` is called exactly once, on the transition to Freed. It is never called
+while the frame is in Running, Suspended, AtFinalSuspend, or Draining.
+
+## Cancellation Protocol
+
+### Invoking cancellation
+
+`cancel()` sets an internal flag on the `Coro<T>`. It is not a preemptive interrupt — it
+does not stop a `Coro<T>::poll()` call that is already mid-execution. The flag is checked
+at the entry of each `Coro<T>::poll()` call, so cancellation takes effect the next time
+`poll()` is entered for that coroutine. That may be within the same outer task poll cycle
+(if the combinator re-polls the branch after cancelling it) or in a subsequent cycle.
+
+### Step 1 — drain or drop the awaited future
+
+When `poll()` is called with the cancellation flag set and the frame is suspended at a
+`co_await`, the treatment of the awaited future depends on whether it satisfies
+`Cancellable`:
+
+1. **Cancellable awaited future** — call `cancel()` on it, then continue polling it on
+   every subsequent `poll()` call until it returns a non-`Pending` result. A `Cancellable`
+   future has its own execution tree that must drain before the outer frame is safe to tear
+   down.
+
+2. **Non-Cancellable awaited future** — proceed directly to step 3 (`handle.destroy()`).
+   Non-Cancellable futures are leaf futures: they do not await children and hold no
+   references to the caller's frame locals. Their destructors execute immediate cleanup
+   (e.g., removing a waker registration from shared state) and are safe to call at any
+   time. The `FutureAwaitable` holding the non-Cancellable future is destroyed as part of
+   LIFO teardown in `handle.destroy()`.
+
+The `Cancellable` concept carries a semantic contract: a type opting in declares that it
+is not safe to destroy mid-execution — it must be cancelled and polled to `PollDropped`
+first. A type that does not implement `cancel()` declares that dropping it at any point
+is safe.
+
+### Step 2 — drain pre-existing pending children
+
+While waiting for the awaited future, the scope may also have pending children that were
+registered earlier (JoinHandles dropped before cancellation was set). These are drained in
+parallel with step 1 using the same scope-waker mechanism used on the normal completion
+path. The frame is not destroyed until this list is also empty.
+
+### Step 3 — eager frame destruction
+
+Once both conditions are clear (no awaited future, no pre-existing pending children),
+`handle.destroy()` is called with `t_current_coro` pointing to this coroutine's scope.
+This runs all remaining local variable destructors in LIFO order. Any `JoinHandle`
+destructors that fire during this step cancel their children and add them to the scope's
+pending list.
+
+The frame allocation is freed by this `handle.destroy()` call.
+
+### Step 4 — drain new children
+
+Any children registered during step 3 are now drained using the scope-waker mechanism.
+Once the list is empty, `PollDropped` is returned.
+
+### Sequence diagram
+
+```mermaid
+sequenceDiagram
+    participant Executor
+    participant Coro as Coro
+    participant Awaited as Awaited Future
+    participant OldChildren as Pre-existing Children
+    participant NewChildren as Children from frame teardown
+
+    Executor->>Coro: cancel()
+    Executor->>Coro: poll()
+    Coro->>Awaited: cancel() [if Cancellable]
+    Coro->>OldChildren: install scope waker [if any]
+    loop Until awaited done AND old children drained
+        Coro-->>Executor: PollPending
+        Executor->>Coro: poll()
+        Coro->>Awaited: poll()
+        Awaited-->>Coro: PollPending / PollDropped / Ready / Error
+    end
+    Note over Coro: awaited future done, old children drained
+    Coro->>Coro: handle.destroy() — LIFO dtors, JoinHandle dtors register new children
+    Note over Coro: frame memory freed
+    loop Until new children drained
+        Coro->>NewChildren: install scope waker
+        NewChildren-->>Coro: wake (child done)
+        Executor->>Coro: poll()
+    end
+    Coro-->>Executor: PollDropped
+```
+
+## Design — `CoroutineScope` as a Value Member
+
+### Scope
+
+Everything in this section applies equally to `Coro<T>` and `CoroStream<T>`. Both types
+own a `CoroutineScope`, follow the same frame lifetime invariant, and implement the same
+cancellation protocol. `CoroStream` additionally requires a `m_cancel_current` hook in its
+`promise_type` (analogous to the one in `CoroPromiseBase`) so that Cancellable awaited
+futures can be cooperatively cancelled before the stream frame is destroyed.
 
 ### Core idea
 
-A coroutine frame owning referenced objects cannot be safely freed until all tasks spawned
-with references have completed. Rather than requiring the programmer to use an explicit
-`Synchronize` block, we make this guarantee automatic: every coroutine implicitly tracks its
-spawned children and defers frame destruction until they finish.
+`CoroutineScope` tracks spawned children whose `JoinHandle`s were dropped during the
+coroutine's execution. It is owned directly by the `Coro<T>` (or `CoroStream<T>`) object
+(value member, not `unique_ptr`).
 
-Cancellation changes semantics in two ways:
+`CoroutineScope` contains a `std::mutex` which is not movable, but `Coro<T>` must be
+movable to be returned from coroutine functions and moved into a `Task`. This is safe
+because:
 
-- **The coroutine body stops executing.** A cancelled coroutine does not resume when polled;
-  its frame is destroyed directly via `handle.destroy()`, running all local destructors in
-  LIFO order.
-- **The `Coro<T>` future stays alive until children drain.** Even after the frame is
-  destroyed, the `Coro<T>` wrapper keeps returning `PollPending` until all registered child
-  tasks have completed, then returns `PollDropped`.
+- Moves of `Coro<T>` only occur **before the first `poll()` call** — when the return value
+  is transferred from the coroutine function to the caller and then into a `Task`. After
+  that, the `Coro<T>` lives inside a heap-allocated `Task` (held by `shared_ptr`) and is
+  never moved again.
+- Before first `poll()`, `m_pending` is always empty. No `JoinHandle` destructor has fired,
+  so the scope has no state that depends on its address.
 
-This mirrors how `std::thread::scope` works for threads: destruction blocks until all scoped
-threads finish, even if the scope is unwound by an exception.
+`CoroutineScope` therefore implements a custom move constructor and move-assignment that
+**moves `m_pending` and default-constructs a fresh mutex** at the destination. The source
+mutex is left in its default state and destroyed with the moved-from object.
 
-### `PollDropped` — a new poll state
+### Thread-local current coroutine
 
-`PollResult<T>` gains a fourth state alongside `PollReady(value)`, `PollError(exception)`,
-and `PollPending`:
+During each `poll()` call, the `Coro<T>` installs a `CurrentCoroGuard` that points
+`t_current_coro` at its `CoroutineScope`. Any code running on that thread during the
+poll — including coroutine body code and all destructors it triggers — can read this
+thread-local to identify which scope to register with.
+
+### Registration mechanism
+
+When a `JoinHandle` is destroyed and `t_current_coro` is non-null, the destructor:
+1. Sets `cancelled = true` on the child `TaskState`.
+2. Calls `t_current_coro->add_child(is_done, set_scope_waker)` to register the child.
+
+The `JoinHandle` destructor fires during the coroutine body's LIFO unwind (guaranteed by
+the frame lifetime invariant above), so `t_current_coro` is always valid at that point.
+
+### `transfer_to` is not needed
+
+The legacy `transfer_to` method existed to migrate pending children from a dying inner
+`Coro<T>` to the enclosing scope when the inner frame was destroyed eagerly (without first
+draining its awaited future). With the revised invariant, the awaited future is always
+drained and pre-existing pending children are always cleared before `handle.destroy()` is
+called. When `handle.destroy()` runs the inner `Coro<T>`'s destructor it will find the
+scope empty, so there is nothing to migrate.
+
+`transfer_to` and its associated locking are therefore removed.
+
+### Memory cycle note
+
+The scope waker — a `TaskWaker` that holds a `shared_ptr<Task>` for the parent — is **not**
+stored as a member of `CoroutineScope`. Storing it would create the cycle:
+
+```
+Task → Coro<T> → CoroutineScope → TaskWaker → Task
+```
+
+The waker is passed to each pending child's `set_scope_waker` callback and lives in
+`TaskState::scope_waker`, which is cleared when the child completes. No member storage of
+the waker in `CoroutineScope` is needed.
+
+## `PollDropped` — a dedicated cancellation state
+
+`PollResult<T>` carries four states:
 
 | State | Meaning |
 |---|---|
@@ -85,165 +244,97 @@ and `PollPending`:
 | `PollDropped` | cancelled and fully drained — safe to discard |
 
 `PollDropped` propagates up through the caller chain the same way a value or error does.
-Each layer that receives `PollDropped` from a child treats it as a clean termination signal:
-no value to unwrap, no exception to rethrow, just acknowledgement that the branch has
-finished draining. Combinators (select, timeout) use `PollDropped` from a cancelled branch
-as the signal that cleanup is complete and the held result can be delivered to the caller.
+Each layer that receives `PollDropped` from a child treats it as a clean termination signal.
+Combinators (select, timeout) use `PollDropped` from a cancelled branch as the signal that
+cleanup is complete.
 
-### Thread-local current coroutine
+## Protection guarantees and limitations
 
-During `poll()`, each coroutine registers itself in a thread-local slot `t_current_coro`
-(analogous to the existing `current_runtime()` mechanism). Any code running on that thread
-during the poll — including the coroutine body and any destructors triggered by it — can
-read this slot to identify which coroutine is the current "scope owner."
+The scope mechanism prevents the **frame allocation** from being freed while running futures
+or children could still reference it. It does **not** prevent the logical values of local
+variables from being destroyed while children spawned from within the frame are still
+running.
 
-### Registration mechanism
+When `handle.destroy()` is called (step 3 of the cancellation protocol, or after
+`final_suspend` on the normal path), it destructs in-scope locals in LIFO order. Any
+`JoinHandle` whose destructor fires during this destruction cancels and registers its child
+before the matching local variable is destroyed — so from the `JoinHandle`'s perspective the
+local is still live. But the cancelled child task continues running asynchronously and may
+access the local after its destructor has already run.
 
-When a `JoinHandle` is destroyed, its destructor:
-1. Sets `cancelled = true` on the child `TaskState` (existing behaviour).
-2. Reads `t_current_coro`.
-3. Adds the `TaskState` to that coroutine's pending child list.
+This is a fundamental limitation: the scope mechanism cannot prevent a spawned task from
+reading a reference after the referent is destroyed, because C++ has no borrow checker.
 
-For the normal (non-cancelled) path, the coroutine does not stall at the point of JoinHandle
-destruction. It continues executing until it reaches the next natural suspension point:
-a `co_await`, `co_yield`, or `co_return`. At that point, before proceeding, it checks its
-pending child list. If any children are still running, it returns `PollPending` instead of
-suspending or completing. The `Coro<T>` future — and all locals still in scope at that
-suspension point — remains alive while the drain proceeds. When the last pending child
-finishes it wakes the coroutine, which re-checks the list and resumes normal behaviour.
+The recommended fix is to avoid passing references to frame locals to spawned tasks
+entirely — move the data into the task, or share it via `std::shared_ptr`. When a reference
+truly must be shared, use `co_invoke` to push the spawning into an inner coroutine: the
+outer frame (and its locals) remains suspended at `co_await co_invoke(...)` for the entire
+inner coroutine lifetime, including through exceptions in the inner body. The referenced
+local is therefore guaranteed to be alive for as long as any child spawned inside runs.
 
-This is the async equivalent of `std::async`'s `std::future` blocking in its destructor:
-rather than blocking the calling thread, we delay the next suspension point.
-
-**Only tasks that are not `co_await`ed to completion need tracking.** A `JoinHandle` that is
-fully awaited is destroyed after the task is already done — the registration is a no-op and
-nothing is added to the pending list.
-
-**`detach()` opts out.** `JoinHandle::detach()` clears `m_state` before the destructor body
-runs, so the registration step is skipped entirely. Detached tasks are fire-and-forget and
-do not block the coroutine.
-
-### Cancellation propagation
-
-When a coroutine's `poll()` is called with the cancellation flag set, it does **not** resume
-the coroutine handle. Instead it:
-
-1. Sets `t_current_coro` to this coroutine (as in every poll).
-2. Calls `handle.destroy()`, which destructs all locals in LIFO order.
-3. Each `JoinHandle` destructor fires while `t_current_coro` is active, cancels its child
-   task, and registers the child's `TaskState` in this coroutine's pending list.
-4. If the pending list is non-empty, returns `PollPending`.
-5. When the last child completes it wakes the coroutine; the next poll sees an empty pending
-   list and returns `PollDropped`.
-
-Because cancelled futures are never dropped — they are always polled to `PollDropped` —
-`t_current_coro` is guaranteed to be active during frame destruction. There is no path that
-tears down a frame outside of a `poll()` call.
-
-Cancellation propagates down the task tree automatically. Each child receives its cancelled
-flag before its next poll, goes through the same destroy-and-drain sequence, and returns
-`PollDropped` when its own children have cleared. The entire subtree drains without any
-coroutine ever resuming after cancellation.
-
-### How combinators (select, timeout) participate
-
-A combinator that cancels a branch does not drop it. Instead it:
-
-1. Marks the branch as cancelled.
-2. Continues polling the cancelled branch alongside normal work.
-3. Returns `PollDropped` to its caller only once all cancelled branches have themselves
-   returned `PollDropped` (i.e., fully drained).
-
-The combinator may have its winning result in hand before the drain completes; it holds that
-result internally and delivers it to the caller only after cleanup is done.
-
-### Protection guarantees and limitations
-
-The mechanism protects locals that are **still in scope at the next suspension point**.
-It does not protect objects that are destroyed between the `JoinHandle` drop and that
-suspension point. If a child task holds a reference to an object that falls out of scope in
-that window, the reference becomes dangling before the drain completes.
-
-The `co_return` case is a notable exception: by the time `co_return` is reached, the
-coroutine's locals have already been destroyed in LIFO order. The mechanism keeps the
-`Coro<T>` future alive past `co_return` to drain children, but the referenced data is gone.
-**`Synchronize` is the explicit solution for this case** — it adds a suspend point while
-locals are still in scope, ensuring the drain completes before any referenced data is
-destroyed:
+`co_await js.drain()` placed in the same frame as the referenced local is not a safe
+alternative: any exception thrown between the `spawn()` call and the `co_await`
+short-circuits to `co_return` via the exception path, bypassing the drain and destroying
+the local while children are still running.
 
 ```cpp
-// Unsafe — local_data is destroyed before the child finishes
-Coro<void> unsafe_example() {
+// Unsafe — child continues running after local_data is destroyed
+Coro<void> bad() {
     int local_data = 42;
     auto h = spawn(worker(&local_data)).submit();
-    co_return;  // local_data destroyed here; drain wait is too late
-}
-
-// Fragile — the co_await acts as a drain point only if no exception is thrown
-// between the JoinHandle drop and the co_await. An uncaught exception would
-// unwind the stack and destroy local_data before the drain begins.
-Coro<void> fragile_example() {
-    int local_data = 42;
-    auto h = spawn(worker(&local_data)).submit();
-    // ...
-    co_await some_other_work();  // drain completes here if we reach this point
     co_return;
 }
 
-// Safe — Synchronize provides a guaranteed suspend point while local_data is alive
-Coro<void> safe_example() {
+// Deceptively unsafe — co_await js.drain() is bypassed if anything before it throws
+Coro<void> fragile() {
     int local_data = 42;
-    co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
-        sync.spawn(worker(&local_data)).submit();
-        co_return;
-    });
-    // local_data still alive here; Synchronize ensured worker finished
+    JoinSet<void> js;
+    js.add(spawn(worker(&local_data)).submit());
+    co_await js.drain();
+}
+
+// Safe — local_data lives in the outer frame, which stays suspended at co_await co_invoke()
+// for the entire inner coroutine lifetime, including through exceptions thrown inside.
+Coro<void> safe(int local_data) {
+    co_await co_invoke([](int& data) -> Coro<void> {
+        JoinSet<void> js;
+        js.add(spawn(worker(&data)).submit());
+        co_await js.drain();
+    }(local_data));
 }
 ```
 
-### Non-coroutine futures
+## Non-coroutine futures
 
-A non-coroutine future only needs to actively participate in this mechanism if it directly
-calls `spawn()` itself. If it doesn't spawn, the only relevant case is polling a child
-`Coro<T>` that spawns tasks — and in that case the child coroutine manages its own drain
-and only returns `PollDropped` once its frame is safe to free. The non-coroutine parent
-propagates this transparently by continuing to poll until it sees `PollDropped`, which is
-what any well-written future combinator already does.
+A non-coroutine future only needs to participate in this mechanism if it directly calls
+`spawn()` itself. If it wraps other futures, it propagates `PollDropped` transparently by
+continuing to poll until it sees `PollDropped`, which any correct future combinator already
+does.
 
-The one requirement on non-coroutine futures that wrap other futures: they must not drop a
-child early in their cancellation or error-handling paths. A future that drops its child
-before it has drained would short-circuit the guarantee. Such futures need to treat a
-cancelled child's `PollDropped` as the drain completion signal, not a normal result.
+The one requirement on combinators that cancel branches: they must not drop a child future
+before it returns `PollDropped`. They must continue polling the cancelled branch until it
+signals that cleanup is complete.
 
-Non-coroutine futures that call `spawn()` directly would need an explicit mechanism —
-registering with the current coroutine via `t_current_coro`, or managing their own pending
-list. In practice this is expected to be rare: the natural place to spawn tasks is inside a
-coroutine body, not inside a hand-written future.
+## Interaction with explicit `Synchronize`
+
+> **Deprecated:** prefer `co_invoke` + `JoinSet::drain()` for new code.
+
+`Synchronize` provides an explicit mid-coroutine drain point. Both roles are now covered
+by `co_invoke` + `JoinSet`. The safe `Synchronize` example above can be rewritten as:
+
+```cpp
+Coro<void> safe_example() {
+    int local_data = 42;
+    co_await co_invoke([](int& data) -> Coro<void> {
+        JoinSet<void> js;
+        js.add(spawn(worker(&data)).submit());
+        co_await js.drain();
+    }(local_data));
+}
+```
 
 **Comparison with Tokio:** Tokio does not have this problem because `tokio::spawn()` requires
 `Send + 'static` — spawned tasks must own all their data, making it structurally impossible
 for a spawned task to hold a reference into the spawning context. The type system enforces
-the guarantee at compile time. The third-party `tokio_scoped` crate approaches what we are
-building, but achieves safety by blocking the scope exit synchronously rather than via async
-draining. Our implicit scope mechanism fills the gap that Rust closes with the borrow
-checker, trading a compile-time guarantee for a runtime one.
-
-### Interaction with explicit `Synchronize`
-
-> **Deprecated:** prefer `co_invoke` + `JoinSet::drain()` for new code.
-
-`Synchronize` provides an explicit mid-coroutine drain point and a safe scope for
-reference-capturing lambdas. Both roles are now covered by `co_invoke` + `JoinSet`.
-
-The safe `Synchronize` example above can be rewritten as:
-
-```cpp
-Coro<void> safe_example() {
-    int local_data = 42;
-    co_await co_invoke([&]() -> Coro<void> {
-        JoinSet<void> js;
-        js.spawn(worker(&local_data));
-        co_await js.drain();  // guaranteed drain point while local_data is alive
-    });
-}
-```
+the guarantee at compile time. Our implicit scope mechanism fills the gap that Rust closes
+with the borrow checker, trading a compile-time guarantee for a runtime one.

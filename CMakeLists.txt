@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+option(WITH_GPERFTOOLS "Build with gperftools" OFF)
 if(ENABLE_TSAN)
     add_compile_options(-fsanitize=thread -g)
     add_link_options(-fsanitize=thread)
@@ -16,7 +17,9 @@ endif()
 option(BUILD_TESTING "Build unit tests" OFF)
 option(BUILD_EXAMPLES "Build examples" OFF)
 
-#find_package(gperftools REQUIRED)
+if(WITH_GPERFTOOLS)
+    find_package(gperftools REQUIRED)
+endif()
 find_package(libuv REQUIRED)
 find_package(Libwebsockets REQUIRED)
 
@@ -41,7 +44,10 @@ add_library(coro
     src/circular_byte_buffer.cpp
 )
 target_include_directories(coro PUBLIC include)
-target_link_libraries(coro PUBLIC libuv::uv_a websockets cap)
+target_link_libraries(coro PUBLIC
+    libuv::uv_a
+    $<$<BOOL:${WITH_GPERFTOOLS}>:gperftools::gperftools>
+    websockets)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)

@@ -8,7 +8,6 @@
 #include <coroutine>
 #include <exception>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <utility>
 
@@ -24,21 +23,23 @@ struct CoroPromiseBase {
     void unhandled_exception() noexcept { m_exception = std::current_exception(); }
 
     // Only Future<> types may be co_await-ed inside Coro or CoroStream.
-    // Clears m_poll_current so a stale hook from a previous co_await is never mistakenly
-    // called. Passes &m_poll_current to FutureAwaitable so await_suspend() can register
-    // the re-poll hook for spurious-wake protection.
+    // Clears m_poll_current and m_cancel_current so stale hooks from previous co_awaits
+    // are never mistakenly called. Passes both to FutureAwaitable so await_suspend() can
+    // register the re-poll and (for Cancellable futures) cancel hooks.
     // Lvalue overload: future is moved into FutureAwaitable (handle is consumed).
     template<Future F>
     FutureAwaitable<F> await_transform(F& future) {
-        m_poll_current = nullptr;
-        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current);
+        m_poll_current   = nullptr;
+        m_cancel_current = nullptr;
+        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current, &m_cancel_current);
     }
 
     // Rvalue overload: future is forwarded (moved) into FutureAwaitable.
     template<Future F>
     FutureAwaitable<F> await_transform(F&& future) {
-        m_poll_current = nullptr;
-        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current);
+        m_poll_current   = nullptr;
+        m_cancel_current = nullptr;
+        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current, &m_cancel_current);
     }
 
     // Non-Future types are rejected at compile time.
@@ -51,6 +52,10 @@ struct CoroPromiseBase {
     // true (or at the start of the next await_transform). Non-null only while the
     // coroutine is suspended at a co_await expression.
     std::function<bool()> m_poll_current;
+    // Set by FutureAwaitable::await_suspend() only for Cancellable futures.
+    // Called by Coro::poll() when cancelled to cooperatively cancel the awaited future
+    // so it drains before the outer frame is torn down.
+    std::function<void()> m_cancel_current;
 };
 
 template<typename T>
@@ -77,9 +82,14 @@ struct CoroPromiseResult<void> : CoroPromiseBase
  * Satisfies @ref Future<T>. The coroutine starts suspended; the executor drives it
  * by repeatedly calling `poll()` until it returns a non-`Pending` result.
  *
- * Supports cooperative cancellation via `cancel()`. Once cancelled, `poll()` destroys
- * the coroutine frame (firing `JoinHandle` destructors in LIFO order), drains any
- * spawned children tracked by the implicit @ref CoroutineScope, then returns `PollDropped`.
+ * Supports cooperative cancellation via `cancel()`. Once cancelled, `poll()`:
+ * 1. If a Cancellable future is awaited: cancels it and polls until it returns non-Pending.
+ * 2. Calls `handle.destroy()` to free the frame (LIFO dtors; JoinHandle dtors register
+ *    children with the scope).
+ * 3. Drains all pending scope children, then returns `PollDropped`.
+ *
+ * Non-Cancellable awaited futures are leaf futures (no child references) and are dropped
+ * immediately as part of the LIFO teardown in step 2.
  *
  * @tparam T The value type produced on successful completion.
  */
@@ -95,8 +105,7 @@ public:
     };
 
     explicit Coro(std::coroutine_handle<promise_type> handle)
-        : m_handle(handle)
-        , m_scope(std::make_unique<detail::CoroutineScope>()) {}
+        : m_handle(handle) {}
 
     Coro(const Coro&)            = delete;
     Coro& operator=(const Coro&) = delete;
@@ -104,28 +113,29 @@ public:
     Coro(Coro&& other) noexcept
         : m_handle(std::exchange(other.m_handle, {}))
         , m_scope(std::move(other.m_scope))
-        , m_cancelled(other.m_cancelled) {}
+        , m_cancelled(other.m_cancelled)
+        , m_cancel_draining(other.m_cancel_draining) {}
 
     Coro& operator=(Coro&& other) noexcept {
         if (this != &other) {
             if (m_handle) {
-                detail::CurrentCoroGuard guard(m_scope.get());
+                detail::CurrentCoroGuard guard(&m_scope);
                 m_handle.destroy();
             }
-            m_handle    = std::exchange(other.m_handle, {});
-            m_scope     = std::move(other.m_scope);
-            m_cancelled = other.m_cancelled;
+            m_handle          = std::exchange(other.m_handle, {});
+            m_scope           = std::move(other.m_scope);
+            m_cancelled       = other.m_cancelled;
+            m_cancel_draining = other.m_cancel_draining;
         }
         return *this;
     }
 
     ~Coro() {
-        if (m_handle) {
-            // Set t_current_coro so any JoinHandle destructors in the frame register
-            // their children with this scope before the frame memory is freed.
-            detail::CurrentCoroGuard guard(m_scope.get());
-            m_handle.destroy();
-        }
+        if (!m_handle) return;
+        // Set t_current_coro so any JoinHandle destructors in the frame register
+        // their children with this scope before the frame memory is freed.
+        detail::CurrentCoroGuard guard(&m_scope);
+        m_handle.destroy();
     }
 
     /// @brief Marks this coroutine for cancellation. Takes effect on the next `poll()` call.
@@ -141,15 +151,38 @@ public:
             Coro *self;
         };
 
-        // Cancelled path: destroy the frame (fires JoinHandle dtors → registers children),
-        // then drain pending children before returning PollDropped.
         if (m_cancelled) {
             if (m_handle && !m_handle.done()) {
-                detail::CurrentCoroGuard guard(m_scope.get());
-                m_handle.destroy();
-                m_handle = {};
+                auto& promise = m_handle.promise();
+                promise.m_ctx = &ctx;
+
+                // Step 1: if a Cancellable future is awaited, cancel it and wait for
+                // it to drain before destroying the frame. Non-Cancellable futures are
+                // leaf futures — they are dropped immediately in handle.destroy() below.
+                if (!m_cancel_draining && promise.m_cancel_current) {
+                    promise.m_cancel_current();
+                    promise.m_cancel_current = nullptr;
+                    m_cancel_draining = true;
+                }
+                if (m_cancel_draining) {
+                    if (promise.m_poll_current && !promise.m_poll_current()) {
+                        return PollPending;  // awaited Cancellable future still draining
+                    }
+                    promise.m_poll_current = nullptr;
+                    m_cancel_draining = false;
+                }
+
+                // Step 2: destroy the frame. Runs LIFO dtors; JoinHandle dtors fire
+                // and register children with our scope.
+                {
+                    detail::CurrentCoroGuard guard(&m_scope);
+                    m_handle.destroy();
+                    m_handle = {};
+                }
             }
-            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+
+            // Step 3: drain all scope children (pre-existing + newly registered above).
+            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
                 return PollPending;
             return PollDropped;
         }
@@ -159,10 +192,10 @@ public:
 
         // Frame already ran to completion but children were still draining — re-check now.
         if (m_handle.done()) {
-            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
                 return PollPending;
             Destroy cleanup(this);
-             auto& p = m_handle.promise();
+            auto& p = m_handle.promise();
             if (p.m_exception)
                 return PollError(p.m_exception);
             if constexpr (std::is_void_v<T>) {
@@ -187,15 +220,15 @@ public:
         }
 
         {
-            detail::CurrentCoroGuard guard(m_scope.get());
+            detail::CurrentCoroGuard guard(&m_scope);
             m_handle.resume();
         }
 
         if (m_handle.done()) {
             // Wait for any children spawned during this execution before completing.
-            if (m_scope->set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
                 return PollPending;
-            
+
             Destroy cleanup(this);
 
             if (promise.m_exception)
@@ -210,16 +243,19 @@ public:
 
         // Coroutine suspended — check if pending children need the waker updated.
         // (Children drain in parallel with the coroutine's own suspension.)
-        if (m_scope->has_pending())
-            m_scope->set_drain_waker(ctx.getWaker()->clone());
+        if (m_scope.has_pending())
+            m_scope.set_drain_waker(ctx.getWaker()->clone());
 
         return PollPending;
     }
 
 private:
-    std::coroutine_handle<promise_type>      m_handle;
-    std::unique_ptr<detail::CoroutineScope>  m_scope;
-    bool                                     m_cancelled = false;
+    std::coroutine_handle<promise_type> m_handle;
+    detail::CoroutineScope              m_scope;
+    bool                                m_cancelled       = false;
+    // True while waiting for an awaited Cancellable future to drain during cancellation.
+    // Persists across poll() calls so re-entries continue polling rather than re-cancelling.
+    bool                                m_cancel_draining = false;
 };
 
 } // namespace coro

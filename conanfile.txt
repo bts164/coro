@@ -1,6 +1,7 @@
 [requires]
 libuv/1.47.0
 libwebsockets/4.3.5
+gperftools/[>=2.17]
 gtest/[>=1.14.0]
 
 [options]

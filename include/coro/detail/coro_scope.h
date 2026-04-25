@@ -31,26 +31,46 @@ struct PendingChild {
 /**
  * @brief Per-coroutine scope that tracks spawned children whose `JoinHandle`s were dropped.
  *
- * Every `Coro<T>` and `CoroStream<T>` owns a `CoroutineScope` (via `unique_ptr` — the
- * scope is not movable because it contains a `std::mutex`). The scope provides the
- * *implicit structured concurrency* guarantee: a coroutine does not complete (or return
- * `PollDropped`) until all children it spawned and then dropped have themselves finished.
+ * Every `Coro<T>` and `CoroStream<T>` owns a `CoroutineScope` as a direct value member.
+ * The scope provides the *implicit structured concurrency* guarantee: a coroutine's frame
+ * is not freed until all children it spawned and then dropped have themselves finished.
+ *
+ * `CoroutineScope` contains a `std::mutex` and is therefore not copyable. It is movable
+ * via a custom move constructor that moves the pending-child list and default-constructs
+ * a fresh mutex at the destination. Moves only occur before the first `poll()` call
+ * (when `Coro<T>` is returned from a coroutine function and moved into a `Task`), at
+ * which point `m_pending` is always empty and the mutex is in its default unlocked state.
  *
  * ### Registration
  * When a `JoinHandle` destructor fires while `t_current_coro` is non-null, it calls
  * `add_child()` to register the child's `TaskState` callbacks with the enclosing scope.
  *
  * ### Drain
- * After the coroutine frame completes (or is destroyed for cancellation), `Coro::poll()`
- * calls `set_drain_waker()`. This installs a waker on every pending child so they can
- * wake the parent when they finish. Once all children are done, `poll()` delivers the
- * final result.
+ * After the coroutine frame is destroyed, `Coro::poll()` calls `set_drain_waker()`. This
+ * installs a waker on every pending child so they can wake the parent when they finish.
+ * Once all children are done, `poll()` delivers `PollDropped`.
  *
  * ### Thread safety
  * All methods are protected by an internal mutex — safe for the multi-threaded executor.
  */
 class CoroutineScope {
 public:
+    CoroutineScope() = default;
+
+    // Move constructor: moves pending children, default-constructs a fresh mutex.
+    // Safe because moves only happen before first poll() when m_pending is always empty.
+    CoroutineScope(CoroutineScope&& other) noexcept
+        : m_pending(std::move(other.m_pending)) {}
+
+    CoroutineScope& operator=(CoroutineScope&& other) noexcept {
+        if (this != &other)
+            m_pending = std::move(other.m_pending);
+        return *this;
+    }
+
+    CoroutineScope(const CoroutineScope&)            = delete;
+    CoroutineScope& operator=(const CoroutineScope&) = delete;
+
     /**
      * @brief Registers a pending child. Called from `JoinHandle::~JoinHandle()` while
      * `t_current_coro` points to this scope.
@@ -86,8 +106,8 @@ public:
      * MEMORY CYCLE WARNING — do NOT store `waker` as a member of this class.
      *
      * `waker` is a TaskWaker that holds a `shared_ptr<Task>` for the parent coroutine.
-     * That Task owns (via unique_ptr) the Coro<T>, which owns (via unique_ptr) this
-     * CoroutineScope.  Storing `waker` here would create the cycle:
+     * That Task owns (via unique_ptr) the Coro<T>, which owns this CoroutineScope as a
+     * value member.  Storing `waker` here would create the cycle:
      *
      *   Task → Coro<T> → CoroutineScope → TaskWaker → Task
      *

@@ -5,6 +5,7 @@
 #include <coro/coro.h>
 #include <coro/task/join_handle.h>
 #include <coro/runtime/runtime.h>
+#include <atomic>
 #include <memory>
 
 using namespace coro;
@@ -190,6 +191,98 @@ Coro<void> spawns_and_returns(std::shared_ptr<int> out, bool cancel = false) {
     co_return;
 }
 
+class MarkExitSequence {
+public:
+    static inline std::atomic_int64_t s_next = 0;
+    MarkExitSequence(std::atomic_int64_t *i) :
+        m_value(i)
+    {}
+    MarkExitSequence(MarkExitSequence &&other) :
+        m_value(std::exchange(other.m_value, nullptr))
+    {}
+    MarkExitSequence& operator=(MarkExitSequence &&other) {
+        m_value = std::exchange(other.m_value, nullptr);
+        return *this;
+    }
+    ~MarkExitSequence() {
+        if (nullptr != m_value) {
+            m_value->store(s_next.fetch_add(1));
+        }
+    }
+private:
+    std::atomic_int64_t *m_value = nullptr;
+};
+
+class EventFuture
+{
+    struct SharedState {
+        std::mutex m_mutex;
+        bool m_set = false;
+        std::shared_ptr<coro::detail::Waker> m_waker;
+    };
+    std::shared_ptr<SharedState> m_state;
+public:
+    using OutputType = void;
+    EventFuture() :
+        m_state(new SharedState())
+    {}
+    EventFuture(EventFuture const &) = default;
+    EventFuture& operator=(EventFuture  const &) = default;
+    ~EventFuture() = default;
+    coro::PollResult<void> poll(coro::detail::Context ctx) {
+        std::unique_lock lk(m_state->m_mutex);
+        if (m_state->m_set) {
+            return PollReady;
+        }
+        m_state->m_waker = ctx.getWaker();
+        return PollPending;
+    }
+    void set() {
+        std::unique_lock lk(m_state->m_mutex);
+        if (!std::exchange(m_state->m_set, true)) {
+            if (auto waker = std::exchange(m_state->m_waker, nullptr); waker) {
+                lk.unlock();
+                waker->wake();
+            }
+        }
+    }
+};
+
+std::atomic_int64_t scopeSequenceLocalRoot = -1;
+std::atomic_int64_t scopeSequenceArgOuter = -1;
+std::atomic_int64_t scopeSequenceArgInner = -1;
+std::atomic_int64_t scopeSequenceLocalOuter = -1;
+std::atomic_int64_t scopeSequenceLocalInner = -1;
+EventFuture rootEvent;
+EventFuture outerEvent;
+EventFuture innerEvent;
+
+TEST(CoroutineScopeIntegration, ScopeLifetimeSequence) {
+    Runtime rt(1);
+    rt.block_on([]() -> coro::Coro<void> {
+        MarkExitSequence local(&scopeSequenceLocalRoot);
+        auto handle = coro::spawn([](MarkExitSequence) -> coro::Coro<void> {
+            // if local were passed by ref to the inner coroutine, then it's lifetime
+            // needs to extend past when the cancel of inner completes and it it drained
+            MarkExitSequence local(&scopeSequenceLocalOuter);
+            co_await coro::spawn([](MarkExitSequence) -> coro::Coro<void> {
+                MarkExitSequence local(&scopeSequenceLocalInner);
+                rootEvent.set();
+                co_await innerEvent;
+                co_return;
+            }(MarkExitSequence(&scopeSequenceArgInner))).submit();
+            co_return;
+        }(MarkExitSequence(&scopeSequenceArgOuter))).submit();
+        co_await rootEvent;
+        co_return;
+    }());
+    EXPECT_EQ((scopeSequenceLocalRoot.load()),  0);
+    EXPECT_EQ((scopeSequenceLocalInner.load()), 1);
+    EXPECT_EQ((scopeSequenceArgInner.load()),   2);
+    EXPECT_EQ((scopeSequenceLocalOuter.load()), 3);
+    EXPECT_EQ((scopeSequenceArgOuter.load()),   4);
+}
+
 TEST(CoroutineScopeIntegration, CoroutineWaitsForDroppedChildBeforeCompleting) {
     Runtime rt(1);
     auto shared = std::make_shared<int>(0);
@@ -241,6 +334,17 @@ Coro<void> outer_calls_inner(std::shared_ptr<int> out) {
     co_await inner_spawn(out);
 }
 
+// Inner coroutine that spawns a fire-and-forget scope child then blocks on a
+// non-Cancellable future. Used by CancelledOuterDrainsInnerCoroScopeChildren.
+Coro<void> inner_with_scope_child(std::shared_ptr<std::atomic<int>> counter,
+                                  EventFuture blocker) {
+    (void)spawn([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
+        counter->fetch_add(1);
+        co_return;
+    }(counter)).submit().cancelOnDestroy(false);
+    co_await blocker;
+}
+
 TEST(CoroutineScopeIntegration, NestedCoroutineDrainsItsOwnChildren) {
     Runtime rt(1);
     auto shared = std::make_shared<int>(0);
@@ -248,7 +352,213 @@ TEST(CoroutineScopeIntegration, NestedCoroutineDrainsItsOwnChildren) {
     EXPECT_EQ(*shared, 99);
 }
 
-// NOTE: End-to-end cancellation propagation tests (cancelled coroutine drains
-// spawned children before returning PollDropped, and children receive cancellation
-// via select/timeout combinators) are deferred until those combinators are
-// implemented. See doc/coroutine_scope.md for the full design.
+// ─────────────────────────────────────────────────────────────────────────────
+// Cancellation integration tests
+// Tests below this line exercise the new cooperative-cancel protocol described in
+// doc/coroutine_scope.md. They require the following changes to be implemented:
+//   1. Coro<T>::poll() cancellation path: drain Cancellable awaited future before
+//      calling handle.destroy() (non-Cancellable futures are dropped immediately).
+//   2. CoroStream::poll_next() cancellation path: same treatment.
+//   3. CoroutineScope: value member with custom move (no unique_ptr).
+//   4. transfer_to removed — co_awaited inner Coros are fully drained via the
+//      cooperative cancel protocol before the outer frame is torn down.
+// Tests that pass today are marked [PASSING]. Tests requiring the above changes
+// are unmarked and expected to fail until the implementation is complete.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test 1: A task sleeping at co_await must actually wake and cancel when its
+// JoinHandle is destroyed.  Without task_waker the wake() call is a no-op and
+// the scope drain would deadlock.
+TEST(CoroutineScopeIntegration, SleepingTaskWakesOnCancel) {
+    Runtime rt(1);
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    EventFuture started;
+    EventFuture blocker; // never set
+
+    rt.block_on([](std::shared_ptr<std::atomic<int>> counter,
+                   EventFuture started, EventFuture blocker) -> Coro<void> {
+        auto handle = spawn([](std::shared_ptr<std::atomic<int>> counter,
+                               EventFuture started, EventFuture blocker) -> Coro<void> {
+            counter->fetch_add(1);
+            started.set();
+            co_await blocker;          // registers task_waker, then parks
+            counter->fetch_add(1);     // must never execute
+        }(counter, started, blocker)).submit();
+        co_await started;
+        // handle destroyed → child cancelled → task_waker fires → child cleans up
+    }(counter, started, blocker));
+
+    EXPECT_EQ(counter->load(), 1);
+}
+
+// Test 2: root cancels A (Cancellable via JoinHandle); A cooperatively cancels B
+// (also Cancellable); B eagerly destroys (EventFuture is not Cancellable).
+// B's locals must be destroyed before A's.
+TEST(CoroutineScopeIntegration, ThreeLevelCooperativeCancelOrdering) {
+    MarkExitSequence::s_next.store(0);
+    std::atomic_int64_t seqA{-1}, seqB{-1};
+    EventFuture innerBlocker; // never set
+    EventFuture innerStarted;
+
+    Runtime rt(1);
+    rt.block_on([](std::atomic_int64_t* seqA, std::atomic_int64_t* seqB,
+                   EventFuture innerBlocker, EventFuture innerStarted) -> Coro<void> {
+        auto handle = spawn([](std::atomic_int64_t* seqA, std::atomic_int64_t* seqB,
+                               EventFuture innerBlocker,
+                               EventFuture innerStarted) -> Coro<void> {
+            MarkExitSequence localA(seqA);
+            co_await spawn([](std::atomic_int64_t* seqB,
+                              EventFuture innerBlocker,
+                              EventFuture innerStarted) -> Coro<void> {
+                MarkExitSequence localB(seqB);
+                innerStarted.set();
+                co_await innerBlocker;
+            }(seqB, innerBlocker, innerStarted)).submit();
+        }(seqA, seqB, innerBlocker, innerStarted)).submit();
+        co_await innerStarted;
+        // handle destroyed → A cancelled → A cooperative-cancels B → B eagerly destroyed
+    }(&seqA, &seqB, innerBlocker, innerStarted));
+
+    EXPECT_GE(seqB.load(), 0);
+    EXPECT_GE(seqA.load(), 0);
+    EXPECT_LT(seqB.load(), seqA.load()); // B's locals die before A's
+}
+
+// Test 3: When a coroutine is cancelled it must complete BOTH the cooperative
+// cancel of a co_awaited child AND the scope drain of a fire-and-forget child.
+TEST(CoroutineScopeIntegration, CooperativeCancelWithScopeDrain) {
+    Runtime rt(1);
+    auto coopCounter  = std::make_shared<std::atomic<int>>(0);
+    auto scopeCounter = std::make_shared<std::atomic<int>>(0);
+    EventFuture coopBlocker; // never set — blocks the co_awaited child
+    EventFuture outerStarted;
+
+    rt.block_on([](std::shared_ptr<std::atomic<int>> coopCounter,
+                   std::shared_ptr<std::atomic<int>> scopeCounter,
+                   EventFuture coopBlocker,
+                   EventFuture outerStarted) -> Coro<void> {
+        auto handle = spawn([](std::shared_ptr<std::atomic<int>> coopCounter,
+                               std::shared_ptr<std::atomic<int>> scopeCounter,
+                               EventFuture coopBlocker,
+                               EventFuture outerStarted) -> Coro<void> {
+            // fire-and-forget child registered in scope (not cancelled when outer is)
+            (void)spawn([](std::shared_ptr<std::atomic<int>> scopeCounter) -> Coro<void> {
+                scopeCounter->fetch_add(1);
+                co_return;
+            }(scopeCounter)).submit().cancelOnDestroy(false);
+
+            outerStarted.set();
+
+            // co_awaited child — Cancellable, triggers cooperative cancel path
+            co_await spawn([](std::shared_ptr<std::atomic<int>> coopCounter,
+                              EventFuture coopBlocker) -> Coro<void> {
+                co_await coopBlocker;
+                coopCounter->fetch_add(1); // must not execute
+            }(coopCounter, coopBlocker)).submit();
+        }(coopCounter, scopeCounter, coopBlocker, outerStarted)).submit();
+
+        co_await outerStarted;
+        // handle destroyed → outer cancelled; both children must settle
+    }(coopCounter, scopeCounter, coopBlocker, outerStarted));
+
+    EXPECT_EQ(coopCounter->load(),  0); // co_awaited child was cancelled
+    EXPECT_EQ(scopeCounter->load(), 1); // fire-and-forget child ran via scope drain
+}
+
+// Test 4: A task whose JoinHandle is dropped (cancelled) before the executor
+// ever polls it must not execute its body and must not hang.
+TEST(CoroutineScopeIntegration, TaskCancelledBeforeFirstPoll) {
+    Runtime rt(1);
+    auto counter = std::make_shared<std::atomic<int>>(0);
+
+    rt.block_on([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
+        {
+            // Single-threaded executor won't poll the child until parent yields,
+            // so cancelled=true is set before the first poll.
+            (void)spawn([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
+                counter->fetch_add(1);
+                co_return;
+            }(counter)).submit(); // handle destroyed immediately → cancelled
+        }
+        co_return;
+    }(counter));
+
+    EXPECT_EQ(counter->load(), 0);
+}
+
+// Test 5: A child spawned with cancelOnDestroy=false inside a cancelled parent
+// must run to completion via scope drain, not be cancelled with the parent.
+TEST(CoroutineScopeIntegration, NoCancelChildWithCancelOnDestroyFalse) {
+    Runtime rt(1);
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    EventFuture parentBlocker; // never set
+    EventFuture parentStarted;
+
+    rt.block_on([](std::shared_ptr<std::atomic<int>> counter,
+                   EventFuture parentBlocker,
+                   EventFuture parentStarted) -> Coro<void> {
+        auto handle = spawn([](std::shared_ptr<std::atomic<int>> counter,
+                               EventFuture parentBlocker,
+                               EventFuture parentStarted) -> Coro<void> {
+            (void)spawn([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
+                counter->fetch_add(1);
+                co_return;
+            }(counter)).submit().cancelOnDestroy(false);
+
+            parentStarted.set();
+            co_await parentBlocker; // blocks here (EventFuture not Cancellable → eager destroy)
+        }(counter, parentBlocker, parentStarted)).submit();
+
+        co_await parentStarted;
+        // handle destroyed → parent cancelled; scope-child must still run
+    }(counter, parentBlocker, parentStarted));
+
+    EXPECT_EQ(counter->load(), 1);
+}
+
+// Test 6: detach() must prevent the task from being registered in the enclosing
+// scope.  A detached task blocking on a never-set EventFuture would deadlock
+// the scope drain if incorrectly registered.  Reaching the SUCCEED() proves
+// the scope drained without waiting for the detached task.
+TEST(CoroutineScopeIntegration, DetachedTaskNotRegisteredInScope) {
+    Runtime rt(1);
+    EventFuture neverSet; // never set — would cause infinite scope drain if registered
+
+    rt.block_on([](EventFuture neverSet) -> Coro<void> {
+        (void)spawn([](EventFuture neverSet) -> Coro<void> {
+            co_await neverSet; // would block forever
+        }(neverSet)).submit().detach();
+        co_return;
+    }(neverSet));
+
+    SUCCEED();
+}
+
+// Test 7: When the outer coroutine is cancelled while co_awaiting an inner coroutine,
+// the inner coroutine is cancelled cooperatively (it is Cancellable), which causes it
+// to drain its own scope children before returning PollDropped. The outer receives
+// PollDropped only after that drain is complete. This verifies the design invariant
+// that makes transfer_to unnecessary: a co_awaited inner Coro is always fully drained
+// via the cancel protocol before the outer frame is torn down.
+TEST(CoroutineScopeIntegration, CancelledOuterDrainsInnerCoroScopeChildren) {
+    Runtime rt(1);
+    auto counter = std::make_shared<std::atomic<int>>(0);
+    EventFuture started;
+    EventFuture blocker; // never set
+
+    rt.block_on([](std::shared_ptr<std::atomic<int>> counter,
+                   EventFuture started, EventFuture blocker) -> Coro<void> {
+        auto handle = spawn([](std::shared_ptr<std::atomic<int>> counter,
+                               EventFuture started,
+                               EventFuture blocker) -> Coro<void> {
+            started.set();
+            co_await inner_with_scope_child(counter, blocker);
+        }(counter, started, blocker)).submit();
+        co_await started;
+        // handle destroyed → outer task cancelled → inner_with_scope_child is
+        // Cancellable, so it must be drained (including its cancelOnDestroy=false
+        // scope child) before PollDropped propagates up.
+    }(counter, started, blocker));
+
+    EXPECT_EQ(counter->load(), 1);
+}

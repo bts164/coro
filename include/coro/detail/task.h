@@ -125,23 +125,42 @@ private:
 
         bool poll(Context& ctx) override {
             if (m_completed) return true;
-            if (m_state && m_state->cancelled.load(std::memory_order_relaxed)) {
-                m_state->mark_done();
-                return true;
+
+            const bool cancelled = m_state && m_state->cancelled.load(std::memory_order_relaxed);
+
+            if (cancelled) {
+                if constexpr (Cancellable<F>) {
+                    // Cooperative cancel: call cancel() once, then poll until the future
+                    // drains (Coro<T>/CoroStream<T> will run the 4-step cancel protocol).
+                    if (!m_cancel_requested) {
+                        m_future.cancel();
+                        m_cancel_requested = true;
+                    }
+                } else {
+                    // Non-Cancellable (leaf) future: drop immediately.
+                    if (m_state) m_state->mark_done();
+                    return true;
+                }
+            } else {
+                // Keep self_waker current so the JoinHandle destructor can wake this task
+                // if it sets cancelled=true while the task is sleeping. Cleared by
+                // mark_done/setResult/setException to break the Task→TaskState→TaskWaker→Task cycle.
+                if (m_state) {
+                    auto waker = ctx.getWaker()->clone();
+                    std::lock_guard lock(m_state->mutex);
+                    m_state->self_waker = std::move(waker);
+                }
             }
 
             auto result = m_future.poll(ctx);
             if (result.isPending()) return false;
 
-            if (result.isDropped()) {
-                if (m_state) m_state->mark_done();
-                return true;
-            }
-
             m_completed = true;
             if (!m_state) return true;
 
-            if (result.isError()) {
+            if (cancelled || result.isDropped()) {
+                m_state->mark_done();
+            } else if (result.isError()) {
                 m_state->setException(result.error());
             } else {
                 if constexpr (std::is_void_v<OutputType>)
@@ -154,7 +173,8 @@ private:
 
         F         m_future;
         StatePtr  m_state;
-        bool      m_completed = false;
+        bool      m_completed        = false;
+        bool      m_cancel_requested = false;
     };
 
     std::unique_ptr<PollableBase> m_impl;

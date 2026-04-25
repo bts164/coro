@@ -43,11 +43,26 @@ public:
     JoinHandle(JoinHandle&&) noexcept            = default;
     JoinHandle& operator=(JoinHandle&&) noexcept = default;
 
-    /// @brief Cancels the task and, if inside a coroutine poll(), registers with the enclosing scope.
+    /// @brief Marks the task for cancellation and wakes it so it sees cancelled on its next poll.
+    /// Satisfies the Cancellable concept — the enclosing Coro<T> cancel protocol calls this,
+    /// then polls the JoinHandle until it returns non-Pending, ensuring the inner task fully
+    /// drains (and its frame locals are destroyed) before the outer frame is torn down.
+    void cancel() noexcept {
+        if (!m_state) return;
+        m_state->cancelled.store(true, std::memory_order_relaxed);
+        std::shared_ptr<detail::Waker> waker;
+        {
+            std::lock_guard lock(m_state->mutex);
+            waker = std::move(m_state->self_waker);
+        }
+        if (waker) waker->wake();
+    }
+
+    /// @brief Cancels the task (if cancelOnDestroy) and registers with the enclosing scope.
     ~JoinHandle() {
         if (!m_state) return;  // detached via detach()
         if (m_cancelOnDestroy) {
-            m_state->cancelled.store(true, std::memory_order_relaxed);
+            cancel();
         }
         if (detail::t_current_coro) {
             auto state = m_state;  // capture shared_ptr by value
@@ -84,17 +99,22 @@ public:
 
     PollResult<T> poll(detail::Context& ctx) {
         std::lock_guard lock(m_state->mutex);
-        if (m_state->exception)
-            return PollError(m_state->exception);
-        if constexpr (std::is_void_v<T>) {
-            if (m_state->result) {
-                m_state->result = false;
-                return PollReady;
+        // Check terminated first: covers normal completion, exception, and cancellation
+        // (mark_done sets terminated without setting result, so checking result alone
+        // would incorrectly leave a cancelled void task as Pending indefinitely).
+        if (m_state->terminated) {
+            if (m_state->exception)
+                return PollError(m_state->exception);
+            if constexpr (std::is_void_v<T>) {
+                if (m_state->result) {
+                    m_state->result = false;
+                    return PollReady;
+                }
+            } else {
+                if (m_state->result.has_value())
+                    return std::move(*m_state->result);
             }
-        } else {
-            if (m_state->result.has_value()) {
-                return std::move(*m_state->result);
-            }
+            return PollDropped; // task was cancelled before producing a result
         }
         // Not ready yet — store waker so the Task can wake us on completion.
         m_state->join_waker = ctx.getWaker();
