@@ -1,7 +1,5 @@
 [requires]
-libuv/1.47.0
-libwebsockets/4.3.5
-gperftools/[>=2.17]
+coro/[0.1.0]
 gtest/[>=1.14.0]
 
 [options]

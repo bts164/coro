@@ -47,6 +47,16 @@ nav:
         - spawn_on: coro/namespacecoro/#function-spawn_on
         - spawn_blocking: coro/namespacecoro/#function-spawn_blocking
         - JoinSet: coro/classcoro_1_1JoinSet.md
+      - Channels:
+        - Oneshot:
+          - OneshotSender: coro/classcoro_1_1oneshot_1_1OneshotSender.md
+          - OneshotReceiver: coro/classcoro_1_1oneshot_1_1OneshotReceiver.md
+        - Mpsc:
+          - MpscSender: coro/classcoro_1_1mpsc_1_1MpscSender.md
+          - MpscReceiver: coro/classcoro_1_1mpsc_1_1MpscReceiver.md
+        - Watch:
+          - WatchSender: coro/classcoro_1_1watch_1_1WatchSender.md
+          - WatchReceiver: coro/classcoro_1_1watch_1_1WatchReceiver.md
       - Combinators:
         - join: coro/namespacecoro/#function-join
         - select: coro/namespacecoro/#function-select

@@ -227,6 +227,37 @@ public:
         return {};
     }
 
+    /**
+     * @brief Modifies the watched value in place, notifying receivers only if changed.
+     *
+     * Calls `modify(T&)` under the exclusive value lock. If `modify` returns `true`
+     * the version is incremented and all suspended receivers are woken. If `modify`
+     * returns `false` the value, version, and waiters are left untouched.
+     *
+     * @param modify Callable with signature `bool(T&)`. Return `true` to signal
+     *               that the value was changed, `false` to suppress notification.
+     * @return `true` if `modify` indicated a change (receivers notified);
+     *         `false` if `modify` indicated no change (no-op).
+     */
+    template<typename F>
+    bool sendIfModified(F&& modify) {
+        std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
+        {
+            std::unique_lock vl(m_shared->value_mutex);
+            if (!modify(m_shared->value)) return false;
+            m_shared->version++;
+            vl.unlock();
+
+            std::lock_guard wl(m_shared->waker_mutex);
+            while (auto* raw = m_shared->receiver_waiters.pop_front()) {
+                auto* node = static_cast<detail::WatchReceiverNode*>(raw);
+                if (node->waker) wakers.push_back(std::move(node->waker));
+            }
+        }
+        for (auto& w : wakers) w->wake();
+        return true;
+    }
+
 private:
     std::shared_ptr<detail::WatchShared<T>> m_shared;
 };
@@ -282,11 +313,30 @@ public:
     /**
      * @brief Acquires a read lock and returns a guard providing access to the current value.
      *
+     * Does **not** update `last_seen` — a subsequent `changed()` will still resolve
+     * for the current value if it has not been marked seen. Use `borrowAndUpdate()`
+     * when you want to consume the current value and wait only for future changes.
+     *
      * @warning Do not hold the returned guard across a `co_await` point.
      */
     [[nodiscard]] BorrowGuard<T> borrow() {
         return BorrowGuard<T>(m_shared,
             std::shared_lock<std::shared_mutex>(m_shared->value_mutex));
+    }
+
+    /**
+     * @brief Acquires a read lock, marks the current version as seen, and returns a guard.
+     *
+     * Equivalent to calling `borrow()` and then updating the receiver's version
+     * atomically under the read lock. After this call, `changed()` will only
+     * resolve for values sent *after* `borrowAndUpdate()` returns.
+     *
+     * @warning Do not hold the returned guard across a `co_await` point.
+     */
+    [[nodiscard]] BorrowGuard<T> borrowAndUpdate() {
+        std::shared_lock<std::shared_mutex> lock(m_shared->value_mutex);
+        m_last_seen = m_shared->version;
+        return BorrowGuard<T>(m_shared, std::move(lock));
     }
 
     /**

@@ -1,4 +1,15 @@
+cmake_minimum_required(VERSION 3.31)
+
+find_package(coro REQUIRED)
 find_package(GTest REQUIRED)
+
+enable_testing()
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(TEST_TARGETS
     test_poll_result
@@ -36,25 +47,25 @@ set(TEST_TARGETS
 foreach(t ${TEST_TARGETS})
     add_executable(${t} ${t}.cpp)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(${t} PRIVATE coro GTest::gtest GTest::gtest_main GTest::gmock)
+    target_link_libraries(${t} PRIVATE coro::coro GTest::gtest GTest::gtest_main GTest::gmock)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
 # PCIe character device PollStream example — decoder, tests, and usage example
 add_library(pcie_decoder pcie_decoder.cpp)
 target_include_directories(pcie_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(pcie_decoder PUBLIC coro)
+target_link_libraries(pcie_decoder PUBLIC coro::coro)
 
 add_executable(test_pcie_decoder test_pcie_decoder.cpp)
 target_include_directories(test_pcie_decoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test_pcie_decoder PRIVATE coro pcie_decoder GTest::gtest GTest::gtest_main)
+target_link_libraries(test_pcie_decoder PRIVATE coro::coro pcie_decoder GTest::gtest GTest::gtest_main)
 add_test(NAME PcieDecoderTest COMMAND test_pcie_decoder)
 
 add_executable(test_pcie_stream_integration test_pcie_stream_integration.cpp)
 target_include_directories(test_pcie_stream_integration PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(test_pcie_stream_integration PRIVATE coro pcie_decoder GTest::gtest GTest::gtest_main)
+target_link_libraries(test_pcie_stream_integration PRIVATE coro::coro pcie_decoder GTest::gtest GTest::gtest_main)
 add_test(NAME PcieStreamIntegrationTest COMMAND test_pcie_stream_integration)
 
 add_executable(pcie_reader pcie_reader.cpp)
 target_include_directories(pcie_reader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(pcie_reader PRIVATE coro pcie_decoder)
+target_link_libraries(pcie_reader PRIVATE coro::coro pcie_decoder)

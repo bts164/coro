@@ -144,6 +144,97 @@ TEST(WatchTest, MultipleReceiversWokenOnSend) {
     EXPECT_EQ(count, 3);
 }
 
+// --- borrowAndUpdate ---
+
+TEST(WatchTest, BorrowAndUpdateReadsCurrentValue) {
+    auto [tx, rx] = watch::channel<int>(7);
+    tx.send(42);
+    auto guard = rx.borrowAndUpdate();
+    EXPECT_EQ(*guard, 42);
+}
+
+TEST(WatchTest, BorrowAndUpdateMarksVersionSeen) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = watch::channel<int>(0);
+        tx.send(1);
+        // borrowAndUpdate marks version as seen — changed() must NOT resolve until
+        // a new send happens after this call.
+        { auto guard = rx.borrowAndUpdate(); (void)guard; }
+        bool resolved = false;
+        auto handle = spawn([&tx = tx]() mutable -> Coro<void> {
+            tx.send(2);
+            co_return;
+        }()).submit();
+        auto r = co_await rx.changed();
+        resolved = r.has_value();
+        co_await std::move(handle);
+        EXPECT_TRUE(resolved);
+        EXPECT_EQ(*rx.borrow(), 2);
+    }());
+}
+
+TEST(WatchTest, BorrowWithoutUpdateStillSeesExistingChange) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = watch::channel<int>(0);
+        tx.send(1);
+        // plain borrow() does NOT mark version seen
+        { auto guard = rx.borrow(); (void)guard; }
+        // changed() should resolve immediately because version > last_seen
+        auto r = co_await rx.changed();
+        EXPECT_TRUE(r.has_value());
+    }());
+}
+
+// --- sendIfModified ---
+
+TEST(WatchTest, SendIfModifiedReturnsTrueWhenModified) {
+    auto [tx, rx] = watch::channel<int>(0);
+    bool result = tx.sendIfModified([](int& v) { v = 42; return true; });
+    EXPECT_TRUE(result);
+    EXPECT_EQ(*rx.borrow(), 42);
+}
+
+TEST(WatchTest, SendIfModifiedReturnsFalseWhenNotModified) {
+    auto [tx, rx] = watch::channel<int>(0);
+    bool result = tx.sendIfModified([](int&) { return false; });
+    EXPECT_FALSE(result);
+    EXPECT_EQ(*rx.borrow(), 0);
+}
+
+TEST(WatchTest, SendIfModifiedDoesNotWakeReceiversWhenNotModified) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = watch::channel<int>(0);
+        // No-op sendIfModified must not increment version.
+        tx.sendIfModified([](int&) { return false; });
+        // changed() should not resolve immediately (version unchanged).
+        // Send a real update to unblock.
+        spawn([&tx = tx]() mutable -> Coro<void> {
+            tx.send(99);
+            co_return;
+        }()).submit().detach();
+        auto r = co_await rx.changed();
+        EXPECT_TRUE(r.has_value());
+        EXPECT_EQ(*rx.borrow(), 99);
+    }());
+}
+
+TEST(WatchTest, SendIfModifiedWakesReceiversWhenModified) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = watch::channel<int>(0);
+        spawn([&tx = tx]() mutable -> Coro<void> {
+            tx.sendIfModified([](int& v) { v = 7; return true; });
+            co_return;
+        }()).submit().detach();
+        auto r = co_await rx.changed();
+        EXPECT_TRUE(r.has_value());
+        EXPECT_EQ(*rx.borrow(), 7);
+    }());
+}
+
 TEST(WatchTest, LastWriteWins) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
