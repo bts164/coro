@@ -4,6 +4,8 @@
 #include <coro/future.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/task_state.h>
+#include <coro/detail/task.h>
+#include <coro/runtime/executor.h>
 #include <coro/detail/coro_scope.h>
 #include <memory>
 #include <mutex>
@@ -34,8 +36,9 @@ class [[nodiscard]] JoinHandle {
 public:
     using OutputType = T;
 
-    explicit JoinHandle(std::shared_ptr<detail::TaskState<T>> state)
-        : m_state(std::move(state)) {}
+    explicit JoinHandle(std::shared_ptr<detail::TaskState<T>> state,
+                        std::shared_ptr<detail::TaskBase> task = nullptr)
+        : m_state(std::move(state)), m_task(std::move(task)) {}
 
     JoinHandle(const JoinHandle&)            = delete;
     JoinHandle& operator=(const JoinHandle&) = delete;
@@ -47,15 +50,50 @@ public:
     /// Satisfies the Cancellable concept — the enclosing Coro<T> cancel protocol calls this,
     /// then polls the JoinHandle until it returns non-Pending, ensuring the inner task fully
     /// drains (and its frame locals are destroyed) before the outer frame is torn down.
+    ///
+    /// Uses the same CAS loop as TaskWaker::wake() to handle all scheduling states:
+    /// - Idle           → Notified: task is parked; enqueue it so it sees cancelled on next poll.
+    /// - Running        → RunningAndNotified: task is mid-poll; worker re-enqueues after poll.
+    /// - Notified / RunningAndNotified / Done: already queued or finished — no-op.
+    ///
+    /// EDGE CASE: if m_task is null (handle created without a TaskBase — see join_handle.h
+    /// header comment) or owning_executor is null (task never scheduled), cancellation is
+    /// degraded: cancelled=true is set but the task is not actively woken. It will remain
+    /// parked until naturally woken by whatever it awaits, at which point it will observe
+    /// cancelled=true and self-terminate. This is safe but not instantaneous.
     void cancel() noexcept {
         if (!m_state) return;
         m_state->cancelled.store(true, std::memory_order_relaxed);
-        std::shared_ptr<detail::Waker> waker;
-        {
-            std::lock_guard lock(m_state->mutex);
-            waker = std::move(m_state->self_waker);
+        if (!m_task || !m_task->owning_executor) return;
+
+        auto expected = detail::SchedulingState::Idle;
+        while (true) {
+            switch (expected) {
+            case detail::SchedulingState::Idle:
+                if (m_task->scheduling_state.compare_exchange_strong(
+                        expected, detail::SchedulingState::Notified,
+                        std::memory_order_acq_rel, std::memory_order_relaxed))
+                {
+                    m_task->owning_executor->enqueue(m_task);
+                    return;
+                }
+                break;
+            case detail::SchedulingState::Running:
+                if (m_task->scheduling_state.compare_exchange_strong(
+                        expected, detail::SchedulingState::RunningAndNotified,
+                        std::memory_order_acq_rel, std::memory_order_relaxed))
+                {
+                    return;
+                }
+                break;
+            case detail::SchedulingState::Notified:
+            case detail::SchedulingState::RunningAndNotified:
+            case detail::SchedulingState::Done:
+                return;
+            default:
+                std::abort();
+            }
         }
-        if (waker) waker->wake();
     }
 
     /// @brief Cancels the task (if cancelOnDestroy) and registers with the enclosing scope.
@@ -89,11 +127,13 @@ public:
 
     JoinHandle& detach() & {
         m_state.reset();
+        m_task.reset();
         return *this;
     }
 
     JoinHandle&& detach() && {
         m_state.reset();
+        m_task.reset();
         return std::forward<JoinHandle>(*this);
     }
 
@@ -124,6 +164,12 @@ public:
 private:
     bool m_cancelOnDestroy = true;
     std::shared_ptr<detail::TaskState<T>> m_state;
+    // Direct reference to the TaskBase for cancel(). Holds the same TaskImpl<F>
+    // allocation as m_state (aliased shared_ptr). Null only when the JoinHandle is
+    // in a moved-from or detached state, or in the rare case where a JoinHandle is
+    // constructed from a TaskState alone (e.g. legacy code). See cancel() for the
+    // degraded-cancellation behavior when null.
+    std::shared_ptr<detail::TaskBase> m_task;
 };
 
 } // namespace coro

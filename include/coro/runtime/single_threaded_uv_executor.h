@@ -65,14 +65,14 @@ public:
     // -----------------------------------------------------------------------
 
     /// Sets `task->scheduling_state` to `Notified` and calls `enqueue()`.
-    void schedule(std::unique_ptr<detail::Task> task) override;
+    void schedule(std::shared_ptr<detail::TaskBase> task) override;
 
     /// Routes a newly-notified task to the appropriate queue.
     /// - Called from the uv thread: pushes directly to `m_ready`; schedules a
     ///   wakeup via `uv_async_send` so the next loop iteration drains it.
     /// - Called from any other thread: pushes to `m_incoming_wakes` and calls
     ///   `uv_async_send` to wake the uv thread.
-    void enqueue(std::shared_ptr<detail::Task> task) override;
+    void enqueue(std::shared_ptr<detail::TaskBase> task) override;
 
     /// Blocks the calling thread until `state.terminated` is true.
     /// The uv thread drives all polling; the caller just waits on `state.cv`.
@@ -118,10 +118,10 @@ private:
     // -----------------------------------------------------------------------
 
     // Local ready queue — accessed only from the uv thread; no lock needed.
-    std::queue<std::shared_ptr<detail::Task>> m_ready;
+    std::queue<std::shared_ptr<detail::TaskBase>> m_ready;
 
     // Remote injection queue — written from any thread, drained on uv thread.
-    std::deque<std::shared_ptr<detail::Task>> m_incoming_wakes;
+    std::deque<std::shared_ptr<detail::TaskBase>> m_incoming_wakes;
     std::mutex                                m_remote_mutex;
 
     // -----------------------------------------------------------------------

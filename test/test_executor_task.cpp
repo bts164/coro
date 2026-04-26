@@ -44,39 +44,33 @@ struct SelfWakingFuture {
     }
 };
 
-// --- Task tests ---
+// --- TaskImpl tests ---
 
 TEST(TaskTest, WrapsAnyFuture) {
-    Task t(ImmediateFuture{42});
+    TaskImpl<ImmediateFuture> t(ImmediateFuture{42});
     (void)t;
-}
-
-TEST(TaskTest, IsMovable) {
-    Task t1(ImmediateFuture{1});
-    Task t2(std::move(t1));
-    (void)t2;
 }
 
 TEST(TaskTest, CompletedTaskPollReturnsTrue) {
     auto waker = std::make_shared<MockWaker>();
     Context ctx(waker);
-    Task t(ImmediateFuture{1});
+    TaskImpl<ImmediateFuture> t(ImmediateFuture{1});
     EXPECT_TRUE(t.poll(ctx));
 }
 
 TEST(TaskTest, PendingTaskPollReturnsFalse) {
     auto waker = std::make_shared<MockWaker>();
     Context ctx(waker);
-    Task t(NeverFuture{});
+    TaskImpl<NeverFuture> t(NeverFuture{});
     EXPECT_FALSE(t.poll(ctx));
 }
 
 TEST(TaskTest, PollWritesResultToState) {
     auto waker = std::make_shared<MockWaker>();
     Context ctx(waker);
-    auto state = std::make_shared<TaskState<int>>();
-    Task t(ImmediateFuture{99}, state);
-    t.poll(ctx);
+    auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{99});
+    std::shared_ptr<TaskState<int>> state = impl;
+    impl->poll(ctx);
     std::lock_guard lock(state->mutex);
     ASSERT_TRUE(state->result.has_value());
     EXPECT_EQ(*state->result, 99);
@@ -85,15 +79,15 @@ TEST(TaskTest, PollWritesResultToState) {
 TEST(TaskTest, PollWritesExceptionToState) {
     auto waker = std::make_shared<MockWaker>();
     Context ctx(waker);
-    auto state = std::make_shared<TaskState<int>>();
     struct ThrowingFuture {
         using OutputType = int;
         PollResult<int> poll(Context&) {
             return PollError(std::make_exception_ptr(std::runtime_error("boom")));
         }
     };
-    Task t(ThrowingFuture{}, state);
-    t.poll(ctx);
+    auto impl = std::make_shared<TaskImpl<ThrowingFuture>>(ThrowingFuture{});
+    std::shared_ptr<TaskState<int>> state = impl;
+    impl->poll(ctx);
     std::lock_guard lock(state->mutex);
     EXPECT_NE(state->exception, nullptr);
 }
@@ -101,10 +95,10 @@ TEST(TaskTest, PollWritesExceptionToState) {
 TEST(TaskTest, CancelledTaskIsSkipped) {
     auto waker = std::make_shared<MockWaker>();
     Context ctx(waker);
-    auto state = std::make_shared<TaskState<int>>();
+    auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{5});
+    std::shared_ptr<TaskState<int>> state = impl;
     state->cancelled.store(true);
-    Task t(ImmediateFuture{5}, state);
-    EXPECT_TRUE(t.poll(ctx));  // treated as done (cancelled)
+    EXPECT_TRUE(impl->poll(ctx));  // treated as done (cancelled)
     std::lock_guard lock(state->mutex);
     EXPECT_FALSE(state->result.has_value());
 }
@@ -118,8 +112,9 @@ TEST(SingleThreadedExecutorTest, EmptyReturnsFalse) {
 
 TEST(SingleThreadedExecutorTest, ScheduleAndPollTask) {
     SingleThreadedExecutor ex;
-    auto state = std::make_shared<TaskState<int>>();
-    ex.schedule(std::make_unique<Task>(ImmediateFuture{7}, state));
+    auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{7});
+    std::shared_ptr<TaskState<int>> state = impl;
+    ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
     EXPECT_TRUE(ex.poll_ready_tasks());
     EXPECT_TRUE(ex.empty());
     std::lock_guard lock(state->mutex);
@@ -129,7 +124,8 @@ TEST(SingleThreadedExecutorTest, ScheduleAndPollTask) {
 
 TEST(SingleThreadedExecutorTest, PendingTaskBecomesIdle) {
     SingleThreadedExecutor ex;
-    ex.schedule(std::make_unique<Task>(NeverFuture{}));
+    auto impl = std::make_shared<TaskImpl<NeverFuture>>(NeverFuture{});
+    ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
     ex.poll_ready_tasks();
     // Task returned Pending without storing a waker — transitions to Idle and
     // then drops immediately (no waker holds the ref). Ready queue is empty.
@@ -138,8 +134,9 @@ TEST(SingleThreadedExecutorTest, PendingTaskBecomesIdle) {
 
 TEST(SingleThreadedExecutorTest, SelfWakingTaskCompletesInTwoPasses) {
     SingleThreadedExecutor ex;
-    auto state = std::make_shared<TaskState<int>>();
-    ex.schedule(std::make_unique<Task>(SelfWakingFuture{42}, state));
+    auto impl = std::make_shared<TaskImpl<SelfWakingFuture>>(SelfWakingFuture{42});
+    std::shared_ptr<TaskState<int>> state = impl;
+    ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
 
     ex.poll_ready_tasks();  // Pending; waker fires synchronously → re-enqueued
     {
@@ -161,9 +158,10 @@ TEST(SingleThreadedExecutorTest, SetResultCallsJoinWaker) {
     EXPECT_CALL(*join_waker, wake()).Times(1);
 
     SingleThreadedExecutor ex;
-    auto state = std::make_shared<TaskState<int>>();
+    auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{1});
+    std::shared_ptr<TaskState<int>> state = impl;
     state->join_waker = join_waker;
-    ex.schedule(std::make_unique<Task>(ImmediateFuture{1}, state));
+    ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
     ex.poll_ready_tasks();
 }
 
@@ -172,9 +170,10 @@ TEST(SingleThreadedExecutorTest, WaitForComplete) {
     EXPECT_CALL(*join_waker, wake()).Times(1);
 
     SingleThreadedExecutor ex;
-    auto state = std::make_shared<TaskState<int>>();
+    auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{1});
+    std::shared_ptr<TaskState<int>> state = impl;
     state->join_waker = join_waker;
-    ex.schedule(std::make_unique<Task>(ImmediateFuture{1}, state));
+    ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
     ex.poll_ready_tasks();
 }
 
@@ -207,8 +206,10 @@ TEST(SingleThreadedExecutorTest, ExternalThreadWakeup) {
     auto waker_future = waker_promise.get_future();
 
     SingleThreadedExecutor ex;
-    auto state = std::make_shared<TaskState<int>>();
-    ex.schedule(std::make_unique<Task>(PromiseWakeFuture{99, &waker_promise}, state));
+    auto impl = std::make_shared<TaskImpl<PromiseWakeFuture>>(
+        PromiseWakeFuture{99, &waker_promise});
+    std::shared_ptr<TaskState<int>> state = impl;
+    ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
 
     // The waker thread blocks on future::get() until the task has been polled
     // and set the promise — no sleep-based races.
@@ -233,8 +234,10 @@ TEST(SingleThreadedExecutorTest, WaitForCompletionDoesNotReturnEarlyWithPendingT
     auto waker_future = waker_promise.get_future();
 
     SingleThreadedExecutor ex;
-    auto state = std::make_shared<TaskState<int>>();
-    ex.schedule(std::make_unique<Task>(PromiseWakeFuture{7, &waker_promise}, state));
+    auto impl = std::make_shared<TaskImpl<PromiseWakeFuture>>(
+        PromiseWakeFuture{7, &waker_promise});
+    std::shared_ptr<TaskState<int>> state = impl;
+    ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
 
     std::thread waker_thread([wf = std::move(waker_future)]() mutable {
         wf.get()->wake();
@@ -251,17 +254,15 @@ TEST(SingleThreadedExecutorTest, WaitForCompletionDoesNotReturnEarlyWithPendingT
 // --- SchedulingState tests ---
 
 TEST(SchedulingStateTest, InitialStateIsIdle) {
-    Task t(ImmediateFuture{1});
+    TaskImpl<ImmediateFuture> t(ImmediateFuture{1});
     EXPECT_EQ(t.scheduling_state.load(), SchedulingState::Idle);
 }
 
 TEST(SchedulingStateTest, ScheduleSetsNotified) {
     SingleThreadedExecutor ex;
-    // Schedule a NeverFuture so we can inspect the state after schedule().
-    // The task goes into the injection queue (Notified).
-    NeverFuture nf{};
-    auto task_ptr = std::make_unique<Task>(nf);
-    Task* raw = task_ptr.get();
-    ex.schedule(std::move(task_ptr));
+    // Keep a shared_ptr alive so we can inspect scheduling_state after schedule().
+    auto impl = std::make_shared<TaskImpl<NeverFuture>>(NeverFuture{});
+    TaskBase* raw = impl.get();
+    ex.schedule(std::shared_ptr<TaskBase>(impl));  // shares ownership; impl still valid
     EXPECT_EQ(raw->scheduling_state.load(), SchedulingState::Notified);
 }

@@ -76,12 +76,12 @@ External threads never touch the local ready queue directly — only the injecti
 ## Task Scheduling State
 
 Rather than tracking suspended tasks in a central `m_suspended` map, the planned design
-follows Tokio's approach: ownership of the `shared_ptr<Task>` moves with the task's
-lifecycle, and an atomic state field in `TaskStateBase` tracks the current phase.
+follows Tokio's approach: ownership of the `shared_ptr<TaskBase>` moves with the task's
+lifecycle, and an atomic state field in `TaskBase` tracks the current phase.
 
 ### States
 
-| State | `shared_ptr<Task>` owner | Description |
+| State | `shared_ptr<TaskBase>` owner | Description |
 |---|---|---|
 | **Idle** | The `Waker` stored by the suspended future | Waiting for an external event |
 | **Running** | The executor / worker | Currently inside `poll()` |
@@ -109,14 +109,14 @@ which data structure holds the task's `shared_ptr`), `SchedulingState` is an exp
 field that must be stored. The CAS operations that replace `m_suspended` have nothing to
 operate on without it.
 
-**Implementation note:** `scheduling_state` lives in `Task`, not `TaskStateBase`. The
-original design placed it in `TaskStateBase`, but fire-and-forget tasks (created by
-`spawn().submit().detach()`) have `m_state = nullptr` — they have no `TaskStateBase` at
-all, yet still need a scheduling state for the waker CAS to work. Placing the field
-directly in `Task` handles both cases uniformly:
+**Implementation note:** `scheduling_state` lives in `TaskBase`. Fire-and-forget tasks
+(created by `spawn().submit().detach()`) have no external `JoinHandle` holding a
+`shared_ptr<TaskState<T>>`, but they still need a scheduling state for the waker CAS to
+work. Placing the field in `TaskBase` — which every `TaskImpl<F>` inherits — handles both
+cases uniformly:
 
 ```cpp
-class Task {
+class TaskBase {
 public:
     std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
     // ...
@@ -130,14 +130,14 @@ atomic value rather than trying to move it.
 
 ### TaskWaker
 
-`TaskWaker` holds exactly two fields: a `shared_ptr<Task>` (to push to a queue on wake)
-and an `Executor*` to determine which queue to target. No `shared_ptr<TaskStateBase>` is
-needed because `scheduling_state` lives directly in `Task`:
+`TaskWaker` holds exactly two fields: a `shared_ptr<TaskBase>` (to push to a queue on
+wake) and an `Executor*` to determine which queue to target. `scheduling_state` lives
+directly in `TaskBase`, so no separate state pointer is needed:
 
 ```cpp
 struct TaskWaker : detail::Waker {
-    shared_ptr<detail::Task> task;
-    Executor*                executor;
+    shared_ptr<detail::TaskBase> task;
+    Executor*                    executor;
 
     void wake() override {
         // Loop so that a CAS failure retries with the freshly-observed state.
@@ -184,11 +184,11 @@ be a silent dropped wakeup.
 
 Multiple waker clones may race to call `wake()`. Only the first `Idle → Notified` CAS
 succeeds and pushes to the queue; the rest observe `Notified` (or `RunningAndNotified`)
-and return as no-ops. Each clone holds its own `shared_ptr<Task>` ref, so the task remains
-alive until the winning clone transfers its ref to the queue.
+and return as no-ops. Each clone holds its own `shared_ptr<TaskBase>` ref, so the task
+remains alive until the winning clone transfers its ref to the queue.
 
 The executor constructs `TaskWaker` immediately before calling `poll()` using just the
-two required fields: `shared_ptr<Task>` (just dequeued) and `Executor*` (`this`).
+two required fields: `shared_ptr<TaskBase>` (just dequeued) and `Executor*` (`this`).
 
 ### Executor::enqueue()
 
@@ -235,18 +235,27 @@ transition: `schedule()` storing `Notified`, workers storing `Running`, and the 
 
 ---
 
-## TaskStateBase and Completion Signalling
+## TaskStateBase, TaskState<T>, and Completion Signalling
 
 `block_on` must block the calling thread until the top-level task completes. The
-completion signal lives in `TaskStateBase` — a non-template base of `TaskState<T>` that
-is shared across both executors.
+completion signal lives in `TaskStateBase` — a non-template base of `TaskState<T>`, which
+is itself a base of every `TaskImpl<F>`. The inheritance chain is:
+
+```
+TaskStateBase   ← mutex, cv, terminated, wait_until_done()
+  └── TaskState<T>   ← cancelled, join_waker, scope_waker, self_waker, result, exception
+        └── TaskImpl<F>   ← m_future, poll() override    (also inherits TaskBase)
+```
+
+`TaskStateBase` and `TaskState<T>` are not allocated separately — they are base subobjects
+of the single `make_shared<TaskImpl<F>>()` call that `spawn()` makes. `JoinHandle<T>`
+holds a `shared_ptr<TaskState<T>>` aliased from that same allocation.
 
 ```cpp
 struct TaskStateBase {
     mutable std::mutex      mutex;
     std::condition_variable cv;
     bool                    terminated{false};
-    std::atomic<bool>       cancelled{false};
 
     // RACE CONDITION NOTE: this is safe because every code path that sets
     // `terminated = true` also calls `cv.notify_all()` *in the same critical section*
@@ -265,13 +274,13 @@ Every terminal method (`setResult`, `setDone`, `setException`, `mark_done`) sets
 `terminated = true` and calls `cv.notify_all()` **inside the same lock**, eliminating
 any lost-wakeup window.
 
-Cancellation is delivered by setting `cancelled = true` and then calling `waker->wake()`.
-This transitions the task from `Idle → Notified` so it is re-enqueued and polled, where
-it observes `cancelled` and enters the `PollDropped` path to run destructors and drain
-child tasks. Simply dropping the `shared_ptr<Task>` is not safe: unlike Rust futures
-(plain values that the compiler drops safely at any `await` point), C++ coroutine frames
-are heap-allocated and the only way to release their resources is to resume and poll
-through completion.
+Cancellation is delivered by setting `cancelled = true` (in `TaskState<T>`) and then
+calling `waker->wake()`. This transitions the task from `Idle → Notified` so it is
+re-enqueued and polled, where it observes `cancelled` and enters the `PollDropped` path
+to run destructors and drain child tasks. Simply dropping the `shared_ptr<TaskBase>` is
+not safe: unlike Rust futures (plain values that the compiler drops safely at any `await`
+point), C++ coroutine frames are heap-allocated and the only way to release their
+resources is to resume and poll through completion.
 
 `wait_for_completion` for `WorkSharingExecutor` delegates entirely:
 
@@ -288,8 +297,8 @@ section for the planned fix.
 `Runtime::block_on` passes `*state` directly to either implementation:
 
 ```cpp
-m_executor->schedule(make_task(future, state));
-m_executor->wait_for_completion(*state);
+m_executor->schedule(task_base_ptr);
+m_executor->wait_for_completion(*task_state_ptr);
 ```
 
 ---
@@ -325,10 +334,10 @@ stateDiagram-v2
 ### Data model
 
 ```
-m_poll_thread_id : thread::id                    ← set when wait_for_completion is entered
-m_incoming_wakes : deque<shared_ptr<Task>>       ← remote enqueue() calls deposit here
-m_remote_mutex   : mutex                         ← guards m_incoming_wakes
-m_remote_cv      : condition_variable            ← signalled by remote enqueue(); waited on by wait_for_completion
+m_poll_thread_id : thread::id                         ← set when wait_for_completion is entered
+m_incoming_wakes : deque<shared_ptr<TaskBase>>        ← remote enqueue() calls deposit here
+m_remote_mutex   : mutex                              ← guards m_incoming_wakes
+m_remote_cv      : condition_variable                 ← signalled by remote enqueue(); waited on by wait_for_completion
 ```
 
 The fields `m_suspended`, `m_running_task_key`, and `m_running_task_woken` that existed
@@ -405,13 +414,13 @@ wait_for_completion(state):
 classDiagram
     class Executor {
         <<abstract>>
-        +schedule(task) void
-        +enqueue(task) void
+        +schedule(task: shared_ptr~TaskBase~) void
+        +enqueue(task: shared_ptr~TaskBase~) void
         +wait_for_completion(state) void
     }
     class SingleThreadedExecutor {
-        -m_ready: queue~Task~
-        -m_incoming_wakes: deque~Task~
+        -m_ready: queue~shared_ptr~TaskBase~~
+        -m_incoming_wakes: deque~shared_ptr~TaskBase~~
         -m_remote_mutex: mutex
         -m_remote_cv: condition_variable
         -m_poll_thread_id: thread_id
@@ -420,7 +429,7 @@ classDiagram
     }
     class WorkSharingExecutor {
         -m_local_queues: vector~WorkStealingDeque~
-        -m_injection_queue: deque~Task~
+        -m_injection_queue: deque~shared_ptr~TaskBase~~
         -m_mutex: mutex
         -m_cv: condition_variable
         -m_stop: bool
@@ -437,12 +446,12 @@ classDiagram
 ```
 WorkSharingExecutor
 │
-├── m_local_queues  : vector<WorkStealingDeque<shared_ptr<Task>>>  ← per-worker local queues
-├── m_injection_queue : deque<shared_ptr<Task>>                    ← remote enqueue path
-├── m_mutex         : mutex                    ← guards m_injection_queue and m_stop only
-├── m_cv            : condition_variable       ← workers wait here when both queues empty
-├── m_stop          : bool                     ← shutdown signal, set under m_mutex
-└── m_workers       : vector<thread>           ← N worker threads
+├── m_local_queues    : vector<WorkStealingDeque<shared_ptr<TaskBase>>>  ← per-worker local queues
+├── m_injection_queue : deque<shared_ptr<TaskBase>>                      ← remote enqueue path
+├── m_mutex           : mutex                    ← guards m_injection_queue and m_stop only
+├── m_cv              : condition_variable       ← workers wait here when both queues empty
+├── m_stop            : bool                     ← shutdown signal, set under m_mutex
+└── m_workers         : vector<thread>           ← N worker threads
 ```
 
 There is no `m_suspended` map — a task in `Idle` is kept alive solely by the
@@ -456,10 +465,10 @@ stateDiagram-v2
     [*] --> Notified : schedule()
     Notified --> Running : worker_loop() — CAS Notified→Running
     Running --> Idle : worker_loop() — CAS Running→Idle succeeds
-    Running --> RunningAndNotified : TaskWaker::wake() — CAS Running→RunningAndNotified
+    Running --> RunningAndNotified : "TaskWaker\:\:wake() — CAS Running→RunningAndNotified"
     RunningAndNotified --> Notified : worker_loop() — CAS RunningAndNotified→Notified, re-enqueue
     Running --> Done : worker_loop() — poll() returns Ready/Error
-    Idle --> Notified : TaskWaker::wake() — CAS Idle→Notified, pushed to local queue / injection queue
+    Idle --> Notified : "TaskWaker\:\:wake() — CAS Idle→Notified, pushed to local queue / injection queue"
     Done --> [*]
 ```
 
@@ -595,11 +604,11 @@ enqueue(task):
 
 | File | Status | Contents |
 |---|---|---|
-| `include/coro/detail/task_state.h` | Complete | `SchedulingState` enum |
-| `include/coro/detail/task.h` | Complete | `scheduling_state` atomic in `Task`; explicit move ctor/assign |
+| `include/coro/detail/task_state.h` | Complete | `TaskStateBase`, `TaskState<T>` — completion signal, result, wakers |
+| `include/coro/detail/task.h` | Complete | `TaskBase` (non-template executor base); `TaskImpl<F>` (concrete template combining `TaskBase` + `TaskState<T>` + future in one allocation) |
 | `include/coro/detail/work_stealing_deque.h` | Complete | `WorkStealingDeque<T>` — mutex-backed, Chase-Lev interface |
-| `include/coro/runtime/executor.h` | Complete | `enqueue(shared_ptr<Task>)` pure virtual |
-| `include/coro/runtime/task_waker.h` | Complete | Shared `TaskWaker` — `shared_ptr<Task>` + `Executor*` |
+| `include/coro/runtime/executor.h` | Complete | `schedule`/`enqueue(shared_ptr<TaskBase>)` pure virtual |
+| `include/coro/runtime/task_waker.h` | Complete | Shared `TaskWaker` — `shared_ptr<TaskBase>` + `Executor*` |
 | `include/coro/runtime/single_threaded_executor.h` | Complete | Injection queue fields; `m_suspended` and self-wake fields removed |
 | `src/single_threaded_executor.cpp` | Complete | `enqueue` routing; CAS-based poll loop; fixed `wait_for_completion` |
 | `include/coro/runtime/work_sharing_executor.h` | Complete | Per-worker local queues; `m_suspended`, `m_self_woken` removed |

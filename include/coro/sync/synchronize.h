@@ -197,10 +197,10 @@ private:
 // Defined after Synchronize is complete so add_child() is available.
 template<Future F>
 void SyncSpawnBuilder<F>::submit() && {
-    auto state = std::make_shared<detail::TaskState<OutputType>>();
+    auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(m_future));
+    std::shared_ptr<detail::TaskState<OutputType>> state = impl;
     m_sync->add_child(std::make_unique<detail::SyncChild<OutputType>>(state));
-    current_runtime().schedule_task(
-        std::make_unique<detail::Task>(std::move(m_future), state));
+    current_runtime().schedule_task(std::shared_ptr<detail::TaskBase>(std::move(impl)));
 }
 
 } // namespace coro

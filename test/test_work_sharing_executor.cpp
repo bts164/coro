@@ -197,7 +197,6 @@ TEST(WorkSharingExecutorTest, DirectConstructionAndSchedule) {
     Runtime rt(1);  // use rt for thread-local setup
     WorkSharingExecutor exec(&rt, 2);
     // schedule an immediate task; executor should not crash on destruction
-    exec.schedule(std::make_unique<detail::Task>(
-        ImmediateVoid{},
-        std::make_shared<detail::TaskState<void>>()));
+    auto impl = std::make_shared<detail::TaskImpl<ImmediateVoid>>(ImmediateVoid{});
+    exec.schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
 }

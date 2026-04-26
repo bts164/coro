@@ -24,13 +24,13 @@ TEST(SingleThreadedUvExecutor, RunsSimpleCoroutine) {
     SingleThreadedUvExecutor exec;
 
     bool ran = false;
-    auto state = std::make_shared<detail::TaskState<void>>();
-    auto task = [&](bool &ran) -> Coro<void> {
+    auto coro = [](bool &ran) -> Coro<void> {
         ran = true;
         co_return;
     }(ran);
-
-    exec.schedule(std::make_unique<detail::Task>(std::move(task), state));
+    auto impl = std::make_shared<detail::TaskImpl<Coro<void>>>(std::move(coro));
+    std::shared_ptr<detail::TaskState<void>> state = impl;
+    exec.schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
     exec.wait_for_completion(*state);
 
     EXPECT_TRUE(ran);
@@ -39,12 +39,12 @@ TEST(SingleThreadedUvExecutor, RunsSimpleCoroutine) {
 TEST(SingleThreadedUvExecutor, ReturnsValue) {
     SingleThreadedUvExecutor exec;
 
-    auto state = std::make_shared<detail::TaskState<int>>();
-    auto task = []() -> Coro<int> {
+    auto coro = []() -> Coro<int> {
         co_return 42;
     }();
-
-    exec.schedule(std::make_unique<detail::Task>(std::move(task), state));
+    auto impl = std::make_shared<detail::TaskImpl<Coro<int>>>(std::move(coro));
+    std::shared_ptr<detail::TaskState<int>> state = impl;
+    exec.schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
     exec.wait_for_completion(*state);
 
     ASSERT_TRUE(state->result.has_value());
@@ -63,13 +63,14 @@ TEST(SingleThreadedUvExecutor, RunsMultipleTasks) {
 
     std::vector<std::shared_ptr<detail::TaskState<void>>> states;
     for (int i = 0; i < N; ++i) {
-        auto state = std::make_shared<detail::TaskState<void>>();
-        auto task = [](int &counter) -> Coro<void> {
+        auto coro = [](int &counter) -> Coro<void> {
             ++counter;
             co_return;
         }(counter);
-        exec.schedule(std::make_unique<detail::Task>(std::move(task), state));
-        states.push_back(state);
+        auto impl = std::make_shared<detail::TaskImpl<Coro<void>>>(std::move(coro));
+        std::shared_ptr<detail::TaskState<void>> state = impl;
+        exec.schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
+        states.push_back(std::move(state));
     }
 
     for (auto& s : states)
@@ -86,13 +87,13 @@ TEST(SingleThreadedUvExecutor, CurrentUvExecutorAccessibleFromUvThread) {
     SingleThreadedUvExecutor exec;
 
     SingleThreadedUvExecutor* observed = nullptr;
-    auto state = std::make_shared<detail::TaskState<void>>();
-    auto task = [](auto &observed) -> Coro<void> {
+    auto coro = [](auto &observed) -> Coro<void> {
         observed = &current_uv_executor();
         co_return;
     }(observed);
-
-    exec.schedule(std::make_unique<detail::Task>(std::move(task), state));
+    auto impl = std::make_shared<detail::TaskImpl<Coro<void>>>(std::move(coro));
+    std::shared_ptr<detail::TaskState<void>> state = impl;
+    exec.schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
     exec.wait_for_completion(*state);
 
     EXPECT_EQ(observed, &exec);

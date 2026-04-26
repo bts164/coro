@@ -39,14 +39,14 @@ SingleThreadedUvExecutor::~SingleThreadedUvExecutor() {
 // Executor interface
 // ---------------------------------------------------------------------------
 
-void SingleThreadedUvExecutor::schedule(std::unique_ptr<detail::Task> task) {
-    auto shared = std::shared_ptr<detail::Task>(std::move(task));
-    shared->scheduling_state.store(
+void SingleThreadedUvExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
+    task->owning_executor = this;
+    task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
-    enqueue(std::move(shared));
+    enqueue(std::move(task));
 }
 
-void SingleThreadedUvExecutor::enqueue(std::shared_ptr<detail::Task> task) {
+void SingleThreadedUvExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
     if (std::this_thread::get_id() == m_uv_thread_id) {
         // On the uv thread — push directly to the local ready queue.
         // uv_async_send schedules another io_async_cb to drain it after the
@@ -153,7 +153,7 @@ void SingleThreadedUvExecutor::io_thread_loop() {
 }
 
 void SingleThreadedUvExecutor::drain_incoming_wakes() {
-    std::deque<std::shared_ptr<detail::Task>> local;
+    std::deque<std::shared_ptr<detail::TaskBase>> local;
     {
         std::lock_guard lock(m_remote_mutex);
         std::swap(local, m_incoming_wakes);
@@ -186,9 +186,9 @@ void SingleThreadedUvExecutor::drain_ready_tasks() {
         waker->task     = task;
         waker->executor = this;
         detail::Context ctx(waker);
-        detail::Task::current = task.get();
+        detail::TaskBase::current = task.get();
         bool done = task->poll(ctx);
-        detail::Task::current = nullptr;
+        detail::TaskBase::current = nullptr;
 
         if (done) {
             task->scheduling_state.store(

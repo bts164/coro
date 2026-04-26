@@ -23,8 +23,8 @@ namespace coro {
  * the Idle → Notified CAS calls enqueue(); the rest are no-ops.
  */
 struct TaskWaker final : detail::Waker {
-    std::shared_ptr<detail::Task> task;
-    Executor*                     executor;
+    std::shared_ptr<detail::TaskBase> task;
+    Executor*                         executor;
 
     void wake() override {
         // Loop so that a CAS failure retries with the freshly-observed state.

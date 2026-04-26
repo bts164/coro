@@ -53,7 +53,7 @@ public:
     WorkStealingExecutor& operator=(const WorkStealingExecutor&) = delete;
 
     /// @brief Submit a new task. Routes to injection queue then wakes a worker.
-    void schedule(std::unique_ptr<detail::Task> task) override;
+    void schedule(std::shared_ptr<detail::TaskBase> task) override;
 
     /// @brief Re-enqueue a woken task.
     ///
@@ -64,7 +64,7 @@ public:
     ///
     /// After routing, calls `notify_if_needed()` to wake a parked worker if no
     /// workers are currently searching.
-    void enqueue(std::shared_ptr<detail::Task> task) override;
+    void enqueue(std::shared_ptr<detail::TaskBase> task) override;
 
     /// @brief Delegates to `state.wait_until_done()`.
     void wait_for_completion(detail::TaskStateBase& state) override;
@@ -89,12 +89,12 @@ private:
 
     // --- Per-worker state ---
 
-    std::vector<detail::WorkStealingDeque<std::shared_ptr<detail::Task>>> m_local_queues;
-    std::vector<std::unique_ptr<WorkerSlot>>                              m_workers;
+    std::vector<detail::WorkStealingDeque<std::shared_ptr<detail::TaskBase>>> m_local_queues;
+    std::vector<std::unique_ptr<WorkerSlot>>                                  m_workers;
 
     // --- Shared injection queue (remote enqueue / initial schedule) ---
 
-    std::deque<std::shared_ptr<detail::Task>> m_injection_queue;
+    std::deque<std::shared_ptr<detail::TaskBase>> m_injection_queue;
     std::mutex                                m_mutex; ///< Guards m_injection_queue and m_stop.
     bool                                      m_stop{false};
 

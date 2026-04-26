@@ -13,14 +13,14 @@ SingleThreadedExecutor::SingleThreadedExecutor(Runtime* /*runtime*/) :
 
 SingleThreadedExecutor::~SingleThreadedExecutor() = default;
 
-void SingleThreadedExecutor::schedule(std::unique_ptr<detail::Task> task) {
-    auto shared = std::shared_ptr<detail::Task>(std::move(task));
-    shared->scheduling_state.store(
+void SingleThreadedExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
+    task->owning_executor = this;
+    task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
-    enqueue(std::move(shared));
+    enqueue(std::move(task));
 }
 
-void SingleThreadedExecutor::enqueue(std::shared_ptr<detail::Task> task) {
+void SingleThreadedExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
     if (std::this_thread::get_id() == m_poll_thread_id) {
         // Local path: we are the poll thread — push directly, no lock needed.
         m_ready.push(std::move(task));
@@ -70,9 +70,9 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
         waker->task     = task;
         waker->executor = this;
         detail::Context ctx(waker);
-        detail::Task::current = task.get();
+        detail::TaskBase::current = task.get();
         bool done = task->poll(ctx);
-        detail::Task::current = nullptr;
+        detail::TaskBase::current = nullptr;
 
         if (done) {
             task->scheduling_state.store(

@@ -9,4 +9,4 @@ Executor::~Executor() = default;
 
 // Definition of the thread-local current task pointer.
 // Set to the running Task* before each poll() call and cleared to nullptr after.
-thread_local coro::detail::Task* coro::detail::Task::current = nullptr;
+thread_local coro::detail::TaskBase* coro::detail::TaskBase::current = nullptr;

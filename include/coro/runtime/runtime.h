@@ -77,9 +77,9 @@ public:
         set_current_runtime(this);
         set_current_uv_executor(&m_uv_executor);
 
-        auto state = std::make_shared<detail::TaskState<typename F::OutputType>>();
-        m_executor->schedule(
-            std::make_unique<detail::Task>(std::move(future), state));
+        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
+        std::shared_ptr<detail::TaskState<typename F::OutputType>> state = impl;
+        m_executor->schedule(std::shared_ptr<detail::TaskBase>(impl));
 
         m_executor->wait_for_completion(*state);
 
@@ -93,7 +93,7 @@ public:
     }
 
     /// @brief Submits a pre-constructed task directly. Used internally by @ref Synchronize.
-    void schedule_task(std::unique_ptr<detail::Task> task) {
+    void schedule_task(std::shared_ptr<detail::TaskBase> task) {
         m_executor->schedule(std::move(task));
     }
 

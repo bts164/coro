@@ -43,12 +43,12 @@ public:
     explicit SingleThreadedExecutor(Runtime* runtime = nullptr);
     ~SingleThreadedExecutor() override;
 
-    void schedule(std::unique_ptr<detail::Task> task) override;
+    void schedule(std::shared_ptr<detail::TaskBase> task) override;
 
     /// @brief Route a newly-notified task to the appropriate queue.
     /// Local thread (poll thread) → directly to m_ready, no lock.
     /// Any other thread → m_incoming_wakes + m_remote_cv signal.
-    void enqueue(std::shared_ptr<detail::Task> task) override;
+    void enqueue(std::shared_ptr<detail::TaskBase> task) override;
 
     /// @brief Drains the injection queue, then polls all ready tasks once.
     /// @return `true` if at least one task was polled.
@@ -61,10 +61,10 @@ public:
     bool empty() const;
 
 private:
-    std::queue<std::shared_ptr<detail::Task>> m_ready;
+    std::queue<std::shared_ptr<detail::TaskBase>> m_ready;
 
     // Injection queue — remote enqueue() calls land here.
-    std::deque<std::shared_ptr<detail::Task>> m_incoming_wakes;
+    std::deque<std::shared_ptr<detail::TaskBase>> m_incoming_wakes;
     mutable std::mutex                        m_remote_mutex;
     std::condition_variable                   m_remote_cv;
 

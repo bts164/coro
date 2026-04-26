@@ -15,9 +15,10 @@ distinct user-facing types:
   complete before the scope exits. **Deprecated** — prefer `co_invoke` + `JoinSet::drain()`
   for new code.
 
-**`Task`** is an internal, type-erased heap-allocated unit of work. It wraps any `Future<T>`,
-not just coroutines. Users never construct a `Task` directly — `spawn()` creates one
-internally.
+**`Task`** is an internal, heap-allocated unit of work. `spawn()` creates a single
+`TaskImpl<F>` object (via `make_shared`) that combines the executor-facing interface
+(`TaskBase`) and the result/cancellation state (`TaskState<T>`) into one allocation.
+Users never construct a `Task` directly.
 
 The `Executor` drives tasks by polling them. The `Runtime` bundles the executor, thread pool,
 and libuv I/O reactor into a single user-facing object.
@@ -215,20 +216,22 @@ Coro<void> example()
 `JoinHandle<T>` satisfies `Future<T>` and is marked `[[nodiscard]]` — discarding it drops
 and cancels the task immediately, which is almost never intentional.
 
-The task and its `JoinHandle` share a ref-counted `TaskState<T>` object. This shared state
-manages the result slot, the waker, and the cancellation flag:
+`spawn()` creates a single `TaskImpl<F>` object via `make_shared`. `TaskImpl<F>` inherits
+from both `TaskBase` (the executor-facing interface) and `TaskState<T>` (the result,
+cancellation flag, and wakers). Two aliased `shared_ptr`s are produced from this one
+allocation — they share the same reference count and keep the same `TaskImpl<F>` alive, but
+point to different base subobjects:
 
 ```mermaid
 flowchart LR
     S["spawn()"]
+    I["<b>TaskImpl&lt;F&gt;</b><br/>one make_shared allocation<br/>= TaskBase + TaskState&lt;T&gt; + F m_future"]
+    E["Executor queue / TaskWaker<br/>shared_ptr&lt;TaskBase&gt;"]
+    J["JoinHandle&lt;T&gt;<br/>shared_ptr&lt;TaskState&lt;T&gt;&gt;"]
 
-    S -->|"moves future into"| T
-    S -->|"returns"| J
-
-    T["<b>Task</b><br/>executor holds this<br/>polls the future<br/>writes result/exception<br/>into shared state when done"]
-    J["<b>JoinHandle</b><br/>caller holds this<br/>polls shared state via poll()<br/>stores waker for completion<br/>sets cancellation flag on drop"]
-
-    T <-->|"shared_ptr&lt;TaskState&lt;T&gt;&gt;"| J
+    S -->|"creates"| I
+    I -->|"aliased to"| E
+    I -->|"aliased to"| J
 ```
 
 `JoinHandle` exposes explicit control over the task's lifetime:
@@ -250,13 +253,13 @@ public:
 };
 ```
 
-`TaskState<T>` must handle these scenarios safely:
+The shared `TaskState<T>` (embedded in `TaskImpl<F>`) handles these scenarios safely:
 
 - Task completes before `JoinHandle` is polled — result stored, handle reads it on next poll
 - `JoinHandle` polled before task completes — waker registered, task calls `wake()` on completion
 - `JoinHandle` dropped — cancellation flag set; task checks flag at each poll and exits early
-- `JoinHandle::detach()` called — handle releases its reference to `TaskState`; task continues unaffected
-- Task throws — exception stored in `TaskState`, re-thrown when `JoinHandle` is `co_await`ed
+- `JoinHandle::detach()` called — handle releases its `shared_ptr<TaskState<T>>`; task continues unaffected
+- Task throws — exception stored in `TaskState<T>`, re-thrown when `JoinHandle` is `co_await`ed
 
 `StreamHandle<T>` satisfies `Stream<T>` and is also `[[nodiscard]]`. Internally it is the
 consumer end of a bounded channel. The spawned task drives `poll_next()` on the original
@@ -319,18 +322,39 @@ This three-way design mirrors Julia's pattern extended with explicit detach:
 - `runtime.spawn().submit()` + `.detach()` → fire and forget, task runs to completion
 - `runtime.spawn().submit()` + drop → cancel and discard
 
-### Internal Task type
+### Internal Task types
 
-`Task` is a type-erased, heap-allocated wrapper around any `Future`. It is created by
-`spawn()` and held by the executor. Users never interact with it directly.
+`TaskBase` is a non-template abstract base held by the executor queue and `TaskWaker`.
+`TaskImpl<F>` is the concrete template that inherits from both `TaskBase` and
+`TaskState<F::OutputType>` and stores the future directly — one `make_shared` allocation
+covers the entire task. Users never interact with either type directly.
 
 ```cpp
 // Internal — not public API
-class Task {
+
+class TaskBase {
 public:
-    void poll(Context& ctx);   // type-erased poll dispatch
-    // ...
+    std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
+    std::string name;
+    int         last_worker_index = -1;
+    virtual bool poll(Context& ctx) = 0;
+    virtual ~TaskBase() = default;
 };
+
+template<Future F>
+class TaskImpl : public TaskBase, public TaskState<typename F::OutputType> {
+    F    m_future;
+    bool m_completed        = false;
+    bool m_cancel_requested = false;
+    bool poll(Context& ctx) override { /* ... cooperative cancel protocol ... */ }
+};
+
+// spawn() produces two aliased shared_ptrs from one allocation:
+auto impl = std::make_shared<TaskImpl<F>>(std::move(future));
+std::shared_ptr<TaskBase>                    exec_ptr{impl, impl.get()};
+std::shared_ptr<TaskState<typename F::OutputType>> join_ptr{impl, static_cast<TaskState<...>*>(impl.get())};
+executor->schedule(exec_ptr);
+return JoinHandle<T>(join_ptr);
 ```
 
 ### Abstract Executor interface
@@ -339,7 +363,8 @@ public:
 class Executor {
 public:
     virtual ~Executor();
-    virtual void schedule(std::unique_ptr<Task> task) = 0;
+    virtual void schedule(std::shared_ptr<TaskBase> task) = 0;
+    virtual void enqueue(std::shared_ptr<TaskBase> task)  = 0;
 };
 ```
 

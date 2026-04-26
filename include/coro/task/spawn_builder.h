@@ -40,13 +40,13 @@ public:
     /// @brief Enqueues the task on the executor and returns a @ref JoinHandle.
     /// The builder must not be used again after this call.
     JoinHandle<OutputType> submit() {
-        auto state = std::make_shared<detail::TaskState<OutputType>>();
-        if (m_executor) {
-            auto task = std::make_unique<detail::Task>(std::move(m_future), state);
-            task->name = std::move(m_name);
-            m_executor->schedule(std::move(task));
-        }
-        return JoinHandle<OutputType>(std::move(state));
+        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(m_future));
+        impl->name = std::move(m_name);
+        std::shared_ptr<detail::TaskState<OutputType>> state = impl;
+        std::shared_ptr<detail::TaskBase> task = impl;  // aliased; copied before impl is moved
+        if (m_executor)
+            m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
+        return JoinHandle<OutputType>(std::move(state), std::move(task));
     }
 
 private:
@@ -175,10 +175,11 @@ public:
     StreamHandle<ItemType> submit() {
         auto channel = std::make_shared<detail::Channel<ItemType>>(m_buffer_size);
         if (m_executor) {
-            auto task = std::make_unique<detail::Task>(
-                detail::StreamDriver<S>{std::move(m_stream), channel, std::nullopt});
-            task->name = std::move(m_name);
-            m_executor->schedule(std::move(task));
+            using Driver = detail::StreamDriver<S>;
+            auto impl = std::make_shared<detail::TaskImpl<Driver>>(
+                Driver{std::move(m_stream), channel, std::nullopt});
+            impl->name = std::move(m_name);
+            m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
         }
         return StreamHandle<ItemType>(std::move(channel));
     }

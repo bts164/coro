@@ -19,9 +19,8 @@ class Executor {
 public:
     virtual ~Executor();
 
-    /// @brief Submit a task for scheduling. The executor takes ownership.
-    /// Sets `task->scheduling_state` to `Notified` before enqueuing.
-    virtual void schedule(std::unique_ptr<detail::Task> task) = 0;
+    /// @brief Submit a task for scheduling. Sets `scheduling_state` to `Notified`.
+    virtual void schedule(std::shared_ptr<detail::TaskBase> task) = 0;
 
     /// @brief Route a task to the appropriate ready queue.
     ///
@@ -29,7 +28,7 @@ public:
     /// Implementations check the calling thread's identity:
     /// - Same thread as the owning worker → local queue, no lock.
     /// - Any other thread → mutex-protected injection queue + condvar signal.
-    virtual void enqueue(std::shared_ptr<detail::Task> task) = 0;
+    virtual void enqueue(std::shared_ptr<detail::TaskBase> task) = 0;
 
     /// @brief Block the calling thread until `state.terminated` is true.
     ///

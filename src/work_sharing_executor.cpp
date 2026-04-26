@@ -37,14 +37,14 @@ WorkSharingExecutor::~WorkSharingExecutor() {
         t.join();
 }
 
-void WorkSharingExecutor::schedule(std::unique_ptr<detail::Task> task) {
-    auto shared = std::shared_ptr<detail::Task>(std::move(task));
-    shared->scheduling_state.store(
+void WorkSharingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
+    task->owning_executor = this;
+    task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
-    enqueue(std::move(shared));
+    enqueue(std::move(task));
 }
 
-void WorkSharingExecutor::enqueue(std::shared_ptr<detail::Task> task) {
+void WorkSharingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
     const int idx = t_worker_index;
     if (idx >= 0 && t_owning_executor == this) {
         // Local path: this is a worker of *this* executor — push to its own queue, no lock.
@@ -70,7 +70,7 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     set_current_uv_executor(&m_runtime->uv_executor());
 
     while (true) {
-        std::shared_ptr<detail::Task> task;
+        std::shared_ptr<detail::TaskBase> task;
 
         // Try the local queue first — no lock needed.
         if (auto local = m_local_queues[worker_index].pop()) {
@@ -114,9 +114,9 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
         waker->task     = task;
         waker->executor = this;
         detail::Context ctx(waker);
-        detail::Task::current = task.get();
+        detail::TaskBase::current = task.get();
         bool done = task->poll(ctx);
-        detail::Task::current = nullptr;
+        detail::TaskBase::current = nullptr;
 
         if (done) {
             task->scheduling_state.store(

@@ -47,14 +47,14 @@ WorkStealingExecutor::~WorkStealingExecutor() {
         slot->thread.join();
 }
 
-void WorkStealingExecutor::schedule(std::unique_ptr<detail::Task> task) {
-    auto shared = std::shared_ptr<detail::Task>(std::move(task));
-    shared->scheduling_state.store(
+void WorkStealingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
+    task->owning_executor = this;
+    task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
-    enqueue(std::move(shared));
+    enqueue(std::move(task));
 }
 
-void WorkStealingExecutor::enqueue(std::shared_ptr<detail::Task> task) {
+void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
     const int local_idx = t_wse_worker_index;
 
     if (local_idx >= 0 && t_wse_owning_executor == this) {
@@ -104,7 +104,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     const int    max_search   = std::max(1, n / 2);
 
     while (true) {
-        std::shared_ptr<detail::Task> task;
+        std::shared_ptr<detail::TaskBase> task;
 
         // --- Step 1: own local queue ---
         if (auto t = m_local_queues[worker_index].pop()) {
@@ -216,9 +216,9 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         waker->task     = task;
         waker->executor = this;
         detail::Context ctx(waker);
-        detail::Task::current = task.get();
+        detail::TaskBase::current = task.get();
         const bool done = task->poll(ctx);
-        detail::Task::current = nullptr;
+        detail::TaskBase::current = nullptr;
 
         if (done) {
             task->scheduling_state.store(

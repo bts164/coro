@@ -329,12 +329,12 @@ public:
     template<Future F>
         requires std::same_as<typename F::OutputType, T>
     void spawn(F future) {
-        // Pre-create the TaskState so we can build a JoinHandle before scheduling.
-        // to_destroy destructs here — JoinHandle destructors fire outside the lock.
-        auto task_state = std::make_shared<detail::TaskState<T>>();
-        auto task = std::make_unique<detail::Task>(std::move(future), task_state);
-        coro::current_runtime().schedule_task(std::move(task));
-        add(JoinHandle<T>(task_state));
+        // One allocation covers both the executor-facing TaskBase and the JoinHandle's TaskState<T>.
+        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
+        std::shared_ptr<detail::TaskState<T>> task_state = impl;
+        std::shared_ptr<detail::TaskBase> task = impl;  // aliased; copied before impl is moved
+        coro::current_runtime().schedule_task(std::shared_ptr<detail::TaskBase>(std::move(impl)));
+        add(JoinHandle<T>(std::move(task_state), std::move(task)));
     }
 
     /**
