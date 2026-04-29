@@ -54,7 +54,7 @@ struct SyncChild final : SyncChildBase {
 
     void set_waker(std::shared_ptr<Waker> waker) override {
         std::lock_guard lock(state->mutex);
-        state->join_waker = std::move(waker);
+        state->waker = std::move(waker);
     }
 };
 

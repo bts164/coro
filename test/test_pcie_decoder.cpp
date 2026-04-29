@@ -13,9 +13,9 @@ using namespace coro;
 
 class TestPacketBuilder {
 public:
-    TestPacketBuilder& with_header1(uint32_t magic, uint16_t flags,
-                                    uint16_t payload_len, uint64_t timestamp) {
-        PciePacket::Header1 h1{magic, flags, payload_len, timestamp};
+    TestPacketBuilder& with_header1(uint32_t magic, bool has_header2, uint32_t packet_type,
+                                    uint32_t payload_len, uint64_t timestamp) {
+        PciePacket::Header1 h1{magic, has_header2 ? 1u : 0u, packet_type, payload_len, timestamp};
         auto* ptr = reinterpret_cast<const std::byte*>(&h1);
         m_bytes.insert(m_bytes.end(), ptr, ptr + sizeof(h1));
         return *this;
@@ -67,7 +67,7 @@ static_assert(ZeroCopyDecoder<PcieDecoder>);
 TEST(PcieDecoderTest, DecodeMinimalPacket) {
     // Build packet with header1 only (no header2) + 4KB payload + footer
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0x12345678, 0x0000, 4096, 0xABCDEF0123456789ULL)
+        .with_header1(0x12345678, false, 0, 4096, 0xABCDEF0123456789ULL)
         .with_payload_size(4096, std::byte{0xAA})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -81,8 +81,8 @@ TEST(PcieDecoderTest, DecodeMinimalPacket) {
 
     auto& pkt = *result;
     EXPECT_EQ(pkt.header1.magic, 0x12345678U);
-    EXPECT_EQ(pkt.header1.flags, 0x0000);
-    EXPECT_EQ(pkt.header1.payload_length, 4096);
+    EXPECT_EQ(pkt.header1.has_header2, 0u);
+    EXPECT_EQ(pkt.header1.payload_length, 4096u);
     EXPECT_EQ(pkt.header1.timestamp, 0xABCDEF0123456789ULL);
     EXPECT_FALSE(pkt.header2.has_value());
     EXPECT_EQ(pkt.payload.size(), 4096);
@@ -94,7 +94,7 @@ TEST(PcieDecoderTest, DecodeMinimalPacket) {
 TEST(PcieDecoderTest, DecodePacketWithHeader2) {
     // Build packet with header1 (flag set) + header2 + payload + footer
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0x87654321, 0x0001, 8192, 0x1122334455667788ULL)  // flags & 0x01 = true
+        .with_header1(0x87654321, true, 0, 8192, 0x1122334455667788ULL)
         .with_header2(0x9999999999999999ULL, 0x0000000000000000ULL)
         .with_payload_size(8192, std::byte{0xBB})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
@@ -108,7 +108,7 @@ TEST(PcieDecoderTest, DecodePacketWithHeader2) {
     EXPECT_EQ(consumed, packet_bytes.size());
 
     auto& pkt = *result;
-    EXPECT_EQ(pkt.header1.flags, 0x0001);
+    EXPECT_EQ(pkt.header1.has_header2, 1u);
     ASSERT_TRUE(pkt.header2.has_value());
     EXPECT_EQ(pkt.header2->sequence_number, 0x9999999999999999ULL);
     EXPECT_EQ(pkt.payload.size(), 8192);
@@ -117,7 +117,7 @@ TEST(PcieDecoderTest, DecodePacketWithHeader2) {
 TEST(PcieDecoderTest, DISABLED_DecodeMaxSizePayload) {
     // Build packet with 128KB payload (maximum allowed)
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0x11111111, 0x0000, 128 * 1024, 0x1234567890ABCDEFULL)
+        .with_header1(0x11111111, false, 0, 128 * 1024, 0x1234567890ABCDEFULL)
         .with_payload_size(128 * 1024, std::byte{0xCC})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -137,7 +137,7 @@ TEST(PcieDecoderTest, DISABLED_DecodeMaxSizePayload) {
 TEST(PcieDecoderTest, DISABLED_DecodeAcrossMultipleCalls_Header1Split) {
     // Build complete packet
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0xAABBCCDD, 0x0000, 4096, 0x1111111111111111ULL)
+        .with_header1(0xAABBCCDD, false, 0, 4096, 0x1111111111111111ULL)
         .with_payload_size(4096, std::byte{0xDD})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -162,7 +162,7 @@ TEST(PcieDecoderTest, DISABLED_DecodeAcrossMultipleCalls_Header1Split) {
 TEST(PcieDecoderTest, DISABLED_DecodeAcrossMultipleCalls_PayloadSplit) {
     // Build complete packet
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0x55555555, 0x0000, 4096, 0x7777ULL)
+        .with_header1(0x55555555, false, 0, 4096, 0x7777ULL)
         .with_payload_size(4096, std::byte{0x55})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -194,7 +194,7 @@ TEST(PcieDecoderTest, DISABLED_DecodeAcrossMultipleCalls_PayloadSplit) {
 TEST(PcieDecoderTest, DecodeAcrossMultipleCalls_FooterSplit) {
     // Build complete packet
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0x66666666, 0x0000, 4096, 0x8888ULL)
+        .with_header1(0x66666666, false, 0, 4096, 0x8888ULL)
         .with_payload_size(4096, std::byte{0x66})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -223,7 +223,7 @@ TEST(PcieDecoderTest, DecodeAcrossMultipleCalls_FooterSplit) {
 TEST(PcieDecoderTest, InvalidPayloadLength_TooSmall) {
     // Build packet with payload_length = 1024 (< 4KB min)
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0xFFFFFFFF, 0x0000, 1024, 0x0ULL)  // 1024 < 4096 min
+        .with_header1(0xFFFFFFFF, false, 0, 1024, 0x0ULL)  // 1024 < 4096 min
         .with_payload_size(1024)
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -236,7 +236,7 @@ TEST(PcieDecoderTest, InvalidPayloadLength_TooSmall) {
 TEST(PcieDecoderTest, InvalidPayloadLength_TooLarge) {
     // Build packet with payload_length = 256KB (> 128KB max)
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0xFFFFFFFF, 0x0000, 256 * 1024, 0x0ULL)  // 256KB > 128KB max
+        .with_header1(0xFFFFFFFF, false, 0, 256 * 1024, 0x0ULL)  // 256KB > 128KB max
         .with_payload_size(256 * 1024)
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -249,7 +249,7 @@ TEST(PcieDecoderTest, InvalidPayloadLength_TooLarge) {
 TEST(PcieDecoderTest, InvalidFooterMagic) {
     // Build packet with wrong footer magic numbers
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0x12345678, 0x0000, 4096, 0x0ULL)
+        .with_header1(0x12345678, false, 0, 4096, 0x0ULL)
         .with_payload_size(4096)
         .with_footer(0xBADBADBADBADBAD, 0xBADBADBADBADBAD)  // Wrong magic
         .build();
@@ -266,7 +266,7 @@ TEST(PcieDecoderTest, InvalidFooterMagic) {
 TEST(PcieDecoderTest, ZeroCopy_DirectPayloadWrite) {
     // Build just header and footer (we'll write payload directly)
     auto header_bytes = TestPacketBuilder()
-        .with_header1(0x99999999, 0x0000, 4096, 0xAAAULL)
+        .with_header1(0x99999999, false, 0, 4096, 0xAAAULL)
         .build();
 
     auto footer_bytes = TestPacketBuilder()
@@ -303,7 +303,7 @@ TEST(PcieDecoderTest, ZeroCopy_DirectPayloadWrite) {
 TEST(PcieDecoderTest, ZeroCopy_PartialPayloadWrites) {
     // Build header and footer
     auto header_bytes = TestPacketBuilder()
-        .with_header1(0xCCCCCCCC, 0x0000, 4096, 0xBBBULL)
+        .with_header1(0xCCCCCCCC, false, 0, 4096, 0xBBBULL)
         .build();
 
     auto footer_bytes = TestPacketBuilder()
@@ -345,19 +345,19 @@ TEST(PcieDecoderTest, ZeroCopy_PartialPayloadWrites) {
 TEST(PcieDecoderTest, DecodeMultiplePacketsSequentially) {
     // Build buffer with 3 complete packets back-to-back
     auto pkt1 = TestPacketBuilder()
-        .with_header1(0x11111111, 0x0000, 4096, 0x1ULL)
+        .with_header1(0x11111111, false, 0, 4096, 0x1ULL)
         .with_payload_size(4096, std::byte{0x11})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
 
     auto pkt2 = TestPacketBuilder()
-        .with_header1(0x22222222, 0x0000, 4096, 0x2ULL)
+        .with_header1(0x22222222, false, 0, 4096, 0x2ULL)
         .with_payload_size(4096, std::byte{0x22})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
 
     auto pkt3 = TestPacketBuilder()
-        .with_header1(0x33333333, 0x0000, 4096, 0x3ULL)
+        .with_header1(0x33333333, false, 0, 4096, 0x3ULL)
         .with_payload_size(4096, std::byte{0x33})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();
@@ -402,7 +402,7 @@ TEST(PcieDecoderTest, DecodeMultiplePacketsSequentially) {
 TEST(PcieDecoderTest, ResetAfterPartialDecode) {
     // Build complete packet
     auto packet_bytes = TestPacketBuilder()
-        .with_header1(0xDEADBEEF, 0x0000, 4096, 0x9999ULL)
+        .with_header1(0xDEADBEEF, false, 0, 4096, 0x9999ULL)
         .with_payload_size(4096, std::byte{0xEE})
         .with_footer(PCIE_FOOTER_MAGIC1, PCIE_FOOTER_MAGIC2)
         .build();

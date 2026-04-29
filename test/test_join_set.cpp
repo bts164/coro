@@ -2,12 +2,14 @@
 #include <coro/coro.h>
 #include <coro/co_invoke.h>
 #include <coro/sync/join.h>
+#include <coro/sync/select.h>
 #include <coro/task/join_set.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/single_threaded_executor.h>
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #include <stdexcept>
+#include <variant>
 #include <vector>
 #include <algorithm>
 
@@ -382,6 +384,28 @@ TEST(JoinSetTest, PendingTaskIsCancelledNotCompleted) {
 }
 
 // -----------------------------------------------------------------------
+// build_task() builder interface
+// -----------------------------------------------------------------------
+
+TEST(JoinSetTest, BuildTaskSpawnsTask) {
+    Runtime rt(1);
+    std::vector<int> results;
+
+    rt.block_on(co_invoke([&results]() -> Coro<void> {
+        JoinSet<int> js;
+        js.build_task(ReadyFuture<int>{1}).spawn();
+        js.build_task(ReadyFuture<int>{2}).name("second").spawn();
+        js.build_task(ReadyFuture<int>{3}).name("third").spawn();
+
+        while (auto item = co_await next(js))
+            results.push_back(*item);
+    }));
+
+    std::sort(results.begin(), results.end());
+    EXPECT_EQ(results, (std::vector<int>{1, 2, 3}));
+}
+
+// -----------------------------------------------------------------------
 // Composition with co_invoke
 // -----------------------------------------------------------------------
 
@@ -421,4 +445,281 @@ TEST(JoinSetVoidTest, ComposesWithCoInvokeAndCapture) {
     }));
 
     EXPECT_EQ(sum, 60);
+}
+
+// -----------------------------------------------------------------------
+// Async consumer parking — next() must suspend and be woken by a later-
+// completing task. Exercises on_task_complete() → consumer_waker->wake().
+// -----------------------------------------------------------------------
+
+TEST(JoinSetTest, NextSuspendsAndIsWokenByAsyncTask) {
+    // OneShotFuture suspends on the first poll and completes on the second,
+    // so the consumer's co_await next(js) parks before the result is ready.
+    Runtime rt(1);
+    std::vector<int> results;
+
+    rt.block_on(co_invoke([&results]() -> Coro<void> {
+        JoinSet<int> js;
+        js.spawn(OneShotFuture<int>{10});
+        js.spawn(OneShotFuture<int>{20});
+        js.spawn(OneShotFuture<int>{30});
+
+        while (auto item = co_await next(js))
+            results.push_back(*item);
+    }));
+
+    std::sort(results.begin(), results.end());
+    EXPECT_EQ(results, (std::vector<int>{10, 20, 30}));
+}
+
+TEST(JoinSetTest, DrainSuspendsAndIsWokenByAsyncTask) {
+    Runtime rt(1);
+    int drain_count = 0;
+
+    rt.block_on(co_invoke([&drain_count]() -> Coro<void> {
+        JoinSet<int> js;
+        js.spawn(OneShotFuture<int>{1});
+        js.spawn(OneShotFuture<int>{2});
+        co_await js.drain();
+        drain_count = 1;
+    }));
+
+    EXPECT_EQ(drain_count, 1);
+}
+
+TEST(JoinSetVoidTest, NextSuspendsAndIsWokenByAsyncTask) {
+    // Use co_invoke to produce Coro<void> futures that each suspend once before
+    // completing, so the consumer's co_await next(js) parks mid-stream.
+    Runtime rt(1);
+    int count = 0;
+
+    rt.block_on(co_invoke([&count]() -> Coro<void> {
+        JoinSet<void> js;
+        for (int i = 0; i < 3; ++i)
+            js.spawn(co_invoke([]() -> Coro<void> {
+                co_await OneShotFuture<int>{0};
+            }));
+
+        while (co_await next(js))
+            ++count;
+    }));
+
+    EXPECT_EQ(count, 3);
+}
+
+// -----------------------------------------------------------------------
+// Multiple exceptions — drain discards all but the first
+// -----------------------------------------------------------------------
+
+TEST(JoinSetTest, DrainDiscardsAllButFirstException) {
+    Runtime rt(1);
+    int caught_count = 0;
+    std::string first_message;
+
+    rt.block_on(co_invoke([&]() -> Coro<void> {
+        JoinSet<int> js;
+        js.spawn(ThrowingFuture{});
+        js.spawn(ThrowingFuture{});
+        js.spawn(ThrowingFuture{});
+
+        try {
+            co_await js.drain();
+        } catch (const std::runtime_error& e) {
+            ++caught_count;
+            first_message = e.what();
+        }
+        // No second exception should escape — the try/catch must not be re-entered.
+    }));
+
+    EXPECT_EQ(caught_count, 1);
+    EXPECT_EQ(first_message, "task failed");
+}
+
+TEST(JoinSetVoidTest, DrainDiscardsAllButFirstException) {
+    Runtime rt(1);
+    int caught_count = 0;
+
+    rt.block_on(co_invoke([&caught_count]() -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(ThrowingVoidFuture{});
+        js.spawn(ThrowingVoidFuture{});
+
+        try {
+            co_await js.drain();
+        } catch (const std::runtime_error&) {
+            ++caught_count;
+        }
+    }));
+
+    EXPECT_EQ(caught_count, 1);
+}
+
+// -----------------------------------------------------------------------
+// Move assignment — must cancel the old set's tasks before adopting the new
+// -----------------------------------------------------------------------
+
+TEST(JoinSetTest, MoveAssignmentCancelsPreviousTasks) {
+    // Assigning a new JoinSet to an existing one must cancel the tasks in the
+    // old set. Use CancellationProbeFuture to confirm they do not complete naturally.
+    Runtime rt(1);
+    std::atomic<bool> old_completed_naturally{false};
+    bool new_task_ran = false;
+
+    rt.block_on(co_invoke([&]() -> Coro<void> {
+        JoinSet<int> js;
+        js.spawn(CancellationProbeFuture{old_completed_naturally});
+
+        // Assign a new JoinSet — old tasks must be cancelled.
+        JoinSet<int> js2;
+        js2.spawn(ReadyFuture<int>{99});
+        js = std::move(js2);
+
+        while (auto item = co_await next(js)) {
+            if (*item == 99) new_task_ran = true;
+        }
+    }));
+
+    EXPECT_FALSE(old_completed_naturally);
+    EXPECT_TRUE(new_task_ran);
+}
+
+// -----------------------------------------------------------------------
+// Multi-threaded — exercises the consumer_waker race between on_task_complete()
+// (worker thread) and poll_next() (consumer thread).
+// -----------------------------------------------------------------------
+
+TEST(JoinSetTest, MultiThreadedCollectViaNext) {
+    Runtime rt(4);
+    std::atomic<int> result_sum{0};
+
+    rt.block_on(co_invoke([&result_sum]() -> Coro<void> {
+        JoinSet<int> js;
+        for (int i = 1; i <= 8; ++i)
+            js.spawn(co_invoke([i]() -> Coro<int> { co_return i; }));
+
+        while (auto item = co_await next(js))
+            result_sum.fetch_add(*item);
+    }));
+
+    EXPECT_EQ(result_sum.load(), 36); // 1+2+...+8
+}
+
+TEST(JoinSetTest, MultiThreadedDrain) {
+    Runtime rt(4);
+    std::atomic<int> completed{0};
+
+    rt.block_on(co_invoke([&completed]() -> Coro<void> {
+        JoinSet<int> js;
+        for (int i = 0; i < 16; ++i)
+            js.spawn(co_invoke([i, &completed]() -> Coro<int> {
+                completed.fetch_add(1);
+                co_return i;
+            }));
+        co_await js.drain();
+    }));
+
+    EXPECT_EQ(completed.load(), 16);
+}
+
+TEST(JoinSetVoidTest, MultiThreadedDrain) {
+    Runtime rt(4);
+    std::atomic<int> completed{0};
+
+    rt.block_on(co_invoke([&completed]() -> Coro<void> {
+        JoinSet<void> js;
+        for (int i = 0; i < 16; ++i)
+            js.spawn(co_invoke([&completed]() -> Coro<void> {
+                completed.fetch_add(1);
+                co_return;
+            }));
+        co_await js.drain();
+    }));
+
+    EXPECT_EQ(completed.load(), 16);
+}
+
+// -----------------------------------------------------------------------
+// NextFuture in select — dropping a next(js) branch must not hang or
+// corrupt the JoinSet. The losing branch registers consumer_waker, which
+// fires a spurious wake; results must still be collectable afterwards.
+// -----------------------------------------------------------------------
+
+TEST(JoinSetTest, NextInSelectLosingBranchLeavesJoinSetUsable) {
+    // select(next(js), ImmediateVoid) — ImmediateVoid wins on every poll.
+    // The next(js) branch suspends, stores consumer_waker, then is dropped.
+    // After select returns, the remaining JoinSet tasks must still be
+    // drainable with no hang and correct results.
+    Runtime rt(1);
+    std::vector<int> results;
+
+    rt.block_on(co_invoke([&results]() -> Coro<void> {
+        JoinSet<int> js;
+        js.spawn(OneShotFuture<int>{10});
+        js.spawn(OneShotFuture<int>{20});
+
+        // next(js) suspends (tasks not yet ready); ImmediateVoid wins.
+        auto sel = co_await select(next(js), ReadyVoidFuture{});
+        EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(sel)));
+
+        // JoinSet still live — drain the remaining results.
+        while (auto item = co_await next(js))
+            results.push_back(*item);
+    }));
+
+    std::sort(results.begin(), results.end());
+    EXPECT_EQ(results, (std::vector<int>{10, 20}));
+}
+
+TEST(JoinSetTest, NextInSelectWinningBranchWorks) {
+    // select(next(js), NeverFuture) — next(js) wins once a task completes.
+    Runtime rt(1);
+    std::optional<int> got;
+
+    rt.block_on(co_invoke([&got]() -> Coro<void> {
+        // NeverFuture: stays pending forever.
+        struct NeverFuture {
+            using OutputType = void;
+            PollResult<void> poll(detail::Context&) { return PollPending; }
+        };
+
+        JoinSet<int> js;
+        js.spawn(OneShotFuture<int>{42});
+
+        auto sel = co_await select(next(js), NeverFuture{});
+        if (std::holds_alternative<SelectBranch<0, std::optional<int>>>(sel))
+            got = *std::get<SelectBranch<0, std::optional<int>>>(sel).value;
+    }));
+
+    EXPECT_TRUE(got.has_value());
+    EXPECT_EQ(*got, 42);
+}
+
+TEST(JoinSetTest, NextInSelectRepeatedRoundsCollectsAll) {
+    // Loop: each iteration uses select(next(js), NeverFuture) to collect
+    // one result. Tests that consumer_waker is correctly refreshed each round.
+    Runtime rt(1);
+    std::vector<int> results;
+
+    rt.block_on(co_invoke([&results]() -> Coro<void> {
+        struct NeverFuture {
+            using OutputType = void;
+            PollResult<void> poll(detail::Context&) { return PollPending; }
+        };
+
+        JoinSet<int> js;
+        for (int i = 1; i <= 4; ++i)
+            js.spawn(OneShotFuture<int>{i * 10});
+
+        while (true) {
+            auto sel = co_await select(next(js), NeverFuture{});
+            if (!std::holds_alternative<SelectBranch<0, std::optional<int>>>(sel))
+                break;
+            auto item = std::get<SelectBranch<0, std::optional<int>>>(sel).value;
+            if (!item) break;
+            results.push_back(*item);
+        }
+    }));
+
+    std::sort(results.begin(), results.end());
+    EXPECT_EQ(results, (std::vector<int>{10, 20, 30, 40}));
 }

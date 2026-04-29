@@ -90,11 +90,15 @@ struct TaskStateBase {
  * Both ends hold a `shared_ptr<TaskState<T>>`. The executor writes the result (or exception)
  * when the task completes; the `JoinHandle` reads it and wakes the waiting coroutine.
  *
- * Two wakers are stored as `weak_ptr` to avoid reference cycles:
- * - `join_waker` — set by `JoinHandle::poll()`; fired when the awaiting coroutine should
- *   be rescheduled to retrieve the result.
- * - `scope_waker` — set by `CoroutineScope::set_drain_waker()`; fired so the parent
- *   coroutine knows a dropped child has finished draining.
+ * A single `waker` slot covers both awaiter cases:
+ * - Set by `JoinHandle::poll()` when the handle is being `co_await`-ed.
+ * - Set by `CoroutineScope::set_drain_waker()` when the handle was dropped and the scope
+ *   is waiting for the child to drain.
+ *
+ * These two cases are mutually exclusive: if the JoinHandle is being awaited it has not
+ * been dropped, so the scope never holds the OwnedTask; if the handle was dropped the scope
+ * owns the child and the JoinHandle can no longer call poll(). Only one waiter exists at
+ * any point in the task's lifetime.
  *
  * Using `weak_ptr<Waker>` (rather than `shared_ptr<Waker>`) breaks the ownership cycles
  * documented in doc/shared_ptr_cycles.md. Task lifetime is anchored by OwnedTask (held
@@ -121,9 +125,9 @@ struct TaskState : TaskStateBase {
     // Category 4 (doc/task_ownership.md): notification-only, no lifetime ownership.
     // weak_ptr so that storing a waker derived from ctx.getWaker() (which IS the task)
     // does not create a shared_ptr cycle back to the owning TaskImpl.
-    // Fire via: if (auto w = join_waker.lock()) w->wake();
-    std::weak_ptr<Waker> join_waker;              ///< Wakes the `JoinHandle` awaiter on completion.
-    std::weak_ptr<Waker> scope_waker;             ///< Wakes the parent `CoroutineScope` drain loop on completion.
+    // At most one waiter exists: either a JoinHandle awaiter or a CoroutineScope drain loop.
+    // Fire via: if (auto w = waker.lock()) w->wake();
+    std::weak_ptr<Waker> waker;                   ///< Wakes the sole waiter (JoinHandle or CoroutineScope) on completion.
     ResultType           result = init_result();  ///< Set by `setResult()` on successful completion.
     std::exception_ptr   exception;               ///< Set by `setException()` on fault.
 
@@ -136,66 +140,58 @@ struct TaskState : TaskStateBase {
     /// @brief Signals terminal state without a result. Used by `Task` on cancellation.
     /// Fires both `join_waker` and `scope_waker`.
     void mark_done() {
-        std::weak_ptr<Waker> join_wk, scope_wk;
+        std::weak_ptr<Waker> wk;
         {
             std::lock_guard lock(mutex);
             terminated = true;
             cv.notify_all();
-            join_wk    = std::move(join_waker);
-            scope_wk   = std::move(scope_waker);
+            wk = std::move(waker);
             self_owned.reset();  // release detached self-ref under the same lock
         }
-        if (auto w = join_wk.lock())  w->wake();
-        if (auto w = scope_wk.lock()) w->wake();
+        if (auto w = wk.lock()) w->wake();
     }
 
-    /// @brief Stores the successful result and signals completion. Fires both wakers.
+    /// @brief Stores the successful result and signals completion. Fires the completion waker.
     void setResult() requires std::is_void_v<T> {
-        std::weak_ptr<Waker> join_wk, scope_wk;
+        std::weak_ptr<Waker> wk;
         {
             std::lock_guard lock(mutex);
             result = true;
             terminated = true;
             cv.notify_all();
-            join_wk    = std::move(join_waker);
-            scope_wk   = std::move(scope_waker);
+            wk = std::move(waker);
             self_owned.reset();
         }
-        if (auto w = join_wk.lock())  w->wake();
-        if (auto w = scope_wk.lock()) w->wake();
+        if (auto w = wk.lock()) w->wake();
     }
 
-    /// @brief Stores the successful result and signals completion. Fires both wakers.
+    /// @brief Stores the successful result and signals completion. Fires the completion waker.
     template<std::convertible_to<T> U> requires (!std::is_void_v<T>)
     void setResult(U &&value) {
-        std::weak_ptr<Waker> join_wk, scope_wk;
+        std::weak_ptr<Waker> wk;
         {
             std::lock_guard lock(mutex);
             result = std::forward<U>(value);
             terminated = true;
             cv.notify_all();
-            join_wk    = std::move(join_waker);
-            scope_wk   = std::move(scope_waker);
+            wk = std::move(waker);
             self_owned.reset();
         }
-        if (auto w = join_wk.lock())  w->wake();
-        if (auto w = scope_wk.lock()) w->wake();
+        if (auto w = wk.lock()) w->wake();
     }
 
-    /// @brief Stores an unhandled exception and signals completion. Fires both wakers.
+    /// @brief Stores an unhandled exception and signals completion. Fires the completion waker.
     void setException(std::exception_ptr e) {
-        std::weak_ptr<Waker> join_wk, scope_wk;
+        std::weak_ptr<Waker> wk;
         {
             std::lock_guard lock(mutex);
             exception = std::move(e);
             terminated = true;
             cv.notify_all();
-            join_wk    = std::move(join_waker);
-            scope_wk   = std::move(scope_waker);
+            wk = std::move(waker);
             self_owned.reset();
         }
-        if (auto w = join_wk.lock())  w->wake();
-        if (auto w = scope_wk.lock()) w->wake();
+        if (auto w = wk.lock()) w->wake();
     }
 };
 

@@ -7,182 +7,99 @@
 #include <coro/detail/waker.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
-#include <coro/task/join_handle.h>
 #include <exception>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <set>
 #include <type_traits>
 #include <utility>
-#include <variant>
+#include <vector>
 
 namespace coro {
 
 namespace detail {
 
-template<typename T>
-struct JoinSetTaskHandle;
-
 // -----------------------------------------------------------------------
 // JoinSetSharedState<T>
-// Shared between JoinSet, every JoinSetTask, and any live DrainFuture.
 // -----------------------------------------------------------------------
 
-// OWNERSHIP AND REFERENCE CYCLES
-//
-// While a child task is pending, the following shared_ptr graph exists:
-//
-//   JoinSet::m_state ──────────────────────────────────► JoinSetSharedState
-//                                                              │
-//                                            pending_handles   │  (std::set)
-//                                                              ▼
-//   TaskState::join_waker ─────────────────────────► JoinSetTaskHandle
-//        │                                                  │     │
-//        │                                          m_state │     │ m_handle
-//        │                                                  │     ▼
-//        │                                                  │  JoinHandle
-//        │                                                  │     │ m_state
-//        │                                                  │     ▼
-//        └──────────────────────────────────────────── TaskState ◄┘
-//
-// Two interlocking cycles are present while the task is live:
-//
-//   Cycle A (task ↔ handle):
-//     JoinSetTaskHandle → (m_handle) → JoinHandle → TaskState
-//     TaskState → (join_waker) → JoinSetTaskHandle
-//
-//   Cycle B (handle ↔ shared state):
-//     JoinSetSharedState → (pending_handles) → JoinSetTaskHandle
-//     JoinSetTaskHandle → (m_state) → JoinSetSharedState
-//
-// HOW THE CYCLES ARE BROKEN
-//
-//   Normal completion (task finishes):
-//     TaskState::setResult/setDone/setException() moves join_waker out, breaking
-//     Cycle A.  JoinSetTaskHandle::wake() then moves m_handle out and calls
-//     pending_handles.erase(self), breaking Cycle B.
-//
-//   Cancellation (JoinSet::cancel_pending() / ~JoinSet):
-//     take_handle() moves m_handle out of each JoinSetTaskHandle (breaking Cycle A),
-//     then pending_handles.clear() drops all handle refs (breaking Cycle B).
-//     The extracted JoinHandles are destroyed outside the lock; their destructors
-//     set cancelled=true on TaskState.  When the executor eventually polls those
-//     tasks, it sees cancelled=true, calls mark_done(), which moves join_waker out
-//     (fires JoinSetTaskHandle::wake(), which is a no-op since m_handle_taken=true),
-//     and frees the remaining chain.
-//
-// WHAT NOT TO DO
-//   Do NOT store the drain waker (or any shared_ptr<TaskBase> pointing back to the
-//   parent Task) inside an object that is itself owned by that Task.  CoroutineScope
-//   previously kept a `m_drain_waker` member for this reason — it created a
-//   self-referential Task→Coro→CoroutineScope→shared_ptr<TaskBase>→Task cycle that
-//   prevented the Task from ever being freed.  See coro_scope.h for the authoritative note.
-
 /**
- * @brief Shared state for a `JoinSet<T>` (non-void specialisation).
+ * @brief Shared state for a JoinSet<T>.
  *
- * All fields are protected by `mutex`. The two handle lists track task
- * lifetimes without requiring an O(n) scan to find completed entries:
+ * - `pending_handles` — strong references to tasks still running. Serves as
+ *   the sole persistent lifetime anchor for each task while it is Idle (parked
+ *   between executor polls). When a task completes, it removes itself from
+ *   pending and moves to idle inside on_task_complete().
  *
- * - `pending_handles` — handles for tasks still running. Each `JoinSetTask`
- *   holds a `std::list` iterator into this list (stable under splicing).
- * - `done_handles`    — handles for tasks that completed or were cancelled,
- *   waiting to be destroyed. `JoinHandle` destructors touch other locks
- *   (atomics, `CoroutineScope`) so they are deferred until the next sweep
- *   point, where they are moved out and destroyed after the mutex is released.
+ * - `idle_handles` — aliased shared_ptr<TaskState<T>> for tasks that have
+ *   reached a terminal state. The consumer reads results directly from
+ *   TaskState<T>, avoiding any extra result copy.
  *
- * The `closing` flag has been removed. `JoinSetTaskHandle::m_state` is now a
- * `weak_ptr<JoinSetSharedState>`, so when `JoinSet` is destroyed and releases
- * its `m_state`, the `JoinSetSharedState` is freed. Any subsequent `wake()`
- * call from a racing task will lock() the weak_ptr, find it null, and return
- * as a no-op — eliminating Cycle 2B. See doc/shared_ptr_cycles.md.
- *
- * @tparam T The value type produced by spawned tasks.
+ * JoinSetTask holds a weak_ptr<JoinSetSharedState> to break the cycle:
+ *   JoinSetSharedState::pending_handles → TaskBase
+ *                                       → (weak) → JoinSetSharedState
  */
 template<typename T>
 struct JoinSetSharedState {
-    std::mutex                                        mutex;
-    std::shared_ptr<Waker>                            consumer_waker;
-    std::set<std::shared_ptr<JoinSetTaskHandle<T>>>   pending_handles;
-    std::list<PollResult<T>>                          results;
+    std::mutex                               mutex;
+    std::shared_ptr<Waker>                   consumer_waker;
+    std::set<std::shared_ptr<TaskBase>>      pending_handles; ///< Running tasks (lifetime anchors).
+    std::list<std::shared_ptr<TaskState<T>>> idle_handles;    ///< Completed tasks awaiting consumption.
 };
 
-template<typename T>
-struct JoinSetTaskHandle : public std::enable_shared_from_this<JoinSetTaskHandle<T>>, public Waker
-{
-    // m_state is a weak_ptr to break Cycle 2B:
-    //   JoinSetTaskHandle → JoinSetSharedState → pending_handles → JoinSetTaskHandle
-    // When JoinSet is destroyed and its m_state drops, the JoinSetSharedState is freed.
-    // Subsequent wake() calls find lock() returning null and are a silent no-op.
-    // See doc/shared_ptr_cycles.md, Cycle 2B.
-    JoinSetTaskHandle(JoinHandle<T> handle, std::weak_ptr<JoinSetSharedState<T>> state) :
-        m_handle(std::move(handle)),
-        m_state(std::move(state))
-    {}
-    JoinSetTaskHandle(JoinSetTaskHandle const &) = delete;
-    JoinSetTaskHandle& operator=(JoinSetTaskHandle const &) = delete;
-    ~JoinSetTaskHandle() override = default;
+// -----------------------------------------------------------------------
+// JoinSetTask<F>
+// -----------------------------------------------------------------------
 
-    std::shared_ptr<Waker> clone() override
-    {
-        return this->shared_from_this();
-    }
+/**
+ * @brief Concrete task for JoinSet::spawn(). A single allocation covers the
+ * executor-facing TaskBase, the result-holding TaskState<T>, and the JoinSet
+ * tracking data — no separate JoinHandle or handle wrapper is needed.
+ *
+ * Inherits TaskImpl<F> for all inner-future polling, the full cancellation
+ * protocol, and result/exception/mark_done delivery. Overrides
+ * on_task_complete() to move itself from pending to idle in the owning
+ * JoinSet's shared state and wake the consumer.
+ *
+ * Uses weak_ptr<JoinSetSharedState> to avoid a reference cycle between the
+ * shared state (which owns pending_handles → this task) and the task itself.
+ * When JoinSet is destroyed, lock() returns null and on_task_complete() is a
+ * silent no-op; the executor's temporary strong reference keeps the task alive
+ * through the remainder of poll().
+ */
+template<Future F>
+class JoinSetTask : public TaskImpl<F> {
+    using T = typename F::OutputType;
+public:
+    JoinSetTask(F future, std::weak_ptr<JoinSetSharedState<T>> set_state)
+        : TaskImpl<F>(std::move(future))
+        , m_set_state(std::move(set_state)) {}
 
-    // Called from JoinSet::cancel_pending() while holding m_state->mutex.
-    // Extracts the JoinHandle so its destructor can run (cancel + scope registration)
-    // outside the lock, and sets m_handle_taken to suppress any racing wake().
-    //
-    // Lock order: m_state->mutex → m_handle_mutex (never reversed).
-    JoinHandle<T> take_handle()
-    {
-        std::lock_guard hlock(m_handle_mutex);
-        m_handle_taken = true;
-        return std::move(m_handle);
-    }
+    void on_task_complete() noexcept override {
+        auto state = m_set_state.lock();
+        if (!state) return;  // JoinSet was destroyed — nothing to notify
 
-    void wake() override
-    {
-        auto self = this->shared_from_this();
-        // Guard against concurrent take_handle() in JoinSet destructor/move-assign.
-        // Poll under m_handle_mutex so take_handle() cannot race on m_handle.
-        // Lock order: m_handle_mutex first, m_state->mutex second (released before acquiring).
-        std::optional<JoinHandle<T>> handle;
-        PollResult<T> result = PollPending;
+        // Build an aliased shared_ptr<TaskState<T>> from shared_from_this().
+        // Both share the same control block (same allocation), but the stored
+        // pointer is the TaskState<T> subobject. The consumer uses this to
+        // read the result directly, the same way JoinHandle::poll() would.
+        auto self_base = this->shared_from_this();  // shared_ptr<TaskBase>
+        std::shared_ptr<TaskState<T>> self_state(self_base, static_cast<TaskState<T>*>(this));
+
+        std::shared_ptr<Waker> waker;
         {
-            std::lock_guard hlock(m_handle_mutex);
-            if (std::exchange(m_handle_taken, true)) return;
-            handle = std::move(m_handle);
+            std::lock_guard lock(state->mutex);
+            state->pending_handles.erase(self_base);
+            state->idle_handles.push_back(std::move(self_state));
+            waker = std::exchange(state->consumer_waker, nullptr);
         }
-        detail::Context ctx(self);
-        result = handle->poll(ctx);
-        if (result.isPending()) {
-            std::terminate();
-        }
-        std::move(handle).value().detach();
-        // Lock m_state if it's still alive. JoinSet may have been destroyed between
-        // our poll and here — in that case lock() returns null and we are a no-op.
-        auto state = m_state.lock();
-        if (!state) return;
-        std::unique_lock lock(state->mutex);
-        if (0 == state->pending_handles.erase(self)) {
-            std::terminate();
-        }
-        state->results.emplace_back(std::move(result));
-        auto waker = std::exchange(state->consumer_waker, nullptr);
-        lock.unlock();
-        if (waker) {
-            waker->wake();
-        }
+        if (waker) waker->wake();
     }
 
-    JoinHandle<T>                        m_handle;
-    std::weak_ptr<JoinSetSharedState<T>> m_state;  // weak — breaks Cycle 2B
-    // Protects m_handle against concurrent wake() and take_handle().
-    std::mutex                           m_handle_mutex;
-    bool                                 m_handle_taken{false};
+private:
+    std::weak_ptr<JoinSetSharedState<T>> m_set_state;
 };
 
 // -----------------------------------------------------------------------
@@ -190,14 +107,12 @@ struct JoinSetTaskHandle : public std::enable_shared_from_this<JoinSetTaskHandle
 // -----------------------------------------------------------------------
 
 /**
- * @brief `Future<void>` returned by `JoinSet::drain()`.
+ * @brief Future<void> returned by JoinSet::drain().
  *
- * Polls until all pending tasks have completed or been cancelled. On each
- * poll, sweeps `done_handles` (destroying them after releasing the lock) and
- * drains the results queue — discarding values, capturing the first exception.
- * Rethrows the first exception after `pending_count` reaches zero.
- *
- * @tparam T Value type of the owning `JoinSet` (may be `void`).
+ * Polls until all pending tasks have completed or been cancelled. Each poll
+ * sweeps idle_handles (discarding values, capturing the first exception) and
+ * returns Pending if any tasks are still running. Rethrows the first exception
+ * after pending_handles reaches zero.
  */
 template<typename T>
 class JoinSetDrainFuture {
@@ -210,29 +125,37 @@ public:
     JoinSetDrainFuture(JoinSetDrainFuture&&) noexcept = default;
 
     PollResult<void> poll(detail::Context& ctx) {
-        std::size_t pending_count = 0;
-        std::list<PollResult<T>> results;
+        std::list<std::shared_ptr<TaskState<T>>> to_process;
+        bool any_pending;
         {
             std::lock_guard lock(m_state->mutex);
-            std::swap(m_state->results, results);
-            pending_count = m_state->pending_handles.size();
-            if (pending_count > 0) {
+            std::swap(m_state->idle_handles, to_process);
+            any_pending = !m_state->pending_handles.empty();
+            if (any_pending)
                 m_state->consumer_waker = ctx.getWaker()->clone();
+        }
+
+        // Process completed tasks outside the lock — collect first exception, discard values.
+        for (auto& ts : to_process) {
+            if (!m_first_exception) {
+                std::lock_guard tlock(ts->mutex);
+                if (ts->exception) m_first_exception = ts->exception;
             }
         }
-        for (auto &result : results) {
-            if (m_first_exception) {
-                break;
-            }
-            if (result.isError()) {
-                m_first_exception = result.error();
-                break;
+        // to_process destructs here, releasing task allocations.
+
+        if (any_pending) return PollPending;
+
+        // No pending tasks at snapshot time. Re-check: a task may have completed
+        // and moved to idle between our swap and here.
+        {
+            std::lock_guard lock(m_state->mutex);
+            if (!m_state->pending_handles.empty() || !m_state->idle_handles.empty()) {
+                m_state->consumer_waker = ctx.getWaker()->clone();
+                return PollPending;
             }
         }
-        if (pending_count > 0) {
-            return PollPending;
-        }
-        // to_destroy destructs here, outside the lock.
+
         if (m_first_exception) return PollError(std::move(m_first_exception));
         return PollReady;
     }
@@ -246,46 +169,100 @@ private:
 
 
 // -----------------------------------------------------------------------
+// JoinSetSpawnBuilder<T, F>
+// -----------------------------------------------------------------------
+
+/**
+ * @brief Builder returned by `JoinSet<T>::build_task()`. Mirrors Tokio's
+ * `JoinSet::build_task()` interface.
+ *
+ * Call `.name("...")` to set a human-readable task name, then `.spawn()` to
+ * submit the task. `[[nodiscard]]` — discarding the builder without calling
+ * `.spawn()` silently drops the future without scheduling it.
+ */
+template<typename T, Future F>
+    requires std::same_as<typename F::OutputType, T>
+class [[nodiscard]] JoinSetSpawnBuilder {
+public:
+    JoinSetSpawnBuilder(F future, std::shared_ptr<detail::JoinSetSharedState<T>> state)
+        : m_future(std::move(future)), m_state(std::move(state)) {}
+
+    JoinSetSpawnBuilder(JoinSetSpawnBuilder&&) noexcept            = default;
+    JoinSetSpawnBuilder(const JoinSetSpawnBuilder&)                = delete;
+    JoinSetSpawnBuilder& operator=(const JoinSetSpawnBuilder&)     = delete;
+    JoinSetSpawnBuilder& operator=(JoinSetSpawnBuilder&&) noexcept = default;
+
+    /// @brief Sets a human-readable name visible in diagnostics.
+    JoinSetSpawnBuilder& name(std::string n) & {
+        m_name = std::move(n);
+        return *this;
+    }
+
+    JoinSetSpawnBuilder&& name(std::string n) && {
+        m_name = std::move(n);
+        return std::move(*this);
+    }
+
+    /// @brief Schedules the future as a child task in the owning `JoinSet`.
+    /// Must be called exactly once. Consumes the builder.
+    void spawn() && {
+        auto task = std::make_shared<detail::JoinSetTask<F>>(
+            std::move(m_future),
+            std::weak_ptr<detail::JoinSetSharedState<T>>(m_state));
+        task->name = std::move(m_name);
+        std::shared_ptr<detail::TaskBase> task_base(task);
+        {
+            std::lock_guard lock(m_state->mutex);
+            m_state->pending_handles.insert(task_base);
+        }
+        coro::current_runtime().schedule_task(std::move(task_base));
+    }
+
+private:
+    F                                               m_future;
+    std::shared_ptr<detail::JoinSetSharedState<T>>  m_state;
+    std::string                                     m_name;
+};
+
+
+// -----------------------------------------------------------------------
 // JoinSet<T> — public API
 // -----------------------------------------------------------------------
 
 /**
  * @brief Structured-concurrency set for spawning and collecting homogeneous child tasks.
  *
- * All tasks spawned into a `JoinSet<T>` must produce values of type `T`. Results are
- * delivered in completion order. `JoinSet<T>` satisfies `Stream<T>`, making it composable
- * with `next()`, `select`, and other stream combinators.
+ * All tasks spawned into a `JoinSet<T>` must produce values of type `T`. Results
+ * are delivered in completion order via `next()` or discarded via `drain()`.
+ * `JoinSet<T>` satisfies `Stream<T>`.
  *
- * **Handle lifecycle:** each spawned task's `JoinHandle<void>` lives in `pending_handles`
- * until the task finishes, then is spliced O(1) to `done_handles`. At the next sweep
- * point (`poll_next()`, `spawn()`, or `drain()` poll), done handles are destroyed outside
- * the shared-state lock.
+ * **Allocation model:** each `spawn()` creates a single `JoinSetTask<F>` allocation
+ * that covers the executor-facing `TaskBase`, the result-holding `TaskState<T>`, and
+ * the JoinSet tracking data. When the task completes it moves itself from the pending
+ * to idle queue; the consumer reads the result directly from `TaskState<T>` without
+ * an extra copy or intermediate handle.
  *
- * **Cancel on drop:** dropping a `JoinSet` cancels all pending tasks. When dropped inside
- * a coroutine, the enclosing `CoroutineScope` ensures tasks drain before the coroutine
- * completes — use inside `co_invoke` to guarantee reference safety.
+ * **Cancel on drop:** destroying a `JoinSet` cancels all pending tasks and drops the
+ * persistent strong references. Tasks that are currently Idle are woken via
+ * `cancel_task()` so the executor picks them up, observes `cancelled = true`, and
+ * drains them; tasks that are Running or Notified are already held by the executor's
+ * temporary reference and will self-terminate on their next poll.
  *
- * **Exception handling:**
- * - `next()`: rethrows a child's exception when that result is dequeued.
- * - `drain()`: waits for all tasks; rethrows the first exception after all finish.
- *
- * @tparam T The value type produced by spawned tasks. For `void` tasks use `JoinSet<void>`.
+ * @tparam T The value type produced by spawned tasks. Use `JoinSet<void>` for tasks
+ *           that produce no value.
  */
 template<typename T>
 class [[nodiscard]] JoinSet {
 public:
-    using ItemType = T;
-    using OptionalType = std::conditional_t<
-        std::is_void_v<T>,
-        bool, std::optional<T>>;
+    using ItemType     = T;
+    using OptionalType = std::conditional_t<std::is_void_v<T>, bool, std::optional<T>>;
 
     JoinSet() : m_state(std::make_shared<detail::JoinSetSharedState<T>>()) {}
 
     JoinSet(const JoinSet&)            = delete;
     JoinSet& operator=(const JoinSet&) = delete;
-    JoinSet(JoinSet&&) noexcept            = default;
+    JoinSet(JoinSet&&) noexcept        = default;
 
-    // Custom move-assignment: cancel pending tasks on the old state before overwriting.
     JoinSet& operator=(JoinSet&& other) noexcept {
         if (this != &other) {
             cancel_pending();
@@ -294,127 +271,106 @@ public:
         return *this;
     }
 
-    // Cancels all pending tasks and registers them with the enclosing CoroutineScope
-    // (if any) so the scope drains them before the parent coroutine completes.
     ~JoinSet() { cancel_pending(); }
 
     /**
      * @brief Spawns `future` as a child task. The result is delivered via `next()` or `drain()`.
      *
-     * Inserts a `JoinHandle<void>` into `pending_handles`, passes its iterator to the
-     * `JoinSetTask`, and sweeps any accumulated `done_handles` before scheduling.
-     *
      * May only be called from within a `Runtime::block_on()` context.
+     * Use `build_task(future).name("...").spawn()` to set a task name.
      */
-    void add(JoinHandle<T> join_handle) {
-        // Pre-create the TaskState so we can build a JoinHandle before scheduling.
-        // to_destroy destructs here — JoinHandle destructors fire outside the lock.
-        auto join_set_handle = std::make_shared<detail::JoinSetTaskHandle<T>>(
-            std::move(join_handle), std::weak_ptr<detail::JoinSetSharedState<T>>(m_state));
-        {
-            std::lock_guard lock(m_state->mutex);
-            m_state->pending_handles.insert(join_set_handle);
-        }
-        // now poll the join_handle to either move it to the idle queue now, or register the
-        // set_handle as the waker for the join_handle so it moves it upon completion
-        detail::Context ctx(join_set_handle);
-        auto result = join_set_handle->m_handle.poll(ctx);
-        if (!result.isPending()) {
-            std::lock_guard lock(m_state->mutex);
-            if (0 == m_state->pending_handles.erase(join_set_handle)) {
-                std::terminate();
-            }
-            m_state->results.emplace_back(std::move(result));
-        }
+    template<Future F>
+        requires std::same_as<typename F::OutputType, T>
+    void spawn(F future) {
+        build_task(std::move(future)).spawn();
     }
 
     /**
-     * @brief Spawns `future` as a child task. The result is delivered via `next()` or `drain()`.
+     * @brief Returns a builder for configuring and spawning a child task.
      *
-     * Inserts a `JoinHandle<void>` into `pending_handles`, passes its iterator to the
-     * `JoinSetTask`, and sweeps any accumulated `done_handles` before scheduling.
+     * Mirrors Tokio's `JoinSet::build_task()`. Call `.name("...")` to attach a
+     * human-readable name, then `.spawn()` to submit. `[[nodiscard]]` — discarding
+     * the builder without calling `.spawn()` silently drops the future.
      *
      * May only be called from within a `Runtime::block_on()` context.
      */
     template<Future F>
         requires std::same_as<typename F::OutputType, T>
-    void spawn(F future) {
-        // One allocation covers both the executor-facing TaskBase and the JoinHandle's TaskState<T>.
-        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
-        std::shared_ptr<detail::TaskState<T>> task_state = impl;
-        // Aliased shared_ptr wrapped in OwnedTask — sole persistent strong ref to the task.
-        detail::OwnedTask owned{std::shared_ptr<detail::TaskBase>(impl)};
-        coro::current_runtime().schedule_task(std::shared_ptr<detail::TaskBase>(std::move(impl)));
-        add(JoinHandle<T>(std::move(task_state), std::move(owned)));
+    [[nodiscard]] JoinSetSpawnBuilder<T, F> build_task(F future) {
+        return JoinSetSpawnBuilder<T, F>(std::move(future), m_state);
     }
 
     /**
-     * @brief Satisfies `Stream<T>`. Returns the next completed result, or `nullopt` when
-     * all tasks have finished. Rethrows a child's exception immediately when dequeued.
-     * Sweeps `done_handles` on each call.
+     * @brief Satisfies `Stream<T>`. Returns the next completed result, or end-of-stream
+     * when all tasks have finished. Rethrows a child's exception when dequeued.
      *
+     * If a task was cancelled before producing a result, returns `PollDropped`.
      * Use via `co_await next(js)` rather than calling directly.
      */
     PollResult<OptionalType> poll_next(detail::Context& ctx) {
         std::unique_lock lock(m_state->mutex);
-        if (m_state->results.empty()) {
-            if (m_state->pending_handles.empty()) {
-                if constexpr (std::is_void_v<T>) {
-                    return PollResult<OptionalType>(false);
-                } else {
-                    return PollResult<OptionalType>(std::nullopt);
-                }
+
+        if (!m_state->idle_handles.empty()) {
+            auto task_state = std::move(m_state->idle_handles.front());
+            m_state->idle_handles.pop_front();
+            lock.unlock();
+
+            // Read result directly from TaskState — same logic as JoinHandle::poll().
+            std::lock_guard tlock(task_state->mutex);
+            if (task_state->exception)
+                return PollError(task_state->exception);
+            if constexpr (std::is_void_v<T>) {
+                if (task_state->result)
+                    return PollResult<OptionalType>(true);
+            } else {
+                if (task_state->result.has_value())
+                    return PollResult<OptionalType>(std::move(*task_state->result));
             }
+            return PollDropped;  // task was cancelled before producing a result
+        }
+
+        if (!m_state->pending_handles.empty()) {
             m_state->consumer_waker = ctx.getWaker()->clone();
             return PollPending;
         }
-        auto result = std::move(m_state->results.front());
-        m_state->results.pop_front();
-        lock.unlock();
-        if (result.isReady()) {
-            if constexpr (std::is_void_v<T>) {
-                return PollResult<OptionalType>(true);
-            } else {
-                return PollResult<OptionalType>(std::move(result).value());
-            }
-        } else if (result.isError()) {
-            return PollError(result.error());
-        } else if (result.isDropped()) {
-            return PollDropped;
-        }
-        std::terminate();
-        return PollPending;
+
+        // Stream exhausted — no pending or idle tasks remain.
+        if constexpr (std::is_void_v<T>)
+            return PollResult<OptionalType>(false);
+        else
+            return PollResult<OptionalType>(std::nullopt);
     }
 
     /**
      * @brief Returns a `Future<void>` that completes once all spawned tasks finish.
      *
-     * Result values are discarded. The first exception encountered is rethrown after all
-     * tasks complete. `[[nodiscard]]` — discarding it skips the wait entirely.
+     * Result values are discarded. The first exception encountered is rethrown after
+     * all tasks complete. `[[nodiscard]]` — discarding it skips the wait entirely.
      */
     [[nodiscard]] detail::JoinSetDrainFuture<T> drain() {
         return detail::JoinSetDrainFuture<T>{m_state};
     }
 
 private:
-    // Breaks the JoinSetSharedState ↔ JoinSetTaskHandle reference cycle by extracting
-    // all JoinHandle<T> objects while holding m_state->mutex, then destroying them
-    // outside the lock.  JoinHandle<T>::~JoinHandle() marks each task cancelled and,
-    // if called from within a coroutine's poll(), registers it with the enclosing
-    // CoroutineScope so the scope drains those tasks before the parent completes.
+    // Marks all pending tasks cancelled and drops the persistent strong references.
+    // Tasks that are Idle are woken by cancel_task() so the executor observes
+    // cancelled=true and drains them. Running/Notified tasks are already held by the
+    // executor's temporary reference and self-terminate on the next poll.
     void cancel_pending() {
         if (!m_state) return;
-        std::vector<JoinHandle<T>> to_cancel;
+        std::vector<std::shared_ptr<detail::TaskBase>> to_cancel;
         {
             std::lock_guard lock(m_state->mutex);
-            // No closing flag needed: JoinSetTaskHandle::m_state is a weak_ptr, so
-            // any racing wake() after we clear pending_handles will find lock() == null.
             to_cancel.reserve(m_state->pending_handles.size());
             for (auto& h : m_state->pending_handles)
-                to_cancel.push_back(h->take_handle());
-            m_state->pending_handles.clear();
+                to_cancel.push_back(h);
+            m_state->pending_handles.clear();  // drop persistent refs
         }
-        // JoinHandle<T> destructors fire here, outside the lock.
+        // Call cancel_task() while to_cancel still holds strong refs — prevents
+        // premature deallocation of Idle tasks between the ref drop and the wake.
+        for (auto& task : to_cancel)
+            task->cancel_task();
+        // to_cancel destructs here; tasks are now Notified (executor holds temp ref).
     }
 
     std::shared_ptr<detail::JoinSetSharedState<T>> m_state;

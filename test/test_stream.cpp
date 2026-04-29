@@ -1,7 +1,13 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include <coro/stream.h>
+#include <coro/coro.h>
+#include <coro/co_invoke.h>
+#include <coro/sync/select.h>
+#include <coro/runtime/runtime.h>
 
+#include <optional>
+#include <variant>
 #include <vector>
 
 using namespace coro;
@@ -182,4 +188,156 @@ TEST(ErrorStreamTest, PropagatesError) {
     auto second = s.poll_next(ctx);
     EXPECT_TRUE(second.isError());
     EXPECT_THROW(second.rethrowIfError(), std::runtime_error);
+}
+
+// Stream that suspends once per item (stores waker, re-wakes itself, returns PollPending),
+// then delivers the item on the next poll. Used to exercise waker registration and
+// NextFuture drop paths.
+template<typename T>
+class SuspendingStream {
+public:
+    using ItemType = T;
+    explicit SuspendingStream(std::vector<T> items) : m_items(std::move(items)) {}
+
+    PollResult<std::optional<T>> poll_next(detail::Context& ctx) {
+        if (m_index >= m_items.size())
+            return std::optional<T>(std::nullopt);
+        if (!m_suspended) {
+            m_suspended = true;
+            m_waker = ctx.getWaker()->clone();
+            m_waker->wake();  // re-schedule immediately; simulates async I/O callback
+            return PollPending;
+        }
+        m_suspended = false;
+        m_waker.reset();
+        return std::optional<T>(std::move(m_items[m_index++]));
+    }
+
+private:
+    std::vector<T>                  m_items;
+    std::size_t                     m_index     = 0;
+    bool                            m_suspended = false;
+    std::shared_ptr<detail::Waker>  m_waker;
+};
+
+static_assert(Stream<SuspendingStream<int>>);
+
+// -----------------------------------------------------------------------
+// NextFuture drop — low-level unit test
+//
+// Dropping a NextFuture after it has suspended (stored a waker and returned
+// PollPending) must leave the stream in a usable state: the next NextFuture
+// created from the same stream must deliver the item correctly.
+// -----------------------------------------------------------------------
+
+TEST(NextFutureTest, DroppedAfterSuspendLeavesStreamUsable) {
+    // Use a concrete waker that records whether wake() was called.
+    class CountingWaker : public detail::Waker {
+    public:
+        int count = 0;
+        void wake() override { ++count; }
+        std::shared_ptr<Waker> clone() override {
+            return std::make_shared<CountingWaker>();
+        }
+    };
+
+    SuspendingStream<int> s({42});
+
+    // First NextFuture: poll once → PollPending (waker stored in stream).
+    {
+        auto waker = std::make_shared<CountingWaker>();
+        detail::Context ctx(waker);
+        auto n = next(s);
+        auto r = n.poll(ctx);
+        EXPECT_TRUE(r.isPending());
+        // n destroyed here — stream still holds (now stale) waker
+    }
+
+    // Second NextFuture: stream should deliver the item on the second poll
+    // (SuspendingStream advances past the suspend on re-poll).
+    auto waker2 = std::make_shared<CountingWaker>();
+    detail::Context ctx2(waker2);
+    auto n2 = next(s);
+    auto r = n2.poll(ctx2);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_EQ(r.value(), 42);
+}
+
+// -----------------------------------------------------------------------
+// NextFuture in select — integration tests
+//
+// These verify that a NextFuture used as a select branch works correctly
+// when the branch loses (NextFuture dropped mid-suspension) and that the
+// stream is still usable in subsequent rounds.
+// -----------------------------------------------------------------------
+
+// Immediately-ready void future used as the "other branch" in select.
+struct SelectVoidBranch {
+    using OutputType = void;
+    PollResult<void> poll(detail::Context&) { return PollReady; }
+};
+
+// Never-completes future used as the "other branch" when we want next() to win.
+struct SelectNeverBranch {
+    using OutputType = void;
+    PollResult<void> poll(detail::Context&) { return PollPending; }
+};
+
+TEST(NextFutureTest, SelectLosingBranchLeavesStreamUsable) {
+    // select(next(s), ImmediateVoid) — ImmediateVoid wins; next(s) was pending.
+    // After select returns, the stream must still deliver all its items.
+    Runtime rt(1);
+    std::vector<int> results;
+
+    rt.block_on(co_invoke([&results]() -> Coro<void> {
+        SuspendingStream<int> s({10, 20, 30});
+
+        // next(s) suspends on first poll; ImmediateVoid wins immediately.
+        auto sel = co_await select(next(s), SelectVoidBranch{});
+        EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(sel)));
+
+        // Stream still usable — collect remaining items.
+        while (auto item = co_await next(s))
+            results.push_back(*item);
+    }));
+
+    std::sort(results.begin(), results.end());
+    EXPECT_EQ(results, (std::vector<int>{10, 20, 30}));
+}
+
+TEST(NextFutureTest, SelectWinningBranchDeliversItem) {
+    // select(next(s), NeverFuture) — next(s) wins once the item is ready.
+    Runtime rt(1);
+    std::optional<int> got;
+
+    rt.block_on(co_invoke([&got]() -> Coro<void> {
+        SuspendingStream<int> s({42});
+        auto sel = co_await select(next(s), SelectNeverBranch{});
+        if (std::holds_alternative<SelectBranch<0, std::optional<int>>>(sel))
+            got = std::get<SelectBranch<0, std::optional<int>>>(sel).value;
+    }));
+
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, 42);
+}
+
+TEST(NextFutureTest, SelectRepeatedRoundsCollectsAllItems) {
+    // Each iteration wraps next(s) in select. Verifies waker is refreshed correctly
+    // each round and all items are delivered in order.
+    Runtime rt(1);
+    std::vector<int> results;
+
+    rt.block_on(co_invoke([&results]() -> Coro<void> {
+        SuspendingStream<int> s({1, 2, 3, 4});
+        while (true) {
+            auto sel = co_await select(next(s), SelectNeverBranch{});
+            if (!std::holds_alternative<SelectBranch<0, std::optional<int>>>(sel))
+                break;
+            auto item = std::get<SelectBranch<0, std::optional<int>>>(sel).value;
+            if (!item) break;
+            results.push_back(*item);
+        }
+    }));
+
+    EXPECT_EQ(results, (std::vector<int>{1, 2, 3, 4}));
 }

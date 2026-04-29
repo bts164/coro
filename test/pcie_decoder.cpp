@@ -23,7 +23,7 @@ std::optional<PciePacket> PcieDecoder::decode(std::span<const std::byte> buffer,
             consumed += 16;
 
             // Extract flags and payload length
-            m_has_header2 = (m_packet.header1.flags & 0x01) != 0;
+            m_has_header2 = (m_packet.header1.has_header2) != 0;
             std::size_t payload_length = m_packet.header1.payload_length;
 
             // Validate payload length

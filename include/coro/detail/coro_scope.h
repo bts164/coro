@@ -93,8 +93,8 @@ public:
      * 2. Install the weak waker on remaining children via OwnedTask::set_scope_waker().
      * 3. Sweep again — a child may have completed between steps 1 and 2.
      *
-     * The waker is stored as `weak_ptr<Waker>` on the child's TaskState::scope_waker.
-     * When the child completes it calls `scope_waker.lock()->wake()` to notify the parent.
+     * The waker is stored as `weak_ptr<Waker>` on the child's TaskState::waker.
+     * When the child completes it calls `waker.lock()->wake()` to notify the parent.
      * This does not create a reference cycle — see doc/shared_ptr_cycles.md, Cycle 3.
      *
      * @return `true` if at least one child is still pending after the double-sweep.
@@ -107,7 +107,7 @@ public:
             m_pending.end());
         if (m_pending.empty()) return false;
         for (auto& task : m_pending)
-            task.set_scope_waker(waker);
+            task.set_waker(waker);
         m_pending.erase(
             std::remove_if(m_pending.begin(), m_pending.end(),
                 [](const OwnedTask& t) { return t.is_complete(); }),

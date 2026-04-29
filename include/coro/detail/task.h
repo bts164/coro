@@ -102,7 +102,25 @@ public:
      * Called by CoroutineScope::set_drain_waker() through OwnedTask to notify
      * the parent when a dropped child finishes. Implemented by TaskImpl<F>.
      */
-    virtual void set_scope_waker(std::weak_ptr<Waker> waker) = 0;
+    virtual void set_waker(std::weak_ptr<Waker> waker) = 0;
+
+    /**
+     * @brief Called by TaskImpl<F>::poll() immediately after the terminal
+     * setResult/setException/mark_done call, before returning true.
+     *
+     * Default is a no-op. Override (e.g. in JoinSetTask) to perform
+     * post-completion bookkeeping without re-implementing the full poll loop.
+     */
+    virtual void on_task_complete() noexcept {}
+
+    /**
+     * @brief Marks the task cancelled and wakes it so it sees cancelled on
+     * its next poll. Implemented by TaskImpl<F>.
+     *
+     * Default is a no-op. Called by JoinSet::cancel_pending() through the
+     * type-erased TaskBase* stored in pending_handles.
+     */
+    virtual void cancel_task() noexcept {}
 
     // Waker implementation — defined in task.cpp to break the circular include with executor.h.
     void wake() override;
@@ -150,9 +168,14 @@ public:
         return this->terminated;
     }
 
-    void set_scope_waker(std::weak_ptr<Waker> waker) override {
+    void set_waker(std::weak_ptr<Waker> waker) override {
         std::lock_guard lock(this->mutex);
-        this->scope_waker = std::move(waker);
+        this->waker = std::move(waker);
+    }
+
+    void cancel_task() noexcept override {
+        this->cancelled.store(true, std::memory_order_relaxed);
+        wake();
     }
 
     bool poll(Context& ctx) override {
@@ -170,7 +193,9 @@ public:
                 }
             } else {
                 // Non-Cancellable (leaf) future: mark done immediately.
+                m_completed = true;
                 this->mark_done();
+                on_task_complete();
                 return true;
             }
         }
@@ -190,6 +215,7 @@ public:
             else
                 this->setResult(std::move(result).value());
         }
+        on_task_complete();
         return true;
     }
 
@@ -239,9 +265,9 @@ public:
         return m_ptr && m_ptr->is_complete();
     }
 
-    /// @brief Installs a weak scope waker on the task.
-    void set_scope_waker(std::weak_ptr<Waker> waker) {
-        if (m_ptr) m_ptr->set_scope_waker(std::move(waker));
+    /// @brief Installs the completion waker on the task. Fired when the task reaches a terminal state.
+    void set_waker(std::weak_ptr<Waker> waker) {
+        if (m_ptr) m_ptr->set_waker(std::move(waker));
     }
 
 private:

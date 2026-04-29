@@ -138,7 +138,7 @@ TEST(TaskStateTest, MarkDoneFiresScopeWaker) {
     auto waker = std::make_shared<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
-        state->scope_waker = waker;
+        state->waker = waker;
     }
     state->mark_done();
     EXPECT_TRUE(waker->woken);
@@ -159,7 +159,7 @@ TEST(TaskStateTest, SetResultMarksDoneAndFiresScopeWaker) {
     auto waker = std::make_shared<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
-        state->scope_waker = waker;
+        state->waker = waker;
     }
     state->setResult(42);
     EXPECT_TRUE(waker->woken);

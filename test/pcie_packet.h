@@ -21,10 +21,11 @@ struct PciePacket {
      * @brief Primary header (always present, 16 bytes).
      */
     struct Header1 {
-        uint32_t magic;           // Protocol magic number
-        uint16_t flags;           // Bit 0: has_header2, bits 8-15: packet type
-        uint16_t payload_length;  // Payload size in bytes (4096-131072)
-        uint64_t timestamp;       // PCIe device timestamp
+        uint32_t magic;              // Protocol magic number
+        uint32_t has_header2   : 1;  // Packet has header2 if set
+        uint32_t packet_type   : 3;  // Packet data type
+        uint32_t payload_length: 28; // Payload size in bytes (4096-131072)
+        uint64_t timestamp;          // PCIe device timestamp
     } header1;
 
     /**

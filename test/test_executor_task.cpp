@@ -160,7 +160,7 @@ TEST(SingleThreadedExecutorTest, SetResultCallsJoinWaker) {
     SingleThreadedExecutor ex;
     auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{1});
     std::shared_ptr<TaskState<int>> state = impl;
-    state->join_waker = join_waker;
+    state->waker = join_waker;
     ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
     ex.poll_ready_tasks();
 }
@@ -172,7 +172,7 @@ TEST(SingleThreadedExecutorTest, WaitForComplete) {
     SingleThreadedExecutor ex;
     auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{1});
     std::shared_ptr<TaskState<int>> state = impl;
-    state->join_waker = join_waker;
+    state->waker = join_waker;
     ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
     ex.poll_ready_tasks();
 }

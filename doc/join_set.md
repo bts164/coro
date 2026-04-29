@@ -8,21 +8,21 @@ sequenceDiagram
     participant C as Coroutine
     participant JS as JoinSet<T>
     participant E as Executor
-    participant T1 as Task A
-    participant T2 as Task B
+    participant T1 as JoinSetTask A
+    participant T2 as JoinSetTask B
 
     C->>JS: spawn(task_a)
-    JS->>E: schedule(JoinSetTask wrapping task_a)
+    JS->>E: schedule(JoinSetTask A)
     C->>JS: spawn(task_b)
-    JS->>E: schedule(JoinSetTask wrapping task_b)
+    JS->>E: schedule(JoinSetTask B)
 
     E->>T1: poll() → Ready(result_a)
-    T1->>JS: push result_a to queue, splice handle pending→done, wake consumer
+    T1->>JS: on_task_complete(): pending→idle, wake consumer
     E->>T2: poll() → Ready(result_b)
-    T2->>JS: push result_b to queue, splice handle pending→done, wake consumer
+    T2->>JS: on_task_complete(): pending→idle, wake consumer
 
-    C->>JS: co_await next(js) → result_a, sweep done handles
-    C->>JS: co_await next(js) → result_b, sweep done handles
+    C->>JS: co_await next(js) → result_a (read directly from TaskState<T>)
+    C->>JS: co_await next(js) → result_b (read directly from TaskState<T>)
     C->>JS: co_await next(js) → nullopt (exhausted)
 ```
 
@@ -95,67 +95,80 @@ co_await co_invoke([&data]() -> Coro<void> {
 
 ## Internal design
 
+### Allocation model
+
+Each `spawn()` call creates a single `JoinSetTask<F>` via `make_shared`. `JoinSetTask<F>`
+inherits `TaskImpl<F>`, which in turn inherits both `TaskBase` (executor interface / waker)
+and `TaskState<T>` (result, exception, cancellation flag). One allocation therefore covers:
+
+- The executor-facing `TaskBase` interface
+- The result-holding `TaskState<T>` subobject
+- The `JoinSet` tracking data (`weak_ptr<JoinSetSharedState<T>>`)
+- The user's future `F`
+
+No separate handle wrapper is needed.
+
 ### Shared state
 
 `JoinSetSharedState<T>` (internal, `detail/`) is shared between the `JoinSet`, every
-`JoinSetTask` wrapper, and any live `JoinSetDrainFuture` via `shared_ptr`. It holds:
+live `JoinSetTask`, and any live `JoinSetDrainFuture` via `shared_ptr`. It holds:
 
-| Field | Description |
-|---|---|
-| `results` | Queue of `variant<T, exception_ptr>` (non-void) or `queue<exception_ptr>` (void) |
-| `pending_count` | Number of tasks not yet completed or cancelled |
-| `consumer_waker` | Wakes the `next()`/`drain()` consumer when results arrive |
-| `pending_handles` | `std::list<JoinHandle<void>>` — handles for tasks still running |
-| `done_handles` | `std::list<JoinHandle<void>>` — handles for tasks that have finished |
+| Field | Type | Description |
+|---|---|---|
+| `pending_handles` | `set<shared_ptr<TaskBase>>` | Strong refs to running tasks — lifetime anchors while tasks are Idle between executor polls |
+| `idle_handles` | `list<shared_ptr<TaskState<T>>>` | Completed tasks awaiting consumption; aliased into the same allocation as the corresponding `TaskBase` |
+| `consumer_waker` | `shared_ptr<Waker>` | Wakes the `next()`/`drain()` consumer when a task completes |
+| `mutex` | `std::mutex` | Protects all fields |
 
-All fields are protected by a single `mutex`.
+### Task lifecycle
 
-### Handle lifecycle
+`JoinSetTask<F>` overrides `on_task_complete()`, which `TaskImpl<F>::poll()` calls at
+every terminal exit (after `setResult`, `setException`, or `mark_done`). The override:
 
-Every `spawn()` call inserts a `JoinHandle<void>` at the back of `pending_handles` and
-passes the resulting `std::list` iterator to the corresponding `JoinSetTask`. Using
-`std::list` gives stable iterators — no iterator invalidation when other nodes are
-inserted or spliced.
+1. Locks `JoinSetSharedState::mutex`.
+2. Erases `self` from `pending_handles`.
+3. Pushes an aliased `shared_ptr<TaskState<T>>` (same allocation, `TaskState<T>*`
+   stored pointer) onto `idle_handles`.
+4. Steals `consumer_waker` while still under the lock.
+5. Releases the lock, then calls `waker->wake()`.
 
-When a task finishes (in `JoinSetTask::poll()`) or is cancelled (in
-`~JoinSetTask()`), it splices its node from `pending_handles` to `done_handles` in **O(1)**
-under the mutex. The handle is not destroyed immediately; it waits in the done list.
-
-At the next **sweep point** — any call to `poll_next()`, `spawn()`, or
-`JoinSetDrainFuture::poll()` — the done list is moved out of the shared state under the
-lock, then destroyed after the lock is released. This keeps `JoinHandle` destructors
-(which touch atomics and the `CoroutineScope` mutex) outside the shared-state lock,
-preventing any lock-ordering issue.
+`JoinSet::poll_next()` pops from `idle_handles` and reads the result directly from
+`TaskState<T>` under its own mutex — the same logic used by `JoinHandle::poll()`. No
+result copy into an intermediate queue is needed.
 
 ```
 After spawn(A), spawn(B), spawn(C):
-  pending_handles: [A] → [B] → [C]
-  done_handles:    []
+  pending_handles: {A, B, C}
+  idle_handles:    []
 
-After B completes (JoinSetTask::poll() splices B):
-  pending_handles: [A] → [C]
-  done_handles:    [B]
+After B completes (on_task_complete() moves B):
+  pending_handles: {A, C}
+  idle_handles:    [B]          ← B's TaskState<T> is readable; no extra allocation
 
-After next poll_next() sweep:
-  pending_handles: [A] → [C]
-  done_handles:    []        ← B's JoinHandle destroyed here (outside lock)
+After poll_next() consumes B:
+  pending_handles: {A, C}
+  idle_handles:    []           ← B's allocation freed when shared_ptr<TaskState<T>> drops
 ```
+
+The `JoinSetTask` uses a `weak_ptr<JoinSetSharedState<T>>` to avoid a reference cycle:
+`JoinSetSharedState::pending_handles` → `TaskBase` → `(weak)` → `JoinSetSharedState`.
+When the `JoinSet` is destroyed, `lock()` returns null and `on_task_complete()` is a
+silent no-op; the executor's temporary strong reference keeps the task alive through the
+remainder of `poll()`.
 
 ### Cancellation flow
 
-When `JoinSet` is dropped, `pending_handles` and `done_handles` are destroyed as part of
-`JoinSetSharedState`'s destructor (or when its `shared_ptr` ref count hits zero). Each
-`JoinHandle<void>` destructor:
+When `JoinSet` is dropped, `cancel_pending()`:
 
-1. Marks `TaskState<void>::cancelled = true`.
-2. If inside a coroutine `poll()` (`t_current_coro` is non-null), registers a
-   `PendingChild` with the enclosing `CoroutineScope`.
+1. Collects all entries from `pending_handles` into a local `vector` (keeping tasks
+   alive via temporary strong refs).
+2. Clears `pending_handles` (drops the persistent refs).
+3. Calls `cancel_task()` on each task — sets `cancelled = true` and enqueues the task
+   so the executor sees the flag on the next poll.
 
-The `CoroutineScope` then drains all registered children before the parent coroutine
-delivers its result, ensuring no task outlives the scope that spawned it.
-
-Handles already in `done_handles` have `terminated == true`; their `CoroutineScope`
-registration completes immediately (no blocking).
+Tasks that are currently Running or Notified are already held by the executor's
+temporary strong reference and self-terminate on their next poll. The local `vector`
+ensures Idle tasks are not freed between the ref-drop and the `cancel_task()` enqueue.
 
 ### Stream<T> satisfaction
 

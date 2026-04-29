@@ -289,7 +289,7 @@ Coro<void> bad() {
 Coro<void> fragile() {
     int local_data = 42;
     JoinSet<void> js;
-    js.add(spawn(worker(&local_data)).submit());
+    js.spawn(worker(&local_data));
     co_await js.drain();
 }
 
@@ -298,7 +298,7 @@ Coro<void> fragile() {
 Coro<void> safe(int local_data) {
     co_await co_invoke([](int& data) -> Coro<void> {
         JoinSet<void> js;
-        js.add(spawn(worker(&data)).submit());
+        js.spawn(worker(&data));
         co_await js.drain();
     }(local_data));
 }
@@ -327,7 +327,7 @@ Coro<void> safe_example() {
     int local_data = 42;
     co_await co_invoke([](int& data) -> Coro<void> {
         JoinSet<void> js;
-        js.add(spawn(worker(&data)).submit());
+        js.spawn(worker(&data));
         co_await js.drain();
     }(local_data));
 }

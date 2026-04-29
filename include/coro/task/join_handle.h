@@ -198,7 +198,7 @@ public:
         }
         // Not ready yet — store weak waker so the Task can wake us on completion.
         // weak_ptr avoids contributing to ownership cycles (see doc/task_ownership.md).
-        m_state->join_waker = ctx.get_weak_waker();
+        m_state->waker = ctx.get_weak_waker();
         return PollPending;
     }
 

@@ -85,21 +85,21 @@ auto [n2, b2] = co_await h2;
 
 ### Managed with JoinSet
 
-For continuous streaming, managing individual handles gets tedious. Pass them to a
+For continuous streaming, managing individual handles gets tedious. Spawn them into a
 `JoinSet` instead and let it track completion and surface errors:
 
 ```cpp
 // Write side — fire and forget into a JoinSet<void>
 coro::JoinSet<void> writes;
-writes.add(pipe.write(std::move(buf1)));
-writes.add(pipe.write(std::move(buf2)));
-writes.add(pipe.write(std::move(buf3)));
+writes.spawn(pipe.write(std::move(buf1)));
+writes.spawn(pipe.write(std::move(buf2)));
+writes.spawn(pipe.write(std::move(buf3)));
 co_await writes.drain();   // wait for all; rethrows first error if any
 
 // Read side — collect results via next()
 coro::JoinSet<std::pair<std::size_t, Buf>> reads;
-reads.add(pipe.read(std::move(buf1)));
-reads.add(pipe.read(std::move(buf2)));
+reads.spawn(pipe.read(std::move(buf1)));
+reads.spawn(pipe.read(std::move(buf2)));
 while (auto result = co_await coro::next(reads)) {
     auto [n, buf] = std::move(*result);
     process(buf.data(), n);

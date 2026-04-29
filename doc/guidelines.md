@@ -60,13 +60,12 @@ Coro<void> fragile() {
     // h dropped here → drain begins, but local_data already destroyed
 }
 
-// BAD — looks safe but is not: any exception thrown between js.add() and
-// co_await js.drain() bypasses the drain and destroys local_data while
-// children are still running.
+// BAD — looks safe but is not: any exception thrown before co_await js.drain()
+// bypasses the drain and destroys local_data while children are still running.
 Coro<void> deceptive() {
     int local_data = 42;
     JoinSet<void> js;
-    js.add(spawn(worker(&local_data)).submit());
+    js.spawn(worker(&local_data));
     co_await js.drain();  // NOT reached if anything above this line throws
 }
 
@@ -76,7 +75,7 @@ Coro<void> deceptive() {
 Coro<void> safe(int local_data) {
     co_await co_invoke([](int& data) -> Coro<void> {
         JoinSet<void> js;
-        js.add(spawn(worker(&data)).submit());
+        js.spawn(worker(&data));
         co_await js.drain();
     }(local_data));
 }
@@ -97,7 +96,7 @@ Coro<void> process(std::vector<Item>& items) {
     co_await co_invoke([](std::vector<Item>& items) -> Coro<void> {
         JoinSet<void> js;
         for (auto& item : items)
-            js.add(spawn(process_item(item)).submit());
+            js.spawn(process_item(item));
         co_await js.drain();
     }(items));
 }

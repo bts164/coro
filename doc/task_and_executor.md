@@ -348,8 +348,10 @@ public:
     int         last_worker_index = -1;
     std::shared_ptr<void> self_owned; // detached-task self-reference; cleared at terminal state
     virtual bool poll(Context& ctx) = 0;
-    virtual bool is_complete() const = 0;                         // checked by CoroutineScope
-    virtual void set_scope_waker(std::weak_ptr<Waker> waker) = 0; // called by CoroutineScope
+    virtual bool is_complete() const = 0;                    // checked by CoroutineScope
+    virtual void set_waker(std::weak_ptr<Waker> waker) = 0; // called by JoinHandle and CoroutineScope
+    virtual void on_task_complete() noexcept {}              // hook for JoinSetTask bookkeeping
+    virtual void cancel_task() noexcept {}                   // type-erased cancellation for JoinSet
     virtual ~TaskBase() = default;
 };
 
@@ -358,9 +360,10 @@ class TaskImpl : public TaskBase, public TaskState<typename F::OutputType> {
     F    m_future;
     bool m_completed        = false;
     bool m_cancel_requested = false;
-    bool poll(Context& ctx) override { /* ... cooperative cancel protocol ... */ }
+    bool poll(Context& ctx) override { /* cooperative cancel protocol; calls on_task_complete() at terminal exit */ }
     bool is_complete() const override { /* checks TaskState::terminated under lock */ }
-    void set_scope_waker(std::weak_ptr<Waker> w) override { /* stores in TaskState::scope_waker */ }
+    void set_waker(std::weak_ptr<Waker> w) override { /* stores in TaskState::waker */ }
+    void cancel_task() noexcept override { /* sets cancelled flag, calls wake() */ }
 };
 
 // spawn() produces one allocation; OwnedTask is the sole persistent lifetime anchor:
