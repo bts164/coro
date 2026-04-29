@@ -30,6 +30,11 @@ struct SyncChildBase {
 
 template<typename T>
 struct SyncChild final : SyncChildBase {
+    // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same TaskImpl
+    // allocation as the one passed to schedule_task(). Acts as the lifetime anchor —
+    // when the executor parks the child and drops its ref, this is the sole surviving
+    // strong reference, keeping the TaskImpl alive until the parent Synchronize polls
+    // and sees is_done()==true.
     std::shared_ptr<TaskState<T>> state;
 
     explicit SyncChild(std::shared_ptr<TaskState<T>> s) : state(std::move(s)) {}

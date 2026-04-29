@@ -1,5 +1,4 @@
 #include <coro/runtime/single_threaded_executor.h>
-#include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
 #include <cstdlib>
 #include <iostream>
@@ -66,10 +65,7 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
             std::abort();
         }
 
-        auto waker = std::make_shared<TaskWaker>();
-        waker->task     = task;
-        waker->executor = this;
-        detail::Context ctx(waker);
+        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task));
         detail::TaskBase::current = task.get();
         bool done = task->poll(ctx);
         detail::TaskBase::current = nullptr;
@@ -79,14 +75,14 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
                 detail::SchedulingState::Done, std::memory_order_relaxed);
             // Task completed — drop it (destructor fires here).
         } else {
-            // Try Running → Idle: park the task, waker owns the only ref.
+            // Try Running → Idle: park the task; OwnedTask in parent holds the only persistent ref.
             expected = detail::SchedulingState::Running;
             if (task->scheduling_state.compare_exchange_strong(
                     expected, detail::SchedulingState::Idle,
                     std::memory_order_acq_rel,
                     std::memory_order_relaxed))
             {
-                task.reset(); // waker holds the only ref; parks until wake() fires
+                task.reset(); // release temporary executor ref; task lives via OwnedTask
             } else {
                 // CAS failed: expected now holds the actual state. The only valid
                 // state here is RunningAndNotified — wake() fired during poll().

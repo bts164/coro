@@ -13,8 +13,12 @@ std::shared_ptr<Waker> Context::getWaker() const {
     return m_waker;
 }
 
+std::weak_ptr<Waker> Context::get_weak_waker() const {
+    return m_waker;
+}
+
 std::shared_ptr<CancellationToken> Context::getCancellationToken() const {
     return m_token;
 }
 
-} // namespace coro
+} // namespace coro::detail

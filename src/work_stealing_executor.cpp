@@ -1,7 +1,6 @@
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
 #include <bit>
 #include <cstdlib>
@@ -212,10 +211,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 
         task->last_worker_index = worker_index;
 
-        auto waker = std::make_shared<TaskWaker>();
-        waker->task     = task;
-        waker->executor = this;
-        detail::Context ctx(waker);
+        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task));
         detail::TaskBase::current = task.get();
         const bool done = task->poll(ctx);
         detail::TaskBase::current = nullptr;
@@ -232,7 +228,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                     std::memory_order_acq_rel,
                     std::memory_order_relaxed))
             {
-                task.reset(); // waker holds the only ref
+                task.reset(); // release temporary executor ref; task lives via OwnedTask
             } else {
                 // CAS failed: expected now holds the actual state. The only valid
                 // state here is RunningAndNotified — wake() fired during poll().

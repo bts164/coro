@@ -3,19 +3,12 @@ project(coro VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
 option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
 option(WITH_GPERFTOOLS "Build with gperftools" OFF)
 if(ENABLE_TSAN)
     add_compile_options(-fsanitize=thread -g)
     add_link_options(-fsanitize=thread)
 endif()
-
-option(BUILD_TESTING "Build unit tests" OFF)
-option(BUILD_EXAMPLES "Build examples" OFF)
 
 if(WITH_GPERFTOOLS)
     find_package(gperftools REQUIRED)
@@ -27,6 +20,7 @@ file(GLOB_RECURSE CORO_PUBLIC_HEADERS "include/coro/*.h" "include/coro/*.hpp")
 message(STATUS ${CORO_PUBLIC_HEADERS})
 add_library(coro
     src/waker.cpp
+    src/task.cpp
     src/blocking_pool.cpp
     src/cancellation_token.cpp
     src/context.cpp
@@ -49,18 +43,8 @@ target_link_libraries(coro PUBLIC
     $<$<BOOL:${WITH_GPERFTOOLS}>:gperftools::gperftools>
     websockets)
 
-if(BUILD_TESTING)
-    find_package(GTest REQUIRED)
-    enable_testing()
-    add_subdirectory(test)
-endif()
-
-if(BUILD_EXAMPLES)
-    add_subdirectory(examples/io)
-endif()
-
 install(TARGETS coro PUBLIC_HEADER DESTINATION include/coro)
-install(DIRECTORY include/coro                                                                                                          
-    DESTINATION include                                                                                                                 
-    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"                                                                                        
+install(DIRECTORY include/coro
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
 )

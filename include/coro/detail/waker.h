@@ -17,7 +17,7 @@ namespace coro::detail {
  * **Thread safety:** `wake()` must be safe to call from any thread, including libuv
  * callback threads.
  *
- * Implementors: `SingleThreadedExecutor` provides a concrete `TaskWaker` subclass.
+ * Implementors: `TaskBase` is the concrete `Waker` — tasks are their own wakers.
  */
 class Waker {
 public:

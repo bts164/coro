@@ -55,7 +55,7 @@ the poll thread wakes up if it is blocked. The poll thread drains the injection 
 at the start of each cycle.
 
 The thread identity check is performed inside `Executor::enqueue()` — the method called
-by `TaskWaker::wake()` after winning the `Idle → Notified` CAS. This replaces the old
+by `TaskBase::wake()` after winning the `Idle → Notified` CAS. This replaces the old
 `wake_task(key)` pattern that required a `m_suspended` lookup:
 
 ```
@@ -128,46 +128,44 @@ public:
 `scheduling_state` was added. Explicit move operations were required that load/store the
 atomic value rather than trying to move it.
 
-### TaskWaker
+### TaskBase as Waker
 
-`TaskWaker` holds exactly two fields: a `shared_ptr<TaskBase>` (to push to a queue on
-wake) and an `Executor*` to determine which queue to target. `scheduling_state` lives
-directly in `TaskBase`, so no separate state pointer is needed:
+`TaskBase` IS the `Waker`. It inherits both `detail::Waker` and
+`std::enable_shared_from_this<TaskBase>`, so a waker clone is simply a `shared_ptr`
+refcount increment on the existing task allocation — no separate heap object is needed.
+
+`scheduling_state` and `owning_executor` live directly in `TaskBase`, giving `wake()` all
+the state it needs without an extra indirection:
 
 ```cpp
-struct TaskWaker : detail::Waker {
-    shared_ptr<detail::TaskBase> task;
-    Executor*                    executor;
+void TaskBase::wake() {
+    auto expected = SchedulingState::Idle;
+    while (true) {
+        switch (expected) {
+        case SchedulingState::Idle:
+            if (CAS(expected → Notified)) { owning_executor->enqueue(shared_from_this()); return; }
+            break; // expected updated; retry
 
-    void wake() override {
-        // Loop so that a CAS failure retries with the freshly-observed state.
-        // compare_exchange_strong updates `expected` on failure, so each iteration
-        // handles the actual current state. A CAS failure in Idle or Running
-        // breaks out of the switch and loops; all terminal states return directly.
-        auto expected = SchedulingState::Idle;
-        while (true) {
-            switch (expected) {
-            case SchedulingState::Idle:
-                if (CAS(expected → Notified)) { executor->enqueue(task); return; }
-                break; // expected updated; retry
+        case SchedulingState::Running:
+            if (CAS(expected → RunningAndNotified)) { return; }
+            break; // expected updated; retry
 
-            case SchedulingState::Running:
-                if (CAS(expected → RunningAndNotified)) { return; }
-                break; // expected updated; retry
+        case SchedulingState::Notified:
+        case SchedulingState::RunningAndNotified:
+            return; // already pending — no-op
 
-            case SchedulingState::Notified:
-            case SchedulingState::RunningAndNotified:
-                return; // already pending — no-op
+        case SchedulingState::Done:
+            return; // task completed — no-op
 
-            case SchedulingState::Done:
-                return; // task completed — no-op
-
-            default:
-                std::abort(); // unknown state — bug
-            }
+        default:
+            std::abort(); // unknown state — bug
         }
     }
-};
+}
+
+std::shared_ptr<Waker> TaskBase::clone() {
+    return shared_from_this(); // refcount increment only — no allocation
+}
 ```
 
 `acq_rel` on the winning CAS synchronizes-with any subsequent load of the task's state,
@@ -184,11 +182,15 @@ be a silent dropped wakeup.
 
 Multiple waker clones may race to call `wake()`. Only the first `Idle → Notified` CAS
 succeeds and pushes to the queue; the rest observe `Notified` (or `RunningAndNotified`)
-and return as no-ops. Each clone holds its own `shared_ptr<TaskBase>` ref, so the task
-remains alive until the winning clone transfers its ref to the queue.
+and return as no-ops. Each clone is a `shared_ptr<TaskBase>`, so the task remains alive
+until the winning clone transfers its ref to the queue via `enqueue()`.
 
-The executor constructs `TaskWaker` immediately before calling `poll()` using just the
-two required fields: `shared_ptr<TaskBase>` (just dequeued) and `Executor*` (`this`).
+The executor obtains the initial waker immediately before calling `poll()` with a simple
+cast — no allocation:
+
+```cpp
+Context ctx(std::static_pointer_cast<detail::Waker>(task));
+```
 
 ### Executor::enqueue()
 
@@ -314,10 +316,10 @@ stateDiagram-v2
     [*] --> Notified : schedule()
     Notified --> Running : poll_ready_tasks() — CAS Notified→Running
     Running --> Idle : poll_ready_tasks() — CAS Running→Idle succeeds
-    Running --> RunningAndNotified : TaskWaker wake() — CAS Running→RunningAndNotified
+    Running --> RunningAndNotified : wake() — CAS Running→RunningAndNotified
     RunningAndNotified --> Notified : poll_ready_tasks() — CAS RunningAndNotified→Notified, re-enqueue
     Running --> Done : poll_ready_tasks() — poll() returns Ready/Error
-    Idle --> Notified : TaskWaker wake() — CAS Idle→Notified, pushed to m_ready / m_incoming_wakes
+    Idle --> Notified : wake() — CAS Idle→Notified, pushed to m_ready / m_incoming_wakes
     Done --> [*]
 ```
 
@@ -326,10 +328,10 @@ stateDiagram-v2
 | `[*] → Notified` | `schedule()` — stores `Notified` before first `enqueue()` call |
 | `Notified → Running` | `poll_ready_tasks()` — CAS before invoking `task->poll()` |
 | `Running → Idle` | `poll_ready_tasks()` — CAS after `poll()` returns `Pending`; succeeds when no concurrent wake |
-| `Running → RunningAndNotified` | `TaskWaker::wake()` — second CAS when task is mid-poll |
+| `Running → RunningAndNotified` | `TaskBase::wake()` — second CAS when task is mid-poll |
 | `RunningAndNotified → Notified` | `poll_ready_tasks()` — CAS after `poll()` returns `Pending`; fires when first CAS failed; re-enqueues via `m_ready` |
 | `Running → Done` | `poll_ready_tasks()` — `poll()` returned `true`; task dropped in place |
-| `Idle → Notified` | `TaskWaker::wake()` — first CAS; calls `enqueue()` which routes to `m_ready` (local) or `m_incoming_wakes` (remote) |
+| `Idle → Notified` | `TaskBase::wake()` — first CAS; calls `enqueue()` which routes to `m_ready` (local) or `m_incoming_wakes` (remote) |
 
 ### Data model
 
@@ -346,7 +348,7 @@ in earlier iterations have been replaced by the `SchedulingState` CAS machine �
 
 ### Enqueue routing
 
-`TaskWaker::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS
+`TaskBase::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS
 succeeds. `enqueue` routes based on thread identity:
 
 ```
@@ -363,7 +365,7 @@ enqueue(task):
 ```
 
 The `Running → RunningAndNotified` self-wake CAS is handled entirely inside
-`TaskWaker::wake()` — no executor involvement needed.
+`TaskBase::wake()` — no executor involvement needed.
 
 ### poll_ready_tasks — drain injection queue first
 
@@ -454,9 +456,9 @@ WorkSharingExecutor
 └── m_workers         : vector<thread>           ← N worker threads
 ```
 
-There is no `m_suspended` map — a task in `Idle` is kept alive solely by the
-`shared_ptr<Task>` inside its waker. There is no `m_self_woken` map — self-wake is
-handled by the `Running → RunningAndNotified` CAS in `TaskWaker::wake()`.
+There is no `m_suspended` map — a task in `Idle` is kept alive solely by the waker
+clone(s) held by leaf futures. There is no `m_self_woken` map — self-wake is handled by
+the `Running → RunningAndNotified` CAS in `TaskBase::wake()`.
 
 ### Task state machine
 
@@ -465,10 +467,10 @@ stateDiagram-v2
     [*] --> Notified : schedule()
     Notified --> Running : worker_loop() — CAS Notified→Running
     Running --> Idle : worker_loop() — CAS Running→Idle succeeds
-    Running --> RunningAndNotified : "TaskWaker\:\:wake() — CAS Running→RunningAndNotified"
+    Running --> RunningAndNotified : "TaskBase\:\:wake() — CAS Running→RunningAndNotified"
     RunningAndNotified --> Notified : worker_loop() — CAS RunningAndNotified→Notified, re-enqueue
     Running --> Done : worker_loop() — poll() returns Ready/Error
-    Idle --> Notified : "TaskWaker\:\:wake() — CAS Idle→Notified, pushed to local queue / injection queue"
+    Idle --> Notified : "TaskBase\:\:wake() — CAS Idle→Notified, pushed to local queue / injection queue"
     Done --> [*]
 ```
 
@@ -477,13 +479,13 @@ stateDiagram-v2
 | `[*] → Notified` | `schedule()` — stores `Notified` before first `enqueue()` call |
 | `Notified → Running` | `worker_loop()` — CAS before invoking `task->poll()` |
 | `Running → Idle` | `worker_loop()` — CAS after `poll()` returns `Pending`; succeeds when no concurrent wake |
-| `Running → RunningAndNotified` | `TaskWaker::wake()` — second CAS when task is mid-poll on a worker |
+| `Running → RunningAndNotified` | `TaskBase::wake()` — second CAS when task is mid-poll on a worker |
 | `RunningAndNotified → Notified` | `worker_loop()` — CAS after `poll()` returns `Pending`; fires when first CAS failed; re-enqueues via `enqueue()` |
 | `Running → Done` | `worker_loop()` — `poll()` returned `true`; task dropped outside any lock |
-| `Idle → Notified` | `TaskWaker::wake()` — first CAS; calls `enqueue()` which routes to `m_local_queues[t_worker_index]` (local) or `m_injection_queue` (remote) |
+| `Idle → Notified` | `TaskBase::wake()` — first CAS; calls `enqueue()` which routes to `m_local_queues[t_worker_index]` (local) or `m_injection_queue` (remote) |
 
 **Self-wake** (waker fires while the task is mid-poll on a worker thread) is handled
-lock-free via the `Running → RunningAndNotified` CAS in `TaskWaker::wake()`. No shared
+lock-free via the `Running → RunningAndNotified` CAS in `TaskBase::wake()`. No shared
 `m_self_woken` map is needed — after `poll()` returns `Pending`, `worker_loop()` attempts
 `Running → Idle`; if that CAS fails the state must be `RunningAndNotified`, so the worker
 CASes to `Notified` and re-enqueues.
@@ -508,8 +510,7 @@ worker_loop():
         expected = Notified
         ASSERT CAS(expected → Running) succeeds
 
-        waker = TaskWaker(task, this)
-        done = task->poll(Context(waker))      ← runs outside any lock
+        done = task->poll(Context(task))        ← runs outside any lock
 
         if done:
             drop task
@@ -517,7 +518,7 @@ worker_loop():
             // Try Running → Idle; re-enqueue if woken during poll
             expected = Running
             if CAS(expected → Idle):
-                task.reset()    // waker holds the only ref
+                task.reset()    // waker clone holds the only ref
             else:
                 expected = RunningAndNotified
                 ASSERT CAS(expected → Notified) succeeds
@@ -557,7 +558,7 @@ destruct.
 
 ### Enqueue routing
 
-`TaskWaker::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS.
+`TaskBase::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS.
 Two thread-locals identify the calling worker:
 
 ```cpp
@@ -593,7 +594,7 @@ enqueue(task):
 |---|---|---|
 | **External wake safety** | `m_incoming_wakes` injection queue; `m_remote_cv` blocks when idle | `m_injection_queue` + `m_cv`; workers block when both local and injection queues empty |
 | **Suspended task storage** | `Idle` atomic state; waker holds the only `shared_ptr<Task>` ref | `Idle` atomic state; waker holds the only `shared_ptr<Task>` ref |
-| **Self-wake detection** | `RunningAndNotified` CAS in `TaskWaker::wake()` | `RunningAndNotified` CAS in `TaskWaker::wake()` |
+| **Self-wake detection** | `RunningAndNotified` CAS in `TaskBase::wake()` | `RunningAndNotified` CAS in `TaskBase::wake()` |
 | **Local enqueue path** | Direct to `m_ready`, no lock (poll thread only) | Direct to `m_local_queue[t_worker_index]`, no lock (owning worker only) |
 | **Remote enqueue path** | `m_incoming_wakes` + `m_remote_cv.notify_one()` | `m_injection_queue` + `m_cv.notify_one()` |
 | **wait_for_completion** | Drives poll loop; blocks on `m_remote_cv` when ready queue empty | Delegates entirely to `state.wait_until_done()` |
@@ -608,7 +609,7 @@ enqueue(task):
 | `include/coro/detail/task.h` | Complete | `TaskBase` (non-template executor base); `TaskImpl<F>` (concrete template combining `TaskBase` + `TaskState<T>` + future in one allocation) |
 | `include/coro/detail/work_stealing_deque.h` | Complete | `WorkStealingDeque<T>` — mutex-backed, Chase-Lev interface |
 | `include/coro/runtime/executor.h` | Complete | `schedule`/`enqueue(shared_ptr<TaskBase>)` pure virtual |
-| `include/coro/runtime/task_waker.h` | Complete | Shared `TaskWaker` — `shared_ptr<TaskBase>` + `Executor*` |
+| `src/task.cpp` | Complete | `TaskBase::wake()` / `TaskBase::clone()` — out-of-line to break circular include with `executor.h` |
 | `include/coro/runtime/single_threaded_executor.h` | Complete | Injection queue fields; `m_suspended` and self-wake fields removed |
 | `src/single_threaded_executor.cpp` | Complete | `enqueue` routing; CAS-based poll loop; fixed `wait_for_completion` |
 | `include/coro/runtime/work_sharing_executor.h` | Complete | Per-worker local queues; `m_suspended`, `m_self_woken` removed |

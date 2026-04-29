@@ -40,8 +40,8 @@ class Runtime;
  *
  * ### Coroutine tasks
  * Submit tasks via `schedule()` (initial dispatch) or `enqueue()` (re-wakeup via
- * @ref TaskWaker). Tasks polled here receive a @ref TaskWaker whose `executor`
- * pointer targets this executor, so `wake()` routes back through `enqueue()`.
+ * `TaskBase::wake()`). Tasks are their own wakers; `wake()` routes back through
+ * `enqueue()` using the `owning_executor` pointer set at schedule time.
  *
  * ### I/O operations
  * Use `with_context(*uv_exec, coro)` to run a coroutine on the uv thread.
@@ -117,11 +117,12 @@ private:
     // Coroutine task queues
     // -----------------------------------------------------------------------
 
-    // Local ready queue — accessed only from the uv thread; no lock needed.
-    std::queue<std::shared_ptr<detail::TaskBase>> m_ready;
-
-    // Remote injection queue — written from any thread, drained on uv thread.
-    std::deque<std::shared_ptr<detail::TaskBase>> m_incoming_wakes;
+    // Category 3 (see doc/task_ownership.md): temporary strong references held while
+    // a task is Notified (in queue) or Running (local variable in poll loop).
+    // Dropped when task parks (Running → Idle). Must be shared_ptr — no other strong
+    // reference keeps a Notified task alive between enqueue and poll.
+    std::queue<std::shared_ptr<detail::TaskBase>> m_ready;         // local — uv thread only
+    std::deque<std::shared_ptr<detail::TaskBase>> m_incoming_wakes; // remote injection queue
     std::mutex                                m_remote_mutex;
 
     // -----------------------------------------------------------------------

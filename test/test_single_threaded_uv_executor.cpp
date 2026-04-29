@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/runtime/task_waker.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/coro.h>

@@ -17,14 +17,14 @@ namespace detail {
 
 // Mixin that provides return_void() when HasFinalValue = false.
 template<typename T, bool HasFinalValue>
-struct CoroStreamReturn {
+struct CoroStreamReturn : public PollablePromise {
     void return_void() noexcept {}
 };
 
 // Mixin that provides return_value(T) when HasFinalValue = true.
 // The final value is stored in m_final_value and emitted as the last stream item.
 template<typename T>
-struct CoroStreamReturn<T, true> {
+struct CoroStreamReturn<T, true> : public PollablePromise {
     void return_value(T value) { m_final_value = std::move(value); }
     std::optional<T> m_final_value;
 };
@@ -73,29 +73,20 @@ public:
         // Lvalue overload: future is moved into FutureAwaitable (handle is consumed).
         template<Future F>
         FutureAwaitable<F> await_transform(F& future) {
-            m_poll_current   = nullptr;
-            m_cancel_current = nullptr;
-            return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current, &m_cancel_current);
+            return FutureAwaitable<F>(std::move(future), this);
         }
 
         // Rvalue overload: future is forwarded (moved) into FutureAwaitable.
         template<Future F>
         FutureAwaitable<F> await_transform(F&& future) {
-            m_poll_current   = nullptr;
-            m_cancel_current = nullptr;
-            return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current, &m_cancel_current);
+            return FutureAwaitable<F>(std::move(future), this);
         }
 
         template<typename U> requires (!Future<std::remove_cvref_t<U>>)
         void await_transform(U&&) = delete;
 
-        detail::Context*              m_ctx         = nullptr;
         std::optional<T>              m_yielded;
         std::exception_ptr            m_exception;
-        // Non-null only while coroutine is suspended at a co_await (not at co_yield).
-        std::function<bool()>         m_poll_current;
-        // Set by FutureAwaitable::await_suspend() only for Cancellable futures.
-        std::function<void()>         m_cancel_current;
     };
 
     explicit CoroStream(std::coroutine_handle<promise_type> handle)
@@ -149,12 +140,12 @@ public:
                 // it to drain before destroying the frame. Non-Cancellable futures are
                 // leaf futures — they are dropped immediately in handle.destroy() below.
                 if (!m_cancel_draining && promise.m_cancel_current) {
-                    promise.m_cancel_current();
+                    promise.m_cancel_current->cancel();
                     promise.m_cancel_current = nullptr;
                     m_cancel_draining = true;
                 }
                 if (m_cancel_draining) {
-                    if (promise.m_poll_current && !promise.m_poll_current()) {
+                    if (promise.m_poll_current && !promise.m_poll_current->poll()) {
                         return PollPending;  // awaited Cancellable future still draining
                     }
                     promise.m_poll_current = nullptr;
@@ -171,7 +162,7 @@ public:
             }
 
             // Step 3: drain all scope children (pre-existing + newly registered above).
-            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             return PollDropped;
         }
@@ -192,7 +183,7 @@ public:
                     return std::optional<T>(std::move(val));
                 }
             }
-            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             auto& p = m_handle.promise();
             if (p.m_exception)
@@ -207,7 +198,7 @@ public:
         // before resuming. m_poll_current is null when suspended at co_yield, so
         // yield-point resumes are unaffected.
         if (promise.m_poll_current) {
-            if (!promise.m_poll_current())
+            if (!promise.m_poll_current->poll())
                 return PollPending;
             promise.m_poll_current = nullptr;
         }
@@ -235,7 +226,7 @@ public:
                     return std::optional<T>(std::move(val));
                 }
             }
-            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             if (promise.m_exception)
                 return PollError(promise.m_exception);
@@ -243,7 +234,7 @@ public:
         }
 
         if (m_scope.has_pending())
-            m_scope.set_drain_waker(ctx.getWaker()->clone());
+            m_scope.set_drain_waker(ctx.get_weak_waker());
 
         return PollPending;
     }

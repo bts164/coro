@@ -78,6 +78,10 @@ public:
         set_current_uv_executor(&m_uv_executor);
 
         auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
+        // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same
+        // TaskImpl allocation as the executor's ref. Acts as the lifetime anchor for
+        // the root task — the sole persistent strong reference once the executor parks
+        // it. Lives on this call stack until wait_for_completion() returns.
         std::shared_ptr<detail::TaskState<typename F::OutputType>> state = impl;
         m_executor->schedule(std::shared_ptr<detail::TaskBase>(impl));
 

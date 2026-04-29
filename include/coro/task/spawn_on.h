@@ -34,8 +34,7 @@ template<Future F>
  * Equivalent to `co_await spawn_on(exec, future).submit()`. The coroutine runs
  * entirely on `exec`; when it completes its waker fires, resuming the caller on
  * whichever executor is driving the parent task (no explicit return-context switch
- * is needed — the parent's executor re-schedules the parent automatically via its
- * @ref TaskWaker).
+ * is needed — the parent re-schedules itself automatically via its waker).
  *
  * **Reference capture safety:** if `future` captures references to locals owned by
  * the calling coroutine, those locals must outlive the `co_await`. Since

@@ -93,7 +93,7 @@ TEST(JoinHandleTest, PollStoresWakerInState) {
     auto state = make_int_state();
     JoinHandle<int> h(state);
     h.poll(ctx);
-    EXPECT_EQ(state->join_waker, waker);
+    EXPECT_EQ(state->join_waker.lock(), waker);
 }
 
 TEST(JoinHandleTest, VoidPollReturnsPendingWhenNoResult) {

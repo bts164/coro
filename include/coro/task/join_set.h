@@ -75,11 +75,11 @@ struct JoinSetTaskHandle;
 //     and frees the remaining chain.
 //
 // WHAT NOT TO DO
-//   Do NOT store the drain waker (or any TaskWaker pointing back to the parent
-//   Task) inside an object that is itself owned by that Task.  CoroutineScope
+//   Do NOT store the drain waker (or any shared_ptr<TaskBase> pointing back to the
+//   parent Task) inside an object that is itself owned by that Task.  CoroutineScope
 //   previously kept a `m_drain_waker` member for this reason — it created a
-//   self-referential Task→Coro→CoroutineScope→TaskWaker→Task cycle that prevented
-//   the Task from ever being freed.  See coro_scope.h for the authoritative note.
+//   self-referential Task→Coro→CoroutineScope→shared_ptr<TaskBase>→Task cycle that
+//   prevented the Task from ever being freed.  See coro_scope.h for the authoritative note.
 
 /**
  * @brief Shared state for a `JoinSet<T>` (non-void specialisation).
@@ -94,6 +94,12 @@ struct JoinSetTaskHandle;
  *   (atomics, `CoroutineScope`) so they are deferred until the next sweep
  *   point, where they are moved out and destroyed after the mutex is released.
  *
+ * The `closing` flag has been removed. `JoinSetTaskHandle::m_state` is now a
+ * `weak_ptr<JoinSetSharedState>`, so when `JoinSet` is destroyed and releases
+ * its `m_state`, the `JoinSetSharedState` is freed. Any subsequent `wake()`
+ * call from a racing task will lock() the weak_ptr, find it null, and return
+ * as a no-op — eliminating Cycle 2B. See doc/shared_ptr_cycles.md.
+ *
  * @tparam T The value type produced by spawned tasks.
  */
 template<typename T>
@@ -102,17 +108,19 @@ struct JoinSetSharedState {
     std::shared_ptr<Waker>                            consumer_waker;
     std::set<std::shared_ptr<JoinSetTaskHandle<T>>>   pending_handles;
     std::list<PollResult<T>>                          results;
-    // Set by JoinSet destructor/move-assignment before clearing pending_handles.
-    // wake() checks this to avoid terminate() when the JoinSet has been dropped.
-    bool                                              closing{false};
 };
 
 template<typename T>
 struct JoinSetTaskHandle : public std::enable_shared_from_this<JoinSetTaskHandle<T>>, public Waker
 {
-    JoinSetTaskHandle(JoinHandle<T> handle, std::shared_ptr<JoinSetSharedState<T>> state) :
+    // m_state is a weak_ptr to break Cycle 2B:
+    //   JoinSetTaskHandle → JoinSetSharedState → pending_handles → JoinSetTaskHandle
+    // When JoinSet is destroyed and its m_state drops, the JoinSetSharedState is freed.
+    // Subsequent wake() calls find lock() returning null and are a silent no-op.
+    // See doc/shared_ptr_cycles.md, Cycle 2B.
+    JoinSetTaskHandle(JoinHandle<T> handle, std::weak_ptr<JoinSetSharedState<T>> state) :
         m_handle(std::move(handle)),
-        m_state(state)
+        m_state(std::move(state))
     {}
     JoinSetTaskHandle(JoinSetTaskHandle const &) = delete;
     JoinSetTaskHandle& operator=(JoinSetTaskHandle const &) = delete;
@@ -154,25 +162,27 @@ struct JoinSetTaskHandle : public std::enable_shared_from_this<JoinSetTaskHandle
             std::terminate();
         }
         std::move(handle).value().detach();
-        std::unique_lock lock(m_state->mutex);
-        // JoinSet was dropped between our poll and acquiring m_state->mutex.
-        if (m_state->closing) return;
-        if (0 == m_state->pending_handles.erase(self)) {
+        // Lock m_state if it's still alive. JoinSet may have been destroyed between
+        // our poll and here — in that case lock() returns null and we are a no-op.
+        auto state = m_state.lock();
+        if (!state) return;
+        std::unique_lock lock(state->mutex);
+        if (0 == state->pending_handles.erase(self)) {
             std::terminate();
         }
-        m_state->results.emplace_back(std::move(result));
-        auto waker = std::exchange(m_state->consumer_waker, nullptr);
+        state->results.emplace_back(std::move(result));
+        auto waker = std::exchange(state->consumer_waker, nullptr);
         lock.unlock();
         if (waker) {
             waker->wake();
         }
     }
 
-    JoinHandle<T>                          m_handle;
-    std::shared_ptr<JoinSetSharedState<T>> m_state;
+    JoinHandle<T>                        m_handle;
+    std::weak_ptr<JoinSetSharedState<T>> m_state;  // weak — breaks Cycle 2B
     // Protects m_handle against concurrent wake() and take_handle().
-    std::mutex                             m_handle_mutex;
-    bool                                   m_handle_taken{false};
+    std::mutex                           m_handle_mutex;
+    bool                                 m_handle_taken{false};
 };
 
 // -----------------------------------------------------------------------
@@ -300,7 +310,7 @@ public:
         // Pre-create the TaskState so we can build a JoinHandle before scheduling.
         // to_destroy destructs here — JoinHandle destructors fire outside the lock.
         auto join_set_handle = std::make_shared<detail::JoinSetTaskHandle<T>>(
-            std::move(join_handle), m_state);
+            std::move(join_handle), std::weak_ptr<detail::JoinSetSharedState<T>>(m_state));
         {
             std::lock_guard lock(m_state->mutex);
             m_state->pending_handles.insert(join_set_handle);
@@ -332,9 +342,10 @@ public:
         // One allocation covers both the executor-facing TaskBase and the JoinHandle's TaskState<T>.
         auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
         std::shared_ptr<detail::TaskState<T>> task_state = impl;
-        std::shared_ptr<detail::TaskBase> task = impl;  // aliased; copied before impl is moved
+        // Aliased shared_ptr wrapped in OwnedTask — sole persistent strong ref to the task.
+        detail::OwnedTask owned{std::shared_ptr<detail::TaskBase>(impl)};
         coro::current_runtime().schedule_task(std::shared_ptr<detail::TaskBase>(std::move(impl)));
-        add(JoinHandle<T>(std::move(task_state), std::move(task)));
+        add(JoinHandle<T>(std::move(task_state), std::move(owned)));
     }
 
     /**
@@ -396,7 +407,8 @@ private:
         std::vector<JoinHandle<T>> to_cancel;
         {
             std::lock_guard lock(m_state->mutex);
-            m_state->closing = true;
+            // No closing flag needed: JoinSetTaskHandle::m_state is a weak_ptr, so
+            // any racing wake() after we clear pending_handles will find lock() == null.
             to_cancel.reserve(m_state->pending_handles.size());
             for (auto& h : m_state->pending_handles)
                 to_cancel.push_back(h->take_handle());

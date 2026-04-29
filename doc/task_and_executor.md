@@ -226,11 +226,11 @@ point to different base subobjects:
 flowchart LR
     S["spawn()"]
     I["<b>TaskImpl&lt;F&gt;</b><br/>one make_shared allocation<br/>= TaskBase + TaskState&lt;T&gt; + F m_future"]
-    E["Executor queue / TaskWaker<br/>shared_ptr&lt;TaskBase&gt;"]
-    J["JoinHandle&lt;T&gt;<br/>shared_ptr&lt;TaskState&lt;T&gt;&gt;"]
+    E["Executor queue<br/>shared_ptr&lt;TaskBase&gt; — temporary only"]
+    J["JoinHandle&lt;T&gt;<br/>OwnedTask m_owned (lifetime anchor)<br/>shared_ptr&lt;TaskState&lt;T&gt;&gt; m_state (result access)"]
 
     S -->|"creates"| I
-    I -->|"aliased to"| E
+    I -->|"temporary ref while\nNotified or Running"| E
     I -->|"aliased to"| J
 ```
 
@@ -243,12 +243,18 @@ public:
     // Satisfies Future<T> — co_await to get the result
     PollResult<T> poll(Context& ctx);
 
-    // Detaches without cancelling. The task runs to completion independently.
-    // After calling detach(), the JoinHandle is consumed and the result is discarded.
-    // The parent can no longer synchronize with or cancel the task.
-    void detach() &&;
+    // Detaches without cancelling. Moves OwnedTask into TaskBase::self_owned so the
+    // task anchors its own lifetime until it reaches a terminal state.
+    JoinHandle& detach() &;
+    JoinHandle&& detach() &&;
 
-    // Destructor: cancels the task if not yet awaited or detached.
+    // Configure whether dropping this handle cancels the task (default: true).
+    JoinHandle& cancelOnDestroy(bool b = true) &;
+    JoinHandle&& cancelOnDestroy(bool b = true) &&;
+
+    // Destructor: cancels the task (if cancelOnDestroy) and transfers OwnedTask to
+    // the enclosing CoroutineScope if inside a poll(), otherwise self-anchors the
+    // task via self_owned when cancelOnDestroy=false.
     ~JoinHandle();
 };
 ```
@@ -256,9 +262,10 @@ public:
 The shared `TaskState<T>` (embedded in `TaskImpl<F>`) handles these scenarios safely:
 
 - Task completes before `JoinHandle` is polled — result stored, handle reads it on next poll
-- `JoinHandle` polled before task completes — waker registered, task calls `wake()` on completion
-- `JoinHandle` dropped — cancellation flag set; task checks flag at each poll and exits early
-- `JoinHandle::detach()` called — handle releases its `shared_ptr<TaskState<T>>`; task continues unaffected
+- `JoinHandle` polled before task completes — weak waker registered, task fires it on completion
+- `JoinHandle` dropped inside coroutine — `OwnedTask` transferred to `CoroutineScope`; scope drains before parent completes
+- `JoinHandle` dropped outside coroutine — cancellation flag set; task self-terminates at next natural wakeup
+- `JoinHandle::detach()` called — `OwnedTask` moved into `TaskBase::self_owned`; task continues unaffected until terminal state
 - Task throws — exception stored in `TaskState<T>`, re-thrown when `JoinHandle` is `co_await`ed
 
 `StreamHandle<T>` satisfies `Stream<T>` and is also `[[nodiscard]]`. Internally it is the
@@ -309,12 +316,14 @@ There are three ways to relinquish a `JoinHandle`, with different effects on the
 | Action | Effect on task |
 |---|---|
 | `co_await handle` | Waits for completion, returns result or rethrows exception |
-| `handle.detach()` | Task runs to completion; result is discarded; no cancellation |
-| Drop (destructor) | Cancellation flag set; task exits at next poll; result discarded |
+| `handle.detach()` | Task runs to completion; `OwnedTask` moved into `self_owned`; result discarded; no cancellation |
+| Drop inside coroutine | `OwnedTask` transferred to enclosing `CoroutineScope`; scope drains before parent frame is freed |
+| Drop outside coroutine | Cancellation flag set; task exits at next natural wakeup; result discarded |
 
-`detach()` is the explicit fire-and-forget path. It is still subject to the same convention
-as `spawn()` — the detached task must own all its data. Use `Synchronize` when the task
-needs to reference parent-owned data.
+`detach()` is the explicit fire-and-forget path. Detached tasks are not tracked by the
+enclosing `CoroutineScope` — they run to completion independently. Use `cancelOnDestroy(false)`
+when the task should complete (not be cancelled) but still participate in the scope's drain
+guarantee.
 
 This three-way design mirrors Julia's pattern extended with explicit detach:
 
@@ -324,7 +333,7 @@ This three-way design mirrors Julia's pattern extended with explicit detach:
 
 ### Internal Task types
 
-`TaskBase` is a non-template abstract base held by the executor queue and `TaskWaker`.
+`TaskBase` is a non-template abstract base held by the executor queue and waker clones.
 `TaskImpl<F>` is the concrete template that inherits from both `TaskBase` and
 `TaskState<F::OutputType>` and stores the future directly — one `make_shared` allocation
 covers the entire task. Users never interact with either type directly.
@@ -337,7 +346,10 @@ public:
     std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
     std::string name;
     int         last_worker_index = -1;
+    std::shared_ptr<void> self_owned; // detached-task self-reference; cleared at terminal state
     virtual bool poll(Context& ctx) = 0;
+    virtual bool is_complete() const = 0;                         // checked by CoroutineScope
+    virtual void set_scope_waker(std::weak_ptr<Waker> waker) = 0; // called by CoroutineScope
     virtual ~TaskBase() = default;
 };
 
@@ -347,14 +359,16 @@ class TaskImpl : public TaskBase, public TaskState<typename F::OutputType> {
     bool m_completed        = false;
     bool m_cancel_requested = false;
     bool poll(Context& ctx) override { /* ... cooperative cancel protocol ... */ }
+    bool is_complete() const override { /* checks TaskState::terminated under lock */ }
+    void set_scope_waker(std::weak_ptr<Waker> w) override { /* stores in TaskState::scope_waker */ }
 };
 
-// spawn() produces two aliased shared_ptrs from one allocation:
+// spawn() produces one allocation; OwnedTask is the sole persistent lifetime anchor:
 auto impl = std::make_shared<TaskImpl<F>>(std::move(future));
-std::shared_ptr<TaskBase>                    exec_ptr{impl, impl.get()};
-std::shared_ptr<TaskState<typename F::OutputType>> join_ptr{impl, static_cast<TaskState<...>*>(impl.get())};
-executor->schedule(exec_ptr);
-return JoinHandle<T>(join_ptr);
+std::shared_ptr<TaskState<typename F::OutputType>> join_ptr = impl;
+detail::OwnedTask owned{std::shared_ptr<TaskBase>(impl)};
+executor->schedule(std::shared_ptr<TaskBase>(std::move(impl)));
+return JoinHandle<T>(std::move(join_ptr), std::move(owned));
 ```
 
 ### Abstract Executor interface

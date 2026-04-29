@@ -25,8 +25,7 @@ include/coro/
 │   ├── io_service.h            libuv I/O reactor integration
 │   ├── single_threaded_executor.h
 │   ├── work_sharing_executor.h
-│   ├── work_stealing_executor.h
-│   └── task_waker.h            TaskWaker — executor-side Waker implementation
+│   └── work_stealing_executor.h
 │
 ├── task/               tokio::task — task spawning and handles
 │   ├── join_handle.h

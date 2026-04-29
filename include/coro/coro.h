@@ -17,7 +17,7 @@ namespace detail {
 
 /// @brief Shared promise base for `Coro<T>` and `Coro<void>`.
 /// Handles suspend points, exception storage, context propagation, and `await_transform`.
-struct CoroPromiseBase {
+struct CoroPromiseBase : public PollablePromise {
     std::suspend_always initial_suspend() noexcept { return {}; }
     std::suspend_always final_suspend() noexcept { return {}; }
     void unhandled_exception() noexcept { m_exception = std::current_exception(); }
@@ -29,9 +29,7 @@ struct CoroPromiseBase {
     // Lvalue overload: future is moved into FutureAwaitable (handle is consumed).
     template<Future F>
     FutureAwaitable<F> await_transform(F& future) {
-        m_poll_current   = nullptr;
-        m_cancel_current = nullptr;
-        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current, &m_cancel_current);
+        return FutureAwaitable<F>(std::move(future), this);
     }
 
     // Rvalue overload: future is forwarded (moved) into FutureAwaitable.
@@ -39,23 +37,14 @@ struct CoroPromiseBase {
     FutureAwaitable<F> await_transform(F&& future) {
         m_poll_current   = nullptr;
         m_cancel_current = nullptr;
-        return FutureAwaitable<F>(std::move(future), &m_ctx, &m_poll_current, &m_cancel_current);
+        return FutureAwaitable<F>(std::move(future), this);
     }
 
     // Non-Future types are rejected at compile time.
     template<typename U> requires (!Future<std::remove_cvref_t<U>>)
     void await_transform(U&&) = delete;
 
-    Context*              m_ctx         = nullptr;
     std::exception_ptr    m_exception;
-    // Set by FutureAwaitable::await_suspend(); cleared by Coro::poll() after it returns
-    // true (or at the start of the next await_transform). Non-null only while the
-    // coroutine is suspended at a co_await expression.
-    std::function<bool()> m_poll_current;
-    // Set by FutureAwaitable::await_suspend() only for Cancellable futures.
-    // Called by Coro::poll() when cancelled to cooperatively cancel the awaited future
-    // so it drains before the outer frame is torn down.
-    std::function<void()> m_cancel_current;
 };
 
 template<typename T>
@@ -160,12 +149,12 @@ public:
                 // it to drain before destroying the frame. Non-Cancellable futures are
                 // leaf futures — they are dropped immediately in handle.destroy() below.
                 if (!m_cancel_draining && promise.m_cancel_current) {
-                    promise.m_cancel_current();
+                    promise.m_cancel_current->cancel();
                     promise.m_cancel_current = nullptr;
                     m_cancel_draining = true;
                 }
                 if (m_cancel_draining) {
-                    if (promise.m_poll_current && !promise.m_poll_current()) {
+                    if (promise.m_poll_current && !promise.m_poll_current->poll()) {
                         return PollPending;  // awaited Cancellable future still draining
                     }
                     promise.m_poll_current = nullptr;
@@ -182,7 +171,7 @@ public:
             }
 
             // Step 3: drain all scope children (pre-existing + newly registered above).
-            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             return PollDropped;
         }
@@ -192,7 +181,7 @@ public:
 
         // Frame already ran to completion but children were still draining — re-check now.
         if (m_handle.done()) {
-            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             Destroy cleanup(this);
             auto& p = m_handle.promise();
@@ -214,7 +203,7 @@ public:
         // still Pending, the waker is re-registered and we return Pending without
         // disturbing the coroutine. Only resume when the future is confirmed ready.
         if (promise.m_poll_current) {
-            if (!promise.m_poll_current())
+            if (!promise.m_poll_current->poll())
                 return PollPending;
             promise.m_poll_current = nullptr;
         }
@@ -226,7 +215,7 @@ public:
 
         if (m_handle.done()) {
             // Wait for any children spawned during this execution before completing.
-            if (m_scope.set_drain_waker(ctx.getWaker()->clone()))
+            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
 
             Destroy cleanup(this);
@@ -244,7 +233,7 @@ public:
         // Coroutine suspended — check if pending children need the waker updated.
         // (Children drain in parallel with the coroutine's own suspension.)
         if (m_scope.has_pending())
-            m_scope.set_drain_waker(ctx.getWaker()->clone());
+            m_scope.set_drain_waker(ctx.get_weak_waker());
 
         return PollPending;
     }

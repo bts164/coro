@@ -25,6 +25,7 @@ plugins:
             GENERATE_XML: "YES"
 nav:
   - Introduction: index.md
+  - Library Overview: overview.md
   - Getting Started Guide: getting_started.md
   - Library Usage Guidelines: guidelines.md
   - API Reference:
@@ -71,23 +72,35 @@ nav:
     - Namespaces: coro/namespaces.md
     - Files: coro/files.md
   - Internal Design Details:
-    - Futures and Streams: future_and_stream.md
-    - Tasks, Wakers, and Context: waker_and_context_propagation.md
-    - Tasks, Executors, and Runtime: task_and_executor.md
+    - Architecture Overview: architecture.md
+    - Core Components:
+      - Futures and Streams: future_and_stream.md
+      - Tasks, Wakers, and Context: waker_and_context_propagation.md
+      - Tasks, Executors, and Runtime: task_and_executor.md
+      - Blocking Thread Pool: spawn_blocking.md
+      - Task Ownership Model: task_ownership.md
     - Executor Design:
       - Overview: executor_design.md
       - Work-Stealing Scheduler: work_stealing_executor.md
     - I/O Integration:
-      - I/O Coroutines: io_coroutine.md
       - libuv Integration: libuv_integration.md
+      - I/O Coroutines: io_coroutine.md
+      - File I/O: file_io.md
       - WebSocket Stream: websocket_stream.md
       - PollStreams: poll_streams.md
+      - Pipelined I/O: pipe_streaming.md
+      #- Shared Memory Stream: shm_stream.md
     - Synchronization:
       - Coroutine Scope: coroutine_scope.md
       - JoinSet: join_set.md
       - Channels: channels.md
       - Select: select.md
+    - Platform & Integration:
+      - Raspberry Pi Pico Port: pico_port.md
+      - Real-Time Scheduling: preempt_rt_producer.md
     - Module Structure: module_structure.md
-  - Examples: examples.md
+  - Examples & Tutorials:
+    - Examples: examples.md
+    - gRPC Tutorial: grpc_tutorial.md
   - Roadmap and Future Plans:
     - Roadmap Overview: roadmap.md

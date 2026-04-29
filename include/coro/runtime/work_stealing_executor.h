@@ -89,11 +89,16 @@ private:
 
     // --- Per-worker state ---
 
+    // Category 3 (see doc/task_ownership.md): temporary strong references held while
+    // a task is Notified (in queue) or Running (local variable in worker loop).
+    // Dropped when the task parks (Running → Idle). Must be shared_ptr — no other strong
+    // reference keeps a Notified task alive between enqueue and the worker's poll call.
     std::vector<detail::WorkStealingDeque<std::shared_ptr<detail::TaskBase>>> m_local_queues;
     std::vector<std::unique_ptr<WorkerSlot>>                                  m_workers;
 
     // --- Shared injection queue (remote enqueue / initial schedule) ---
 
+    // Same category 3 reasoning as m_local_queues.
     std::deque<std::shared_ptr<detail::TaskBase>> m_injection_queue;
     std::mutex                                m_mutex; ///< Guards m_injection_queue and m_stop.
     bool                                      m_stop{false};

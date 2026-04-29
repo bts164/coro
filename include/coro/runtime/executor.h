@@ -24,7 +24,7 @@ public:
 
     /// @brief Route a task to the appropriate ready queue.
     ///
-    /// Called by `TaskWaker::wake()` after winning the `Idle → Notified` CAS.
+    /// Called by `TaskBase::wake()` after winning the `Idle → Notified` CAS.
     /// Implementations check the calling thread's identity:
     /// - Same thread as the owning worker → local queue, no lock.
     /// - Any other thread → mutex-protected injection queue + condvar signal.

@@ -43,10 +43,12 @@ public:
         auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(m_future));
         impl->name = std::move(m_name);
         std::shared_ptr<detail::TaskState<OutputType>> state = impl;
-        std::shared_ptr<detail::TaskBase> task = impl;  // aliased; copied before impl is moved
+        // Aliased shared_ptr to the same TaskImpl allocation — wrapped in OwnedTask
+        // to enforce the single-owner invariant (see doc/task_ownership.md).
+        detail::OwnedTask owned{std::shared_ptr<detail::TaskBase>(impl)};
         if (m_executor)
             m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
-        return JoinHandle<OutputType>(std::move(state), std::move(task));
+        return JoinHandle<OutputType>(std::move(state), std::move(owned));
     }
 
 private:

@@ -274,22 +274,15 @@ below for a full description of how it works and what changes when the time come
 Unchanged: `std::deque<shared_ptr<Task>>` protected by `m_mutex`. Remote wakers and
 `schedule()` calls push here. Workers drain it under the lock.
 
-### TaskWaker — Worker Affinity
+### Worker Affinity
 
-`TaskWaker` gains one additional field:
-
-```cpp
-int m_last_worker_index = -1;  // -1 = unknown / not on this executor
-```
-
-After each successful `poll()`, the executor stores `t_worker_index` into the task's
-waker. When the waker fires, `enqueue()` uses the stored index to push directly onto
-that worker's local queue instead of the injection queue, provided the executor pointer
-still matches.
+`TaskBase` carries `last_worker_index` (initialized to -1). After each successful
+`poll()`, the executor stores `t_worker_index` into it. When `wake()` fires,
+`enqueue()` uses the stored index to push directly onto that worker's local queue
+instead of the injection queue, provided the executor pointer still matches.
 
 The benefit: a woken task re-enters on the same core it last ran on, keeping its data
 warm in L1/L2 and avoiding an injection-queue lock acquisition on the hot wakeup path.
-The cost is one extra `int` in `TaskWaker` and a trivial branch in `enqueue()`.
 
 ### State Additions
 

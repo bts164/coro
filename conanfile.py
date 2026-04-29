@@ -1,6 +1,7 @@
 import re, os
 from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
+from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
 
 class CoroRecipe(ConanFile):
     name = "coro"
@@ -20,7 +21,7 @@ class CoroRecipe(ConanFile):
         "with_gperftools": True
     }
     exports_sources = "include/*.h","include/*.hpp", "src/*.cpp", "CMakeLists.txt"
-    
+
     def config_options(self):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
@@ -28,6 +29,11 @@ class CoroRecipe(ConanFile):
     def configure(self):
         if self.options.shared:
             self.options.rm_safe("fPIC")
+
+    def system_requirements(self):
+        Apt(self).install(["libcap-dev"])
+        Dnf(self).install(["libcap-devel"])
+        PacMan(self).install(["libcap"])
 
     def requirements(self):
         if self.options.with_gperftools:
@@ -41,7 +47,7 @@ class CoroRecipe(ConanFile):
             options={"with_libuv": True},
             transitive_headers = True,
             transitive_libs = True)
-    
+
     def layout(self):
         cmake_layout(self)
 
@@ -63,11 +69,12 @@ class CoroRecipe(ConanFile):
 
     def package_info(self):
         self.cpp_info.libs = ["coro"]
+        self.cpp_info.system_libs = ["cap"]
         if self.options.with_gperftools:
             self.cpp_info.requires.append("gperftools::gperftools")
         self.cpp_info.requires.append("libuv::libuv")
         self.cpp_info.requires.append("libwebsockets::libwebsockets")
-        
+
         self.cpp_info.set_property("cmake_find_package", "coro")
         self.cpp_info.set_property("cmake_find_package_multi", "coro")
         self.cpp_info.set_property("pkg_config", "coro")

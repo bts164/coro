@@ -1,5 +1,4 @@
 #include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/runtime/task_waker.h>
 #include <coro/detail/context.h>
 #include <libwebsockets.h>
 #include <cstdlib>
@@ -182,10 +181,7 @@ void SingleThreadedUvExecutor::drain_ready_tasks() {
             std::abort();
         }
 
-        auto waker      = std::make_shared<TaskWaker>();
-        waker->task     = task;
-        waker->executor = this;
-        detail::Context ctx(waker);
+        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task));
         detail::TaskBase::current = task.get();
         bool done = task->poll(ctx);
         detail::TaskBase::current = nullptr;

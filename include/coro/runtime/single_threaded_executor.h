@@ -28,11 +28,11 @@ class Runtime;
  * | Notified           | `m_ready` queue       | Waiting to be polled                 |
  * | Running            | (on the call stack)   | Currently inside `poll()`            |
  * | RunningAndNotified | (on the call stack)   | Inside `poll()`, wake() already fired|
- * | Idle               | owned by TaskWaker    | Waiting for an external wakeup       |
+ * | Idle               | kept alive by waker clone | Waiting for an external wakeup   |
  * | Done               | freed                 | `poll()` returned a terminal result  |
  *
  * **External wakeups:** `TimerService` and other external threads call `enqueue()`
- * via `TaskWaker::wake()`. External calls are routed to `m_incoming_wakes` (the
+ * via `TaskBase::wake()`. External calls are routed to `m_incoming_wakes` (the
  * injection queue), protected by `m_remote_mutex`. `wait_for_completion()` blocks
  * on `m_remote_cv` when the ready queue is empty rather than returning prematurely.
  */
@@ -61,9 +61,13 @@ public:
     bool empty() const;
 
 private:
+    // Category 3 (see doc/task_ownership.md): temporary strong references held while
+    // a task is Notified (in the queue) or Running (local variable in poll loop).
+    // Dropped when the task parks (Running → Idle). Must be shared_ptr, not weak_ptr —
+    // no other strong reference keeps a Notified task alive between enqueue and poll.
     std::queue<std::shared_ptr<detail::TaskBase>> m_ready;
 
-    // Injection queue — remote enqueue() calls land here.
+    // Injection queue — remote enqueue() calls land here. Same category 3 reasoning.
     std::deque<std::shared_ptr<detail::TaskBase>> m_incoming_wakes;
     mutable std::mutex                        m_remote_mutex;
     std::condition_variable                   m_remote_cv;

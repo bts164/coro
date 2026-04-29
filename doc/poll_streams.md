@@ -68,7 +68,7 @@ With File + uv_fs_read per packet:
   Packet arrives → eventually detected by pending read on threadpool
               → worker thread completes read
               → callback posts to event loop
-              → TaskWaker::wake() → enqueue → schedule → resume
+              → TaskBase::wake() → enqueue → schedule → resume
               → process 1 packet
               → submit next read → back to threadpool
 ```

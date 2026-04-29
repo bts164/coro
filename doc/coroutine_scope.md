@@ -202,8 +202,8 @@ thread-local to identify which scope to register with.
 ### Registration mechanism
 
 When a `JoinHandle` is destroyed and `t_current_coro` is non-null, the destructor:
-1. Sets `cancelled = true` on the child `TaskState`.
-2. Calls `t_current_coro->add_child(is_done, set_scope_waker)` to register the child.
+1. Sets `cancelled = true` on the child `TaskState` (via `cancel()`).
+2. Calls `t_current_coro->add_child(std::move(m_owned))` to transfer ownership of the child's `OwnedTask` to the scope.
 
 The `JoinHandle` destructor fires during the coroutine body's LIFO unwind (guaranteed by
 the frame lifetime invariant above), so `t_current_coro` is always valid at that point.
@@ -221,11 +221,11 @@ scope empty, so there is nothing to migrate.
 
 ### Memory cycle note
 
-The scope waker — a `TaskWaker` that holds a `shared_ptr<Task>` for the parent — is **not**
-stored as a member of `CoroutineScope`. Storing it would create the cycle:
+The scope waker — a `shared_ptr<TaskBase>` for the parent — is **not** stored as a member
+of `CoroutineScope`. Storing it would create the cycle:
 
 ```
-Task → Coro<T> → CoroutineScope → TaskWaker → Task
+Task → Coro<T> → CoroutineScope → shared_ptr<TaskBase> → Task
 ```
 
 The waker is passed to each pending child's `set_scope_waker` callback and lives in

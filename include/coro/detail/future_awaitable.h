@@ -9,6 +9,32 @@
 
 namespace coro {
 
+class PollableFuture;
+struct PollablePromise
+{
+    detail::Context*              m_ctx         = nullptr;
+    // Set by FutureAwaitable::await_suspend(); cleared by Coro::poll() after it returns
+    // true (or at the start of the next await_transform). Non-null only while the
+    // coroutine is suspended at a co_await expression.
+    PollableFuture*       m_poll_current = nullptr;
+    // Set by FutureAwaitable::await_suspend() only for Cancellable futures.
+    // Called by Coro::poll() when cancelled to cooperatively cancel the awaited future
+    // so it drains before the outer frame is torn down.
+    PollableFuture*       m_cancel_current = nullptr;
+};
+
+class PollableFuture {
+public:
+    virtual bool poll() noexcept = 0;
+    virtual void cancel() noexcept = 0;
+
+protected:
+    PollableFuture() = default;
+    PollableFuture(PollableFuture &&pollable) = default;
+    PollableFuture& operator=(PollableFuture &&) = delete;
+    ~PollableFuture() = default;
+};
+
 // Adapts any Future into a C++20 awaitable for use inside Coro and CoroStream coroutines.
 // Only reachable via await_transform in promise_type — not exposed as operator co_await.
 //
@@ -26,24 +52,20 @@ namespace coro {
 // F may be a value type (rvalue path) or an lvalue reference type (lvalue path).
 // BaseF strips cv-ref qualifiers for member type lookups and PollResult storage.
 template<typename F>
-class FutureAwaitable {
+class FutureAwaitable : private PollableFuture {
     using BaseF = std::remove_cvref_t<F>;
 public:
     // cancel_hook is optional (null for non-Cancellable futures). When provided,
     // await_suspend() installs a cancel callback so the outer Coro/CoroStream can
     // cooperatively cancel the awaited future before destroying the frame.
-    explicit FutureAwaitable(F future, detail::Context** ctx_ptr,
-                             std::function<bool()>* poll_hook,
-                             std::function<void()>* cancel_hook = nullptr)
+    explicit FutureAwaitable(F future, PollablePromise *promise)
         : m_future(std::forward<F>(future))
-        , m_ctx_ptr(ctx_ptr)
-        , m_poll_hook(poll_hook)
-        , m_cancel_hook(cancel_hook) {}
+        , m_promise(promise) {}
 
     // Poll once eagerly. If the future completes synchronously, skip suspension entirely.
     bool await_ready() noexcept{
         try {
-            m_result = m_future.poll(**m_ctx_ptr);
+            m_result = m_future.poll(*m_promise->m_ctx);
         } catch (...) {
             m_result = PollError(std::current_exception());
         }
@@ -55,18 +77,9 @@ public:
     // can verify the future is ready before resuming this coroutine.
     // Also registers the cancel hook if the awaited future satisfies Cancellable.
     void await_suspend(std::coroutine_handle<>) noexcept{
-        *m_poll_hook = [this]() noexcept -> bool {
-            try {
-                m_result = m_future.poll(**m_ctx_ptr);
-            } catch (...) {
-                m_result = PollError(std::current_exception());
-            }
-            return !m_result.isPending();
-        };
-        if (m_cancel_hook) {
-            if constexpr (Cancellable<BaseF>) {
-                *m_cancel_hook = [this]() noexcept { m_future.cancel(); };
-            }
+        m_promise->m_poll_current = this;
+        if constexpr (Cancellable<BaseF>) {
+            m_promise->m_cancel_current = this;
         }
     }
 
@@ -80,11 +93,24 @@ public:
             return std::move(m_result).value();
     }
 
+    void cancel() noexcept override {
+        if constexpr (Cancellable<BaseF>) {
+            m_future.cancel();
+        }
+    }
+
+    bool poll() noexcept override {
+        try {
+            m_result = m_future.poll(*m_promise->m_ctx);
+        } catch (...) {
+            m_result = PollError(std::current_exception());
+        }
+        return !m_result.isPending();
+    }
+
 private:
     F                                       m_future;   // reference for lvalue path, value for rvalue path
-    detail::Context**                       m_ctx_ptr;
-    std::function<bool()>*                  m_poll_hook;
-    std::function<void()>*                  m_cancel_hook;
+    PollablePromise*                        m_promise = nullptr;
     PollResult<typename BaseF::OutputType>  m_result{PollPending};
 };
 

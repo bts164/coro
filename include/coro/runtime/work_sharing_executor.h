@@ -28,11 +28,11 @@ class Runtime;
  * | Notified           | local queue or inj. queue  | Waiting to be polled                 |
  * | Running            | (worker call stack)        | Currently inside `poll()`            |
  * | RunningAndNotified | (worker call stack)        | Inside `poll()`, wake() already fired|
- * | Idle               | owned by TaskWaker         | Waiting for an external wakeup       |
+ * | Idle               | kept alive by waker clone  | Waiting for an external wakeup       |
  * | Done               | freed                      | `poll()` returned a terminal result  |
  *
  * **Suspension:** there is no `m_suspended` map. A task in Idle is kept alive
- * solely by the `shared_ptr<Task>` stored in its TaskWaker.
+ * solely by the waker clone(s) held by the leaf futures awaiting it.
  *
  * **Thread-locals:** each worker sets `t_current_runtime` and
  * `t_current_timer_service` at startup, and a per-executor worker index
@@ -62,10 +62,13 @@ public:
 private:
     void worker_loop(int worker_index);
 
-    // Per-worker local queues — no lock for the owning worker.
+    // Category 3 (see doc/task_ownership.md): temporary strong references held while
+    // a task is Notified (in queue) or Running (local variable in worker loop).
+    // Dropped when task parks (Running → Idle). Must be shared_ptr — no other strong
+    // reference keeps a Notified task alive between enqueue and the worker's poll call.
     std::vector<detail::WorkStealingDeque<std::shared_ptr<detail::TaskBase>>> m_local_queues;
 
-    // Injection queue — remote enqueue() calls and initial schedule() land here.
+    // Injection queue — same category 3 reasoning as m_local_queues.
     std::deque<std::shared_ptr<detail::TaskBase>> m_injection_queue;
     std::mutex               m_mutex;   ///< Guards m_injection_queue and m_stop.
     std::condition_variable  m_cv;
