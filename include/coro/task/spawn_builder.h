@@ -12,52 +12,6 @@
 
 namespace coro {
 
-/**
- * @brief Builder for submitting a @ref Future as a background task.
- *
- * Returned by `Runtime::spawn(future)` and the free `spawn(future)` function.
- * Configure the task with optional setters, then call `submit()` to enqueue it
- * and receive a @ref JoinHandle.
- *
- * `[[nodiscard]]` — discarding the builder silently drops the future without submitting it.
- *
- * @tparam F A type satisfying @ref Future.
- */
-template<Future F>
-class [[nodiscard]] SpawnBuilder {
-public:
-    using OutputType = typename F::OutputType;
-
-    explicit SpawnBuilder(F future, Executor* executor)
-        : m_future(std::move(future)), m_executor(executor) {}
-
-    /// @brief Sets an optional name for the task (for diagnostics).
-    SpawnBuilder& name(std::string n) {
-        m_name = std::move(n);
-        return *this;
-    }
-
-    /// @brief Enqueues the task on the executor and returns a @ref JoinHandle.
-    /// The builder must not be used again after this call.
-    JoinHandle<OutputType> submit() {
-        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(m_future));
-        impl->name = std::move(m_name);
-        std::shared_ptr<detail::TaskState<OutputType>> state = impl;
-        // Aliased shared_ptr to the same TaskImpl allocation — wrapped in OwnedTask
-        // to enforce the single-owner invariant (see doc/task_ownership.md).
-        detail::OwnedTask owned{std::shared_ptr<detail::TaskBase>(impl)};
-        if (m_executor)
-            m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
-        return JoinHandle<OutputType>(std::move(state), std::move(owned));
-    }
-
-private:
-    F           m_future;
-    Executor*   m_executor;
-    std::string m_name;
-};
-
-
 namespace detail {
 
 // StreamDriver<S> — internal Future<void> that drives a stream and pushes items
@@ -142,52 +96,61 @@ struct StreamDriver {
 
 
 /**
- * @brief Builder for spawning a @ref Stream as a background task.
+ * @brief Builder for configuring a background task before spawning it.
  *
- * Returned by `Runtime::spawn(stream)` and the free `spawn(stream)` function.
- * The stream runs as a `StreamDriver` task that pushes items into a bounded channel;
- * the consumer reads from the returned @ref StreamHandle.
+ * Returned by `Runtime::build_task()` and the free `build_task()` function.
+ * Configure the task with optional setters, then call `spawn(future)` or
+ * `spawn(stream)` to enqueue it and receive a @ref JoinHandle or @ref StreamHandle.
  *
- * `[[nodiscard]]` — discarding the builder silently drops the stream without submitting it.
- *
- * @tparam S A type satisfying @ref Stream.
+ * `[[nodiscard]]` — discarding the builder silently drops the configuration without
+ * spawning anything.
  */
-template<Stream S>
-class [[nodiscard]] StreamSpawnBuilder {
+class [[nodiscard]] SpawnBuilder {
 public:
-    using ItemType = typename S::ItemType;
-
-    explicit StreamSpawnBuilder(S stream, Executor* executor)
-        : m_stream(std::move(stream)), m_executor(executor) {}
+    explicit SpawnBuilder(Executor* executor) : m_executor(executor) {}
 
     /// @brief Sets an optional name for the task (for diagnostics).
-    StreamSpawnBuilder& name(std::string n) {
+    SpawnBuilder& name(std::string n) {
         m_name = std::move(n);
         return *this;
     }
 
-    /// @brief Sets the bounded channel capacity (default: 64 items).
-    /// The stream driver parks under backpressure when the buffer is full.
-    StreamSpawnBuilder& buffer(std::size_t size) {
+    /// @brief Sets the bounded channel capacity for stream tasks (default: 64 items).
+    SpawnBuilder& buffer(std::size_t size) {
         m_buffer_size = size;
         return *this;
     }
 
+    /// @brief Enqueues `future` as a background task and returns a @ref JoinHandle.
+    template<Future F>
+    JoinHandle<typename F::OutputType> spawn(F future) {
+        using T = typename F::OutputType;
+        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
+        impl->name = std::move(m_name);
+        std::shared_ptr<detail::TaskState<T>> state = impl;
+        // Aliased shared_ptr to the same TaskImpl allocation — wrapped in OwnedTask
+        // to enforce the single-owner invariant (see doc/task_ownership.md).
+        detail::OwnedTask owned{std::shared_ptr<detail::TaskBase>(impl)};
+        if (m_executor)
+            m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
+        return JoinHandle<T>(std::move(state), std::move(owned));
+    }
+
     /// @brief Creates a bounded channel, schedules the stream driver, and returns a @ref StreamHandle.
-    StreamHandle<ItemType> submit() {
-        auto channel = std::make_shared<detail::Channel<ItemType>>(m_buffer_size);
+    template<Stream S>
+    StreamHandle<typename S::ItemType> spawn(S stream) {
+        auto channel = std::make_shared<detail::Channel<typename S::ItemType>>(m_buffer_size);
         if (m_executor) {
             using Driver = detail::StreamDriver<S>;
             auto impl = std::make_shared<detail::TaskImpl<Driver>>(
-                Driver{std::move(m_stream), channel, std::nullopt});
+                Driver{std::move(stream), channel, std::nullopt});
             impl->name = std::move(m_name);
             m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
         }
-        return StreamHandle<ItemType>(std::move(channel));
+        return StreamHandle<typename S::ItemType>(std::move(channel));
     }
 
 private:
-    S           m_stream;
     Executor*   m_executor;
     std::string m_name;
     std::size_t m_buffer_size = 64;

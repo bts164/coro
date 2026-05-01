@@ -26,7 +26,7 @@ TEST(SpawnOnTest, RunsOnTargetExecutor) {
                     o = &current_uv_executor();
                     co_return;
                 }(obs)
-            ).submit();
+            );
         }(uv_exec, observed)
     );
 
@@ -43,7 +43,7 @@ TEST(SpawnOnTest, ReturnsValue) {
         [](SingleThreadedUvExecutor& exec, int& out) -> Coro<void> {
             out = co_await spawn_on(exec, []() -> Coro<int> {
                 co_return 42;
-            }()).submit();
+            }());
         }(uv_exec, result)
     );
 
@@ -54,7 +54,7 @@ TEST(SpawnOnTest, ReturnsValue) {
 // with_context
 // ---------------------------------------------------------------------------
 
-// with_context is equivalent to spawn_on(...).submit(): the child runs on the
+// with_context is equivalent to spawn_on(...): the child runs on the
 // target executor and the result is returned to the awaiting caller.
 TEST(WithContextTest, ReturnsValue) {
     Runtime rt(1);

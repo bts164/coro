@@ -64,7 +64,7 @@ struct MpscShared {
     size_t                         capacity;        ///< Maximum buffered values.
     size_t                         sender_count  = 0;
     bool                           receiver_alive = true;
-    coro::detail::IntrusiveList    sender_waiters; ///< Suspended senders (MpscSenderNode<T>*).
+    coro::detail::IntrusiveList<>    sender_waiters; ///< Suspended senders (MpscSenderNode<T>*).
     std::optional<MpscReceiverNode> receiver_waiter; ///< At most one (single consumer).
 
     explicit MpscShared(size_t cap) : capacity(cap) {}

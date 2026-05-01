@@ -153,7 +153,7 @@ private:
  * });
  *
  * // Also composes with spawn:
- * auto handle = spawn(co_invoke([x]() -> Coro<void> { ... })).submit();
+ * auto handle = spawn(co_invoke([x]() -> Coro<void> { ... }));
  * ```
  *
  * @param lambda A callable with no arguments returning a @ref Future or @ref Stream.

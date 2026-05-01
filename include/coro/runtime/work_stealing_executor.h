@@ -4,6 +4,9 @@
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/work_stealing_deque.h>
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+#include <coro/detail/local_run_queue.h>
+#endif
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +73,24 @@ public:
     void wait_for_completion(detail::TaskStateBase& state) override;
 
 private:
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+    // shared_ptr<TaskBase> is stored by value directly in the ring buffer.
+    // The head/tail Release/Acquire fences synchronize buffer slot access, so
+    // no per-element atomics or boxing are needed.
+    using TaskPtr = detail::TaskBase*;
+
+    // One per worker: the owner-side Local handle plus a clonable Steal handle
+    // that other workers call steal_into() on.
+    struct WorkerQueue {
+        detail::Local<TaskPtr> local;
+        detail::Steal<TaskPtr> steal;
+
+        WorkerQueue(detail::Local<TaskPtr> l, detail::Steal<TaskPtr> s)
+            : local(std::move(l)), steal(std::move(s)) {}
+        WorkerQueue(WorkerQueue&&) = default;
+    };
+#endif
+
     /// @brief One slot per worker thread. Not movable due to binary_semaphore.
     struct WorkerSlot {
         std::thread           thread;
@@ -93,13 +114,17 @@ private:
     // a task is Notified (in queue) or Running (local variable in worker loop).
     // Dropped when the task parks (Running → Idle). Must be shared_ptr — no other strong
     // reference keeps a Notified task alive between enqueue and the worker's poll call.
-    std::vector<detail::WorkStealingDeque<std::shared_ptr<detail::TaskBase>>> m_local_queues;
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+    std::vector<WorkerQueue>                                                   m_worker_queues;
+#else
+    std::vector<detail::WorkStealingDeque<detail::TaskBase*>> m_local_queues;
+#endif
     std::vector<std::unique_ptr<WorkerSlot>>                                  m_workers;
 
     // --- Shared injection queue (remote enqueue / initial schedule) ---
 
     // Same category 3 reasoning as m_local_queues.
-    std::deque<std::shared_ptr<detail::TaskBase>> m_injection_queue;
+    std::deque<detail::TaskBase*>             m_injection_queue;
     std::mutex                                m_mutex; ///< Guards m_injection_queue and m_stop.
     bool                                      m_stop{false};
 

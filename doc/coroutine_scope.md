@@ -2,24 +2,21 @@
 
 ## Problem
 
-`Synchronize` was designed to make it safe for spawned child tasks to hold references to
-data owned by the parent coroutine. It guarantees that all children complete before the
-parent's `co_await Synchronize(...)` returns, so the data stays alive for as long as any
-child needs it.
+The goal is to make it safe for spawned child tasks to hold references to data owned by the
+parent coroutine. Naively, a parent can `co_await` a future that collects all children, keeping
+its frame alive until all children complete. But this guarantee breaks whenever that collecting
+future is itself cancelled — for example, when it is the losing branch of a `select` or
+`timeout`. In that case:
 
-This guarantee breaks when the `Synchronize` future itself is cancelled — for example, when
-it is one branch of a `select` or `timeout` that loses. In that case:
-
-1. The losing branch is dropped, tearing down the `Synchronize` future and its body coroutine.
+1. The losing branch is dropped, tearing down the future and its body coroutine.
 2. The spawned child tasks are still running in the executor.
 3. Those children hold references to data that may now be freed.
 
 This is a use-after-free waiting to happen, and it cannot be caught at compile time because
 C++ has no lifetime borrow checker.
 
-The root cause is deeper than `Synchronize`: any future combinator that can abandon a branch
-creates this hazard for any coroutine in that branch that has spawned tasks holding borrowed
-references.
+The root cause is fundamental: any future combinator that can abandon a branch creates this
+hazard for any coroutine in that branch that has spawned tasks holding borrowed references.
 
 ## Guarantee
 
@@ -281,7 +278,7 @@ the local while children are still running.
 // Unsafe — child continues running after local_data is destroyed
 Coro<void> bad() {
     int local_data = 42;
-    auto h = spawn(worker(&local_data)).submit();
+    auto h = spawn(worker(&local_data));
     co_return;
 }
 
@@ -315,12 +312,10 @@ The one requirement on combinators that cancel branches: they must not drop a ch
 before it returns `PollDropped`. They must continue polling the cancelled branch until it
 signals that cleanup is complete.
 
-## Interaction with explicit `Synchronize`
+## Explicit scoping with `co_invoke` + `JoinSet`
 
-> **Deprecated:** prefer `co_invoke` + `JoinSet::drain()` for new code.
-
-`Synchronize` provides an explicit mid-coroutine drain point. Both roles are now covered
-by `co_invoke` + `JoinSet`. The safe `Synchronize` example above can be rewritten as:
+When you need a mid-coroutine drain point — guaranteeing all children finish before
+proceeding — use `co_invoke` + `JoinSet::drain()`:
 
 ```cpp
 Coro<void> safe_example() {

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.31)
 
-find_package(coro REQUIRED)
-find_package(GTest REQUIRED)
+find_package(coro CONFIG REQUIRED)
+find_package(GTest CONFIG REQUIRED)
 
 enable_testing()
 
@@ -16,6 +16,7 @@ set(TEST_TARGETS
     test_poll_result
     test_waker_context
     test_future
+    test_future_ref
     test_stream
     test_coro
     test_coro_stream
@@ -45,6 +46,8 @@ set(TEST_TARGETS
     test_skynet
     test_pcie_decoder
     test_pcie_stream_integration
+    test_intrusive_list
+    test_local_run_queue
 )
 
 foreach(t ${TEST_TARGETS})

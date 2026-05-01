@@ -42,7 +42,6 @@ include/coro/
 │   ├── select.h            select() — race futures, return first ready
 │   ├── sleep.h             sleep_for() / SleepFuture
 │   ├── stream_handle.h     StreamHandle<T> — consumer end of a spawned stream
-│   ├── synchronize.h       Synchronize — structured concurrency scope
 │   ├── timeout.h           timeout() — race any future against a deadline
 │   └── watch.h             watch::channel — single latest-value, multi-consumer
 │
@@ -87,7 +86,7 @@ Types that represent the *handle* to a running or completed task, and the builde
 configure and submit tasks. This includes:
 - `JoinHandle<T>` — `co_await` to retrieve a spawned task's result
 - `JoinSet<T>` — fan out many homogeneous tasks; collect results in completion order
-- `SpawnBuilder<F>` / `StreamSpawnBuilder<S>` — returned by `spawn()`, configured before `submit()`
+- `SpawnBuilder` — returned by `build_task()`, configure name/buffer before calling `.spawn(f)`
 - `BlockingHandle<T>` / `spawn_blocking()` — run blocking code on a dedicated thread pool
 
 ### `sync/` — synchronization primitives and channels
@@ -96,7 +95,6 @@ Types that coordinate between concurrently running tasks. This includes:
 - **Channels**: `oneshot` (single-value), `mpsc` (bounded multi-producer), `watch` (latest-value multi-consumer)
 - **Combinators**: `join()`, `select()`, `timeout()`, `sleep_for()`
 - `StreamHandle<T>` — consumer end of the bounded channel that backs `spawn(stream)`
-- `Synchronize` — structured concurrency scope; guarantees all child tasks finish before the parent continues
 - `CancellationToken` — cooperative cancellation signal passed via `Context`
 
 ### `io/` — async I/O

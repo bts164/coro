@@ -10,7 +10,7 @@ include/coro/          # Public headers — see doc/module_structure.md for plac
   stream.h             #   Stream concept + next() helper
   runtime/             #   Runtime, Executor (tokio::runtime analogue)
   task/                #   JoinHandle, SpawnBuilder (tokio::task analogue)
-  sync/                #   Synchronize, StreamHandle, CancellationToken (tokio::sync analogue)
+  sync/                #   JoinSet, StreamHandle, channels, CancellationToken (tokio::sync analogue)
   detail/              #   Internal plumbing + low-level extension points (PollResult, Waker, Context)
 src/                   # Implementation source files
 test/                  # gtest unit tests
@@ -115,12 +115,12 @@ Always invoke the lambda first so that `spawn` receives the resulting coroutine:
 
 ```cpp
 // WRONG — passes the lambda itself as if it were a Future:
-coro::spawn([&foo]() -> coro::Coro<void> { ... }).submit();
+coro::spawn([&foo]() -> coro::Coro<void> { ... });
 
 // CORRECT — call the lambda (or use co_invoke) to produce the Coro:
-coro::spawn(co_invoke([&foo]() -> coro::Coro<void> { ... })).submit();
+coro::spawn(co_invoke([&foo]() -> coro::Coro<void> { ... }));
 // or equivalently:
-coro::spawn([&foo]() -> coro::Coro<void> { ... }()).submit();
+coro::spawn([&foo]() -> coro::Coro<void> { ... }());
 ```
 
 ### Use the owned-buffer API for async I/O; do not pass spans or raw pointers

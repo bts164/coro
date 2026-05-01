@@ -42,17 +42,43 @@ preset and build directory must match:
 Common headers:
 
 ```cpp
-#include <coro/coro.h>               // Coro<T> — async function return type
-#include <coro/coro_stream.h>        // CoroStream<T> — async generator return type
-#include <coro/runtime/runtime.h>    // Runtime, spawn()
-#include <coro/sync/select.h>        // select()
-#include <coro/sync/sleep.h>         // sleep_for()
-#include <coro/sync/timeout.h>       // timeout()
-#include <coro/task/join_set.h>      // JoinSet<T>
-#include <coro/task/spawn_blocking.h>// spawn_blocking()
-#include <coro/sync/oneshot.h>       // oneshot::channel<T>
-#include <coro/sync/mpsc.h>          // mpsc::channel<T>
-#include <coro/sync/watch.h>         // watch::channel<T>
+// Core coroutine types
+#include <coro/coro.h>                    // Coro<T> — async function return type
+#include <coro/coro_stream.h>             // CoroStream<T> — async generator return type
+#include <coro/future.h>                  // Future/Cancellable concepts, FutureRef, coro::ref()
+#include <coro/stream.h>                  // Stream concept, coro::next()
+#include <coro/co_invoke.h>               // co_invoke() — safe capturing-lambda coroutines
+
+// Runtime
+#include <coro/runtime/runtime.h>         // Runtime, spawn(), build_task()
+
+// Tasks
+#include <coro/task/join_handle.h>        // JoinHandle<T>
+#include <coro/task/join_set.h>           // JoinSet<T>
+#include <coro/task/spawn_blocking.h>     // spawn_blocking()
+#include <coro/task/spawn_on.h>           // spawn_on(), with_context()
+
+// Sync primitives
+#include <coro/sync/select.h>             // select()
+#include <coro/sync/join.h>               // join()
+#include <coro/sync/sleep.h>              // sleep_for()
+#include <coro/sync/timeout.h>            // timeout()
+#include <coro/sync/event.h>              // Event — single-waiter set/wait primitive
+#include <coro/sync/mutex.h>              // Mutex — async mutex
+#include <coro/sync/stream_handle.h>      // StreamHandle<T>
+
+// Channels
+#include <coro/sync/oneshot.h>            // oneshot::channel<T>
+#include <coro/sync/mpsc.h>               // mpsc::channel<T>
+#include <coro/sync/watch.h>              // watch::channel<T>
+
+// I/O
+#include <coro/io/file.h>                 // File — async file I/O
+#include <coro/io/tcp_stream.h>           // TcpStream — async TCP
+#include <coro/io/tcp_listener.h>         // TcpListener — TCP accept loop
+#include <coro/io/ws_stream.h>            // WsStream — async WebSocket client
+#include <coro/io/ws_listener.h>          // WsListener — WebSocket server
+#include <coro/io/poll_stream.h>          // PollStream — character-device / fd streaming
 ```
 
 ---
@@ -141,8 +167,8 @@ coro::Coro<int> fetch(int id) {
 coro::Coro<void> run() {
     // Spawn both tasks before awaiting either — they run concurrently.
     // .name() is optional; it tags the task for debugging.
-    auto h1 = coro::spawn(fetch(1)).name("fetch-1").submit();
-    auto h2 = coro::spawn(fetch(2)).name("fetch-2").submit();
+    auto h1 = coro::build_task().name("fetch-1").spawn(fetch(1));
+    auto h2 = coro::build_task().name("fetch-2").spawn(fetch(2));
 
     int a = co_await h1;  // 10
     int b = co_await h2;  // 20
@@ -163,7 +189,7 @@ completes — so there are no dangling tasks.
 
 ```cpp
 coro::Coro<void> run() {
-    auto handle = coro::spawn(fetch(1)).submit();
+    auto handle = coro::spawn(fetch(1));
     // handle goes out of scope here — task is cancelled and drained automatically
     co_return;
 }
@@ -172,7 +198,7 @@ coro::Coro<void> run() {
 To let the task run without cancelling or waiting for it, call `detach()`:
 
 ```cpp
-coro::spawn(fetch(1)).submit().detach();  // fire and forget
+coro::spawn(fetch(1)).detach();  // fire and forget
 ```
 
 ### Task lifetime and the scope safety problem
@@ -186,7 +212,7 @@ coroutine:
 coro::Coro<void> unsafe_example() {
     int local_data = 42;
     // Dangerous — child captures a pointer to local_data.
-    auto h = coro::spawn(worker(&local_data)).submit();
+    auto h = coro::spawn(worker(&local_data));
     co_return;  // local_data destroyed here; child may still be running
 }
 ```
@@ -385,6 +411,63 @@ int main() {
 }
 ```
 
+### Keeping a future alive across a losing `select` branch — `coro::ref()`
+
+By default `select()` takes its futures by value and cancels any branch that loses. Sometimes
+you want the underlying work to keep running regardless of which branch wins — for example,
+polling a long-running task while also watching for an external event.
+
+`coro::ref(f)` wraps any lvalue future in a non-owning `FutureRef<F>` that delegates `poll()`
+to `f` without taking ownership. When the `FutureRef` branch loses, only the wrapper is
+discarded; the underlying future is untouched and can be used again.
+
+```cpp
+#include <coro/coro.h>
+#include <coro/sync/select.h>
+#include <coro/sync/sleep.h>
+#include <chrono>
+#include <iostream>
+
+using namespace std::chrono_literals;
+
+coro::Coro<void> run() {
+    // Task is spawned once and reused across every select round.
+    coro::JoinHandle<int> task = coro::spawn(long_running_work());
+
+    while (true) {
+        // sleep_for fires every 100 ms so we can do periodic work.
+        // coro::ref(task) borrows the handle — the task keeps running if the
+        // timer branch wins.
+        auto sel = co_await coro::select(coro::ref(task), coro::sleep_for(100ms));
+
+        if (std::holds_alternative<coro::SelectBranch<0, int>>(sel)) {
+            // Task completed first.
+            int result = std::get<coro::SelectBranch<0, int>>(sel).value;
+            std::cout << "result: " << result << "\n";
+            break;
+        }
+
+        // Timer fired — task still running.  Do periodic work, then loop.
+        check_progress();
+    }
+}
+```
+
+**Key points:**
+
+- `coro::ref()` only accepts lvalues. You must store the future in a named variable before
+  wrapping it — `coro::ref(spawn(f()))` is a compile error because `spawn(f())` is an rvalue
+  that would be immediately destroyed.
+- `FutureRef` is non-copyable. It is meant to be created, passed to `select` (or similar),
+  and discarded within the same expression.
+- If the `coro::ref(f)` branch wins and delivers a result, the result is moved out of `f`.
+  Do not await `f` again — it is logically consumed even though it was not moved.
+- `FutureRef` is never `Cancellable`, regardless of whether `F` is. When the ref branch
+  loses, `select()` simply discards the wrapper without calling `cancel()` on the underlying
+  future — leaving it running for the next round. The tradeoff is that any waker `f`
+  registered during the losing poll remains live and may fire spuriously, causing one extra
+  scheduler wake-up. This is harmless: `poll()` is required to tolerate spurious calls.
+
 ---
 
 ## 9. Timeouts
@@ -484,7 +567,7 @@ coro::Coro<void> run() {
         [tx = std::move(tx)]() mutable -> coro::Coro<void> {
             tx.send(42);
             co_return;
-        })).submit();
+        }));
 
     auto result = co_await rx;      // std::expected<int, ChannelError>
     std::cout << result.value() << "\n";  // 42
@@ -547,7 +630,7 @@ coro::Coro<void> run() {
                     if (!r) co_return;          // sender dropped — channel closed
                     std::cout << *rx.borrow() << "\n";
                 }
-            })).submit();
+            }));
 
         tx.send(1);
         tx.send(2);
@@ -595,7 +678,7 @@ co_await co_invoke([x]() -> Coro<void> {
 });
 
 // Also works with spawn:
-auto handle = spawn(co_invoke([x]() -> Coro<void> { ... })).submit();
+auto handle = spawn(co_invoke([x]() -> Coro<void> { ... }));
 ```
 
 `co_invoke` also works with `CoroStream<T>` lambdas.

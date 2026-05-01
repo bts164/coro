@@ -14,7 +14,7 @@
 namespace coro {
 
 /**
- * @brief Owned handle to a spawned task. Returned by `spawn(...).submit()`. Satisfies `Future<T>`.
+ * @brief Owned handle to a spawned task. Returned by `spawn(...)`. Satisfies `Future<T>`.
  *
  * **Awaiting:** `co_await handle` suspends the caller until the task completes and returns its value.
  *

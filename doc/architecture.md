@@ -226,18 +226,18 @@ the lambda body.
 
 ```cpp
 // Returns JoinHandle<T> — owns the result and can cancel
-JoinHandle<int> h = spawn(compute()).submit();
+JoinHandle<int> h = spawn(compute());
 
 // Fire and forget
-spawn(background_work()).submit().detach();
+spawn(background_work()).detach();
 
-// Named task (for debugging)
-spawn(compute()).name("my-task").submit();
+// Named task (for debugging) — use build_task() builder
+JoinHandle<int> h2 = build_task().name("my-task").spawn(compute());
 ```
 
-`spawn()` returns a `SpawnBuilder`. `.submit()` schedules the task on the runtime and
-returns a `JoinHandle<T>`. `.detach()` on the handle drops interest in the result;
-the task runs to completion independently.
+`spawn()` immediately schedules the task on the runtime and returns a `JoinHandle<T>`.
+Use `build_task()` when you need to set a name or buffer size. `.detach()` on the handle
+drops interest in the result; the task runs to completion independently.
 
 `JoinHandle<T>` satisfies `Future<T>`. `co_await handle` suspends until the task
 completes, then returns the result (or rethrows the exception).
@@ -619,7 +619,6 @@ include/coro/
 
   sync/
     sleep.h                 SleepFuture, sleep_for()
-    synchronize.h           Synchronize (deprecated)
     oneshot.h               oneshot::channel<T>
     mpsc.h                  mpsc::channel<T>
     watch.h                 watch::channel<T>

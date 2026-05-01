@@ -100,7 +100,7 @@ TEST(CoInvokeTest, ComposesWithSpawn) {
         auto handle = spawn(co_invoke([&result, &polls]() -> Coro<void> {
             co_await TwoPollFuture{&polls};
             result = 77;
-        })).submit();
+        }));
         co_await handle;
     }());
 

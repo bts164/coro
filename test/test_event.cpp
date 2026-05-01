@@ -201,12 +201,36 @@ TEST(EventTest, SetFromSpawnedTask) {
         auto setter = spawn([](auto &ev) -> Coro<void> {
             ev.set();
             co_return;
-        }(ev)).submit();
+        }(ev));
 
         co_await ev.wait();
         reached = true;
         co_await setter;
     }(ev, reached));
+
+    EXPECT_TRUE(reached);
+}
+
+// ---------------------------------------------------------------------------
+// Destroying an Event while a waiter is suspended wakes the waiter and
+// resolves the WaitFuture as if set() had been called.
+// ---------------------------------------------------------------------------
+
+TEST(EventTest, DroppingEventWakesWaiter) {
+    std::optional<Event> gate;
+    gate.emplace();
+    bool reached = false;
+
+    Runtime rt;
+    rt.block_on([](auto &gate, auto &reached) -> Coro<void> {
+        auto setter = spawn_blocking([&gate] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            gate.reset();
+        });
+        co_await gate->wait();
+        reached = true;
+        co_await setter;
+    }(gate, reached));
 
     EXPECT_TRUE(reached);
 }

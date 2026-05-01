@@ -1,14 +1,18 @@
 #pragma once
 
 // Internal — not part of the public API.
-// Per-worker task deque with a Chase-Lev style interface.
+// Per-worker FIFO task queue with a work-stealing interface.
 //
 // Currently backed by std::mutex + std::deque for correctness and simplicity.
-// The interface (push / pop / steal) is compatible with a future lock-free
-// Chase-Lev implementation — callers will not need to change.
 //
-//   push / pop  — owner thread operations (push to back, pop from back)
-//   steal       — thief thread operation  (steal from front)
+//   push        — owner thread: enqueue to back
+//   pop         — owner thread: dequeue from front (FIFO)
+//   steal       — thief thread: dequeue from front (same end as pop)
+//
+// Because both pop and steal consume from the front, the owner and thieves
+// compete for the same tasks and ordering is strictly FIFO. This differs from
+// a Chase-Lev deque where the owner pops from the back (LIFO) and thieves
+// steal from the front.
 
 #include <deque>
 #include <mutex>
@@ -26,13 +30,13 @@ public:
         m_deque.push_back(std::move(item));
     }
 
-    /// @brief Pop an item from the back. Called only by the owning worker.
+    /// @brief Pop the oldest item from the front. Called only by the owning worker.
     /// @return The item, or std::nullopt if the deque is empty.
     std::optional<T> pop() {
         std::lock_guard lock(m_mutex);
         if (m_deque.empty()) return std::nullopt;
-        T item = std::move(m_deque.back());
-        m_deque.pop_back();
+        T item = std::move(m_deque.front());
+        m_deque.pop_front();
         return item;
     }
 

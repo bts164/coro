@@ -5,6 +5,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
 option(WITH_GPERFTOOLS "Build with gperftools" OFF)
+option(CORO_USE_LOCAL_RUN_QUEUE "Use lock-free local run queue in WorkStealingExecutor (experimental)" ON)
 if(ENABLE_TSAN)
     add_compile_options(-fsanitize=thread -g)
     add_link_options(-fsanitize=thread)
@@ -37,6 +38,9 @@ add_library(coro
     src/file.cpp
     src/circular_byte_buffer.cpp
 )
+if(CORO_USE_LOCAL_RUN_QUEUE)
+    target_compile_definitions(coro PUBLIC CORO_USE_LOCAL_RUN_QUEUE)
+endif()
 target_include_directories(coro PUBLIC include)
 target_link_libraries(coro PUBLIC
     libuv::uv_a

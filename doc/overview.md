@@ -55,8 +55,6 @@ owns the executor, the I/O reactor (`IoService`), and the blocking thread pool
 - **`JoinSet<T>`** — spawn homogeneous child tasks, collect results in completion order
   via `next()`, or discard via `drain()`; satisfies `Stream<T>` for non-void T;
   cancel-on-drop with scope-guaranteed drain
-- **`Synchronize`** — deprecated; use `co_invoke` + `JoinSet::drain()` instead
-
 ### Combinators
 - **`select(f1, f2, ...)`** — first-ready-wins; cancels and drains losing branches before
   delivering result; `SelectBranch<N, T>` tagging handles homogeneous types
@@ -109,7 +107,7 @@ include/coro/
   stream.h             Stream concept + next() helper
   runtime/             Runtime, Executor, IoService, BlockingPool
   task/                JoinHandle, SpawnBuilder, spawn_blocking
-  sync/                JoinSet, Synchronize (deprecated), channels, sleep
+  sync/                JoinSet, channels, sleep
   io/                  TcpStream, WsStream, WsListener
   detail/              PollResult, Waker, Context, internal plumbing
 ```
@@ -122,7 +120,6 @@ include/coro/
 |---|---|
 | Migrate to `std::expected` returns | `JoinHandle`, `timeout`, other fallible futures |
 | C++20 compat shim | `coro::detail::expected` aliasing `std::expected` or `tl::expected` |
-| Remove `Synchronize` | Headers, tests, and doc references |
 | `broadcast` channel | All-values multi-consumer; lower priority |
 | Async `Mutex<T>` | Task-suspending lock; FIFO fairness |
 | Stream combinators | `map`, `filter`, `take`, `chain`, `flat_map` |

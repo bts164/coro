@@ -103,12 +103,12 @@ TEST(SpawnBlocking, ExecutorThreadIsFreeDuringBlockingWork) {
                 count.fetch_add(1);
             });
             co_return;
-        })).submit();
+        }));
 
         auto h2 = coro::spawn(coro::co_invoke([&]() -> coro::Coro<void> {
             count.fetch_add(1);
             co_return;
-        })).submit();
+        }));
 
         co_await h1;
         co_await h2;

@@ -93,7 +93,7 @@ coroutine. Awaiting the handle waits for completion and retrieves the result. Dr
 handle without awaiting it cancels the task.
 
 ```cpp
-auto handle = coro::spawn(compute(42)).submit();
+auto handle = coro::spawn(compute(42));
 // ... do other work while compute() runs in the background
 int result = co_await handle;
 ```

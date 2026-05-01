@@ -32,7 +32,7 @@ TEST(StreamHandleTest, EmptyStreamYieldsNothing) {
         co_return;
     };
 
-    auto handle = rt.spawn(make_empty()).submit();
+    auto handle = rt.spawn(make_empty());
     auto items  = rt.block_on(drain(std::move(handle)));
     EXPECT_TRUE(items.empty());
 }
@@ -44,7 +44,7 @@ TEST(StreamHandleTest, SingleItemStream) {
         co_yield 42;
     };
 
-    auto handle = rt.spawn(make_stream()).submit();
+    auto handle = rt.spawn(make_stream());
     auto items  = rt.block_on(drain(std::move(handle)));
     ASSERT_EQ(items.size(), 1u);
     EXPECT_EQ(items[0], 42);
@@ -59,7 +59,7 @@ TEST(StreamHandleTest, MultipleItems) {
         co_yield 3;
     };
 
-    auto handle = rt.spawn(make_stream()).submit();
+    auto handle = rt.spawn(make_stream());
     auto items  = rt.block_on(drain(std::move(handle)));
     ASSERT_EQ(items.size(), 3u);
     EXPECT_EQ(items[0], 1);
@@ -78,7 +78,7 @@ TEST(StreamHandleTest, SmallBufferDrainsCorrectly) {
     };
 
     // Buffer smaller than number of items forces backpressure.
-    auto handle = rt.spawn(make_stream()).buffer(2).submit();
+    auto handle = rt.build_task().buffer(2).spawn(make_stream());
     auto items  = rt.block_on(drain(std::move(handle)));
     ASSERT_EQ(items.size(), 10u);
     for (int i = 0; i < 10; ++i)
@@ -96,7 +96,7 @@ TEST(StreamHandleTest, ExceptionPropagatesFromStream) {
         co_yield 2;
     };
 
-    auto handle = rt.spawn(make_stream()).submit();
+    auto handle = rt.spawn(make_stream());
 
     EXPECT_THROW(rt.block_on(drain(std::move(handle))), std::runtime_error);
 }

@@ -18,9 +18,9 @@ using helloworld::HelloReply;
 using helloworld::HelloRequest;
 
 /*!
- * \brief Example gRPC server using coro::Runtime and the GrpcServer base class. 
+ * \brief Example gRPC server using coro::Runtime and the GrpcServer base class.
  * The server listens for incoming SayHello RPCs and responds with a greeting message.
- */ 
+ */
 class HelloWorldServer : public GrpcServer<HelloWorldServer, helloworld::Greeter::AsyncService>
 {
     // Choose a random delay between 250ms and 1000ms to simulate work and demonstrate
@@ -69,7 +69,7 @@ public:
      * request message. The handler can co_await as needed to process the request and produce a reply,
      * which it returns to be sent back to the client.
      * */
-   coro::Coro<HelloReply> Handle(coro::mpsc::Receiver<HelloRequest> req_rx) {
+   coro::Coro<HelloReply> Handle(coro::CoroStream<HelloRequest> req_stream) {
         std::size_t i = m_request_count++;
         LOG(INFO) << "m_request_count: " << i;
         LOG(INFO) << "SayHelloStreamRequest: receiving client stream";
@@ -77,7 +77,7 @@ public:
         std::optional<std::string> previous_name;
         std::string names;
         int count = 0;
-        while (auto req = co_await coro::next(req_rx)) {
+        while (auto req = co_await coro::next(req_stream)) {
             LOG(INFO) << "SayHelloStreamRequest: received name=\"" << (*req).name() << "\"";
             if (previous_name) {
                 if (!names.empty()) names += ", ";
@@ -134,12 +134,12 @@ public:
      * return-type problem (CoroStream vs Coro). Echoes each request back as a
      * greeting, one reply per request, until the client half-closes.
      */
-    coro::CoroStream<HelloReply> Process(coro::mpsc::Receiver<HelloRequest> req_rx) {
+    coro::CoroStream<HelloReply> Process(coro::CoroStream<HelloRequest> req_stream) {
         std::size_t i = m_request_count++;
         LOG(INFO) << "m_request_count: " << i;
         LOG(INFO) << "SayHelloBidiStream: session started";
         int count = 0;
-        while (auto req = co_await coro::next(req_rx)) {
+        while (auto req = co_await coro::next(req_stream)) {
             LOG(INFO) << "SayHelloBidiStream: received \"" << (*req).name() << "\"";
             HelloReply reply;
             reply.set_message("Echo from request number " + std::to_string(i) + ": " + (*req).name());

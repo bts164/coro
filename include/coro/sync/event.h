@@ -33,8 +33,11 @@ namespace coro {
  * **Single-waiter:** at most one task may be suspended on `wait()` at a time.
  * Waiting from multiple tasks concurrently is undefined behaviour.
  *
- * **Lifetime:** the `Event` must outlive all outstanding `WaitFuture` instances
- * derived from it.
+ * **Lifetime:** if the `Event` is destroyed while a waiter is suspended, the
+ * waiter is woken immediately and the `WaitFuture` resolves as if `set()` had
+ * been called. The waiter cannot distinguish between a normal `set()` and
+ * destruction of the `Event` — both complete the future with `void`.
+ * If no task is currently suspended, destruction is a no-op.
  *
  * **Thread safety:** `set()` and `clear()` are safe to call from any thread.
  * `wait()` must be called from the owning coroutine's thread.
@@ -48,6 +51,7 @@ public:
      * registers a waker that `set()` will call when the event fires.
      */
     class WaitFuture {
+        friend class Event;
     public:
         using OutputType = void;
 
@@ -59,15 +63,7 @@ public:
             other.m_event = nullptr;
         }
 
-        WaitFuture& operator=(WaitFuture&& other) noexcept {
-            if (this != &other) {
-                _clearWaker();
-                m_event = other.m_event;
-                other.m_event = nullptr;
-            }
-            return *this;
-        }
-
+        WaitFuture& operator=(WaitFuture&& other) = delete;
         WaitFuture(const WaitFuture&)            = delete;
         WaitFuture& operator=(const WaitFuture&) = delete;
 
@@ -77,6 +73,9 @@ public:
         ~WaitFuture() { _clearWaker(); }
 
         PollResult<void> poll(detail::Context& ctx) {
+            if (nullptr == m_event) {
+                return PollReady;
+            }
             std::lock_guard lock(m_event->m_mutex);
             if (m_event->m_set) {
                 return PollReady;
@@ -84,6 +83,7 @@ public:
             // RACE CONDITION NOTE: waker is set inside the mutex so set() cannot
             // sneak in between our m_set check and the waker registration, which
             // would produce a lost wakeup.
+            m_event->m_wait_future = this;
             m_event->m_waker = ctx.getWaker();
             return PollPending;
         }
@@ -94,12 +94,22 @@ public:
         void _clearWaker() noexcept {
             if (!m_event) return;
             std::lock_guard lock(m_event->m_mutex);
+            m_event->m_wait_future = nullptr;
             m_event->m_waker = nullptr;
         }
     };
 
     Event()                        = default;
-    ~Event()                       = default;
+    ~Event()
+    {
+        std::unique_lock lk(m_mutex);
+        if (nullptr != m_wait_future) {
+            std::exchange(m_wait_future, nullptr)->m_event = nullptr;
+            auto waker = std::exchange(m_waker, nullptr);
+            lk.unlock();
+            waker->wake();
+        }
+    }
     Event(const Event&)            = delete;
     Event& operator=(const Event&) = delete;
     // Not movable: WaitFuture holds a raw pointer to this object.
@@ -159,6 +169,7 @@ public:
 private:
     mutable std::mutex             m_mutex;
     bool                           m_set   = false;
+    WaitFuture*                    m_wait_future = nullptr;
     std::shared_ptr<detail::Waker> m_waker;
 };
 

@@ -471,8 +471,8 @@ Pipe::OpenFuture Pipe::open(std::string path, PipeMode mode) {
                 throw_uv_error(rv, "uv_pipe_open");
 
             // Spawn background drivers; they run for the lifetime of the Pipe.
-            spawn_on(exec, write_driver(state)).submit().detach();
-            spawn_on(exec, read_driver(state)).submit().detach();
+            spawn_on(exec, write_driver(state)).detach();
+            spawn_on(exec, read_driver(state)).detach();
 
             co_return Pipe(std::move(state));
         }(exec, std::move(path), flags)

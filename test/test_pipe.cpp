@@ -75,7 +75,7 @@ TEST(PipeTest, WriteAndRead) {
                 Pipe reader = co_await Pipe::open(p, PipeMode::Read);
                 co_return co_await reader.read(std::array<std::byte, 32>{});
             }(path)
-        ).submit();
+        );
 
         // Open the writer — this completes the FIFO rendezvous.
         Pipe writer = co_await Pipe::open(path, PipeMode::Write);
@@ -108,7 +108,7 @@ TEST(PipeTest, ReaderGetsEofAfterWriterCloses) {
                 auto [n, buf] = co_await reader.read(std::array<std::byte, 32>{});
                 co_return n;
             }(path)
-        ).submit();
+        );
 
         {
             Pipe writer = co_await Pipe::open(path, PipeMode::Write);
@@ -162,7 +162,7 @@ TEST(PipeTest, PipelinedWrites) {
                 }
                 co_return result;
             }(path)
-        ).submit();
+        );
 
         Pipe writer = co_await Pipe::open(path, PipeMode::Write);
 

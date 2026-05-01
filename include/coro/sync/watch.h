@@ -50,7 +50,7 @@ struct WatchShared {
     uint64_t                     version = 0;    ///< Incremented on every send().
 
     std::mutex                   waker_mutex;
-    coro::detail::IntrusiveList  receiver_waiters; ///< Suspended ChangedFuture nodes.
+    coro::detail::IntrusiveList<> receiver_waiters; ///< Suspended ChangedFuture nodes.
     size_t                       receiver_count = 0;
     bool                         sender_alive   = true;
 

@@ -250,10 +250,6 @@ m_executor->wait_for_completion(*state);
 `block_on` call stack until `wait_for_completion` returns, keeping the task alive even
 after the executor parks it. No `OwnedTask` is needed here.
 
-The deprecated `Synchronize` class uses the same pattern: `SyncChild::state` is a
-`shared_ptr<TaskState<T>>` aliased from the spawned `TaskImpl`; it acts as the
-lifetime anchor for each child task while the parent `Synchronize` waits for them.
-
 ---
 
 ### Category 3 — Executor queue: temporary strong reference (Notified/Running only)
@@ -311,7 +307,6 @@ See [shared_ptr_cycles.md](shared_ptr_cycles.md) for the full cycle analysis.
 | `JoinHandle::m_state` | `shared_ptr<TaskState<T>>` | 2 — companion alias | typed result access; same allocation as m_owned |
 | `JoinSetSharedState::idle_handles` | `list<shared_ptr<TaskState<T>>>` | 2 — companion alias | aliased into same JoinSetTask allocation; consumer reads result directly |
 | `Runtime::block_on()` `state` | `shared_ptr<TaskState<T>>` | 2 — companion alias | root task anchor for synchronous call stack |
-| `SyncChild::state` (deprecated) | `shared_ptr<TaskState<T>>` | 2 — companion alias | child task anchor for Synchronize scope |
 | Executor queue entries | `shared_ptr<TaskBase>` | 3 — temporary (Notified/Running) | task must stay alive between enqueue and poll |
 | `TaskState::waker` | `weak_ptr<Waker>` | 4 — notification only | shared slot for JoinHandle awaiter and CoroutineScope drain; must not create cycle |
 | Leaf future waker fields | `weak_ptr<Waker>` | 4 — notification only | fires task wake from I/O or timer callback |

@@ -11,10 +11,6 @@ distinct user-facing types:
   Uses `co_yield` to produce values and can `co_await` futures internally.
 - **`JoinHandle<T>`** — returned by `spawn()`. Satisfies `Future<T>`. Allows the caller to
   `co_await` the result of a spawned task.
-- **`Synchronize`** — structured concurrency scope. Guarantees all tasks spawned within it
-  complete before the scope exits. **Deprecated** — prefer `co_invoke` + `JoinSet::drain()`
-  for new code.
-
 **`Task`** is an internal, heap-allocated unit of work. `spawn()` creates a single
 `TaskImpl<F>` object (via `make_shared`) that combines the executor-facing interface
 (`TaskBase`) and the result/cancellation state (`TaskState<T>`) into one allocation.
@@ -61,8 +57,8 @@ Coro<int> compute()
 
 Coro<void> my_async_main()
 {
-    JoinHandle<int> h = runtime.spawn(compute()).submit();   // Coro<int> — accepted as any Future
-    JoinHandle<int> h2 = runtime.spawn(ImmediateFuture<int>(7)).submit();  // hand-written Future also works
+    JoinHandle<int> h = runtime.spawn(compute());            // Coro<int> — accepted as any Future
+    JoinHandle<int> h2 = runtime.spawn(ImmediateFuture<int>(7));  // hand-written Future also works
     int result = co_await h;
 }
 ```
@@ -168,27 +164,22 @@ template<typename T> requires (!Future<T>)
 void await_transform(T&&) = delete;
 ```
 
-### SpawnBuilder and StreamSpawnBuilder
+### spawn() and build_task()
 
-`runtime.spawn(x)` returns a builder rather than immediately submitting the task. The builder
-exposes configuration setters and a terminal `.submit()` that consumes the builder, submits
-the task, and returns the handle. `runtime.spawn()` is overloaded on `Future` vs `Stream`,
-returning different builder types so `buffer()` is only available when spawning a stream.
+`runtime.spawn(x)` immediately schedules the task and returns the handle. Use the free
+`build_task()` builder when you need to set a name or stream buffer size before spawning.
 
 ```cpp
-template<Future F>
 class SpawnBuilder {
 public:
     SpawnBuilder& name(std::string name);
-    JoinHandle<typename F::OutputType> submit();  // consumes builder, submits task
-};
+    SpawnBuilder& buffer(std::size_t size);  // bounded channel capacity for streams (default: 64)
 
-template<Stream S>
-class StreamSpawnBuilder {
-public:
-    StreamSpawnBuilder& name(std::string name);
-    StreamSpawnBuilder& buffer(std::size_t size);  // bounded channel capacity (default: 64)
-    StreamHandle<typename S::ItemType> submit();
+    template<Future F>
+    JoinHandle<typename F::OutputType> spawn(F future);
+
+    template<Stream S>
+    StreamHandle<typename S::ItemType> spawn(S stream);
 };
 ```
 
@@ -197,14 +188,18 @@ Usage:
 ```cpp
 Coro<void> example()
 {
-    JoinHandle<int> h = runtime.spawn(compute())
-        .name("compute-task")
-        .submit();
+    // Direct spawn — most common path:
+    JoinHandle<int> h = runtime.spawn(compute());
 
-    StreamHandle<Packet> s = runtime.spawn(read_packets(sock))
+    StreamHandle<Packet> s = runtime.spawn(read_packets(sock));
+
+    // Builder path — use when a name or buffer size is needed:
+    JoinHandle<int> h2 = runtime.build_task().name("compute-task").spawn(compute());
+
+    StreamHandle<Packet> s2 = runtime.build_task()
         .name("packet-reader")
         .buffer(128)
-        .submit();
+        .spawn(read_packets(sock));
 
     int result = co_await h;
     while (auto pkt = co_await next(s)) { process(*pkt); }
@@ -273,42 +268,6 @@ consumer end of a bounded channel. The spawned task drives `poll_next()` on the 
 stream and sends values through the channel, suspending when the buffer is full to preserve
 back-pressure.
 
-### Synchronize
-
-> **Deprecated** — prefer `co_invoke` + `JoinSet::drain()` for new code.
-
-`Synchronize` is a structured concurrency scope that guarantees all tasks spawned within it
-complete before the scope's `co_await` returns — including when an exception unwinds the
-parent coroutine. It predates `JoinSet` and is retained for compatibility.
-
-```cpp
-Coro<void> parent()
-{
-    int local = 42;
-
-    co_await Synchronize([&](Synchronize& sync) -> Coro<void> {
-        sync.spawn(child(local)).name("child-a").submit();
-        sync.spawn(other_child(local)).name("child-b").submit();
-    });
-    // All children guaranteed finished here.
-}
-```
-
-Prefer the equivalent `JoinSet` pattern for new code:
-
-```cpp
-Coro<void> parent()
-{
-    int local = 42;
-    co_await co_invoke([&]() -> Coro<void> {
-        JoinSet<void> js;
-        js.spawn(child(local));
-        js.spawn(other_child(local));
-        co_await js.drain();
-    });
-}
-```
-
 ### JoinHandle lifetime options
 
 There are three ways to relinquish a `JoinHandle`, with different effects on the child task:
@@ -327,9 +286,9 @@ guarantee.
 
 This three-way design mirrors Julia's pattern extended with explicit detach:
 
-- `runtime.spawn().submit()` + `co_await` → synchronize with result
-- `runtime.spawn().submit()` + `.detach()` → fire and forget, task runs to completion
-- `runtime.spawn().submit()` + drop → cancel and discard
+- `runtime.spawn(f)` + `co_await` → synchronize with result
+- `runtime.spawn(f)` + `.detach()` → fire and forget, task runs to completion
+- `runtime.spawn(f)` + drop → cancel and discard
 
 ### Internal Task types
 
@@ -480,7 +439,7 @@ Usage:
 Coro<void> my_coro()
 {
     // No need to pass runtime around — uses thread-local runtime implicitly
-    JoinHandle<int> h = spawn(compute()).name("compute").submit();
+    JoinHandle<int> h = build_task().name("compute").spawn(compute());
     int result = co_await h;
 }
 ```
@@ -531,10 +490,10 @@ with worker threads via `uv_async_t` notifications.
 
 ### spawn() ownership
 
-`runtime.spawn(x)` moves `x` into the builder immediately. `.submit()` then consumes the
-builder and submits the task, returning the handle. The caller is left with only the
-`JoinHandle` or `StreamHandle` and cannot interact with the original future or stream
-after calling `runtime.spawn()`.
+`runtime.spawn(x)` moves `x` into the task immediately, schedules it, and returns the
+`JoinHandle` or `StreamHandle`. The caller cannot interact with the original future or
+stream after calling `runtime.spawn()`. Use `runtime.build_task()` when you need to
+configure a name or buffer size before spawning.
 
 ### block_on threading
 
@@ -576,5 +535,5 @@ exception is swallowed. Once logging is available, unhandled task exceptions wil
 at that point. The exception is stored in the `JoinHandle`'s shared slot regardless — it is
 only discarded when the `JoinHandle` is destroyed without being awaited.
 
-For tasks spawned inside a `Synchronize` scope, the first exception is re-thrown by the
-`co_await Synchronize(...)` expression after all children have completed.
+For tasks spawned inside a `JoinSet`, the first exception is re-thrown by `co_await next(js)`
+or `co_await js.drain()` after all children have completed.

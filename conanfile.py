@@ -13,12 +13,14 @@ class CoroRecipe(ConanFile):
     options = {
         "shared": [True, False],
         "fPIC": [True, False],
-        "with_gperftools": [True, False]
+        "with_gperftools": [True, False],
+        "with_local_run_queue": [True, False]
     }
     default_options = {
         "shared": True,
         "fPIC": True,
-        "with_gperftools": True
+        "with_gperftools": True,
+        "with_local_run_queue": True
     }
     exports_sources = "include/*.h","include/*.hpp", "src/*.cpp", "CMakeLists.txt"
 
@@ -56,6 +58,7 @@ class CoroRecipe(ConanFile):
         deps.generate()
         tc = CMakeToolchain(self)
         tc.cache_variables["WITH_GPERFTOOLS"] = self.options.with_gperftools
+        tc.cache_variables["CORO_USE_LOCAL_RUN_QUEUE"] = self.options.with_local_run_queue
         tc.generate()
 
     def build(self):
@@ -72,6 +75,8 @@ class CoroRecipe(ConanFile):
         self.cpp_info.system_libs = ["cap"]
         if self.options.with_gperftools:
             self.cpp_info.requires.append("gperftools::gperftools")
+        if self.options.with_local_run_queue:
+            self.cpp_info.defines.append("CORO_USE_LOCAL_RUN_QUEUE")
         self.cpp_info.requires.append("libuv::libuv")
         self.cpp_info.requires.append("libwebsockets::libwebsockets")
 

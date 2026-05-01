@@ -15,13 +15,44 @@ namespace coro {
 thread_local WorkStealingExecutor* t_wse_owning_executor = nullptr;
 thread_local int                   t_wse_worker_index    = -1;
 
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+using TaskSP = detail::TaskBase*;
 
-WorkStealingExecutor::WorkStealingExecutor(Runtime* runtime, std::size_t num_threads)
-    : m_local_queues(num_threads)
-    , m_runtime(runtime)
+// Overflow handler for Local<TaskSP>::push_or_overflow().
+// Moves spilled tasks directly into the injection queue — no boxing needed.
+struct InjectionOverflow {
+    std::mutex&           mutex;
+    std::deque<TaskSP>&   queue;
+
+    void push(TaskSP task) {
+        std::lock_guard lock(mutex);
+        queue.push_back(std::move(task));
+    }
+
+    void push_batch(TaskSP* tasks, std::size_t n) {
+        std::lock_guard lock(mutex);
+        for (std::size_t i = 0; i < n; ++i)
+            queue.push_back(std::move(tasks[i]));
+    }
+};
+#endif
+
+WorkStealingExecutor::WorkStealingExecutor(Runtime* runtime, std::size_t num_threads) :
+#ifndef CORO_USE_LOCAL_RUN_QUEUE
+    m_local_queues(num_threads),
+#endif
+    m_runtime(runtime)
 {
     if (num_threads > MAX_WORKERS)
         throw std::invalid_argument("WorkStealingExecutor: num_threads exceeds MAX_WORKERS (64)");
+
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+    m_worker_queues.reserve(num_threads);
+    for (std::size_t i = 0; i < num_threads; ++i) {
+        auto [steal, local] = detail::make_local_run_queue<detail::TaskBase*>();
+        m_worker_queues.emplace_back(std::move(local), std::move(steal));
+    }
+#endif
 
     m_workers.reserve(num_threads);
     for (std::size_t i = 0; i < num_threads; ++i) {
@@ -56,20 +87,33 @@ void WorkStealingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
 void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
     const int local_idx = t_wse_worker_index;
 
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+    if (local_idx >= 0 && t_wse_owning_executor == this) {
+        // Fast path: push to own local queue; spill to injection queue if full.
+        InjectionOverflow overflow{m_mutex, m_injection_queue};
+        m_worker_queues[local_idx].local.push_or_overflow(task.get(), overflow);
+    } else {
+        // Local<T> is single-owner so we cannot push directly to another
+        // worker's ring from here. All remote pushes go to the injection queue.
+        std::lock_guard lock(m_mutex);
+        m_injection_queue.push_back(task.get());
+    }
+#else
     if (local_idx >= 0 && t_wse_owning_executor == this) {
         // Fast path: called from a worker of this executor.
-        m_local_queues[local_idx].push(std::move(task));
+        m_local_queues[local_idx].push(task.get());
     } else {
         const int affinity = task->last_worker_index;
         if (affinity >= 0 && affinity < static_cast<int>(m_local_queues.size())) {
             // Affinity path: re-enqueue to the worker that last ran this task.
-            m_local_queues[affinity].push(std::move(task));
+            m_local_queues[affinity].push(task.get());
         } else {
             // Remote path: injection queue.
             std::lock_guard lock(m_mutex);
-            m_injection_queue.push_back(std::move(task));
+            m_injection_queue.push_back(task.get());
         }
     }
+#endif
     notify_if_needed();
 }
 
@@ -106,15 +150,20 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         std::shared_ptr<detail::TaskBase> task;
 
         // --- Step 1: own local queue ---
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+        if (auto t = m_worker_queues[worker_index].local.pop())
+            task = t->shared_from_this();
+#else
         if (auto t = m_local_queues[worker_index].pop()) {
-            task = std::move(*t);
+            task = (*t)->shared_from_this();
         }
+#endif
 
         // --- Step 2: injection queue ---
         if (!task) {
             std::lock_guard lock(m_mutex);
             if (!m_injection_queue.empty()) {
-                task = std::move(m_injection_queue.front());
+                task = std::move(m_injection_queue.front()->shared_from_this());
                 m_injection_queue.pop_front();
             }
         }
@@ -131,17 +180,23 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                 for (int i = 0; i < n && !task; ++i) {
                     const int victim = (worker_index + 1 + i) % n;
                     if (victim == worker_index) continue;
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+                    if (auto t = m_worker_queues[victim].steal.steal_into(
+                                     m_worker_queues[worker_index].local))
+                        task = t->shared_from_this();
+#else
                     if (auto t = m_local_queues[victim].steal_half(
                                      m_local_queues[worker_index])) {
-                        task = std::move(*t);
+                        task = (*t)->shared_from_this();
                     }
+#endif
                 }
 
                 // Re-check injection queue after sweep.
                 if (!task) {
                     std::lock_guard lock(m_mutex);
                     if (!m_injection_queue.empty()) {
-                        task = std::move(m_injection_queue.front());
+                        task = m_injection_queue.front()->shared_from_this();
                         m_injection_queue.pop_front();
                     }
                 }
@@ -156,20 +211,29 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
             m_idle_mask.fetch_or(1ull << worker_index, std::memory_order_release);
 
             // Re-check local queue.
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+            if (auto t = m_worker_queues[worker_index].local.pop())
+                task = t->shared_from_this();
+#else
             if (auto t = m_local_queues[worker_index].pop())
-                task = std::move(*t);
+                task = (*t)->shared_from_this();
+#endif
 
             // Re-check injection queue.
             if (!task) {
                 std::lock_guard lock(m_mutex);
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+                if (m_stop && m_injection_queue.empty() &&
+                        m_worker_queues[worker_index].local.len() == 0) {
+#else
                 if (m_stop && m_injection_queue.empty()) {
-                    // Drain local queue one last time, then exit.
+#endif
                     m_idle_mask.fetch_and(~(1ull << worker_index),
                                          std::memory_order_relaxed);
                     break;
                 }
                 if (!m_injection_queue.empty()) {
-                    task = std::move(m_injection_queue.front());
+                    task = std::move(m_injection_queue.front()->shared_from_this());
                     m_injection_queue.pop_front();
                 }
             }
@@ -184,8 +248,13 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                 // Check shutdown after waking.
                 {
                     std::lock_guard lock(m_mutex);
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
                     if (m_stop && m_injection_queue.empty() &&
-                        m_local_queues[worker_index].empty())
+                            m_worker_queues[worker_index].local.len() == 0)
+#else
+                    if (m_stop && m_injection_queue.empty() &&
+                            m_local_queues[worker_index].empty())
+#endif
                         break;
                 }
                 continue;

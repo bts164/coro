@@ -43,7 +43,7 @@ Coro<int> throwing_coro() {
 }
 
 Coro<int> nested_spawn_coro() {
-    auto h = coro::spawn(ImmediateInt{99}).submit();
+    auto h = coro::spawn(ImmediateInt{99});
     co_return co_await std::move(h);
 }
 

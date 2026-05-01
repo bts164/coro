@@ -56,7 +56,7 @@ public:
      * All subsequent transitions are CAS operations — see `SchedulingState` for the
      * full transition table.
      */
-    std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
+    alignas(64) std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
 
     /// @brief Optional human-readable name set via SpawnBuilder::name(). Empty if unset.
     std::string name;

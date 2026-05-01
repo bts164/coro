@@ -109,7 +109,7 @@ TEST(OneshotTest, ReceiverSuspendsUntilSend) {
         co_await coro::spawn([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send(7);
             co_return;
-        }()).submit();
+        }());
         auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
         EXPECT_EQ(*result, 7);
@@ -166,7 +166,7 @@ TEST(OneshotVoidTest, ReceiverSuspendsUntilSend) {
         co_await coro::spawn([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send();
             co_return;
-        }()).submit();
+        }());
         auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
     }());

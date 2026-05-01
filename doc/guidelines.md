@@ -47,7 +47,7 @@ which is the source of the pitfalls below.
 // BAD — local_data is destroyed at co_return before the drain begins.
 Coro<void> bad() {
     int local_data = 42;
-    auto h = spawn(worker(&local_data)).submit();
+    auto h = spawn(worker(&local_data));
     co_return;  // local_data destroyed here; drain happens after, too late
 }
 
@@ -55,7 +55,7 @@ Coro<void> bad() {
 // before the drain begins.
 Coro<void> fragile() {
     int local_data = 42;
-    auto h = spawn(worker(&local_data)).submit();
+    auto h = spawn(worker(&local_data));
     co_await might_throw();  // if this throws, local_data is gone before drain
     // h dropped here → drain begins, but local_data already destroyed
 }
@@ -207,14 +207,14 @@ except here it cannot be checked at compile time.
 // BAD — detached task captures a reference to a local
 Coro<void> bad() {
     std::string msg = "hello";
-    spawn(send_message(msg)).submit().detach();  // msg may be gone before task runs
+    spawn(send_message(msg)).detach();  // msg may be gone before task runs
     co_return;
 }
 
 // GOOD — move the data into the task
 Coro<void> good() {
     std::string msg = "hello";
-    spawn(send_message(std::move(msg))).submit().detach();
+    spawn(send_message(std::move(msg))).detach();
     co_return;
 }
 ```
@@ -236,7 +236,7 @@ boundary — dropping a `JoinSet` cancels all pending children cleanly.
 // OK but verbose — awaits in spawn order, not completion order
 std::vector<JoinHandle<int>> handles;
 for (auto& item : items)
-    handles.push_back(spawn(compute(item)).submit());
+    handles.push_back(spawn(compute(item)));
 for (auto& h : handles)
     results.push_back(co_await h);
 
@@ -248,37 +248,25 @@ while (auto r = co_await next(js))
     results.push_back(*r);
 ```
 
-### SP.2 — Always call `.submit()` before using a `SpawnBuilder`
+### SP.2 — Use `build_task().name("...").spawn(f)` for named tasks
 
-**Reason:** `spawn()` constructs a `SpawnBuilder` that describes a task but does not
-schedule it. Nothing is submitted to the executor until `.submit()` is called. A
-`SpawnBuilder` that goes out of scope without `.submit()` silently discards the task — no
-error, no warning beyond `[[nodiscard]]` if the builder itself is not assigned to anything.
-This is a frequent source of "my task never ran" bugs.
+**Reason:** `spawn(f)` immediately schedules the task and returns its `JoinHandle`.
+When you need to attach a name (visible in diagnostics) or set a stream buffer size,
+use the `build_task()` builder instead. Forgetting to call `.spawn()` at the end of the
+builder chain discards the task — `[[nodiscard]]` on `SpawnBuilder` catches the fully-
+discarded case.
 
 ```cpp
-// BAD — task is never scheduled
-auto builder = spawn(compute());
-co_await some_work();
-// builder goes out of scope; compute() never ran
-
-// GOOD
-auto h = spawn(compute()).submit();
+// Direct spawn — most common path
+auto h = spawn(compute());
 co_await some_work();
 co_await h;
-```
 
-### SP.3 — Use `.name()` on long-lived or important tasks to aid debugging
+// Named task via builder
+auto h2 = build_task().name("serve-connection").spawn(serve_connection(conn));
 
-**Reason:** Task names appear in logs, diagnostic output, and crash reports. Unnamed tasks
-are indistinguishable from one another in traces. Naming has no runtime cost when logging
-is disabled and very low cost when it is enabled — there is no reason to skip it for tasks
-that will be running for the lifetime of a connection, a request, or the whole process.
-
-```cpp
-auto h = spawn(serve_connection(conn))
-             .name("serve-connection")
-             .submit();
+// Named stream with custom buffer
+auto sh = build_task().name("packet-reader").buffer(128).spawn(read_packets(sock));
 ```
 
 ---
@@ -625,6 +613,51 @@ black box that "just cancels" is the most common source of `timeout` surprises.
 auto result = co_await timeout(100ms, f());
 ```
 
+### ST.4 — Use `coro::ref(f)` to keep a future alive across a losing `select` branch
+
+**Reason:** `select()` takes futures by value and cancels any branch that does not win. If
+you want the underlying work to keep running — for example, polling a long-running task
+across multiple select rounds while also watching for an external signal — passing the
+future directly would cancel it the first time its branch loses.
+
+`coro::ref(f)` wraps a future in a non-owning `FutureRef<F>` that delegates `poll()` to `f`
+without taking ownership. The wrapper is discarded when the branch loses; the underlying
+future is untouched.
+
+```cpp
+// BAD — task is cancelled the first time the signal branch wins
+while (true) {
+    auto sel = co_await select(spawn(long_work()), signal);
+    // task future was consumed and cancelled if signal won
+}
+
+// GOOD — task keeps running across multiple rounds
+JoinHandle<Result> task = spawn(long_work());
+while (true) {
+    auto sel = co_await select(coro::ref(task), signal);
+    if (std::holds_alternative<SelectBranch<1, void>>(sel)) continue;  // signal fired
+    Result r = std::get<SelectBranch<0, Result>>(sel).value;           // task done
+    break;
+}
+```
+
+Four rules to remember when using `coro::ref()`:
+
+1. **Lvalue only.** `coro::ref()` only accepts lvalues. Store the future in a named variable
+   first; `coro::ref(spawn(f()))` is a compile error. This guarantees the underlying future
+   has a lifetime longer than the wrapper.
+2. **Non-copyable.** `FutureRef` is non-copyable. Create it, pass it to `select`, and let it
+   go — do not store it in a variable or reuse it across multiple calls.
+3. **Result consumption.** If the `coro::ref(f)` branch wins, the result is moved out of `f`.
+   Do not await `f` again afterward — it is logically spent even though it was never moved.
+4. **Never cancels the underlying future.** `FutureRef<F>` is never `Cancellable`, regardless
+   of whether `F` is. When the ref branch loses, `select()` simply drops the wrapper without
+   calling `cancel()` on `f` — keeping it running for the next round. The tradeoff is that
+   any waker `f` registered during the losing poll remains live. If that event fires before
+   the next select round, the task may be polled spuriously. This is harmless — `poll()` is
+   required to tolerate spurious calls — but it may cause one extra scheduler wake-up per
+   round in high-frequency select loops.
+
 ---
 
 ## Silent Cancellation
@@ -640,12 +673,12 @@ case. Always be explicit about the intended lifecycle.
 
 ```cpp
 // BAD — task is immediately cancelled
-spawn(important_work()).submit();  // warning: [[nodiscard]]
+spawn(important_work());  // warning: [[nodiscard]]
 
 // GOOD options:
-auto h = spawn(important_work()).submit();        // await later
-spawn(fire_and_forget()).submit().detach();       // explicit detach
-js.spawn(important_work());                      // JoinSet takes ownership
+auto h = spawn(important_work());        // await later
+spawn(fire_and_forget()).detach();       // explicit detach
+js.spawn(important_work());             // JoinSet takes ownership
 ```
 
 ### SC.2 — Never discard a `BlockingHandle` without intent
@@ -745,7 +778,7 @@ from the behaviour programmers may expect from threads (`std::async` rethrows on
 
 ```cpp
 // Exception is stored; not thrown yet
-auto h = spawn(might_throw()).submit();
+auto h = spawn(might_throw());
 
 // Exception rethrown here
 co_await h;  // throws if the task failed

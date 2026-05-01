@@ -8,30 +8,29 @@
 namespace coro {
 
 /**
- * @brief Schedules `future` on `exec` and returns a builder for controlling the task.
+ * @brief Schedules `future` on `exec` and returns a @ref JoinHandle.
  *
  * Unlike `coro::spawn()` (which targets the current runtime's executor), `spawn_on`
  * lets the caller choose the executor explicitly. Useful for routing work to a
  * specific executor — for example, dispatching I/O-bound coroutines to the
  * @ref SingleThreadedUvExecutor.
  *
- * Call `.submit()` on the returned @ref SpawnBuilder to enqueue the task and receive
- * a @ref JoinHandle.
+ * Use `build_task().name("...").spawn(future)` if you need to set a task name.
  *
  * @param exec   The executor to schedule the task on.
  * @param future The future to schedule.
- * @return A @ref SpawnBuilder; call `.submit()` to enqueue the task.
+ * @return A @ref JoinHandle for the spawned task.
  */
 template<Future F>
-[[nodiscard]] SpawnBuilder<F> spawn_on(Executor& exec, F future) {
-    return SpawnBuilder<F>(std::move(future), &exec);
+[[nodiscard]] JoinHandle<typename F::OutputType> spawn_on(Executor& exec, F future) {
+    return SpawnBuilder(&exec).spawn(std::move(future));
 }
 
 /**
  * @brief Schedules `future` on `exec`, suspends the caller until it completes,
  * and returns the result — Kotlin's `withContext` analogue.
  *
- * Equivalent to `co_await spawn_on(exec, future).submit()`. The coroutine runs
+ * Equivalent to `co_await spawn_on(exec, future)`. The coroutine runs
  * entirely on `exec`; when it completes its waker fires, resuming the caller on
  * whichever executor is driving the parent task (no explicit return-context switch
  * is needed — the parent re-schedules itself automatically via its waker).
@@ -57,7 +56,7 @@ template<Future F>
  */
 template<Future F>
 [[nodiscard]] JoinHandle<typename F::OutputType> with_context(Executor& exec, F future) {
-    return spawn_on(exec, std::move(future)).submit();
+    return spawn_on(exec, std::move(future));
 }
 
 } // namespace coro

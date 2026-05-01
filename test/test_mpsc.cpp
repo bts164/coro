@@ -147,7 +147,7 @@ TEST(MpscTest, SenderSuspendsWhenFull) {
             auto v1 = co_await next(rx); ++(*v1.value());
             auto v2 = co_await next(rx); ++(*v2.value());
             auto v3 = co_await next(rx); ++(*v3.value());
-        })).submit();
+        }));
         EXPECT_EQ(x[0], 0);
         EXPECT_EQ(x[1], 0);
         EXPECT_EQ(x[2], 0);

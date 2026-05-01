@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <coro/coro.h>
+#include <coro/co_invoke.h>
 #include <coro/sync/watch.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
@@ -98,10 +99,10 @@ TEST(WatchTest, ChangedResolvesWhenValueSent) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
         auto [tx, rx] = watch::channel<int>(0);
-        co_await coro::spawn([tx = std::move(tx)]() mutable -> Coro<void> {
+        co_await coro::spawn(coro::co_invoke([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send(42);
             co_return;
-        }()).submit();
+        }));
         auto r = co_await rx.changed();
         EXPECT_TRUE(r.has_value());
         EXPECT_EQ(*rx.borrow(), 42);
@@ -162,10 +163,10 @@ TEST(WatchTest, BorrowAndUpdateMarksVersionSeen) {
         // a new send happens after this call.
         { auto guard = rx.borrowAndUpdate(); (void)guard; }
         bool resolved = false;
-        auto handle = spawn([&tx = tx]() mutable -> Coro<void> {
+        auto handle = spawn(co_invoke([&tx = tx]() mutable -> Coro<void> {
             tx.send(2);
             co_return;
-        }()).submit();
+        }));
         auto r = co_await rx.changed();
         resolved = r.has_value();
         co_await std::move(handle);
@@ -211,10 +212,10 @@ TEST(WatchTest, SendIfModifiedDoesNotWakeReceiversWhenNotModified) {
         tx.sendIfModified([](int&) { return false; });
         // changed() should not resolve immediately (version unchanged).
         // Send a real update to unblock.
-        spawn([&tx = tx]() mutable -> Coro<void> {
+        spawn(co_invoke([&tx = tx]() mutable -> Coro<void> {
             tx.send(99);
             co_return;
-        }()).submit().detach();
+        })).detach();
         auto r = co_await rx.changed();
         EXPECT_TRUE(r.has_value());
         EXPECT_EQ(*rx.borrow(), 99);
@@ -225,10 +226,10 @@ TEST(WatchTest, SendIfModifiedWakesReceiversWhenModified) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
         auto [tx, rx] = watch::channel<int>(0);
-        spawn([&tx = tx]() mutable -> Coro<void> {
+        spawn(co_invoke([&tx = tx]() mutable -> Coro<void> {
             tx.sendIfModified([](int& v) { v = 7; return true; });
             co_return;
-        }()).submit().detach();
+        })).detach();
         auto r = co_await rx.changed();
         EXPECT_TRUE(r.has_value());
         EXPECT_EQ(*rx.borrow(), 7);

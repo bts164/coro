@@ -110,7 +110,7 @@ field that must be stored. The CAS operations that replace `m_suspended` have no
 operate on without it.
 
 **Implementation note:** `scheduling_state` lives in `TaskBase`. Fire-and-forget tasks
-(created by `spawn().submit().detach()`) have no external `JoinHandle` holding a
+(created by `spawn().detach()`) have no external `JoinHandle` holding a
 `shared_ptr<TaskState<T>>`, but they still need a scheduling state for the waker CAS to
 work. Placing the field in `TaskBase` — which every `TaskImpl<F>` inherits — handles both
 cases uniformly:

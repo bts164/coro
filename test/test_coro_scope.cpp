@@ -197,7 +197,7 @@ struct WritingFuture {
 // Coroutine spawns a child task, drops the JoinHandle, then co_returns.
 // The implicit scope must hold completion until the child finishes.
 Coro<void> spawns_and_returns(std::shared_ptr<int> out, bool cancel = false) {
-    (void)spawn(WritingFuture{out, 42}).submit().cancelOnDestroy(cancel);
+    (void)spawn(WritingFuture{out, 42}).cancelOnDestroy(cancel);
     co_return;
 }
 
@@ -280,9 +280,9 @@ TEST(CoroutineScopeIntegration, ScopeLifetimeSequence) {
                 rootEvent.set();
                 co_await innerEvent;
                 co_return;
-            }(MarkExitSequence(&scopeSequenceArgInner))).submit();
+            }(MarkExitSequence(&scopeSequenceArgInner)));
             co_return;
-        }(MarkExitSequence(&scopeSequenceArgOuter))).submit();
+        }(MarkExitSequence(&scopeSequenceArgOuter)));
         co_await rootEvent;
         co_return;
     }());
@@ -317,9 +317,9 @@ struct AddingFuture {
 
 // Multiple dropped children — all must complete before the coroutine finishes.
 Coro<void> spawns_multiple(std::shared_ptr<int> counter) {
-    (void)spawn(AddingFuture{counter, 1}).submit().cancelOnDestroy(false);
-    (void)spawn(AddingFuture{counter, 2}).submit().cancelOnDestroy(false);
-    (void)spawn(AddingFuture{counter, 3}).submit().cancelOnDestroy(false);
+    (void)spawn(AddingFuture{counter, 1}).cancelOnDestroy(false);
+    (void)spawn(AddingFuture{counter, 2}).cancelOnDestroy(false);
+    (void)spawn(AddingFuture{counter, 3}).cancelOnDestroy(false);
     co_return;
 }
 
@@ -336,7 +336,7 @@ TEST(CoroutineScopeIntegration, CoroutineWaitsForAllDroppedChildren) {
 // JoinHandle dropped inside a nested scope (child coroutine) — registers with the
 // child's scope, not the parent's.
 Coro<void> inner_spawn(std::shared_ptr<int> out) {
-    (void)spawn(WritingFuture{out, 99}).submit().cancelOnDestroy(false);
+    (void)spawn(WritingFuture{out, 99}).cancelOnDestroy(false);
     co_return;
 }
 
@@ -351,7 +351,7 @@ Coro<void> inner_with_scope_child(std::shared_ptr<std::atomic<int>> counter,
     (void)spawn([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
         counter->fetch_add(1);
         co_return;
-    }(counter)).submit().cancelOnDestroy(false);
+    }(counter)).cancelOnDestroy(false);
     co_await blocker;
 }
 
@@ -393,7 +393,7 @@ TEST(CoroutineScopeIntegration, SleepingTaskWakesOnCancel) {
             started.set();
             co_await blocker;          // stores waker clone, then parks
             counter->fetch_add(1);     // must never execute
-        }(counter, started, blocker)).submit();
+        }(counter, started, blocker));
         co_await started;
         // handle destroyed → child cancelled → waker fires → child cleans up
     }(counter, started, blocker));
@@ -423,8 +423,8 @@ TEST(CoroutineScopeIntegration, ThreeLevelCooperativeCancelOrdering) {
                 MarkExitSequence localB(seqB);
                 innerStarted.set();
                 co_await innerBlocker;
-            }(seqB, innerBlocker, innerStarted)).submit();
-        }(seqA, seqB, innerBlocker, innerStarted)).submit();
+            }(seqB, innerBlocker, innerStarted));
+        }(seqA, seqB, innerBlocker, innerStarted));
         co_await innerStarted;
         // handle destroyed → A cancelled → A cooperative-cancels B → B eagerly destroyed
     }(&seqA, &seqB, innerBlocker, innerStarted));
@@ -455,7 +455,7 @@ TEST(CoroutineScopeIntegration, CooperativeCancelWithScopeDrain) {
             (void)spawn([](std::shared_ptr<std::atomic<int>> scopeCounter) -> Coro<void> {
                 scopeCounter->fetch_add(1);
                 co_return;
-            }(scopeCounter)).submit().cancelOnDestroy(false);
+            }(scopeCounter)).cancelOnDestroy(false);
 
             outerStarted.set();
 
@@ -464,8 +464,8 @@ TEST(CoroutineScopeIntegration, CooperativeCancelWithScopeDrain) {
                               EventFuture coopBlocker) -> Coro<void> {
                 co_await coopBlocker;
                 coopCounter->fetch_add(1); // must not execute
-            }(coopCounter, coopBlocker)).submit();
-        }(coopCounter, scopeCounter, coopBlocker, outerStarted)).submit();
+            }(coopCounter, coopBlocker));
+        }(coopCounter, scopeCounter, coopBlocker, outerStarted));
 
         co_await outerStarted;
         // handle destroyed → outer cancelled; both children must settle
@@ -488,7 +488,7 @@ TEST(CoroutineScopeIntegration, TaskCancelledBeforeFirstPoll) {
             (void)spawn([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
                 counter->fetch_add(1);
                 co_return;
-            }(counter)).submit(); // handle destroyed immediately → cancelled
+            }(counter)); // handle destroyed immediately → cancelled
         }
         co_return;
     }(counter));
@@ -513,11 +513,11 @@ TEST(CoroutineScopeIntegration, NoCancelChildWithCancelOnDestroyFalse) {
             (void)spawn([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
                 counter->fetch_add(1);
                 co_return;
-            }(counter)).submit().cancelOnDestroy(false);
+            }(counter)).cancelOnDestroy(false);
 
             parentStarted.set();
             co_await parentBlocker; // blocks here (EventFuture not Cancellable → eager destroy)
-        }(counter, parentBlocker, parentStarted)).submit();
+        }(counter, parentBlocker, parentStarted));
 
         co_await parentStarted;
         // handle destroyed → parent cancelled; scope-child must still run
@@ -537,7 +537,7 @@ TEST(CoroutineScopeIntegration, DetachedTaskNotRegisteredInScope) {
     rt.block_on([](EventFuture neverSet) -> Coro<void> {
         (void)spawn([](EventFuture neverSet) -> Coro<void> {
             co_await neverSet; // would block forever
-        }(neverSet)).submit().detach();
+        }(neverSet)).detach();
         co_return;
     }(neverSet));
 
@@ -563,7 +563,7 @@ TEST(CoroutineScopeIntegration, CancelledOuterDrainsInnerCoroScopeChildren) {
                                EventFuture blocker) -> Coro<void> {
             started.set();
             co_await inner_with_scope_child(counter, blocker);
-        }(counter, started, blocker)).submit();
+        }(counter, started, blocker));
         co_await started;
         // handle destroyed → outer task cancelled → inner_with_scope_child is
         // Cancellable, so it must be drained (including its cancelOnDestroy=false

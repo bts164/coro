@@ -506,9 +506,9 @@ TEST(PollStreamTest, MultipleStreamsIndependent) {
                 pairs[s].received.push_back(item->id);
         };
 
-        auto h0 = spawn(read_stream(0)).submit();
-        auto h1 = spawn(read_stream(1)).submit();
-        auto h2 = spawn(read_stream(2)).submit();
+        auto h0 = spawn(read_stream(0));
+        auto h1 = spawn(read_stream(1));
+        auto h2 = spawn(read_stream(2));
         co_await h0;
         co_await h1;
         co_await h2;

@@ -174,30 +174,21 @@ private:
         // Post a handler for the next incoming call before processing this one.
         self->m_join_set.spawn(HandleNextRequest(RpcTypeClientStreamTag{}, self, method));
 
-        // Create a channel to stream requests to Handle(). Capacity 16 lets gRPC
-        // reads stay a little ahead of Handle's processing without unbounded buffering.
-        auto [req_tx, req_rx] = coro::mpsc::channel<RequestType>(16);
-
-        // Spawn Handle() with the receiver. It reads until the channel closes
-        // (when req_tx is dropped below) and then produces the single reply.
-        auto handle = coro::spawn(self->Handle(std::move(req_rx))).submit();
-
-        // Read messages from the client and forward them into the channel.
-        for (size_t i = 0; true; ++i) {
-            RequestType request;
-            auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
-            reader.Read(&request, &read_tx);
-            auto read_rx_result = co_await read_rx.recv();
-            if (!read_rx_result.has_value() || !read_rx_result.value()) break; // ok=false: client done sending (half-close)
-            co_await req_tx.send(std::move(request));
-        }
-
-        // Explicitly drop the sender to close the channel and signal EOF to Handle().
-        // Without this, Handle() would block waiting for more messages.
-        { [[maybe_unused]] auto drop = std::move(req_tx); }
+        auto stream = [](auto self, auto &reader) ->coro::CoroStream<RequestType> {
+            // Read messages from the client and forward them into the channel.
+            for (size_t i = 0; true; ++i) {
+                RequestType request;
+                auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
+                reader.Read(&request, &read_tx);
+                auto read_rx_result = co_await read_rx.recv();
+                if (!read_rx_result.has_value() || !read_rx_result.value()) break; // ok=false: client done sending (half-close)
+                co_yield std::move(request);
+            }
+            co_return;
+        }(self, reader);
 
         // Wait for Handle() to produce the reply.
-        ReplyType reply = co_await std::move(handle);
+        ReplyType reply = co_await self->Handle(std::move(stream));
 
         // Send the single reply and wait for delivery.
         auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
@@ -312,25 +303,20 @@ private:
         // Post a handler for the next incoming call before processing this one.
         self->m_join_set.spawn(HandleNextRequest(RpcTypeBidiStreamTag{}, self, method));
 
-        auto [req_tx, req_rx] = coro::mpsc::channel<RequestType>(64);
-
-        // Reader task: reads client messages and forwards them into the channel.
-        // Captures stream by reference — safe because we co_await reader below
-        // before returning, ensuring the reader exits before stream is destroyed.
-        auto reader = coro::spawn(coro::co_invoke(
-            [&stream, req_tx = std::move(req_tx)]() mutable -> coro::Coro<void> {
-                while (true) {
-                    RequestType request;
-                    auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
-                    stream.Read(&request, &read_tx);
-                    auto read_result = co_await read_rx.recv();
-                    if (!read_result.has_value() || !read_result.value()) co_return; // client half-closed
-                    co_await req_tx.send(std::move(request));
-                }
-            })).submit();
+        auto request_stream = [](auto self, auto &stream) -> coro::CoroStream<RequestType> {
+            while (true) {
+                RequestType request;
+                auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
+                stream.Read(&request, &read_tx);
+                auto read_result = co_await read_rx.recv();
+                if (!read_result.has_value() || !read_result.value()) co_return; // client half-closed
+                co_yield std::move(request);
+            }
+            co_return;
+        }(self, stream);
 
         // Writer loop: consume replies from Process() and write them to the client.
-        auto reply_stream = self->Process(std::move(req_rx));
+        auto reply_stream = self->Process(std::move(request_stream));
         bool write_ok = true;
         while (auto item = co_await coro::next(reply_stream)) {
             auto [write_tx, write_rx] = coro::oneshot::channel<bool>();
@@ -341,9 +327,6 @@ private:
                 break; // client disconnected
             }
         }
-
-        // Always await the reader before returning (it holds a ref to stream).
-        co_await std::move(reader);
 
         if (!write_ok) {
             co_return; // client disconnected; skip Finish

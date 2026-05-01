@@ -96,35 +96,47 @@ public:
             return std::move(*state->result);
     }
 
-    /// @brief Submits a pre-constructed task directly. Used internally by @ref Synchronize.
+    /// @brief Submits a pre-constructed task directly. Used internally by @ref JoinSet.
     void schedule_task(std::shared_ptr<detail::TaskBase> task) {
         m_executor->schedule(std::move(task));
     }
 
     /**
-     * @brief Returns a builder for spawning a @ref Future as a background task.
+     * @brief Spawns `future` as a background task and returns a @ref JoinHandle.
      *
-     * Call `.submit()` on the returned @ref SpawnBuilder to enqueue the task and
-     * receive a @ref JoinHandle.
+     * Use `build_task().name("...").spawn(future)` to set a task name.
      *
      * @warning Spawned futures may capture references to data owned by the spawning
-     *          coroutine. The coroutine must outlive the spawned task, or use
-     *          @ref Synchronize to enforce the lifetime boundary explicitly.
+     *          coroutine. The coroutine must outlive the spawned task — use
+     *          `co_invoke` + `JoinSet::drain()` to enforce the lifetime boundary.
      */
     template<Future F>
-    [[nodiscard]] SpawnBuilder<F> spawn(F future) {
-        return SpawnBuilder<F>(std::move(future), m_executor.get());
+    [[nodiscard]] JoinHandle<typename F::OutputType> spawn(F future) {
+        return SpawnBuilder(m_executor.get()).spawn(std::move(future));
     }
 
     /**
-     * @brief Returns a builder for spawning a @ref Stream as a background task.
+     * @brief Spawns `stream` as a background task and returns a @ref StreamHandle.
      *
+     * Use `build_task().name("...").buffer(N).spawn(stream)` to configure the task.
      * The stream runs as a `StreamDriver` task that pushes items into a bounded channel.
-     * Call `.submit()` on the returned @ref StreamSpawnBuilder to receive a @ref StreamHandle.
      */
     template<Stream S>
-    [[nodiscard]] StreamSpawnBuilder<S> spawn(S stream) {
-        return StreamSpawnBuilder<S>(std::move(stream), m_executor.get());
+    [[nodiscard]] StreamHandle<typename S::ItemType> spawn(S stream) {
+        return SpawnBuilder(m_executor.get()).spawn(std::move(stream));
+    }
+
+    /**
+     * @brief Returns a @ref SpawnBuilder for configuring a task before spawning it.
+     *
+     * Use to set a task name or stream buffer size before spawning:
+     * @code
+     * auto h = rt.build_task().name("worker").spawn(my_future);
+     * auto s = rt.build_task().name("reader").buffer(128).spawn(my_stream);
+     * @endcode
+     */
+    [[nodiscard]] SpawnBuilder build_task() {
+        return SpawnBuilder(m_executor.get());
     }
 
     /// @brief Returns the runtime's SingleThreadedUvExecutor.
@@ -155,25 +167,38 @@ void set_current_runtime(Runtime* rt);
 Runtime& current_runtime();
 
 /**
- * @brief Spawns a @ref Future on the current runtime. Equivalent to `current_runtime().spawn(future)`.
+ * @brief Spawns a @ref Future on the current runtime and returns a @ref JoinHandle.
  *
- * May only be called from within a `Runtime::block_on()` context.
- * @return A @ref SpawnBuilder; call `.submit()` to enqueue the task.
+ * Equivalent to `current_runtime().spawn(future)`. May only be called from within
+ * a `Runtime::block_on()` context. Use `build_task().name("...").spawn(future)` to
+ * set a task name.
  */
 template<Future F>
-[[nodiscard]] SpawnBuilder<F> spawn(F future) {
+[[nodiscard]] JoinHandle<typename F::OutputType> spawn(F future) {
     return current_runtime().spawn(std::move(future));
 }
 
 /**
- * @brief Spawns a @ref Stream on the current runtime. Equivalent to `current_runtime().spawn(stream)`.
+ * @brief Spawns a @ref Stream on the current runtime and returns a @ref StreamHandle.
  *
- * May only be called from within a `Runtime::block_on()` context.
- * @return A @ref StreamSpawnBuilder; call `.submit()` to receive a @ref StreamHandle.
+ * Equivalent to `current_runtime().spawn(stream)`. May only be called from within
+ * a `Runtime::block_on()` context.
  */
 template<Stream S>
-[[nodiscard]] StreamSpawnBuilder<S> spawn(S stream) {
+[[nodiscard]] StreamHandle<typename S::ItemType> spawn(S stream) {
     return current_runtime().spawn(std::move(stream));
+}
+
+/**
+ * @brief Returns a @ref SpawnBuilder for configuring a task on the current runtime.
+ *
+ * May only be called from within a `Runtime::block_on()` context.
+ * @code
+ * auto h = build_task().name("worker").spawn(my_future);
+ * @endcode
+ */
+[[nodiscard]] inline SpawnBuilder build_task() {
+    return current_runtime().build_task();
 }
 
 } // namespace coro

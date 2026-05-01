@@ -1,7 +1,7 @@
 #pragma once
 
 // Internal — consumer end of a bounded channel backing a spawned stream.
-// Returned by StreamSpawnBuilder::submit().
+// Returned by Runtime::spawn(stream) and SpawnBuilder::spawn(stream).
 
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
@@ -36,7 +36,7 @@ struct Channel {
 /**
  * @brief Consumer end of a bounded channel backed by a background `StreamDriver` task.
  *
- * Returned by `StreamSpawnBuilder::submit()`. Satisfies `Stream<T>`.
+ * Returned by `Runtime::spawn(stream)` and `SpawnBuilder::spawn(stream)`. Satisfies `Stream<T>`.
  *
  * The background driver polls the original stream and pushes items into the channel.
  * `StreamHandle::poll_next()` dequeues items from the channel, blocking under backpressure

@@ -131,7 +131,7 @@ struct WritingFuture {
 };
 
 Coro<void> coro_that_spawns_and_blocks(std::shared_ptr<int> out) {
-    spawn(WritingFuture{out, 99}).submit().cancelOnDestroy(false);
+    spawn(WritingFuture{out, 99}).cancelOnDestroy(false);
     // Block forever — this branch will be cancelled by select.
     struct NeverCoro {
         using OutputType = void;

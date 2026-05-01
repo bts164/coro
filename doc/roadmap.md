@@ -62,16 +62,6 @@ operations. To support strict C++20 targets:
 - `tl::expected` (Conan package `tl-expected`) is the preferred fallback — it is a
   single header, well-tested, and API-compatible with the C++23 standard.
 
-## Remove `Synchronize`
-
-`JoinSet` is complete and `Synchronize` is deprecated. Remaining removal work:
-
-- Remove `include/coro/sync/synchronize.h`
-- Remove `test/test_synchronize.cpp` and its `CMakeLists.txt` entry
-- Remove all `Synchronize` references from docs (`task_and_executor.md`,
-  `coroutine_scope.md`, `module_structure.md`, `getting_started.md`)
-- Remove `Runtime::schedule_task()` if it was only used by `Synchronize`
-
 ## Document: C++ vs. Rust cancellation model
 
 Write a design document (`doc/cancellation_model.md`) explaining why C++ coroutines cannot

@@ -28,8 +28,7 @@ sequenceDiagram
 
 ## Motivation
 
-`Synchronize` (deprecated — prefer `co_invoke` + `JoinSet::drain()`) drained children
-implicitly and discarded their results. `JoinSet` makes the lifecycle **explicit** and gives the user full control:
+`JoinSet` makes the child-task lifecycle **explicit** and gives the user full control:
 
 - Consume results one-by-one as they complete (`next()`)
 - Wait for all to finish and discard results (`drain()`)
@@ -88,8 +87,7 @@ co_await co_invoke([&data]() -> Coro<void> {
 ## Exception handling
 
 - `next()`: an exception from a completed task is rethrown when that result is dequeued.
-- `drain()`: waits for all tasks to finish, then rethrows the first exception encountered
-  (consistent with `Synchronize`'s behaviour).
+- `drain()`: waits for all tasks to finish, then rethrows the first exception encountered.
 - In both cases, remaining tasks continue running and are only cancelled when `JoinSet`
   is dropped.
 

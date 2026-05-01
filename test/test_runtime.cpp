@@ -41,7 +41,7 @@ struct SelfWakingFuture {
     }
 };
 
-// Stream for testing StreamSpawnBuilder
+// Stream for testing spawn(stream) and build_task().spawn(stream)
 struct IntStream {
     using ItemType = int;
     PollResult<std::optional<int>> poll_next(detail::Context&) { return PollPending; }
@@ -124,7 +124,7 @@ TEST(RuntimeTest, BlockOnCoroRethrowsException) {
 // --- spawn + JoinHandle via block_on ---
 
 Coro<int> spawns_task() {
-    JoinHandle<int> h = coro::spawn(ImmediateIntFuture{123}).submit();
+    JoinHandle<int> h = coro::spawn(ImmediateIntFuture{123});
     co_return co_await std::move(h);
 }
 
@@ -133,29 +133,29 @@ TEST(RuntimeTest, BlockOnCoroThatSpawnsTask) {
     EXPECT_EQ(rt.block_on(spawns_task()), 123);
 }
 
-// --- SpawnBuilder interface ---
+// --- spawn interface ---
 
-TEST(RuntimeTest, SpawnBuilderSubmitReturnsJoinHandle) {
+TEST(RuntimeTest, SpawnReturnsJoinHandle) {
     Runtime rt(1);
-    JoinHandle<int> h = rt.spawn(ImmediateIntFuture{1}).submit();
+    JoinHandle<int> h = rt.spawn(ImmediateIntFuture{1});
     (void)h;
 }
 
-TEST(RuntimeTest, SpawnBuilderNameIsChainable) {
+TEST(RuntimeTest, BuildTaskNameIsChainable) {
     Runtime rt(1);
-    JoinHandle<int> h = rt.spawn(ImmediateIntFuture{1}).name("my-task").submit();
+    JoinHandle<int> h = rt.build_task().name("my-task").spawn(ImmediateIntFuture{1});
     (void)h;
 }
 
-TEST(RuntimeTest, StreamBuilderSubmitReturnsStreamHandle) {
+TEST(RuntimeTest, SpawnStreamReturnsStreamHandle) {
     Runtime rt(1);
-    StreamHandle<int> h = rt.spawn(IntStream{}).submit();
+    StreamHandle<int> h = rt.spawn(IntStream{});
     (void)h;
 }
 
-TEST(RuntimeTest, StreamBuilderNameAndBufferAreChainable) {
+TEST(RuntimeTest, BuildTaskNameAndBufferAreChainable) {
     Runtime rt(1);
-    StreamHandle<int> h = rt.spawn(IntStream{}).name("reader").buffer(128).submit();
+    StreamHandle<int> h = rt.build_task().name("reader").buffer(128).spawn(IntStream{});
     (void)h;
 }
 
@@ -176,7 +176,7 @@ TEST(RuntimeTest, CurrentRuntimeThrowsWhenUnset) {
 TEST(RuntimeTest, FreeSpawnDelegatesToCurrentRuntime) {
     Runtime rt(1);
     set_current_runtime(&rt);
-    JoinHandle<int> h = coro::spawn(ImmediateIntFuture{1}).submit();
+    JoinHandle<int> h = coro::spawn(ImmediateIntFuture{1});
     set_current_runtime(nullptr);
     (void)h;
 }

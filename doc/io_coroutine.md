@@ -56,8 +56,7 @@ its original executor throughout — nothing migrates.
 
 **Reference captures are safe.** The caller is synchronously suspended for the entire
 duration of the inner coroutine, so the inner coroutine can capture locals by reference.
-This is the same guarantee provided by `Synchronize` — all coroutines inherently act as
-a synchronize scope.
+This is the same guarantee that structured concurrency provides via `JoinSet::drain()`.
 
 **Exception safety is free.** Exceptions thrown inside the inner coroutine propagate
 through `JoinHandle::join()` to the caller via the existing exception delivery mechanism.
