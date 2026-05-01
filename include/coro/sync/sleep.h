@@ -23,11 +23,15 @@ namespace coro {
  * which re-enqueues the task. The next `poll()` then sees `fired == true`
  * and returns `PollReady`.
  *
- * @note Timer resolution is **milliseconds** (libuv limitation). The remaining
- *       duration is converted with `std::chrono::ceil<milliseconds>` so the
- *       timer never fires before the deadline. Actual wake latency is subject
- *       to I/O-thread scheduling jitter; sub-millisecond precision is not
- *       achievable regardless. See doc/libuv_integration.md § Timer resolution.
+ * @note Timer resolution is **milliseconds** (libuv limitation). The deadline is
+ *       stored in whole milliseconds (ceiled at construction). Because libuv schedules
+ *       timers relative to `loop->time` (frozen at the start of each loop iteration),
+ *       which can lag `steady_clock` by up to 1ms, the timer may fire marginally before
+ *       the deadline. `poll()` detects this, discards the state, and reschedules for the
+ *       remaining ~1ms; the rescheduled timer is guaranteed not to fire early because
+ *       `loop->time` has already advanced past the original deadline by then. Actual
+ *       wake latency is subject to I/O-thread scheduling jitter; sub-millisecond
+ *       precision is not achievable regardless.
  *
  * @note `SleepFuture` must not be shared across threads. It is intended to
  *       live inside a coroutine frame and be polled by a single executor thread.
@@ -68,28 +72,24 @@ public:
     SleepFuture& operator=(SleepFuture&&)      = default;
 
     PollResult<void> poll(detail::Context& ctx) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Check the fired flag before the clock: libuv and steady_clock both use
-        // CLOCK_MONOTONIC on Linux, but OS jitter can cause the timer callback to
-        // fire a few microseconds before steady_clock::now() crosses m_deadline.
-        // Treating fired==true as authoritative avoids a liveness bug where the
-        // clock check returns PollPending with the one-shot timer already consumed.
-        if (m_state &&m_state->fired.load(std::memory_order_acquire)) {
-            if (now < m_deadline) {
-                // std::cerr << "SleepFuture: fired was set before deadline (now=" << now.time_since_epoch().count()
-                //             << "ns, deadline=" << m_deadline.time_since_epoch().count() << "ns)\n";
-                //std::abort();
-            }
-            return PollReady;
+        if (m_state && m_state->fired.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= m_deadline)
+                return PollReady;
+            // libuv fired the timer marginally early: loop->time (set at the start of the
+            // current loop iteration) can lag steady_clock by up to 1ms, making the computed
+            // delay 1ms too short. timer_cb already called uv_close so the handle is being
+            // cleaned up — discard the state and fall through to reschedule for the remaining
+            // ~1ms. The rescheduled timer cannot fire early again because by the time it fires,
+            // loop->time will have advanced past the original deadline.
+            m_state = nullptr;
         }
 
         if (std::chrono::steady_clock::now() >= m_deadline)
             return PollReady;
 
         if (!m_state) {
-            // First poll: allocate shared state and register the timer.
-            // Cache the uv executor pointer so the destructor can cancel the timer
+            // First poll (or reschedule after early firing): allocate shared state and register
+            // the timer. Cache the uv executor pointer so the destructor can cancel the timer
             // even if the thread-local has been cleared before this future is destroyed.
             m_uv_exec = &current_uv_executor();
             m_state = std::make_shared<State>();
