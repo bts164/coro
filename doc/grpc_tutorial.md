@@ -110,7 +110,7 @@ The rest of this tutorial explains what sits beneath these handlers to make that
 
 ## Part 3: Connecting the Server to the Framework
 
-[helloserver.cpp](../examples/grpc/helloserver.cpp) defines `HelloWorldServer`. The class inherits `GrpcServer<HelloWorldServer, Greeter::AsyncService>` who's implementation does two things: registers the gRPC generated methods and connects them to the the handler functions shown in Part 2.
+[helloserver.cpp](../examples/grpc/helloserver.cpp) defines `HelloWorldServer`. The class inherits `GrpcServer<HelloWorldServer, Greeter::AsyncService>`, whose implementation does two things: registers the gRPC-generated methods and connects them to the handler functions shown in Part 2.
 
 ### Registering methods
 
@@ -171,18 +171,18 @@ gRPC's async server API is completion-queue based. To receive one RPC call you m
 
 Streaming adds more reads and writes, each with their own tags and completion events, but it's the same basic idea. This machinery is the same for every server — it belongs in a base class.
 
-Also, this is a slightly simplified version as you don't have to wait for the write to complete in step 4 before starting step 5. In fact neither this `GrpsServer` class or the official gRPC example server work that way. Instead, as soon as step 2 completes they both launch a new context starting at step 1 to register for the next incoming call. This allows the server
-to continue accepting new incoming calls while the current context concurrently completes steps 3 & 4.
+The above is slightly simplified: you don't actually have to wait for the write in step 4 to complete before registering for the next call. Neither `GrpcServer` nor the official gRPC example server work that way. Instead, as soon as a call arrives in step 2, both immediately register a new listener for the next incoming call before processing the current one. The actual sequence is:
 
 1. Register for the next incoming call, providing a tag and a `CompletionQueue` pointer.
 2. Block on `CompletionQueue::Next()` waiting for that tag to fire.
-3. Launch a new context starting at step 1 for the next incoming call
+3. Launch a new context at step 1 to accept the next incoming call.
 4. Deserialize the request, process it, post a `Finish()` with another tag.
 5. Block again waiting for the write to complete.
-5. Cleanup this context
+6. Clean up this context.
 
-For the official gRPC example async server does this by allocating a new `CallData` instance to act as the state machine for the next call while the current `CallData` instance completes the remaining steps for the current call before finally deleting itself. They're basically hand crafting the exact pattern we're using, except our state machine is implemented using coroutines which are much safer & better tested than a hand rolled state machine in addition to looking much more natrual from a code readability standpoint. `GrpcServer` launches a new context to handle the next connection by simple
-spawning a new Handler coroutine task and then just letting the runtime manage scheduling/lifetimes etc.
+This allows the server to keep accepting new requests while the current context concurrently handles steps 4–6.
+
+The official gRPC async example implements this by allocating a new `CallData` object to act as the state machine for the next call while the current one finishes and deletes itself — essentially hand-rolling the same pattern. `GrpcServer` does the same thing by simply spawning a new coroutine task for the next call and letting the runtime manage its scheduling and lifetime. The logic is identical; coroutines just make it far more readable and eliminate the error-prone manual state machine.
 
 ### How it works
 
