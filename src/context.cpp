@@ -2,10 +2,8 @@
 
 namespace coro::detail {
 
-Context::Context(std::shared_ptr<Waker> waker,
-                 std::shared_ptr<CancellationToken> token)
-    : m_waker(std::move(waker))
-    , m_token(std::move(token)) {}
+Context::Context(std::shared_ptr<Waker> waker)
+    : m_waker(std::move(waker)) {}
 
 Context::~Context() = default;
 
@@ -15,10 +13,6 @@ std::shared_ptr<Waker> Context::getWaker() const {
 
 std::weak_ptr<Waker> Context::get_weak_waker() const {
     return m_waker;
-}
-
-std::shared_ptr<CancellationToken> Context::getCancellationToken() const {
-    return m_token;
 }
 
 } // namespace coro::detail

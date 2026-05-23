@@ -37,19 +37,6 @@ TEST(ContextTest, WakerCloneIsCalled) {
     EXPECT_EQ(result, clone);
 }
 
-TEST(ContextTest, GetCancellationTokenDefaultsToNull) {
-    auto waker = std::make_shared<MockWaker>();
-    detail::Context ctx(waker);
-    EXPECT_EQ(ctx.getCancellationToken(), nullptr);
-}
-
-TEST(ContextTest, GetCancellationTokenReturnsSamePointer) {
-    auto waker = std::make_shared<MockWaker>();
-    auto token = std::make_shared<CancellationToken>();
-    detail::Context ctx(waker, token);
-    EXPECT_EQ(ctx.getCancellationToken(), token);
-}
-
 TEST(ContextTest, SubclassCanAddFields) {
     struct DerivedContext : detail::Context {
         explicit DerivedContext(std::shared_ptr<detail::Waker> w, int extra)

@@ -23,7 +23,7 @@ struct CoroPromiseBase : public PollablePromise {
     void unhandled_exception() noexcept { m_exception = std::current_exception(); }
 
     // Only Future<> types may be co_await-ed inside Coro or CoroStream.
-    // Clears m_poll_current and m_cancel_current so stale hooks from previous co_awaits
+    // Clears m_poll_current so stale hooks from previous co_awaits
     // are never mistakenly called. Passes both to FutureAwaitable so await_suspend() can
     // register the re-poll and (for Cancellable futures) cancel hooks.
     // Lvalue overload: future is moved into FutureAwaitable (handle is consumed).
@@ -45,6 +45,8 @@ struct CoroPromiseBase : public PollablePromise {
     void await_transform(U&&) = delete;
 
     std::exception_ptr    m_exception;
+    CoroPromiseBase*      m_prev = nullptr;
+    CoroPromiseBase*      m_next = nullptr;
 };
 
 template<typename T>
@@ -145,19 +147,19 @@ public:
                 auto& promise = m_handle.promise();
                 promise.m_ctx = &ctx;
 
-                // Step 1: if a Cancellable future is awaited, cancel it and wait for
-                // it to drain before destroying the frame. Non-Cancellable futures are
-                // leaf futures — they are dropped immediately in handle.destroy() below.
+                // Step 1: if a Cancellable future is awaited, cancel it and poll
+                // until it drains before destroying the frame. Non-Cancellable futures
+                // are leaf futures — dropped immediately in handle.destroy() below.
                 if (!m_cancel_draining && promise.m_cancel_current) {
                     promise.m_cancel_current->cancel();
-                    promise.m_cancel_current = nullptr;
                     m_cancel_draining = true;
                 }
                 if (m_cancel_draining) {
                     if (promise.m_poll_current && !promise.m_poll_current->poll()) {
                         return PollPending;  // awaited Cancellable future still draining
                     }
-                    promise.m_poll_current = nullptr;
+                    promise.m_poll_current   = nullptr;
+                    promise.m_cancel_current = nullptr;
                     m_cancel_draining = false;
                 }
 
@@ -205,7 +207,8 @@ public:
         if (promise.m_poll_current) {
             if (!promise.m_poll_current->poll())
                 return PollPending;
-            promise.m_poll_current = nullptr;
+            promise.m_poll_current   = nullptr;
+            promise.m_cancel_current = nullptr;
         }
 
         {

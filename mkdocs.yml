@@ -1,5 +1,7 @@
 site_name: C++ Coro Library
 docs_dir: doc
+exclude_docs: |
+  pdf/
 watch:
   - include/
 validation:
@@ -25,9 +27,9 @@ plugins:
             GENERATE_XML: "YES"
 nav:
   - Introduction: index.md
-  - Library Overview: overview.md
   - Getting Started Guide: getting_started.md
   - Library Usage Guidelines: guidelines.md
+  - Cheat Sheet: cheatsheet.md
   - API Reference:
     - Key Types:
       - Concepts:

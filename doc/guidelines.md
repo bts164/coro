@@ -81,18 +81,35 @@ Coro<void> safe(int local_data) {
 }
 ```
 
-### CS.2 — Use `co_invoke` + `JoinSet` to safely spawn tasks that reference local data
+### CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
 
-**Reason:** The outer frame that owns the referenced data stays suspended at
-`co_await co_invoke(...)` for the entire inner coroutine lifetime, including through
-exceptions thrown inside the inner body. This guarantees the referenced data is alive
-for as long as any child spawned inside runs. Placing `JoinSet::drain()` in the same
-frame as the referenced local is not safe — exceptions bypass the drain and destroy
-the local while children are still running.
+**Reason:** The key is the scope relationship: the referenced variable must live in an
+*outer* frame while the `JoinHandle` (or `JoinSet`) that owns the spawned task lives in
+an *inner* scope. `co_invoke` creates that inner coroutine scope. The outer frame stays
+suspended at `co_await co_invoke(...)` for the entire inner lifetime — including through
+exceptions in the inner body — guaranteeing the referenced data is alive for as long as
+any child spawned inside runs.
+
+A plain `JoinHandle` is sufficient for a single task. `JoinSet` is the right choice when
+spawning multiple tasks of the same type. Either way, what makes the pattern safe is not
+which handle type is used, but that the handle lives inside the `co_invoke` scope while
+the referenced variable lives outside it.
+
+Placing `JoinSet::drain()` in the *same* frame as the referenced local is not safe —
+exceptions bypass the drain and destroy the local while children are still running (see
+the `deceptive` example in CS.1).
 
 ```cpp
-// GOOD — items lives in the outer frame; safe through exceptions in the inner body
-Coro<void> process(std::vector<Item>& items) {
+// GOOD — single task; JoinHandle in the inner scope, data in the outer frame
+Coro<void> process_one(Item& item) {
+    co_await co_invoke([](Item& item) -> Coro<void> {
+        auto h = spawn(process_item(item));
+        co_await h;
+    }(item));
+}
+
+// GOOD — multiple tasks; JoinSet in the inner scope, items in the outer frame
+Coro<void> process_many(std::vector<Item>& items) {
     co_await co_invoke([](std::vector<Item>& items) -> Coro<void> {
         JoinSet<void> js;
         for (auto& item : items)

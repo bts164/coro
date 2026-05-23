@@ -1,6 +1,7 @@
 #pragma once
 
 #include <coro/detail/context.h>
+#include <coro/detail/intrusive_list.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
@@ -43,10 +44,15 @@ namespace detail {
  */
 template<typename T>
 struct JoinSetSharedState {
-    std::mutex                               mutex;
-    std::shared_ptr<Waker>                   consumer_waker;
-    std::set<std::shared_ptr<TaskBase>>      pending_handles; ///< Running tasks (lifetime anchors).
-    std::list<std::shared_ptr<TaskState<T>>> idle_handles;    ///< Completed tasks awaiting consumption.
+    struct Node {
+        std::shared_ptr<TaskBase> task;
+        Node *next = nullptr;
+        Node *prev = nullptr;
+    };
+    std::mutex                                mutex;
+    std::shared_ptr<Waker>                    consumer_waker;
+    IntrusiveList<Node*>                      pending_handles; ///< Running tasks (lifetime anchors).
+    std::deque<std::shared_ptr<TaskState<T>>> idle_handles;    ///< Completed tasks awaiting consumption.
 };
 
 // -----------------------------------------------------------------------
@@ -91,13 +97,15 @@ public:
         std::shared_ptr<Waker> waker;
         {
             std::lock_guard lock(state->mutex);
-            state->pending_handles.erase(self_base);
+            state->pending_handles.remove(&m_node);
+            m_node.task.reset();
             state->idle_handles.push_back(std::move(self_state));
             waker = std::exchange(state->consumer_waker, nullptr);
         }
         if (waker) waker->wake();
     }
 
+    JoinSetSharedState<T>::Node m_node;
 private:
     std::weak_ptr<JoinSetSharedState<T>> m_set_state;
 };
@@ -125,7 +133,7 @@ public:
     JoinSetDrainFuture(JoinSetDrainFuture&&) noexcept = default;
 
     PollResult<void> poll(detail::Context& ctx) {
-        std::list<std::shared_ptr<TaskState<T>>> to_process;
+        std::deque<std::shared_ptr<TaskState<T>>> to_process;
         bool any_pending;
         {
             std::lock_guard lock(m_state->mutex);
@@ -211,9 +219,10 @@ public:
             std::weak_ptr<detail::JoinSetSharedState<T>>(m_state));
         task->name = std::move(m_name);
         std::shared_ptr<detail::TaskBase> task_base(task);
+        task->m_node.task = task_base;
         {
             std::lock_guard lock(m_state->mutex);
-            m_state->pending_handles.insert(task_base);
+            m_state->pending_handles.push_back(&task->m_node);
         }
         coro::current_runtime().schedule_task(std::move(task_base));
     }
@@ -362,8 +371,11 @@ private:
         {
             std::lock_guard lock(m_state->mutex);
             to_cancel.reserve(m_state->pending_handles.size());
-            for (auto& h : m_state->pending_handles)
-                to_cancel.push_back(h);
+            while (auto h = m_state->pending_handles.pop_front()) {
+                if (auto ptr = h->task) {
+                    to_cancel.push_back(ptr);
+                }
+            }
             m_state->pending_handles.clear();  // drop persistent refs
         }
         // Call cancel_task() while to_cancel still holds strong refs — prevents

@@ -12,7 +12,7 @@ namespace coro {
 class PollableFuture;
 struct PollablePromise
 {
-    detail::Context*              m_ctx         = nullptr;
+    detail::Context*      m_ctx         = nullptr;
     // Set by FutureAwaitable::await_suspend(); cleared by Coro::poll() after it returns
     // true (or at the start of the next await_transform). Non-null only while the
     // coroutine is suspended at a co_await expression.

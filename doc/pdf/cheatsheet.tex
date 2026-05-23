@@ -1,0 +1,87 @@
+\documentclass[8pt,landscape]{extarticle}
+\usepackage[margin=0.2in,top=0.2in,bottom=0.2in]{geometry}
+\usepackage{multicol}
+\usepackage{fontspec}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{enumitem}
+\usepackage{fancyvrb}
+\usepackage{fvextra}
+\usepackage{framed}
+\usepackage{mdframed}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{needspace}
+
+% ── Fonts ──────────────────────────────────────────────────────────────────────
+\setmainfont{DejaVu Sans}[Scale=1.0]
+\setmonofont{DejaVu Sans Mono}[Scale=1.0]
+
+% ── Colors ─────────────────────────────────────────────────────────────────────
+\definecolor{codebg}{gray}{0.94}
+\definecolor{headcolor}{RGB}{15,82,143}
+\definecolor{rulecolor}{RGB}{180,180,180}
+
+% ── Syntax highlighting macros injected by Pandoc ─────────────────────────────
+$if(highlighting-macros)$
+$highlighting-macros$
+$endif$
+
+% Override Shaded environment to use our compact style
+\renewenvironment{Shaded}{%
+  \begin{mdframed}[
+    backgroundcolor=codebg,
+    linewidth=0pt,
+    innerleftmargin=4pt,
+    innerrightmargin=4pt,
+    innertopmargin=2pt,
+    innerbottommargin=2pt,
+    skipabove=1pt,
+    skipbelow=1pt,
+  ]%
+}{\end{mdframed}}
+
+% ── Section headings ───────────────────────────────────────────────────────────
+\titleformat{\section}
+  {\needspace{4\baselineskip}\normalsize\bfseries\color{headcolor}}
+  {}{0em}{}
+  [\vspace{-2pt}\textcolor{rulecolor}{\hrule height 0.4pt}\vspace{2pt}]
+\titlespacing{\section}{0pt}{6pt}{2pt}
+
+\titleformat{\subsection}
+  {\needspace{3\baselineskip}\small\bfseries}
+  {}{0em}{}
+\titlespacing{\subsection}{0pt}{4pt}{1pt}
+
+% ── Layout ─────────────────────────────────────────────────────────────────────
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2pt}
+\setlength{\columnsep}{0.25in}
+\setlength{\columnseprule}{0.4pt}
+\renewcommand{\columnseprulecolor}{\color{rulecolor}}
+
+% Tighten lists
+\setlist{nosep, leftmargin=1em, topsep=0pt}
+
+% Tighten verbatim
+\fvset{fontsize=\tiny, breaklines=true, breakanywhere=true}
+
+% ── Hyperlinks ─────────────────────────────────────────────────────────────────
+\hypersetup{colorlinks=true, linkcolor=headcolor, urlcolor=headcolor}
+
+% ── Document ───────────────────────────────────────────────────────────────────
+\begin{document}
+\begin{multicols}{3}
+
+% Title bar
+{\large\bfseries\color{headcolor} C++ Coro — Cheat Sheet}
+\hfill{\tiny\textcolor{gray}{see getting\_started.md for full explanations}}
+\vspace{2pt}
+\textcolor{rulecolor}{\hrule height 0.8pt}
+\vspace{4pt}
+
+$body$
+
+\end{multicols}
+\end{document}

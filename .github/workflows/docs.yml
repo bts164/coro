@@ -32,6 +32,18 @@ jobs:
       - name: Install MkDocs dependencies
         run: pip install -r requirements.txt
 
+      - name: Install Pandoc and XeLaTeX
+        run: |
+          sudo apt-get install -y \
+            pandoc \
+            texlive-xetex \
+            texlive-fonts-recommended \
+            texlive-fonts-extra \
+            texlive-latex-extra
+
+      - name: Generate cheat sheet PDF
+        run: make -C doc/pdf
+
       - name: Build docs
         run: mkdocs build
 

@@ -188,22 +188,28 @@ public:
                 // Cooperative cancel: call cancel() once, then poll until the future
                 // drains (Coro<T>/CoroStream<T> will run the 4-step cancel protocol).
                 if (!m_cancel_requested) {
-                    m_future.cancel();
+                    m_future->cancel();
                     m_cancel_requested = true;
                 }
             } else {
                 // Non-Cancellable (leaf) future: mark done immediately.
                 m_completed = true;
+                m_future.reset();
                 this->mark_done();
                 on_task_complete();
                 return true;
             }
         }
 
-        auto result = m_future.poll(ctx);
+        auto result = m_future->poll(ctx);
         if (result.isPending()) return false;
 
         m_completed = true;
+        // Destroy the future (and any coroutine frame it holds) immediately on
+        // completion — Coro<T>/CoroStream<T> already destroy their frames when done,
+        // but other Future types may not. Reset here so that a JoinHandle keeping
+        // TaskState<T> alive does not also pin the future allocation.
+        m_future.reset();
 
         if (cancelled || result.isDropped()) {
             this->mark_done();
@@ -220,7 +226,7 @@ public:
     }
 
 private:
-    F    m_future;
+    std::optional<F> m_future;
     bool m_completed        = false;
     bool m_cancel_requested = false;
 };

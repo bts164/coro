@@ -124,8 +124,10 @@ public:
     Local& operator=(Local&&) noexcept = default;
 
     ~Local() {
-        assert(!pop()      && "queue not empty on destruction");
-        assert(!pop_lifo() && "LIFO slot not empty on destruction");
+        if (nullptr != m_inner) {
+            assert(0 == len() && "queue not empty on destruction");
+            assert(nullptr == m_inner->lifo.load(std::memory_order_acquire) && "LIFO slot not empty on destruction");
+        }
     }
 
     // ── capacity queries ──────────────────────────────────────────────────────

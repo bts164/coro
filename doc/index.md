@@ -70,62 +70,6 @@ int main(int argc, char* argv[]) {
     return rt.block_on(async_main(argc, argv));
 }
 ```
-### Tasks
-
-A **task** is a coroutine scheduled on the executor — the async equivalent of an OS
-thread. Work within a single task is always sequential: each `co_await` completes before
-the next line runs. Work in *different* tasks can run in parallel: on a multi-threaded
-executor, two tasks may execute simultaneously on different worker threads, just as two OS
-threads would. Spawning a task is therefore how you introduce true parallelism, not just
-concurrency.
-
-### Structured concurrency
-
-Spawning background tasks without tracking them leads to the same problems as
-fire-and-forget threads: leaked work, swallowed errors, and lifetimes that are hard to
-reason about. This library encourages **structured concurrency** — every spawned task is
-owned by a handle that lives in the enclosing scope, so tasks cannot outlive the code
-that created them.
-
-**`JoinHandle<T>`** — similar to the `std::future` returned by `std::async`, owns a single
-background task scheduled on the executor. The task runs concurrently with the spawning
-coroutine. Awaiting the handle waits for completion and retrieves the result. Dropping the
-handle without awaiting it cancels the task.
-
-```cpp
-auto handle = coro::spawn(compute(42));
-// ... do other work while compute() runs in the background
-int result = co_await handle;
-```
-
-**`JoinSet<T>`** — owns a dynamic collection of tasks all returning the same type.
-Tasks can be spawned at any time. Results are delivered in completion order.
-Dropping the `JoinSet` cancels all outstanding tasks.
-
-```cpp
-JoinSet<int> js;
-for (int i = 0; i < 10; ++i)
-    js.spawn(compute(i));
-
-// Collect results as they complete (order not guaranteed):
-int sum = 0;
-while (auto result = co_await js.next())
-    sum += *result;
-```
-
-**`join()` / `select()`** — compose a fixed, heterogeneous set of futures within the
-current task, without spawning new tasks on the executor. `join()` runs all futures
-concurrently and returns a tuple of their results when every one has completed.
-`select()` returns as soon as the first future completes, cancelling the rest.
-
-```cpp
-// Wait for both to finish:
-auto [a, b] = co_await coro::join(fetch("url1"), fetch("url2"));
-
-// Return whichever finishes first:
-auto winner = co_await coro::select(fetch("url1"), fetch("url2"));
-```
-
 ## Key features
 
 - **`Coro<T>`** — async function return type; compose with `co_await` like any other future.
@@ -143,71 +87,97 @@ auto winner = co_await coro::select(fetch("url1"), fetch("url2"));
 
 ## Quick example
 
-`CoroStream<T>` is an async generator — a coroutine that produces a sequence of values
-on demand, suspending between each one. This example defines an infinite Fibonacci
-sequence as a stream and prints the first 10 values from four sequences with different
-starting points as a CSV table.
+The following is a common pattern in connection-based server communication: poll two
+redundant server connections for the result of a long-running request, send periodic
+keepalives to detect disconnections while waiting, and enforce an overall deadline. With
+threads and callbacks this requires a state machine, a mutex protecting the shared
+result, a separate timer thread for keepalives, and a cancellation flag threaded through
+every layer. With coroutines the structure maps directly to the intent — and
+cancellation is intrinsic, not bolted on.
 
 ```cpp
 #include <coro/coro.h>
-#include <coro/coro_stream.h>
 #include <coro/runtime/runtime.h>
+#include <coro/sync/join.h>
+#include <coro/sync/select.h>
+#include <coro/sync/sleep.h>
+#include <coro/sync/timeout.h>
 #include <iostream>
 
-// An async generator that yields an infinite Fibonacci sequence.
-// co_yield suspends the coroutine and delivers a value to the caller;
-// execution resumes from after the co_yield on the next call to next().
-coro::CoroStream<int> fibonacci(int x0, int x1) {
-    co_yield x0;
-    co_yield x1;
+// Placeholder types — substitute coro::TcpStream, a gRPC stub, WsStream, etc.
+struct Connection;
+struct Result { bool ready; std::string value; };
+
+coro::Coro<Result> poll_status(Connection& c, int request_id);
+coro::Coro<void>   ping(Connection& c);
+
+// Waits 500ms, then pings both connections concurrently with a 500ms deadline.
+// Throws if either server is unreachable or does not respond in time.
+coro::Coro<void> keepalive(Connection& primary, Connection& backup) {
+    using namespace std::chrono_literals;
+    co_await coro::sleep_for(500ms);
+    auto r = co_await coro::timeout(500ms, coro::join(ping(primary), ping(backup)));
+    if (r.index() != 0)
+        throw std::runtime_error("keepalive timed out");
+}
+
+// Polls two redundant servers until one delivers a ready result.
+coro::Coro<Result> poll_until_ready(Connection& primary, Connection& backup, int id) {
+    using namespace std::chrono_literals;
+
     while (true) {
-        int xn = x0 + x1;
-        co_yield xn;
-        x0 = x1;
-        x1 = xn;
+        // Race both servers against a keepalive tick.
+        // select() drives all three concurrently; first to complete wins.
+        auto sel = co_await coro::select(
+            poll_status(primary, id),
+            poll_status(backup,  id),
+            keepalive(primary, backup)  // branch 2: fires after 500ms of silence
+        );
+
+        if (sel.index() == 0 || sel.index() == 1) {
+            // A server responded — retrieve whichever answered first.
+            Result& r = sel.index() == 0
+                ? std::get<0>(sel).value
+                : std::get<1>(sel).value;
+
+            if (r.ready)
+                co_return r;
+
+            // Not ready yet — pause briefly before polling again.
+            co_await coro::sleep_for(100ms);
+        }
+        // sel.index() == 2: keepalive fired, connections verified — loop and poll again.
+        // A ping failure or timeout throws, propagating out through select before reaching here.
     }
 }
 
-// An async coroutine that drives four streams concurrently.
-// CoroStream<T> is lazy — fibonacci() does no work until next() is called.
-coro::Coro<void> run() {
-    coro::CoroStream<int> fib0 = fibonacci(0, 1);  // 0, 1, 1, 2, 3, 5 ...
-    coro::CoroStream<int> fib1 = fibonacci(1, 2);  // 1, 2, 3, 5, 8 ...
-    coro::CoroStream<int> fib2 = fibonacci(2, 3);  // 2, 3, 5, 8, 13 ...
-    coro::CoroStream<int> fib3 = fibonacci(3, 4);  // 3, 4, 7, 11, 18 ...
+coro::Coro<void> run(Connection& primary, Connection& backup) {
+    using namespace std::chrono_literals;
 
-    for (size_t i = 0; i < 10; ++i) {
-        // co_await coro::next(stream) advances the stream by one step,
-        // suspending until the next value is ready.
-        std::cout
-            << (co_await coro::next(fib0)).value() << ","
-            << (co_await coro::next(fib1)).value() << ","
-            << (co_await coro::next(fib2)).value() << ","
-            << (co_await coro::next(fib3)).value() << "\n";
-    }
+    // Enforce an overall deadline across the entire poll loop.
+    // When it fires, both in-flight requests and any pending keepalive drain cleanly.
+    auto outcome = co_await coro::timeout(30s, poll_until_ready(primary, backup, 42));
+
+    if (outcome.index() == 0)
+        std::cout << std::get<0>(outcome).value.value << "\n";
+    else
+        std::cout << "timed out\n";
 }
 
 int main() {
     coro::Runtime rt;
-    rt.block_on(run());  // runs the coroutine to completion on the runtime
+    Connection primary, backup;
+    rt.block_on(run(primary, backup));
 }
 ```
 
-Output:
-```
-0,1,2,3
-1,2,3,4
-1,3,5,7
-2,5,8,11
-3,8,13,18
-5,13,21,29
-8,21,34,47
-13,34,55,76
-21,55,89,123
-34,89,144,199
-```
+Cancellation composes for free at any granularity: spawn `run()` as a task and drop the
+`JoinHandle` at any point — every `co_await` in the entire tree (poll loop, keepalive,
+timeout) becomes a clean exit point automatically. No cancellation tokens to design
+around, no risk of getting stuck at a blocking call that never checks the flag.
 
 ## Where to go next
 
-- [Getting Started](getting_started.md) — step-by-step guide with examples for all major features.
-- [Internal Design Details](task_and_executor.md) — architecture and design documents.
+- [Getting Started](getting_started.md) — step-by-step introductory tour of all major features with examples.
+- [Library Usage Guidelines](guidelines.md) — [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines) style rules for writing correct, safe, and idiomatic code with this library
+- [Internal Design Details](architecture.md) — architecture, design decisions, and implementation reference.

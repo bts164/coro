@@ -1,26 +1,27 @@
 # Architecture
 
 A detailed reference for the library's design, internals, and implementation patterns.
-For a compact summary see `doc/overview.md`.
 
 ---
 
 ## Table of Contents
 
 1. [Motivation and Goals](#motivation-and-goals)
-2. [Core Abstractions](#core-abstractions)
-3. [Poll Model](#poll-model)
-4. [Runtime and Executors](#runtime-and-executors)
-5. [Coroutine Types](#coroutine-types)
-6. [Task Lifecycle](#task-lifecycle)
-7. [Cancellation and Structured Concurrency](#cancellation-and-structured-concurrency)
-8. [I/O Reactor](#io-reactor)
-9. [Blocking Thread Pool](#blocking-thread-pool)
-10. [Channels](#channels)
-11. [Combinators](#combinators)
-12. [Error Handling Policy](#error-handling-policy)
-13. [Threading and Synchronization](#threading-and-synchronization)
-14. [Header Layout](#header-layout)
+2. [What Is Implemented](#what-is-implemented)
+3. [Key Design Decisions](#key-design-decisions)
+4. [Core Abstractions](#core-abstractions)
+5. [Poll Model](#poll-model)
+6. [Runtime and Executors](#runtime-and-executors)
+7. [Coroutine Types](#coroutine-types)
+8. [Task Lifecycle](#task-lifecycle)
+9. [Cancellation and Structured Concurrency](#cancellation-and-structured-concurrency)
+10. [I/O Reactor](#io-reactor)
+11. [Blocking Thread Pool](#blocking-thread-pool)
+12. [Channels](#channels)
+13. [Combinators](#combinators)
+14. [Error Handling Policy](#error-handling-policy)
+15. [Threading and Synchronization](#threading-and-synchronization)
+16. [Header Layout](#header-layout)
 
 ---
 
@@ -37,6 +38,80 @@ is a compile-time guarantee for a runtime one — unavoidable given C++'s object
 
 Primary target is GCC on Linux (Ubuntu); Clang and MSVC are secondary. Requires C++20.
 Dependencies are managed with Conan.
+
+---
+
+## What Is Implemented
+
+### Runtime & Scheduling
+- **Single-threaded executor** — deterministic, used for testing
+- **Work-sharing executor** — shared injection queue, multiple worker threads
+- **Work-stealing executor** — per-worker `WorkStealingDeque` with CAS-based
+  `SchedulingState` transitions; Tokio-style injection budget enforcement
+- `Runtime` selects executor by thread count at construction; `block_on()` drives the
+  top-level coroutine to completion
+
+### I/O Reactor
+- **`IoService`** — owns a `uv_loop_t` on a dedicated I/O thread; worker threads submit
+  `IoRequest` commands via a thread-safe queue and a `uv_async_t` doorbell
+- **`SleepFuture` / `sleep_for()`** — millisecond-resolution one-shot timers via libuv
+- **`TcpStream`** — async connect, read, write
+- **`WsStream` / `WsListener`** — async WebSocket client and server via libwebsockets
+  sharing the libuv event loop; full and partial frame modes, TLS, subprotocol negotiation
+
+### Task Primitives
+- **`spawn()` / `SpawnBuilder`** — schedule a `Coro<T>` on the runtime; returns a
+  `JoinHandle<T>`; `.detach()` for fire-and-forget
+- **`co_invoke()`** — run a lambda as a coroutine in the current scope
+- **`spawn_blocking()`** — run a blocking callable on a dedicated `BlockingPool` thread;
+  returns `BlockingHandle<T>`; fire-and-forget on drop
+
+### Structured Concurrency
+- **Coroutine scope** — every coroutine implicitly tracks child tasks; frame destruction
+  is deferred until all non-detached children return `PollDropped`
+- **`JoinSet<T>`** — spawn homogeneous child tasks, collect results in completion order
+  via `next()`, or discard via `drain()`; satisfies `Stream<T>` for non-void T;
+  cancel-on-drop with scope-guaranteed drain
+
+### Combinators
+- **`select(f1, f2, ...)`** — first-ready-wins; cancels and drains losing branches before
+  delivering result; `SelectBranch<N, T>` tagging handles homogeneous types
+- **`timeout(duration, future)`** — wraps `select` + `sleep_for`
+- **`next(stream)`** — advance any `Stream<T>` by one item
+
+### Channels (`include/coro/sync/`)
+- **`oneshot`** — single value; synchronous send, async receive
+- **`mpsc`** — bounded ring buffer; cloneable sender, single `Stream<T>` receiver;
+  intrusive waiter nodes; zero-copy direct-handoff paths
+- **`watch`** — latest-value; synchronous overwrite; `changed()` + `borrow()` (returns
+  `BorrowGuard<T>` holding a shared read lock); cloneable receiver
+
+All channels use `std::expected<T, ChannelError>` for fallible operations; `trySend`
+returns `std::expected<void, TrySendError<T>>` so the caller recovers unsent values on
+failure.
+
+---
+
+## Key Design Decisions
+
+**Cancellation via `PollDropped`, not drop.** C++ coroutine frames must be resumed to run
+destructors; cancellation is delivered as a poll signal so the task can drain its children
+before the frame is freed.
+
+**Implicit structured concurrency.** The `t_current_coro` thread-local lets `JoinHandle`
+destructors register pending children with the enclosing coroutine automatically — no
+explicit scope object required in the common case.
+
+**Mutex over atomics.** Shared state uses `std::mutex` by default. Atomics are reserved
+for the `SchedulingState` CAS machine and a handful of documented cross-thread waker
+stores where a mutex would introduce lock-ordering issues.
+
+**`IoService` command pattern.** Worker threads never touch libuv directly. Each I/O
+operation is an `IoRequest` subclass executed on the I/O thread; `IoService` is
+completely ignorant of concrete request types, keeping each I/O subsystem self-contained.
+
+**`std::expected` error policy.** Fallible operations return `std::expected<T, E>` rather
+than throwing. `.value()` is the exception-throwing escape hatch for callers that prefer it.
 
 ---
 
