@@ -129,7 +129,7 @@ public:
 
     // Submit a work item to be executed on a blocking pool thread.
     // Called by spawn_blocking() after allocating BlockingState.
-    void submit(std::function<void()> work_item);
+    void submit(std::move_only_function<void()> work_item);
 
 private:
     void worker_loop();
@@ -137,7 +137,7 @@ private:
     Runtime*                m_runtime;
     std::mutex              m_mutex;
     std::condition_variable m_cv;
-    std::vector<std::function<void()>> m_queue;
+    std::vector<std::move_only_function<void()>> m_queue;
     std::size_t             m_total_threads{0};
     std::size_t             m_idle_threads{0};
     std::size_t             m_max_threads;
@@ -163,7 +163,7 @@ namespace detail {
 // item to the BlockingPool owned by the current runtime. Keeping this out of the
 // template body means spawn_blocking.h needs no knowledge of Runtime, eliminating
 // the circular-include dependency.
-void submit_blocking_work(std::function<void()> work);
+void submit_blocking_work(std::move_only_function<void()> work);
 } // namespace detail
 
 template<std::invocable F>

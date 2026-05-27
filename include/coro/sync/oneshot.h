@@ -5,24 +5,26 @@
 #include <coro/detail/poll_result.h>
 #include <coro/sync/channel_error.h>
 
+#include <condition_variable>
 #include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <utility>
 
-namespace coro::oneshot {
+namespace coro {
 
 namespace detail {
 
 /// `std::optional<void>` is ill-formed, so map void → monostate for the slot.
 template<typename T>
-using SlotType = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
+using OneshotSlotType = std::conditional_t<std::is_void_v<T>, std::monostate, T>;
 
 template<typename T>
 struct OneshotShared {
     std::mutex                           mutex;
-    std::optional<SlotType<T>>           slot;           ///< Filled by send().
+    std::condition_variable              cv;             ///< Notified on send() and sender drop; used by blocking_recv.
+    std::optional<OneshotSlotType<T>>    slot;           ///< Filled by send().
     bool                                 sender_alive   = true;
     bool                                 receiver_alive = true;
     std::shared_ptr<coro::detail::Waker> receiver_waker; ///< Set when receiver suspends.
@@ -119,9 +121,22 @@ public:
         {
             std::lock_guard lock(m_shared->mutex);
             m_shared->sender_alive = false;
+            m_shared->cv.notify_all();
             waker = std::move(m_shared->receiver_waker);
         }
         if (waker) waker->wake();
+    }
+
+    /**
+     * @brief Returns `true` if the receiver has been dropped.
+     *
+     * A `true` result guarantees that any subsequent `send()` will fail.
+     * A `false` result is a snapshot — the receiver may be dropped concurrently
+     * before `send()` is called, so `send()` may still return an error.
+     */
+    [[nodiscard]] bool is_closed() const {
+        std::lock_guard lock(m_shared->mutex);
+        return !m_shared->receiver_alive;
     }
 
     /**
@@ -133,8 +148,6 @@ public:
      *
      * @param value The value to send.
      * @return `{}` on success; `std::unexpected<U>(std::forward<U>(value))` if the receiver is gone.
-     * @note This is a template primarily because this overload needs to be removed using SFINAE when
-     * `T` is `void`. Allowing perfect forwarding and avoiding unnecessary moves is just an added bonus.
      */
     template<typename U> requires (
         !std::is_void_v<T> && std::convertible_to<U, T>
@@ -147,6 +160,7 @@ public:
                 return std::unexpected<std::decay_t<U>>(std::forward<U>(value));
             }
             m_shared->slot = std::forward<std::decay_t<U>>(value);
+            m_shared->cv.notify_all();
             waker = std::move(m_shared->receiver_waker);
             m_shared->sender_alive = false; // consumed
         }
@@ -168,6 +182,7 @@ public:
             if (!m_shared->receiver_alive)
                 return std::unexpected(ChannelError::Closed);
             m_shared->slot = std::monostate{};
+            m_shared->cv.notify_all();
             waker = std::move(m_shared->receiver_waker);
             m_shared->sender_alive = false;
         }
@@ -211,6 +226,18 @@ public:
     }
 
     /**
+     * @brief Returns `true` if the sender has been dropped without sending a value.
+     *
+     * Returns `false` if the sender is still alive or has already sent a value
+     * (in which case `recv()` will resolve immediately with that value).
+     * A `true` result means `recv()` will resolve with `ChannelError::Closed`.
+     */
+    [[nodiscard]] bool sender_dropped() const {
+        std::lock_guard lock(m_shared->mutex);
+        return !m_shared->sender_alive && !m_shared->slot.has_value();
+    }
+
+    /**
      * @brief Returns a future that resolves when the sender sends a value or is dropped.
      *
      * The returned `OneshotRecvFuture<T>` can be `co_await`-ed directly or passed
@@ -219,6 +246,29 @@ public:
      */
     [[nodiscard]] OneshotRecvFuture<T> recv() {
         return OneshotRecvFuture<T>(m_shared);
+    }
+
+    /**
+     * @brief Blocks the calling OS thread until the sender sends a value or is dropped.
+     *
+     * Intended for use on threads created by `spawn_blocking`. **Do not call from a
+     * coroutine or executor thread** — it will block the thread and stall the executor.
+     *
+     * @return `T` (or `void`) on success; `std::unexpected(ChannelError::Closed)` if the
+     *         sender was dropped without sending.
+     */
+    std::expected<T, ChannelError> blocking_recv() {
+        std::unique_lock lock(m_shared->mutex);
+        m_shared->cv.wait(lock, [this] {
+            return m_shared->slot.has_value() || !m_shared->sender_alive;
+        });
+        if (m_shared->slot.has_value()) {
+            if constexpr (std::is_void_v<T>)
+                return {};
+            else
+                return std::move(*m_shared->slot);
+        }
+        return std::unexpected(ChannelError::Closed);
     }
 
 private:
@@ -232,9 +282,9 @@ private:
  * @return A pair `{OneshotSender<T>, OneshotReceiver<T>}`.
  */
 template<typename T>
-[[nodiscard]] std::pair<OneshotSender<T>, OneshotReceiver<T>> channel() {
+[[nodiscard]] std::pair<OneshotSender<T>, OneshotReceiver<T>> oneshot_channel() {
     auto shared = std::make_shared<detail::OneshotShared<T>>();
     return { OneshotSender<T>(shared), OneshotReceiver<T>(shared) };
 }
 
-} // namespace coro::oneshot
+} // namespace coro

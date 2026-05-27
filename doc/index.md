@@ -49,7 +49,7 @@ are suspended waiting for I/O or timers, the executor sleeps and the I/O reactor
 when something is ready.
 
 This library's `Runtime` manages the executor and a libuv I/O reactor for network and
-timer events. The executor is **work-stealing**: tasks are distributed across worker
+timer events. The default executor is **work-stealing**: tasks are distributed across worker
 threads automatically, and idle workers steal tasks from busy workers before going to
 sleep — keeping all cores utilized without manual load balancing.
 
@@ -88,12 +88,15 @@ int main(int argc, char* argv[]) {
 ## Quick example
 
 The following is a common pattern in connection-based server communication: poll two
-redundant server connections for the result of a long-running request, send periodic
-keepalives to detect disconnections while waiting, and enforce an overall deadline. With
-threads and callbacks this requires a state machine, a mutex protecting the shared
-result, a separate timer thread for keepalives, and a cancellation flag threaded through
-every layer. With coroutines the structure maps directly to the intent — and
-cancellation is intrinsic, not bolted on.
+redundant servers for a long-running result, send keepalives while waiting to detect
+disconnections, and enforce an overall deadline. The thread-and-callback version of this
+requires four things that have nothing to do with the logic: a state machine to track
+which phase you're in, a mutex protecting the shared result, a dedicated timer thread for
+keepalives, and a cancellation flag carefully threaded through every layer — with the
+constant risk that a blocking call somewhere never checks it. With coroutines, the
+structure maps directly to the intent. The three concurrent concerns (`poll_status`,
+`poll_status`, `keepalive`) are just three branches of a `select`. The deadline is one
+`timeout` wrapper. Cancellation is intrinsic — every `co_await` is already an exit point.
 
 ```cpp
 #include <coro/coro.h>
@@ -171,10 +174,12 @@ int main() {
 }
 ```
 
-Cancellation composes for free at any granularity: spawn `run()` as a task and drop the
-`JoinHandle` at any point — every `co_await` in the entire tree (poll loop, keepalive,
-timeout) becomes a clean exit point automatically. No cancellation tokens to design
-around, no risk of getting stuck at a blocking call that never checks the flag.
+Structured cancellation composes for free at any granularity: spawn `run()` as a task and
+drop the `JoinHandle` at any point — every `co_await` in the entire tree (poll loop,
+keepalive, timeout) becomes a clean exit point automatically. No tokens to thread through
+every layer, no risk of getting stuck at a blocking call that never checks the flag.
+For cases where the canceller lives outside the task hierarchy, cooperative cancellation
+via `CancellationToken` is coming soon.
 
 ## Where to go next
 

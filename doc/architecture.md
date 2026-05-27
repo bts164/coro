@@ -84,9 +84,9 @@ Dependencies are managed with Conan.
 - **`mpsc`** — bounded ring buffer; cloneable sender, single `Stream<T>` receiver;
   intrusive waiter nodes; zero-copy direct-handoff paths
 - **`watch`** — latest-value; synchronous overwrite; `changed()` + `borrow()` (returns
-  `BorrowGuard<T>` holding a shared read lock); cloneable receiver
+  `WatchBorrowGuard<T>` holding a shared read lock); cloneable receiver
 
-All channels use `std::expected<T, ChannelError>` for fallible operations; `trySend`
+All channels use `std::expected<T, ChannelError>` for fallible operations; `try_send`
 returns `std::expected<void, TrySendError<T>>` so the caller recovers unsent values on
 failure.
 
@@ -331,6 +331,11 @@ skipping all of the above. Detached tasks are fire-and-forget.
 ---
 
 ## Cancellation and Structured Concurrency
+
+> The cancellation described in this section is the library's built-in **structured
+> cancellation**: automatic, drop-based, requires no API surface. A separate opt-in
+> **cooperative cancellation** mechanism (`CancellationToken`) is proposed but not yet
+> implemented — see [CancellationToken Design](cancellation_token.md).
 
 ### The core problem
 
@@ -577,12 +582,12 @@ Single producer, multiple consumers, latest-value semantics. Send never blocks.
 - `std::shared_mutex value_mutex` — shared for `borrow()`, exclusive for `send()`
 - `std::mutex waker_mutex` — guards the receiver waker list only
 
-Separating them means a long-held `BorrowGuard` (shared read lock on `value_mutex`) does
+Separating them means a long-held `WatchBorrowGuard` (shared read lock on `value_mutex`) does
 not block `changed()` from registering its waker (which only needs `waker_mutex`).
 
-`borrow()` returns a `BorrowGuard<T>` — a lightweight RAII handle that holds the shared
+`borrow()` returns a `WatchBorrowGuard<T>` — a lightweight RAII handle that holds the shared
 read lock via `operator*` and `operator->`. The lock releases on guard destruction.
-**Do not hold a `BorrowGuard` across a `co_await` point** — doing so holds the read lock
+**Do not hold a `WatchBorrowGuard` across a `co_await` point** — doing so holds the read lock
 while suspended, blocking all future `send()` calls.
 
 Each receiver stores its own `last_seen` version number. `changed()` suspends if
@@ -642,7 +647,7 @@ T value = (co_await rx.recv()).value();
 errors from coroutine bodies are captured as `std::exception_ptr` and stored as
 `PollError`; `co_await`ing the `JoinHandle` rethrows them.
 
-`trySend` returns `std::expected<void, TrySendError<T>>` where `TrySendError<T>` carries
+`try_send` returns `std::expected<void, TrySendError<T>>` where `TrySendError<T>` carries
 both the failure reason (`Full` or `Disconnected`) and the unsent value, so move-only
 types are never silently dropped.
 
@@ -694,9 +699,9 @@ include/coro/
 
   sync/
     sleep.h                 SleepFuture, sleep_for()
-    oneshot.h               oneshot::channel<T>
-    mpsc.h                  mpsc::channel<T>
-    watch.h                 watch::channel<T>
+    oneshot.h               oneshot_channel<T>
+    mpsc.h                  mpsc_channel<T>
+    watch.h                 watch_channel<T>
 
   io/
     tcp_stream.h            TcpStream

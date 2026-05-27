@@ -21,7 +21,7 @@ BlockingPool::~BlockingPool() {
     m_cv.wait(lock, [this] { return m_total_threads == 0; });
 }
 
-void BlockingPool::submit(std::function<void()> work_item) {
+void BlockingPool::submit(std::move_only_function<void()> work_item) {
     std::lock_guard lock(m_mutex);
 
     m_queue.push_back(std::move(work_item));
@@ -43,7 +43,7 @@ void BlockingPool::worker_loop() {
     set_current_runtime(m_runtime);
 
     while (true) {
-        std::function<void()> work;
+        std::move_only_function<void()> work;
         {
             std::unique_lock lock(m_mutex);
             ++m_idle_threads;
@@ -73,7 +73,7 @@ void BlockingPool::worker_loop() {
 
 namespace detail {
 
-void submit_blocking_work(std::function<void()> work) {
+void submit_blocking_work(std::move_only_function<void()> work) {
     current_runtime().blocking_pool().submit(std::move(work));
 }
 

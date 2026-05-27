@@ -160,7 +160,7 @@ TEST(FutureRefTest, LosingBranchDoesNotCancelTask) {
     int result = -1;
 
     rt.block_on([](int& result) -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<int>();
+        auto [tx, rx] = oneshot_channel<int>();
 
         // Task is blocked waiting for tx — cannot be ready during the select below.
         JoinHandle<int> task = coro::spawn(

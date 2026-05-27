@@ -107,6 +107,32 @@ The end-to-end cancellation tests deferred in `test/test_coro_scope.cpp` can now
 These tests require no new infrastructure; they are Phase 3 validation for the interaction between `CoroutineScope`, `SelectFuture`, and `Coro<T>`.
 
 
+## Channel — multi-sender watch variants (under consideration)
+
+Tokio's `watch::Sender<T>` is cloneable — it uses an atomic `ref_count_tx` alongside
+the `Arc` refcount, and the channel closes when the last sender clone is dropped (see
+`tokio/src/sync/watch.rs`). This library's `WatchSender<T>` is currently move-only;
+making it cloneable to match Tokio is straightforward using the existing
+`WatchShared<T>` infrastructure with a sender ref-count alongside `receiver_count`.
+
+Two related patterns have been identified that would benefit from cloneable senders:
+
+**Multiple independent writers, passive receivers.** Several tasks publish updates to
+the same watched value. With a cloneable sender each task holds its own clone; the
+channel closes when all clones are dropped. The tradeoffs (silent overwrites, no
+feedback to the losing writer, ambiguous `changed()` attribution) are real but the
+same ones Tokio accepts.
+
+**Symmetric peers — tasks that both read and write.** When a task holds both a sender
+and a receiver, its own writes leave the receiver stale, so `changed()` fires
+immediately for its own update rather than waiting for another writer. This is
+arguably a distinct semantic from `watch` and may warrant a separate channel type
+(tentatively `coro::peer::channel<T>`) where each participant holds combined
+sender/receiver capability and own writes automatically advance `last_seen`.
+
+The peer channel and cloneable sender interact — cloneable sender may be sufficient
+for the peer use case, or the two may need to be addressed together. Resolve together.
+
 ## Channel — `broadcast`
 
 `mpsc`, `oneshot`, and `watch` are implemented in `include/coro/sync/`. The remaining
@@ -159,6 +185,37 @@ coro::Coro<void> append(int value) {
 - Fair queuing: waiting tasks are woken in FIFO order.
 
 Lives in `include/coro/sync/mutex.h`.
+
+## `void` support for `mpsc` and `CoroStream`
+
+`JoinSet<void>` already works correctly — it uses `std::conditional_t<std::is_void_v<T>, bool, std::optional<T>>` for its stream item type and has no internal value storage. `mpsc_channel<void>` and `CoroStream<void>` do not compile today because both store `T` values internally.
+
+For `mpsc<void>` the fix requires: replacing `std::deque<T>` with a count, removing the value field from `MpscSenderNode<T>`, changing `send(T)` / `try_send(T)` to zero-argument forms, and threading `if constexpr` or a `ValueOrUnit` type alias through `RecvFuture::poll()` and `_tryPromoteSender()`. Not difficult, just touching many sites.
+
+For `CoroStream<void>` the additional wrinkle is that `co_yield` requires an expression in C++ — `CoroStream<void>` would need `co_yield` with no argument (a new zero-argument `yield_value()` overload in the promise) and a deliberate decision about what the user writes at the call site (likely just `co_yield;` if the compiler supports it, or `co_yield coro::unit` with a unit type).
+
+The use case for both is real: multi-producer event notification where the signal itself is the message and no value needs to be carried.
+
+## `JoinSet` — completed result accumulation
+
+`JoinSet` removes a task from its internal task list when it completes, but the result is
+moved into a completion queue and held there until consumed via `next()`. In a long-running
+server that spawns a task per connection and never drains the set, completed results
+accumulate indefinitely — a slow memory leak proportional to total connections served.
+
+The right fix is unclear and needs more consideration before committing to an API:
+
+- **Auto-drain mode** — a construction flag or member call (e.g. `js.autoDrain()`) that
+  silently discards `void` results and drops non-void results on completion, so the queue
+  never grows. Simple, but removes the ability to observe results later.
+- **Capacity limit with back-pressure** — cap the completion queue; new tasks cannot be
+  spawned until the caller drains at least one result. Correct but changes the spawning API.
+- **Explicit `discard()` / `try_next()`** — a non-suspending poll that drains whatever is
+  ready without blocking, called opportunistically by the spawner between spawns.
+
+Until resolved, callers using `JoinSet` in fire-and-forget patterns (e.g. one task per
+connection) should periodically call `next()` or `drain()` to keep the completion queue
+bounded, or use `spawn(...).detach()` instead if results are not needed at all.
 
 ## Stream combinators
 

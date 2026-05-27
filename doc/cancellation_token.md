@@ -1,5 +1,12 @@
 # CancellationToken Design
 
+> **Status: proposed — not yet implemented.**
+> This document describes a planned cooperative cancellation API (`CancellationToken` /
+> `CancellationSource`). It is distinct from the library's built-in **structured cancellation**
+> mechanism, which is automatic and requires no API surface — see
+> [Coroutine Frame Lifetime](coroutine_scope.md) for that. `CancellationToken` is an
+> opt-in extension for cases where the built-in mechanism is insufficient.
+
 ## Motivation
 
 The library already supports task cancellation via `JoinHandle` drop and `JoinSet` drop.
@@ -381,5 +388,5 @@ include/coro/sync/cancellation_token.h   — CancellationSource, CancellationTok
 src/cancellation_token.cpp               — CancellationState, cancel(), ~CancelledFuture
 ```
 
-`cancellation::make()` follows the `oneshot::channel<T>()` / `mpsc::channel<T>()` naming
+`cancellation::make()` follows the `oneshot_channel<T>()` / `mpsc_channel<T>()` naming
 convention for channel-like paired objects.

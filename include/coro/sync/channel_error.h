@@ -15,11 +15,11 @@ enum class ChannelError {
     Closed,           ///< Sender dropped without sending (oneshot only).
     SenderDropped,    ///< All senders were dropped; no more values will arrive (mpsc, watch).
     ReceiverDropped,  ///< Receiver was dropped; sent value is returned to caller (mpsc).
-    Empty,            ///< tryRecv only — channel is open but no value is available yet.
+    Empty,            ///< try_recv only — channel is open but no value is available yet.
 };
 
 /**
- * @brief Error type returned by `trySend` on failure.
+ * @brief Error type returned by `try_send` on failure.
  *
  * Carries both the reason the send failed and the unsent value so move-only
  * types can be recovered by the caller.

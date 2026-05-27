@@ -7,6 +7,7 @@
 #include <coro/sync/channel_error.h>
 
 #include <cassert>
+#include <condition_variable>
 #include <deque>
 #include <expected>
 #include <memory>
@@ -15,19 +16,16 @@
 #include <utility>
 #include <vector>
 
-namespace coro::mpsc {
+namespace coro {
 
 namespace detail {
 
 /**
- * @brief Intrusive node for a suspended sender. Lives inside `SendFuture<T>`.
+ * @brief Intrusive node for a suspended sender. Lives inside `MpscSendFuture<T>`.
  *
  * The node is embedded in the sender's coroutine frame. When the sender suspends
  * because the buffer is full, the node is linked into `MpscShared::sender_waiters`.
  * The node holds the unsent value until the receiver transfers it.
- *
- * `std::optional<T>` is used for the value so that `T` does not need to be
- * default-constructible.
  */
 template<typename T>
 struct MpscSenderNode : coro::detail::IntrusiveListNode {
@@ -36,7 +34,7 @@ struct MpscSenderNode : coro::detail::IntrusiveListNode {
 };
 
 /**
- * @brief Node for a suspended receiver. Lives inside `Receiver<T>` as a member.
+ * @brief Node for a suspended receiver. Lives inside `MpscReceiver<T>` as a member.
  *
  * Set in `MpscShared::receiver_waiter` when the receiver suspends waiting for
  * a value. A sender that finds this set deposits its value into the buffer
@@ -50,21 +48,18 @@ struct MpscReceiverNode {
 /**
  * @brief Shared state for an mpsc channel.
  *
- * Protected by `mutex`. Allocated once at `channel()` construction and held
- * via `shared_ptr` by all Sender and Receiver handles.
- *
- * @note The ring buffer is currently implemented as a `std::deque` with a
- *       capacity cap. A fixed-size ring buffer can replace this later for
- *       better cache behaviour without changing the external API.
+ * Protected by `mutex`. Allocated once at `mpsc_channel()` construction and held
+ * via `shared_ptr` by all MpscSender and MpscReceiver handles.
  */
 template<typename T>
 struct MpscShared {
-    std::mutex                     mutex;
-    std::deque<T>                  buffer;          ///< Bounded queue.
-    size_t                         capacity;        ///< Maximum buffered values.
-    size_t                         sender_count  = 0;
-    bool                           receiver_alive = true;
-    coro::detail::IntrusiveList<>    sender_waiters; ///< Suspended senders (MpscSenderNode<T>*).
+    std::mutex                      mutex;
+    std::condition_variable         cv;              ///< Notified on every push, pop, and close; used by blocking_recv / blocking_send.
+    std::deque<T>                   buffer;          ///< Bounded queue.
+    size_t                          capacity;        ///< Maximum buffered values.
+    size_t                          sender_count  = 0;
+    bool                            receiver_alive = true;
+    coro::detail::IntrusiveList<>   sender_waiters; ///< Suspended senders (MpscSenderNode<T>*).
     std::optional<MpscReceiverNode> receiver_waiter; ///< At most one (single consumer).
 
     explicit MpscShared(size_t cap) : capacity(cap) {}
@@ -72,11 +67,11 @@ struct MpscShared {
 
 } // namespace detail
 
-template<typename T> class Sender;
-template<typename T> class Receiver;
+template<typename T> class MpscSender;
+template<typename T> class MpscReceiver;
 
 /**
- * @brief Future returned by `Sender<T>::send()`.
+ * @brief Future returned by `MpscSender<T>::send()`.
  *
  * Satisfies `Future<std::expected<void, T>>`. Resolves immediately if buffer
  * space is available; suspends if the buffer is full. If the receiver is dropped
@@ -85,36 +80,36 @@ template<typename T> class Receiver;
  * **Cancellation:** if dropped while suspended, the destructor acquires the channel
  * mutex and unlinks the intrusive node before the coroutine frame is freed.
  *
- * **Move safety:** moving a `SendFuture` is only valid before `poll()` has been
+ * **Move safety:** moving an `MpscSendFuture` is only valid before `poll()` has been
  * called (i.e. before the node is linked into the channel's waiter list).
  *
  * @tparam T The value type being sent.
  */
 template<typename T>
-class SendFuture {
+class MpscSendFuture {
 public:
     using OutputType = std::expected<void, T>;
 
-    SendFuture(std::shared_ptr<detail::MpscShared<T>> shared, T value)
+    MpscSendFuture(std::shared_ptr<detail::MpscShared<T>> shared, T value)
         : m_shared(std::move(shared))
     {
         m_node.value.emplace(std::move(value));
     }
 
-    SendFuture(const SendFuture&)            = delete;
-    SendFuture& operator=(const SendFuture&) = delete;
+    MpscSendFuture(const MpscSendFuture&)            = delete;
+    MpscSendFuture& operator=(const MpscSendFuture&) = delete;
 
     // Only valid before poll() — the node must not be linked when moved.
-    SendFuture(SendFuture&& other) noexcept
+    MpscSendFuture(MpscSendFuture&& other) noexcept
         : m_shared(std::move(other.m_shared))
         , m_node(std::move(other.m_node))
     {
-        assert(!m_node.is_linked() && "SendFuture moved while linked — undefined behaviour");
+        assert(!m_node.is_linked() && "MpscSendFuture moved while linked — undefined behaviour");
     }
 
-    SendFuture& operator=(SendFuture&&) = delete;
+    MpscSendFuture& operator=(MpscSendFuture&&) = delete;
 
-    ~SendFuture() {
+    ~MpscSendFuture() {
         if (!m_shared) return;
         if (m_node.is_linked()) {
             std::lock_guard lock(m_shared->mutex);
@@ -148,6 +143,7 @@ public:
             m_shared->receiver_waiter.reset();
             if (m_node.is_linked())
                 m_shared->sender_waiters.remove(&m_node);
+            m_shared->cv.notify_all();
             lock.unlock();
             waker->wake();
             return OutputType{};
@@ -156,6 +152,7 @@ public:
         // Buffer has space.
         if (m_shared->buffer.size() < m_shared->capacity) {
             m_shared->buffer.push_back(std::move(*m_node.value));
+            m_shared->cv.notify_all();
             return OutputType{};
         }
 
@@ -172,33 +169,30 @@ private:
 };
 
 /**
- * @brief Future returned by `Receiver<T>::recv()`.
+ * @brief Future returned by `MpscReceiver<T>::recv()`.
  *
  * Satisfies `Future<std::optional<T>>`. Resolves with the next value from the
  * channel, or `nullopt` when all senders have been dropped and the buffer is
  * empty. Holding a shared_ptr to the channel state keeps it alive without
- * consuming the `Receiver`, so the receiver can produce further futures after
+ * consuming the `MpscReceiver`, so the receiver can produce further futures after
  * a `select()` branch is cancelled.
- *
- * Dropping this future while suspended clears the receiver waiter so no
- * spurious wake reaches a dead coroutine.
  *
  * @tparam T The value type to receive.
  */
 template<typename T>
-class RecvFuture {
+class MpscRecvFuture {
 public:
     using OutputType = std::optional<T>;
 
-    explicit RecvFuture(std::shared_ptr<detail::MpscShared<T>> shared)
+    explicit MpscRecvFuture(std::shared_ptr<detail::MpscShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
-    RecvFuture(const RecvFuture&)            = delete;
-    RecvFuture& operator=(const RecvFuture&) = delete;
-    RecvFuture(RecvFuture&&)                 = default;
-    RecvFuture& operator=(RecvFuture&&)      = default;
+    MpscRecvFuture(const MpscRecvFuture&)            = delete;
+    MpscRecvFuture& operator=(const MpscRecvFuture&) = delete;
+    MpscRecvFuture(MpscRecvFuture&&)                 = default;
+    MpscRecvFuture& operator=(MpscRecvFuture&&)      = default;
 
-    ~RecvFuture() {
+    ~MpscRecvFuture() {
         if (!m_shared) return;
         std::lock_guard lock(m_shared->mutex);
         m_shared->receiver_waiter.reset();
@@ -218,6 +212,7 @@ public:
             T val = std::move(m_shared->buffer.front());
             m_shared->buffer.pop_front();
             auto waker = _tryPromoteSender();
+            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return std::optional<T>(std::move(val));
@@ -227,6 +222,7 @@ public:
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             T val = std::move(*node->value);
             auto waker = std::move(node->waker);
+            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return std::optional<T>(std::move(val));
@@ -242,8 +238,6 @@ public:
 private:
     std::shared_ptr<detail::MpscShared<T>> m_shared;
 
-    // Moves the head waiting sender's value into the buffer and returns its waker.
-    // Assumes the mutex is held.
     std::shared_ptr<coro::detail::Waker> _tryPromoteSender() {
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
@@ -257,35 +251,35 @@ private:
 /**
  * @brief Producer handle for an mpsc channel. Cloneable; each clone is independent.
  *
- * **Thread safety:** each `Sender` instance must be used by at most one thread at a
+ * **Thread safety:** each `MpscSender` instance must be used by at most one thread at a
  * time. For multi-threaded producers, give each thread its own clone.
  *
  * @tparam T The value type to send.
  */
 template<typename T>
-class Sender {
+class MpscSender {
 public:
-    explicit Sender(std::shared_ptr<detail::MpscShared<T>> shared)
+    explicit MpscSender(std::shared_ptr<detail::MpscShared<T>> shared)
         : m_shared(std::move(shared))
     {
         std::lock_guard lock(m_shared->mutex);
         ++m_shared->sender_count;
     }
 
-    Sender(const Sender&)            = delete;
-    Sender& operator=(const Sender&) = delete;
-    Sender(Sender&&)                 = default;
-    Sender& operator=(Sender&&)      = default;
+    MpscSender(const MpscSender&)            = delete;
+    MpscSender& operator=(const MpscSender&) = delete;
+    MpscSender(MpscSender&&)                 = default;
+    MpscSender& operator=(MpscSender&&)      = default;
 
-    ~Sender() {
+    ~MpscSender() {
         if (!m_shared) return;
         std::shared_ptr<coro::detail::Waker> waker;
         {
             std::lock_guard lock(m_shared->mutex);
             if (--m_shared->sender_count == 0) {
-                // Last sender dropped — wake receiver so it can observe the close.
                 if (m_shared->receiver_waiter.has_value())
                     waker = std::move(m_shared->receiver_waiter->waker);
+                m_shared->cv.notify_all();
             }
         }
         if (waker) waker->wake();
@@ -294,12 +288,12 @@ public:
     /**
      * @brief Sends @p value asynchronously.
      *
-     * Returns a `SendFuture` that resolves immediately if buffer space is
+     * Returns an `MpscSendFuture` that resolves immediately if buffer space is
      * available, or suspends until space opens up. If the receiver is dropped
      * while suspended, resolves with `std::unexpected(value)`.
      */
-    [[nodiscard]] SendFuture<T> send(T value) {
-        return SendFuture<T>(m_shared, std::move(value));
+    [[nodiscard]] MpscSendFuture<T> send(T value) {
+        return MpscSendFuture<T>(m_shared, std::move(value));
     }
 
     /**
@@ -308,7 +302,7 @@ public:
      * Returns `{}` on success. On failure returns `TrySendError<T>` carrying
      * the unsent value and the reason (`Full` or `Disconnected`).
      */
-    std::expected<void, TrySendError<T>> trySend(T value) {
+    std::expected<void, TrySendError<T>> try_send(T value) {
         std::unique_lock lock(m_shared->mutex);
         if (!m_shared->receiver_alive)
             return std::unexpected(TrySendError<T>(
@@ -317,7 +311,7 @@ public:
             return std::unexpected(TrySendError<T>(
                 TrySendError<T>::Kind::Full, std::move(value)));
         m_shared->buffer.push_back(std::move(value));
-        // Wake a waiting receiver if present.
+        m_shared->cv.notify_all();
         if (m_shared->receiver_waiter.has_value()) {
             auto waker = std::move(m_shared->receiver_waiter->waker);
             m_shared->receiver_waiter.reset();
@@ -328,13 +322,57 @@ public:
     }
 
     /**
+     * @brief Blocks the calling OS thread until @p value can be sent or the receiver is dropped.
+     *
+     * Intended for use on threads created by `spawn_blocking`. **Do not call from a
+     * coroutine or executor thread** — it will block the thread and stall the executor.
+     *
+     * @return `{}` on success. `std::unexpected(value)` if the receiver was dropped
+     *         while waiting.
+     */
+    std::expected<void, T> blocking_send(T value) {
+        std::unique_lock lock(m_shared->mutex);
+        m_shared->cv.wait(lock, [this] {
+            return !m_shared->receiver_alive
+                || m_shared->buffer.size() < m_shared->capacity;
+        });
+
+        if (!m_shared->receiver_alive)
+            return std::unexpected(std::move(value));
+
+        m_shared->buffer.push_back(std::move(value));
+        if (m_shared->receiver_waiter.has_value()) {
+            auto waker = std::move(m_shared->receiver_waiter->waker);
+            m_shared->receiver_waiter.reset();
+            m_shared->cv.notify_all();
+            lock.unlock();
+            waker->wake();
+        } else {
+            m_shared->cv.notify_all();
+        }
+        return {};
+    }
+
+    /**
+     * @brief Returns `true` if the receiver has been dropped.
+     *
+     * A `true` result guarantees that any subsequent `send()` or `try_send()` will
+     * fail. A `false` result is a snapshot — the receiver may be dropped
+     * concurrently before the send, so failure is still possible.
+     */
+    [[nodiscard]] bool is_closed() const {
+        std::lock_guard lock(m_shared->mutex);
+        return !m_shared->receiver_alive;
+    }
+
+    /**
      * @brief Creates an independent sender clone that shares the same channel.
      *
      * Each clone increments the sender reference count. The channel closes from
      * the sender side only when the last clone is destroyed.
      */
-    [[nodiscard]] Sender<T> clone() const {
-        return Sender<T>(m_shared);
+    [[nodiscard]] MpscSender<T> clone() const {
+        return MpscSender<T>(m_shared);
     }
 
 private:
@@ -352,21 +390,20 @@ private:
  * @tparam T The value type to receive.
  */
 template<typename T>
-class Receiver {
+class MpscReceiver {
 public:
     using ItemType = T;
 
-    explicit Receiver(std::shared_ptr<detail::MpscShared<T>> shared)
+    explicit MpscReceiver(std::shared_ptr<detail::MpscShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
-    Receiver(const Receiver&)            = delete;
-    Receiver& operator=(const Receiver&) = delete;
-    Receiver(Receiver&&)                 = default;
-    Receiver& operator=(Receiver&&)      = default;
+    MpscReceiver(const MpscReceiver&)            = delete;
+    MpscReceiver& operator=(const MpscReceiver&) = delete;
+    MpscReceiver(MpscReceiver&&)                 = default;
+    MpscReceiver& operator=(MpscReceiver&&)      = default;
 
-    ~Receiver() {
+    ~MpscReceiver() {
         if (!m_shared) return;
-        // Wake all suspended senders so they observe ReceiverDropped.
         std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
         {
             std::lock_guard lock(m_shared->mutex);
@@ -375,22 +412,67 @@ public:
                 auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
                 if (node->waker) wakers.push_back(std::move(node->waker));
             }
+            m_shared->cv.notify_all();
         }
         for (auto& w : wakers) w->wake();
     }
 
     /**
+     * @brief Returns `true` if all senders have been dropped and the buffer is empty.
+     */
+    [[nodiscard]] bool all_senders_dropped() const {
+        std::lock_guard lock(m_shared->mutex);
+        return m_shared->sender_count == 0 && m_shared->buffer.empty();
+    }
+
+    /**
      * @brief Returns a future that resolves to the next value from the channel.
-     *
-     * The returned `RecvFuture<T>` can be `co_await`-ed directly or passed to
-     * `select()`. The receiver remains valid after the future completes or is
-     * cancelled, so you can call `recv()` again in the next loop iteration.
      *
      * Resolves with `nullopt` when all senders have been dropped and the buffer
      * is drained (stream exhausted).
      */
-    [[nodiscard]] RecvFuture<T> recv() {
-        return RecvFuture<T>(m_shared);
+    [[nodiscard]] MpscRecvFuture<T> recv() {
+        return MpscRecvFuture<T>(m_shared);
+    }
+
+    /**
+     * @brief Blocks the calling OS thread until an item is available or the channel closes.
+     *
+     * Intended for use on threads created by `spawn_blocking`. **Do not call from a
+     * coroutine or executor thread** — it will block the thread and stall the executor.
+     *
+     * @return The next item, or `std::nullopt` when all senders are dropped and the
+     *         buffer is drained.
+     */
+    std::optional<T> blocking_recv() {
+        std::unique_lock lock(m_shared->mutex);
+        m_shared->cv.wait(lock, [this] {
+            return !m_shared->buffer.empty()
+                || !m_shared->sender_waiters.empty()
+                || m_shared->sender_count == 0;
+        });
+
+        if (!m_shared->buffer.empty()) {
+            T val = std::move(m_shared->buffer.front());
+            m_shared->buffer.pop_front();
+            auto waker = _tryPromoteSender();
+            m_shared->cv.notify_all();
+            lock.unlock();
+            if (waker) waker->wake();
+            return val;
+        }
+
+        if (auto* raw = m_shared->sender_waiters.pop_front()) {
+            auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
+            T val = std::move(*node->value);
+            auto waker = std::move(node->waker);
+            m_shared->cv.notify_all();
+            lock.unlock();
+            if (waker) waker->wake();
+            return val;
+        }
+
+        return std::nullopt;
     }
 
     /**
@@ -401,12 +483,13 @@ public:
      * - `ChannelError::Empty` — channel open but nothing buffered yet.
      * - `ChannelError::SenderDropped` — all senders gone and buffer drained.
      */
-    [[nodiscard]] std::expected<T, ChannelError> tryRecv() {
+    [[nodiscard]] std::expected<T, ChannelError> try_recv() {
         std::unique_lock lock(m_shared->mutex);
         if (!m_shared->buffer.empty()) {
             T val = std::move(m_shared->buffer.front());
             m_shared->buffer.pop_front();
             auto waker = _tryPromoteSender();
+            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return val;
@@ -418,26 +501,20 @@ public:
 
     /**
      * @brief Advances the stream by one item.
-     *
-     * Returns:
-     * - `Ready(some(T))` — item available.
-     * - `Ready(nullopt)`  — all senders dropped and buffer drained.
-     * - `Pending`         — nothing available yet; waker registered.
      */
     PollResult<std::optional<T>> poll_next(coro::detail::Context& ctx) {
         std::unique_lock lock(m_shared->mutex);
 
-        // Value in buffer — also promote a waiting sender into the freed slot.
         if (!m_shared->buffer.empty()) {
             T val = std::move(m_shared->buffer.front());
             m_shared->buffer.pop_front();
             auto waker = _tryPromoteSender();
+            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return std::optional<T>(std::move(val));
         }
 
-        // No buffer but a sender is already waiting — take its value directly.
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             T val = std::move(*node->value);
@@ -447,20 +524,15 @@ public:
             return std::optional<T>(std::move(val));
         }
 
-        // All senders dropped and buffer empty → stream exhausted.
         if (m_shared->sender_count == 0)
             return std::optional<T>(std::nullopt);
 
-        // Nothing available — register waker and suspend.
         m_recv_node.waker = ctx.getWaker();
         m_shared->receiver_waiter = m_recv_node;
         return PollPending;
     }
 
 private:
-    /// Moves the head waiting sender's value into the buffer and returns its waker.
-    /// The waker must be called after the mutex is released.
-    /// Assumes the mutex is held.
     std::shared_ptr<coro::detail::Waker> _tryPromoteSender() {
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
@@ -471,7 +543,7 @@ private:
     }
 
     std::shared_ptr<detail::MpscShared<T>> m_shared;
-    detail::MpscReceiverNode               m_recv_node; ///< Reused across poll_next calls.
+    detail::MpscReceiverNode               m_recv_node;
 };
 
 /**
@@ -479,12 +551,12 @@ private:
  *
  * @tparam T       The value type to transport.
  * @param capacity Maximum number of values buffered before senders suspend.
- * @return A pair `{Sender<T>, Receiver<T>}`.
+ * @return A pair `{MpscSender<T>, MpscReceiver<T>}`.
  */
 template<typename T>
-[[nodiscard]] std::pair<Sender<T>, Receiver<T>> channel(size_t capacity) {
+[[nodiscard]] std::pair<MpscSender<T>, MpscReceiver<T>> mpsc_channel(size_t capacity) {
     auto shared = std::make_shared<detail::MpscShared<T>>(capacity);
-    return { Sender<T>(shared), Receiver<T>(shared) };
+    return { MpscSender<T>(shared), MpscReceiver<T>(shared) };
 }
 
-} // namespace coro::mpsc
+} // namespace coro

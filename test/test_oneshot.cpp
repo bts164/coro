@@ -5,30 +5,31 @@
 #include <coro/sync/select.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
+#include <coro/task/spawn_blocking.h>
 #include <memory>
 
 using namespace coro;
 
 // --- Concept checks ---
-static_assert(Future<oneshot::OneshotRecvFuture<int>>);
-static_assert(Future<oneshot::OneshotRecvFuture<std::unique_ptr<int>>>);
-static_assert(Future<oneshot::OneshotRecvFuture<void>>);
+static_assert(Future<OneshotRecvFuture<int>>);
+static_assert(Future<OneshotRecvFuture<std::unique_ptr<int>>>);
+static_assert(Future<OneshotRecvFuture<void>>);
 
 // --- Construction ---
 
 TEST(OneshotTest, ChannelReturnsLinkedPair) {
-    auto [tx, rx] = oneshot::channel<int>();
+    auto [tx, rx] = oneshot_channel<int>();
     (void)tx; (void)rx;
 }
 
 TEST(OneshotTest, SenderIsMovable) {
-    auto [tx, rx] = oneshot::channel<int>();
+    auto [tx, rx] = oneshot_channel<int>();
     auto tx2 = std::move(tx);
     (void)tx2; (void)rx;
 }
 
 TEST(OneshotTest, ReceiverIsMovable) {
-    auto [tx, rx] = oneshot::channel<int>();
+    auto [tx, rx] = oneshot_channel<int>();
     auto rx2 = std::move(rx);
     (void)tx; (void)rx2;
 }
@@ -36,14 +37,14 @@ TEST(OneshotTest, ReceiverIsMovable) {
 // --- Synchronous send API ---
 
 TEST(OneshotTest, SendReturnsSuccessWhenReceiverAlive) {
-    auto [tx, rx] = oneshot::channel<int>();
+    auto [tx, rx] = oneshot_channel<int>();
     auto result = tx.send(42);
     EXPECT_TRUE(result.has_value());
     (void)rx;
 }
 
 TEST(OneshotTest, SendReturnsValueWhenReceiverDropped) {
-    auto [tx, rx] = oneshot::channel<int>();
+    auto [tx, rx] = oneshot_channel<int>();
     { auto dropped = std::move(rx); } // drop receiver
     auto result = tx.send(42);
     EXPECT_FALSE(result.has_value());
@@ -51,7 +52,7 @@ TEST(OneshotTest, SendReturnsValueWhenReceiverDropped) {
 }
 
 TEST(OneshotTest, SenderDropWithoutSendCloseChannel) {
-    auto [tx, rx] = oneshot::channel<int>();
+    auto [tx, rx] = oneshot_channel<int>();
     { auto dropped = std::move(tx); } // drop sender without sending
     // rx should be closable — construction test only; async behaviour tested below
     (void)rx;
@@ -60,14 +61,14 @@ TEST(OneshotTest, SenderDropWithoutSendCloseChannel) {
 // --- Move-only types ---
 
 TEST(OneshotTest, SendAcceptsMoveOnlyType) {
-    auto [tx, rx] = oneshot::channel<std::unique_ptr<int>>();
+    auto [tx, rx] = oneshot_channel<std::unique_ptr<int>>();
     auto result = tx.send(std::make_unique<int>(99));
     EXPECT_TRUE(result.has_value());
     (void)rx;
 }
 
 TEST(OneshotTest, FailedSendReturnsMoveOnlyValue) {
-    auto [tx, rx] = oneshot::channel<std::unique_ptr<int>>();
+    auto [tx, rx] = oneshot_channel<std::unique_ptr<int>>();
     { auto dropped = std::move(rx); }
     auto result = tx.send(std::make_unique<int>(99));
     EXPECT_FALSE(result.has_value());
@@ -81,7 +82,7 @@ TEST(OneshotTest, ReceiverGetsValueAfterSend) {
     Runtime rt;
     std::optional<int> received;
     rt.block_on([&]() -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<int>();
+        auto [tx, rx] = oneshot_channel<int>();
         tx.send(42);
         auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
@@ -93,7 +94,7 @@ TEST(OneshotTest, ReceiverGetsValueAfterSend) {
 TEST(OneshotTest, ReceiverErrorWhenSenderDropped) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<int>();
+        auto [tx, rx] = oneshot_channel<int>();
         { auto dropped = std::move(tx); }
         auto result = co_await rx.recv();
         EXPECT_FALSE(result.has_value());
@@ -104,7 +105,7 @@ TEST(OneshotTest, ReceiverErrorWhenSenderDropped) {
 TEST(OneshotTest, ReceiverSuspendsUntilSend) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<int>();
+        auto [tx, rx] = oneshot_channel<int>();
         // Spawn a task that sends after the receiver is waiting.
         co_await coro::spawn([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send(7);
@@ -119,19 +120,19 @@ TEST(OneshotTest, ReceiverSuspendsUntilSend) {
 // --- void specialisation ---
 
 TEST(OneshotVoidTest, ChannelReturnsLinkedPair) {
-    auto [tx, rx] = oneshot::channel<void>();
+    auto [tx, rx] = oneshot_channel<void>();
     (void)tx; (void)rx;
 }
 
 TEST(OneshotVoidTest, SendReturnsSuccessWhenReceiverAlive) {
-    auto [tx, rx] = oneshot::channel<void>();
+    auto [tx, rx] = oneshot_channel<void>();
     auto result = tx.send();
     EXPECT_TRUE(result.has_value());
     (void)rx;
 }
 
 TEST(OneshotVoidTest, SendReturnsClosedWhenReceiverDropped) {
-    auto [tx, rx] = oneshot::channel<void>();
+    auto [tx, rx] = oneshot_channel<void>();
     { auto dropped = std::move(rx); }
     auto result = tx.send();
     EXPECT_FALSE(result.has_value());
@@ -141,7 +142,7 @@ TEST(OneshotVoidTest, SendReturnsClosedWhenReceiverDropped) {
 TEST(OneshotVoidTest, ReceiverGetsSignalAfterSend) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<void>();
+        auto [tx, rx] = oneshot_channel<void>();
         tx.send();
         auto result = co_await rx.recv();
         EXPECT_TRUE(result.has_value());
@@ -151,7 +152,7 @@ TEST(OneshotVoidTest, ReceiverGetsSignalAfterSend) {
 TEST(OneshotVoidTest, ReceiverErrorWhenSenderDropped) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<void>();
+        auto [tx, rx] = oneshot_channel<void>();
         { auto dropped = std::move(tx); }
         auto result = co_await rx.recv();
         EXPECT_FALSE(result.has_value());
@@ -162,7 +163,7 @@ TEST(OneshotVoidTest, ReceiverErrorWhenSenderDropped) {
 TEST(OneshotVoidTest, ReceiverSuspendsUntilSend) {
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<void>();
+        auto [tx, rx] = oneshot_channel<void>();
         co_await coro::spawn([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send();
             co_return;
@@ -179,7 +180,7 @@ TEST(OneshotTest, RecvCanBeReusedAfterCancelledSelect) {
     // by select(), so it can be awaited again if the other branch won.
     Runtime rt;
     rt.block_on([&]() -> Coro<void> {
-        auto [tx, rx] = oneshot::channel<int>();
+        auto [tx, rx] = oneshot_channel<int>();
 
         struct ImmediateInt {
             using OutputType = int;
@@ -195,4 +196,82 @@ TEST(OneshotTest, RecvCanBeReusedAfterCancelledSelect) {
         EXPECT_TRUE(result.has_value());
         EXPECT_EQ(*result, 42);
     }());
+}
+
+// --- blocking_recv ---
+
+TEST(OneshotTest, BlockingRecvGetsValue) {
+    Runtime rt(1);
+    int result = -1;
+    rt.block_on([](int& out) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<int>();
+        tx.send(42);
+        out = co_await coro::spawn_blocking(
+            [rx = std::move(rx)]() mutable -> int {
+                auto r = rx.blocking_recv();
+                return r.has_value() ? *r : -1;
+            });
+    }(result));
+    EXPECT_EQ(result, 42);
+}
+
+TEST(OneshotTest, BlockingRecvBlocksUntilSend) {
+    Runtime rt(1);
+    int result = -1;
+    rt.block_on([](int& out) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<int>();
+        auto handle = coro::spawn_blocking(
+            [rx = std::move(rx)]() mutable -> int {
+                auto r = rx.blocking_recv();
+                return r.has_value() ? *r : -1;
+            });
+        tx.send(99);
+        out = co_await std::move(handle);
+    }(result));
+    EXPECT_EQ(result, 99);
+}
+
+TEST(OneshotTest, BlockingRecvReturnsClosedWhenSenderDropped) {
+    Runtime rt(1);
+    bool got_closed = false;
+    rt.block_on([](bool& out) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<int>();
+        { auto dropped = std::move(tx); }
+        out = co_await coro::spawn_blocking(
+            [rx = std::move(rx)]() mutable -> bool {
+                auto r = rx.blocking_recv();
+                return !r.has_value() && r.error() == ChannelError::Closed;
+            });
+    }(got_closed));
+    EXPECT_TRUE(got_closed);
+}
+
+TEST(OneshotVoidTest, BlockingRecvGetsSignal) {
+    Runtime rt(1);
+    bool got_signal = false;
+    rt.block_on([](bool& out) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<void>();
+        tx.send();
+        out = co_await coro::spawn_blocking(
+            [rx = std::move(rx)]() mutable -> bool {
+                auto r = rx.blocking_recv();
+                return r.has_value();
+            });
+    }(got_signal));
+    EXPECT_TRUE(got_signal);
+}
+
+TEST(OneshotVoidTest, BlockingRecvReturnsClosedWhenSenderDropped) {
+    Runtime rt(1);
+    bool got_closed = false;
+    rt.block_on([](bool& out) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<void>();
+        { auto dropped = std::move(tx); }
+        out = co_await coro::spawn_blocking(
+            [rx = std::move(rx)]() mutable -> bool {
+                auto r = rx.blocking_recv();
+                return !r.has_value() && r.error() == ChannelError::Closed;
+            });
+    }(got_closed));
+    EXPECT_TRUE(got_closed);
 }

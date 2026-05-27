@@ -117,7 +117,7 @@ private:
         // Register for the next incoming unary call. Tag fires (ok=true) when
         // a client request has been received and is ready to process.
         {
-            auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
+            auto [start_tx, start_rx] = coro::oneshot_channel<bool>();
             (self->m_service.*method)(&ctx, &request, &responder,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
             auto start_rx_result = co_await start_rx.recv();
@@ -130,7 +130,7 @@ private:
         // Process the request and send the reply.
         ReplyType reply = co_await self->Handle(request);
 
-        auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
+        auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         responder.Finish(reply, grpc::Status::OK, &finish_tx);
         co_await finish_rx.recv();
     }
@@ -164,7 +164,7 @@ private:
 
         // Register for the next incoming client-streaming call.
         {
-            auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
+            auto [start_tx, start_rx] = coro::oneshot_channel<bool>();
             (self->m_service.*method)(&ctx, &reader,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
             auto start_rx_result = co_await start_rx.recv();
@@ -178,7 +178,7 @@ private:
             // Read messages from the client and forward them into the channel.
             for (size_t i = 0; true; ++i) {
                 RequestType request;
-                auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
+                auto [read_tx, read_rx] = coro::oneshot_channel<bool>();
                 reader.Read(&request, &read_tx);
                 auto read_rx_result = co_await read_rx.recv();
                 if (!read_rx_result.has_value() || !read_rx_result.value()) break; // ok=false: client done sending (half-close)
@@ -191,7 +191,7 @@ private:
         ReplyType reply = co_await self->Handle(std::move(stream));
 
         // Send the single reply and wait for delivery.
-        auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
+        auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         reader.Finish(reply, grpc::Status::OK, &finish_tx);
         co_await finish_rx.recv();
     }
@@ -227,7 +227,7 @@ private:
 
         // Register for the next incoming server-streaming call.
         {
-            auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
+            auto [start_tx, start_rx] = coro::oneshot_channel<bool>();
             (self->m_service.*method)(&ctx, &request, &writer,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
             auto start_rx_result = co_await start_rx.recv();
@@ -242,14 +242,14 @@ private:
 
         // Write each reply to the client one at a time.
         while (auto item = co_await coro::next(reply_stream)) {
-            auto [write_tx, write_rx] = coro::oneshot::channel<bool>();
+            auto [write_tx, write_rx] = coro::oneshot_channel<bool>();
             writer.Write(*item, &write_tx);
             auto write_result = co_await write_rx.recv();
             if (!write_result.has_value() || !write_result.value()) co_return; // client disconnected
         }
 
         // All replies sent; close the stream.
-        auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
+        auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         writer.Finish(grpc::Status::OK, &finish_tx);
         co_await finish_rx.recv();
     }
@@ -293,7 +293,7 @@ private:
 
         // Register for the next incoming bidi-streaming call.
         {
-            auto [start_tx, start_rx] = coro::oneshot::channel<bool>();
+            auto [start_tx, start_rx] = coro::oneshot_channel<bool>();
             (self->m_service.*method)(&ctx, &stream,
                 self->m_cq.get(), self->m_cq.get(), &start_tx);
             auto start_rx_result = co_await start_rx.recv();
@@ -306,7 +306,7 @@ private:
         auto request_stream = [](auto self, auto &stream) -> coro::CoroStream<RequestType> {
             while (true) {
                 RequestType request;
-                auto [read_tx, read_rx] = coro::oneshot::channel<bool>();
+                auto [read_tx, read_rx] = coro::oneshot_channel<bool>();
                 stream.Read(&request, &read_tx);
                 auto read_result = co_await read_rx.recv();
                 if (!read_result.has_value() || !read_result.value()) co_return; // client half-closed
@@ -319,7 +319,7 @@ private:
         auto reply_stream = self->Process(std::move(request_stream));
         bool write_ok = true;
         while (auto item = co_await coro::next(reply_stream)) {
-            auto [write_tx, write_rx] = coro::oneshot::channel<bool>();
+            auto [write_tx, write_rx] = coro::oneshot_channel<bool>();
             stream.Write(*item, &write_tx);
             auto write_result = co_await write_rx.recv();
              if (!write_result.has_value() || !write_result.value()) {
@@ -333,7 +333,7 @@ private:
         }
 
         // All replies sent; close the stream.
-        auto [finish_tx, finish_rx] = coro::oneshot::channel<bool>();
+        auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         stream.Finish(grpc::Status::OK, &finish_tx);
         co_await finish_rx.recv();
     }
@@ -396,7 +396,7 @@ public:
                 // Next() returns false only when the CQ is fully drained after shutdown.
                 if (!self->m_cq->Next(&tag, &ok)) break;
                 // Forward the completion — ok=false is valid for streaming reads.
-                auto* tx = static_cast<coro::oneshot::OneshotSender<bool>*>(tag);
+                auto* tx = static_cast<coro::OneshotSender<bool>*>(tag);
                 tx->send(ok);
             }
         });

@@ -47,7 +47,7 @@ receiver is dropped it is closed from the receiver side. The appropriate error i
 to any task suspended on the other end.
 
 ```cpp
-auto [tx, rx] = coro::oneshot::channel<T>();
+auto [tx, rx] = coro::oneshot_channel<T>();
 
 // Receiver is waiting...
 T x = co_await rx;  // suspended here
@@ -82,12 +82,12 @@ In practice:
 ```cpp
 // Safe — each thread owns its own Sender clone:
 auto tx2 = tx.clone();
-std::thread([tx2 = std::move(tx2)]() mutable { tx2.trySend(1); }).detach();
-tx.trySend(2);  // tx and tx2 are separate objects
+std::thread([tx2 = std::move(tx2)]() mutable { tx2.try_send(1); }).detach();
+tx.try_send(2);  // tx and tx2 are separate objects
 
 // Not safe — two threads sharing the same Sender instance:
-std::thread([&tx]() { tx.trySend(1); }).detach();
-tx.trySend(2);  // data race on tx
+std::thread([&tx]() { tx.try_send(1); }).detach();
+tx.try_send(2);  // data race on tx
 ```
 
 Unlike Rust, C++ cannot enforce these rules at compile time. Violations produce
@@ -105,19 +105,19 @@ co_await tx.send(value);
 T v = co_await rx.recv();
 
 // Synchronous (returns immediately):
-std::expected<void, TrySendError<T>> err = tx.trySend(std::move(value));
-std::expected<T, ChannelError> v = rx.tryRecv();  // ChannelError::Empty if nothing ready
+std::expected<void, TrySendError<T>> err = tx.try_send(std::move(value));
+std::expected<T, ChannelError> v = rx.try_recv();  // ChannelError::Empty if nothing ready
 ```
 
 ### Return-value-on-failure pattern
 
 Following Tokio, try operations that fail return the caller's original value so it is not
-silently dropped. `trySend` returns `std::expected<void, TrySendError<T>>` — truthy on
+silently dropped. `try_send` returns `std::expected<void, TrySendError<T>>` — truthy on
 success; on failure `r.error()` carries both the reason (`Full` or `Disconnected`) and
 the unsent value:
 
 ```cpp
-if (auto r = tx.trySend(std::move(v)); !r)
+if (auto r = tx.try_send(std::move(v)); !r)
     use(std::move(r.error().value));  // send failed — value returned to caller
 ```
 
@@ -140,7 +140,7 @@ The idiomatic solution — the same pattern Tokio uses — is to make the value 
 a result type:
 
 ```cpp
-auto [tx, rx] = coro::mpsc::channel<std::expected<int, MyError>>(16);
+auto [tx, rx] = coro::mpsc_channel<std::expected<int, MyError>>(16);
 ```
 
 The outer `std::expected` (from `recv()`) represents the transport layer: did the channel
@@ -197,7 +197,7 @@ Single value, one sender, one receiver. Send is synchronous (never suspends); re
 async.
 
 ```cpp
-auto [tx, rx] = coro::oneshot::channel<std::unique_ptr<int>>();
+auto [tx, rx] = coro::oneshot_channel<std::unique_ptr<int>>();
 
 // Sender — synchronous; can be called from any thread
 if (auto r = tx.send(std::make_unique<int>(42)); !r)
@@ -239,21 +239,21 @@ needed — no node to unlink.
 Bounded, backpressured queue. Multiple producers, one consumer. Sender is cloneable.
 
 ```cpp
-auto [tx, rx] = coro::mpsc::channel<int>(/*capacity=*/16);
+auto [tx, rx] = coro::mpsc_channel<int>(/*capacity=*/16);
 
 // Producer (cloneable):
 auto tx2 = tx.clone();
 co_await tx.send(42);                   // suspends when buffer is full
-auto unsent = tx.trySend(43);           // returns immediately
+auto unsent = tx.try_send(43);           // returns immediately
 
 // Consumer:
 while (auto v = co_await coro::next(rx))
     use(*v);
 ```
 
-- `Sender<T>` — `send(T)` returns `Future<void>`, suspends when the buffer is full;
-  `trySend(T)` returns immediately. Cloneable. Dropping all senders closes the channel.
-- `Receiver<T>` — satisfies `Stream<T>`; yields items in send order; signals exhaustion
+- `MpscSender<T>` — `send(T)` returns `Future<void>`, suspends when the buffer is full;
+  `try_send(T)` returns immediately. Cloneable. Dropping all senders closes the channel.
+- `MpscReceiver<T>` — satisfies `Stream<T>`; yields items in send order; signals exhaustion
   when all senders are dropped. Dropping the receiver is a hard error for any suspended
   or future sender — `send()` returns `std::expected<void, T>` with the unsent value in
   the error slot.
@@ -350,7 +350,7 @@ Single-value channel; new writes overwrite the previous value. Multiple receiver
 track their own "last seen" version. No backpressure — send never suspends.
 
 ```cpp
-auto [tx, rx] = coro::watch::channel<int>(/*initial=*/0);
+auto [tx, rx] = coro::watch_channel<int>(/*initial=*/0);
 
 // Sender:
 if (auto r = tx.send(42); !r)
@@ -367,10 +367,10 @@ auto rx2 = rx.clone();        // independent cursor for another task
   successful sends. Dropping the sender closes the channel; receivers see an error on
   the next `changed()` call.
 - `WatchReceiver<T>` — `changed()` returns `Future<std::expected<void, ChannelError>>`;
-  `borrow()` returns a `BorrowGuard<T>` that holds a shared read lock for its lifetime;
+  `borrow()` returns a `WatchBorrowGuard<T>` that holds a shared read lock for its lifetime;
   `clone()` creates an independent receiver starting at version 0. Cloneable.
 
-`BorrowGuard<T>` is a lightweight RAII handle — it holds the `value_mutex` shared lock
+`WatchBorrowGuard<T>` is a lightweight RAII handle — it holds the `value_mutex` shared lock
 and exposes `operator*` and `operator->` for read-only access. The lock is released when
 the guard is destroyed:
 
@@ -381,8 +381,8 @@ the guard is destroyed:
 }                          // lock released
 ```
 
-`BorrowGuard` is not copyable (copying would require duplicating the lock) but is
-movable. Callers must not hold a `BorrowGuard` across a `co_await` point — doing so
+`WatchBorrowGuard` is not copyable (copying would require duplicating the lock) but is
+movable. Callers must not hold a `WatchBorrowGuard` across a `co_await` point — doing so
 would hold the read lock while suspended, blocking all `send()` calls indefinitely.
 
 ### Internal state
@@ -430,7 +430,7 @@ enum class ChannelError {
     Closed,           // generic — used by oneshot when sender drops without sending
     SenderDropped,    // all senders were dropped (mpsc, watch)
     ReceiverDropped,  // receiver was dropped (mpsc sender gets its value back)
-    Empty,            // tryRecv only — channel open but no value available yet
+    Empty,            // try_recv only — channel open but no value available yet
 };
 ```
 
@@ -439,13 +439,13 @@ No message string. Richer error context belongs in the value type — see
 
 ### `TrySendError<T>`
 
-`trySend` can fail for two distinct reasons that callers need to distinguish:
+`try_send` can fail for two distinct reasons that callers need to distinguish:
 
 - **`Full`** — buffer is full; the caller may retry later.
 - **`Disconnected`** — receiver was dropped; retrying will never succeed.
 
 Both cases return the unsent value to the caller. A plain `std::expected<void, T>`
-cannot carry the reason alongside the value, so `trySend` returns
+cannot carry the reason alongside the value, so `try_send` returns
 `std::expected<void, TrySendError<T>>`:
 
 ```cpp
@@ -457,7 +457,7 @@ struct TrySendError {
 ```
 
 ```cpp
-if (auto r = tx.trySend(std::move(v)); !r) {
+if (auto r = tx.try_send(std::move(v)); !r) {
     if (r.error().kind == TrySendError<T>::Kind::Disconnected)
         return;  // receiver gone — give up
     // else: Full — buffer full, retry or drop

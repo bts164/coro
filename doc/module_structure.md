@@ -37,13 +37,13 @@ include/coro/
 │   ├── cancellation_token.h
 │   ├── channel_error.h     SendError / RecvError shared by all channel types
 │   ├── join.h              join() — wait for a fixed heterogeneous set of futures
-│   ├── mpsc.h              mpsc::channel — bounded multi-producer single-consumer
-│   ├── oneshot.h           oneshot::channel — single-value, single-use channel
+│   ├── mpsc.h              mpsc_channel — bounded multi-producer single-consumer
+│   ├── oneshot.h           oneshot_channel — single-value, single-use channel
 │   ├── select.h            select() — race futures, return first ready
 │   ├── sleep.h             sleep_for() / SleepFuture
 │   ├── stream_handle.h     StreamHandle<T> — consumer end of a spawned stream
 │   ├── timeout.h           timeout() — race any future against a deadline
-│   └── watch.h             watch::channel — single latest-value, multi-consumer
+│   └── watch.h             watch_channel — single latest-value, multi-consumer
 │
 ├── io/                 Async I/O — network streams and WebSocket
 │   ├── tcp_stream.h        TcpStream — async TCP connection

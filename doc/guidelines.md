@@ -9,8 +9,17 @@ each rule has a short title, a rationale, and concrete examples.
 ## Table of Contents
 
 - [Coroutine Scope](#coroutine-scope)
+  - CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
+  - CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
+  - CS.3 — Never invoke a capturing lambda coroutine directly; use `co_invoke`
+  - CS.4 — Be careful when spawning member function coroutines; `this` is implicitly captured
+  - CS.5 — Detached tasks must own all their data
 - [Spawning and Ownership](#spawning-and-ownership)
 - [Cancellation Safety](#cancellation-safety)
+  - CA.1 — Use RAII for all resources owned by a coroutine frame
+  - CA.2 — Do not assume cancelled futures stop immediately; they drain before completing
+  - CA.3 — Check for cancellation in long-running loops
+  - CA.4 — Do not put blocking destructors in futures that may be cancelled as a losing branch
 - [Blocking Work](#blocking-work)
 - [Channels](#channels)
 - [Select and Timeout](#select-and-timeout)
@@ -24,24 +33,13 @@ each rule has a short title, a rationale, and concrete examples.
 ### CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
 
 **Reason:** If a coroutine spawns a child task that holds a reference to a local variable
-and the parent frame is freed while the child is still running, the child reads dangling
-memory. Unlike Rust, C++ has no borrow checker to catch this at compile time. The
-coroutine scope mechanism provides a runtime guarantee instead: the frame is not freed
-until all non-detached children have finished.
+and that local is destroyed while the child is still running, the child reads dangling
+memory. Unlike Rust, C++ has no borrow checker to catch this at compile time.
 
-This is the coroutine counterpart to how `std::async` works for normal threads. When a
-function is launched with `std::async`, the returned `std::future`'s destructor blocks
-the calling thread until the async function completes, guaranteeing that any references
-it holds remain valid. `JoinHandle` behaves similarly, but with one important difference:
-a `JoinHandle` destructor cannot block without stalling the entire executor worker thread,
-but C++ destructors cannot be coroutines, so they have no mechanism for suspending.
-
-The solution is for the `JoinHandle` destructor to register the child as pending and then
-return immediately. At the coroutine's next suspension point, it checks this list and
-suspends until all registered children have finished before proceeding. This guarantees
-the frame stays alive long enough — but it leaves a window between the `JoinHandle`
-destructor and that suspension point in which referenced objects can still be destroyed,
-which is the source of the pitfalls below.
+The coroutine scope mechanism provides a runtime safety net: the parent frame is not freed
+until all non-detached children have drained. However, there is a window at `co_return` and
+at thrown exceptions where locals are destroyed before the drain wait begins — which is the
+source of the pitfalls below.
 
 ```cpp
 // BAD — local_data is destroyed at co_return before the drain begins.
@@ -83,21 +81,14 @@ Coro<void> safe(int local_data) {
 
 ### CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
 
-**Reason:** The key is the scope relationship: the referenced variable must live in an
-*outer* frame while the `JoinHandle` (or `JoinSet`) that owns the spawned task lives in
-an *inner* scope. `co_invoke` creates that inner coroutine scope. The outer frame stays
-suspended at `co_await co_invoke(...)` for the entire inner lifetime — including through
-exceptions in the inner body — guaranteeing the referenced data is alive for as long as
-any child spawned inside runs.
+**Reason:** The fix for the pitfalls in CS.1 is a scope relationship: the referenced
+variable lives in an *outer* frame while the `JoinHandle` (or `JoinSet`) lives in an
+*inner* `co_invoke` scope. The outer frame stays suspended at `co_await co_invoke(...)`
+for the entire inner lifetime — including through exceptions — so the referenced data is
+always alive as long as any child spawned inside runs.
 
-A plain `JoinHandle` is sufficient for a single task. `JoinSet` is the right choice when
-spawning multiple tasks of the same type. Either way, what makes the pattern safe is not
-which handle type is used, but that the handle lives inside the `co_invoke` scope while
-the referenced variable lives outside it.
-
-Placing `JoinSet::drain()` in the *same* frame as the referenced local is not safe —
-exceptions bypass the drain and destroy the local while children are still running (see
-the `deceptive` example in CS.1).
+What makes the pattern safe is not which handle type is used, but that the handle lives
+inside the `co_invoke` scope while the referenced variable lives outside it.
 
 ```cpp
 // GOOD — single task; JoinHandle in the inner scope, data in the outer frame
@@ -165,21 +156,6 @@ Coro<void> coro = __lambda{my_data}();  // temporary __lambda constructed, opera
 co_await coro;                          // coroutine resumes — accesses dangling 'this'
 ```
 
-The same problem occurs if the lambda is moved after `operator()` is called: the move
-changes the object's address while the coroutine frame still holds the original `this`
-pointer.
-
-```cpp
-// BAD — lambda moved after coroutine is created; 'this' in the frame is now dangling
-auto lambda = [data = my_data]() -> Coro<void> {
-    co_await something();
-    use(data);
-};
-auto coro  = lambda();               // coroutine frame captures &lambda
-auto moved = std::move(lambda);      // lambda relocated — original address now invalid
-co_await coro;                       // use-after-free
-```
-
 `co_invoke` exists specifically to solve this. It returns a `CoInvokeFuture` — a RAII
 handle that owns both the coroutine and the lambda object on the heap, tying their
 lifetimes together so they are always destroyed together. The heap allocation also pins
@@ -212,7 +188,96 @@ ever moved. Prefer `co_invoke` in all cases.
 **Rule of thumb:** if a lambda is a coroutine and captures anything, always wrap it in
 `co_invoke` rather than invoking it directly.
 
-### CS.4 — Detached tasks must own all their data
+### CS.4 — Be careful when spawning member function coroutines; `this` is implicitly captured
+
+**Reason:** A non-static member function coroutine implicitly captures `this` into its
+frame for the same reason a capturing lambda does — the coroutine body is lowered to a
+method on the containing object, and accessing any member variable across a suspension
+point reads through `this`. If the object is destroyed while the coroutine is still
+running, every subsequent member access is a use-after-free.
+
+**`co_await` is safe; `spawn` requires care.** When you `co_await` a member coroutine
+directly, structured cancellation guarantees the coroutine finishes before the enclosing
+scope resumes — and the enclosing scope owns the object — so `this` is always valid:
+
+```cpp
+struct Processor {
+    int value = 42;
+
+    Coro<int> compute() {
+        co_await something();
+        co_return value;  // safe — 'this' is alive; co_await blocks the caller's scope
+    }
+};
+
+Coro<void> run() {
+    Processor p;
+    int result = co_await p.compute();  // safe — compute() finishes before run() can resume and destruct p
+};
+```
+
+Spawning is different. `spawn()` schedules the task independently; `p` can be destroyed
+while `compute()` is still running:
+
+```cpp
+Coro<void> run() {
+    Processor p;
+    auto h = coro::spawn(p.compute());  // compute() holds implicit 'this' → &p
+
+    co_return;
+    // ① h destroyed (reverse declaration order) — compute() receives cancellation signal
+    // ② p destroyed — p.value is gone
+    // ③ scope drain resumes compute() — accesses p.value — use-after-free
+}
+
+Coro<void> run_detached() {
+    Processor p;
+    coro::spawn(p.compute()).detach();  // compute() fully outlives p
+    co_return;                          // p destroyed here; compute() still running
+};
+```
+
+Two safe patterns:
+
+**Option 1 — `co_invoke` scope.** Wrap the spawn in a `co_invoke` scope that the object's
+owner awaits, guaranteeing the object outlives the scope:
+
+```cpp
+Coro<void> run() {
+    Worker w; // outlives the co_invoke — run() suspends here until the spawned task drains
+    co_await co_invoke([&]() -> Coro<void> {  // [&] safe here — co_invoke owns the lambda
+        auto h = spawn(w.task());              // w is alive for the entire co_invoke scope
+        co_await h;
+    });
+}
+```
+
+**Option 2 — static method with explicit `shared_ptr` self.** Convert the member
+coroutine to a static function that takes ownership of the object via `shared_ptr`. The
+lifetime of `self` is tied to the coroutine frame, so the object cannot be destroyed while
+the task is running, regardless of when the original owner goes away:
+
+```cpp
+struct Worker : std::enable_shared_from_this<Worker> {
+    int data = 0;
+
+    static Coro<void> task(std::shared_ptr<Worker> self) {
+        co_await long_running();
+        use(self->data);  // safe — self keeps Worker alive
+    }
+
+    Coro<void> start() {
+        spawn(task(shared_from_this())).detach();  // safe — task owns a ref
+        co_return;
+    }
+};
+```
+
+The static-method approach gives up the implicit `this` syntax in exchange for an
+explicit, auditable lifetime guarantee. Prefer it whenever a member coroutine may be
+spawned without a containing scope that provably outlives it.
+
+### CS.5 — Detached tasks must own all their data
 
 **Reason:** `JoinHandle::detach()` explicitly opts the task out of the coroutine scope
 mechanism. The library makes no lifetime guarantee for detached tasks — they may be
@@ -290,7 +355,50 @@ auto sh = build_task().name("packet-reader").buffer(128).spawn(read_packets(sock
 
 ## Cancellation Safety
 
-### CA.1 — Do not assume cancelled futures stop immediately; they drain before completing
+### CA.1 — Use RAII for all resources owned by a coroutine frame
+
+**Reason:** Cancellation does not propagate via exceptions. When a coroutine is cancelled
+while suspended at a `co_await` point it is simply never resumed again — the only code
+that still runs is the destructors of objects on the coroutine frame, in reverse
+declaration order. A `try`/`catch` or `try`/`finally`-style guard cannot protect against
+this: if the coroutine is suspended inside the `try` block it will never reach the
+corresponding `catch` or cleanup code. The destructors are all that execute.
+
+This makes RAII more important in coroutines than in ordinary synchronous functions. In
+synchronous code an exception is always catchable at the call site; in a coroutine,
+cancellation is a silent exit path that bypasses every piece of non-destructor cleanup.
+Any resource that must be released — a file handle, a lock, a connection, heap memory —
+must be owned by a RAII handle whose destructor performs the release.
+
+```cpp
+// BAD — try/catch looks safe but is bypassed if the coroutine is cancelled
+// while suspended. Cancellation does not throw; the coroutine simply stops
+// being resumed. The catch block and the delete never execute.
+Coro<void> bad() {
+    auto* buf = new char[4096];
+    try {
+        co_await some_io();   // cancelled here — coroutine frame is destroyed,
+                              // catch block never runs, buf is leaked
+        delete[] buf;
+    } catch (...) {
+        delete[] buf;         // handles exceptions, but NOT cancellation
+        throw;
+    }
+}
+
+// GOOD — destructor runs regardless of how the coroutine exits,
+// including cancellation
+Coro<void> good() {
+    auto buf = std::make_unique<char[]>(4096);
+    co_await some_io();   // cancellation here destroys buf via ~unique_ptr
+}
+```
+
+The same applies to mutexes, file descriptors, and any other resource with an explicit
+release step. `std::lock_guard`, `std::unique_lock`, RAII file wrappers, and similar
+handles all guarantee cleanup through their destructor — `try`/`catch` blocks do not.
+
+### CA.2 — Do not assume cancelled futures stop immediately; they drain before completing
 
 **Reason:** Cancellation is cooperative and asynchronous, not instantaneous. When a future
 is cancelled, it must first drain its currently-awaited sub-future (waiting for it to return
@@ -308,32 +416,6 @@ progress.
 auto result = co_await timeout(5s, long_running_task());
 // By the time this line is reached, long_running_task's frame has been
 // fully destroyed and all its children have drained.
-```
-
-### CA.2 — Do not put blocking destructors in futures that may be cancelled as a losing branch
-
-**Reason:** When a branch is cancelled (losing a `select` or expiring a `timeout`), its
-drain runs on whichever executor worker thread happens to poll it next. A destructor that
-blocks that thread — joining a `std::thread`, waiting on a condition variable, flushing a
-synchronous buffer — stalls all other tasks scheduled on that worker for the duration.
-Blocking destructors belong in `spawn_blocking` callables, not in coroutine locals.
-
-```cpp
-// BAD — destructor blocks
-struct BlockingResource {
-    ~BlockingResource() {
-        completion_thread.join();  // blocks an executor thread during drain
-    }
-    std::thread completion_thread;
-};
-
-Coro<void> bad_branch() {
-    BlockingResource r;  // destructor will block the executor during drain
-    co_await long_work();
-}
-
-// GOOD — use spawn_blocking to do the join off the executor thread, or
-// restructure so the resource is cleaned up before any select/timeout.
 ```
 
 ### CA.3 — Check for cancellation in long-running loops
@@ -360,6 +442,32 @@ Coro<void> good(std::vector<Item> items) {
             co_await yield_now();  // allows cancellation to be observed
     }
 }
+```
+
+### CA.4 — Do not put blocking destructors in futures that may be cancelled as a losing branch
+
+**Reason:** When a branch is cancelled (losing a `select` or expiring a `timeout`), its
+drain runs on whichever executor worker thread happens to poll it next. A destructor that
+blocks that thread — joining a `std::thread`, waiting on a condition variable, flushing a
+synchronous buffer — stalls all other tasks scheduled on that worker for the duration.
+Blocking destructors belong in `spawn_blocking` callables, not in coroutine locals.
+
+```cpp
+// BAD — destructor blocks
+struct BlockingResource {
+    ~BlockingResource() {
+        completion_thread.join();  // blocks an executor thread during drain
+    }
+    std::thread completion_thread;
+};
+
+Coro<void> bad_branch() {
+    BlockingResource r;  // destructor will block the executor during drain
+    co_await long_work();
+}
+
+// GOOD — use spawn_blocking to do the join off the executor thread, or
+// restructure so the resource is cleaned up before any select/timeout.
 ```
 
 ---
@@ -441,14 +549,6 @@ Coro<void> good() {
     auto h = spawn_blocking([data = std::move(data)]() { return process(data); });
     co_return;
 }
-
-// ALSO GOOD — co_await before locals are destroyed (but fragile: don't store
-// the handle and await it elsewhere)
-Coro<void> also_good() {
-    std::string data = load_data();
-    int result = co_await spawn_blocking([&data]() { return process(data); });
-    // data still alive; handle already resolved
-}
 ```
 
 ### BL.4 — Use a nested `Runtime` inside `spawn_blocking` to run async code in isolation
@@ -473,17 +573,24 @@ Coro<void> run() {
 
 ## Channels
 
-### CH.1 — Never hold a `BorrowGuard` across a `co_await` point
+Channels are the library's embodiment of the Go proverb: *"Do not communicate by sharing
+memory; instead, share memory by communicating."* Rather than protecting shared state with
+a mutex and having tasks reach in to read or write it, channels let tasks exchange ownership
+of values — the sender produces, the receiver consumes, and the channel handles the
+synchronization transparently. The rules in this section cover the places where that model
+has sharp edges.
 
-**Reason:** `BorrowGuard<T>` holds a shared read lock on the watch channel's value for
+### CH.1 — Never hold a `WatchBorrowGuard` across a `co_await` point
+
+**Reason:** `WatchBorrowGuard<T>` holds a shared read lock on the watch channel's value for
 its entire lifetime. A shared read lock blocks any `send()` call, which requires the
-exclusive write lock. Holding a `BorrowGuard` while suspended means the task is parked —
+exclusive write lock. Holding a `WatchBorrowGuard` while suspended means the task is parked —
 possibly indefinitely — while the lock is held. Any sender that tries to update the value
 will deadlock waiting for the guard to be released. The fix is always to copy the value
 out of the guard before suspending.
 
 ```cpp
-// BAD — BorrowGuard held across co_await
+// BAD — WatchBorrowGuard held across co_await
 Coro<void> bad(WatchReceiver<Config>& rx) {
     auto guard = rx.borrow();
     co_await do_work(*guard);  // read lock held while suspended — blocks all senders
@@ -505,22 +612,22 @@ Coro<void> also_good(WatchReceiver<Config>& rx) {
 }
 ```
 
-### CH.2 — Always recover the value from a failed `trySend`
+### CH.2 — Always recover the value from a failed `try_send`
 
-**Reason:** `trySend` is designed around the principle that a failed send should never
+**Reason:** `try_send` is designed around the principle that a failed send should never
 silently lose the caller's value. For move-only types (`unique_ptr`, file handles, etc.)
-this is critical — if `trySend` consumed the value and then returned an error with no way
+this is critical — if `try_send` consumed the value and then returned an error with no way
 to recover it, the caller would have no way to retry or clean up. The `TrySendError<T>`
 return type is deliberately designed to give the value back. Ignoring the error case and
 letting `r` go out of scope destroys the value with no record of it being undelivered.
 
 ```cpp
 // BAD — move-only value silently lost on failure
-auto r = tx.trySend(std::move(my_unique_ptr));
+auto r = tx.try_send(std::move(my_unique_ptr));
 if (!r) { /* oops — my_unique_ptr is gone and the send failed */ }
 
 // GOOD — recover the value on failure
-if (auto r = tx.trySend(std::move(my_unique_ptr)); !r) {
+if (auto r = tx.try_send(std::move(my_unique_ptr)); !r) {
     my_unique_ptr = std::move(r.error().value);  // reclaim it
     // decide: retry later, drop it, or log
 }
@@ -538,7 +645,7 @@ the outer `expected` is the transport; the inner is the application.
 
 ```cpp
 // GOOD
-auto [tx, rx] = mpsc::channel<std::expected<int, MyError>>(16);
+auto [tx, rx] = mpsc_channel<std::expected<int, MyError>>(16);
 
 // Sender — success:
 co_await tx.send(42);
@@ -565,20 +672,20 @@ object to the thread that needs it.
 
 ```cpp
 // BAD — two threads call methods on the same Sender instance
-std::thread([&tx]() { tx.trySend(1); }).detach();
-tx.trySend(2);  // data race on tx
+std::thread([&tx]() { tx.try_send(1); }).detach();
+tx.try_send(2);  // data race on tx
 
 // GOOD — give each thread its own clone
 auto tx2 = tx.clone();
-std::thread([tx2 = std::move(tx2)]() mutable { tx2.trySend(1); }).detach();
-tx.trySend(2);  // tx and tx2 are independent objects
+std::thread([tx2 = std::move(tx2)]() mutable { tx2.try_send(1); }).detach();
+tx.try_send(2);  // tx and tx2 are independent objects
 ```
 
 ---
 
 ## Select and Timeout
 
-### ST.1 — Expect latency after `select` — the losing branch must finish before the result is delivered
+### ST.1 — Design `select` branches to drain quickly; the losing branch blocks result delivery
 
 **Reason:** C++ futures cannot be freed without running destructors. When a `select`
 branch loses, it cannot simply be dropped — it must be polled to `PollDropped` so its
@@ -616,7 +723,7 @@ auto result = co_await select(fast(), slow_branch());
 // Drain of slow_branch blocks the executor worker while flushing
 ```
 
-### ST.3 — Apply the same latency expectations to `timeout` as to `select`
+### ST.3 — `timeout` has the same drain behaviour as `select`; treat it identically
 
 **Reason:** `timeout(dur, f)` is implemented directly as `select(sleep_for(dur), f)`.
 Every rule about `select` drain behaviour — latency, slow destructors, resource lifetimes
@@ -658,22 +765,13 @@ while (true) {
 }
 ```
 
-Four rules to remember when using `coro::ref()`:
+Two rules to remember when using `coro::ref()`:
 
 1. **Lvalue only.** `coro::ref()` only accepts lvalues. Store the future in a named variable
    first; `coro::ref(spawn(f()))` is a compile error. This guarantees the underlying future
    has a lifetime longer than the wrapper.
-2. **Non-copyable.** `FutureRef` is non-copyable. Create it, pass it to `select`, and let it
-   go — do not store it in a variable or reuse it across multiple calls.
-3. **Result consumption.** If the `coro::ref(f)` branch wins, the result is moved out of `f`.
+2. **Result consumption.** If the `coro::ref(f)` branch wins, the result is moved out of `f`.
    Do not await `f` again afterward — it is logically spent even though it was never moved.
-4. **Never cancels the underlying future.** `FutureRef<F>` is never `Cancellable`, regardless
-   of whether `F` is. When the ref branch loses, `select()` simply drops the wrapper without
-   calling `cancel()` on `f` — keeping it running for the next round. The tradeoff is that
-   any waker `f` registered during the losing poll remains live. If that event fires before
-   the next select round, the task may be polled spuriously. This is harmless — `poll()` is
-   required to tolerate spurious calls — but it may cause one extra scheduler wake-up per
-   round in high-frequency select loops.
 
 ---
 
@@ -821,7 +919,7 @@ it as an unexpected error, logging it, or propagating it up as an exception is i
 it should be a clean exit.
 
 ```cpp
-Coro<void> producer(mpsc::Sender<int> tx) {
+Coro<void> producer(MpscSender<int> tx) {
     for (int i = 0; ; ++i) {
         auto r = co_await tx.send(i);
         if (!r) {

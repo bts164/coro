@@ -14,9 +14,9 @@
 #include <coro/sync/sleep.h>        // sleep_for()
 #include <coro/sync/timeout.h>      // timeout()
 #include <coro/sync/mutex.h>        // Mutex
-#include <coro/sync/oneshot.h>      // oneshot::channel<T>
-#include <coro/sync/mpsc.h>         // mpsc::channel<T>
-#include <coro/sync/watch.h>        // watch::channel<T>
+#include <coro/sync/oneshot.h>      // oneshot_channel<T>
+#include <coro/sync/mpsc.h>         // mpsc_channel<T>
+#include <coro/sync/watch.h>        // watch_channel<T>
 #include <coro/io/tcp_stream.h>     // TcpStream
 #include <coro/io/tcp_listener.h>   // TcpListener
 #include <coro/io/file.h>           // File
@@ -46,8 +46,8 @@ coro::CoroStream<int> range(int n) {
 }
 
 coro::Coro<void> consume() {
-    auto s = range(5);
-    while (auto item = co_await coro::next(s))
+    coro::CoroStream<int> s = range(5);
+    while (std::optional<int> item = co_await coro::next(s))
         use(*item);
 }
 ```
@@ -55,9 +55,12 @@ coro::Coro<void> consume() {
 ## Runtime entry point
 
 ```cpp
-coro::Runtime rt;    // WorkStealingExecutor, hardware_concurrency() threads
-coro::Runtime rt(4); // WorkStealingExecutor, 4 threads
-coro::Runtime rt(1); // SingleThreadedExecutor — deterministic, good for tests
+// WorkStealingExecutor, hardware_concurrency() threads
+coro::Runtime rt;
+// WorkStealingExecutor, 4 threads
+coro::Runtime rt(4);
+// SingleThreadedExecutor — deterministic, good for tests
+coro::Runtime rt(1);
 
 int result = rt.block_on(compute());
 rt.block_on(do_work());
@@ -72,14 +75,17 @@ coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
 ## Spawn & JoinHandle
 
 ```cpp
-auto h = coro::spawn(compute());
+coro::JoinHandle<int> h = coro::spawn(compute());
 int v = co_await h;
 
-auto h = coro::build_task().name("my-task").spawn(compute()); // named, for debugging
-coro::spawn(compute()).detach();                               // fire and forget
+// named task — useful for debugging
+coro::JoinHandle<int> h =
+    coro::build_task().name("my-task").spawn(compute());
+// fire and forget
+coro::spawn(compute()).detach();
 
 {
-    auto h = coro::spawn(compute());
+    coro::JoinHandle<int> h = coro::spawn(compute());
 }  // h goes out of scope → task cancelled and drained
 ```
 
@@ -91,38 +97,36 @@ co_await coro::co_invoke([&]() -> coro::Coro<void> {
     coro::JoinSet<int> js;
     for (int i = 0; i < N; ++i)
         js.spawn(compute(i));
-    while (auto result = co_await coro::next(js))
+    // For JoinSet<void>, next() returns bool (true = completed,
+    // false = exhausted) since std::optional<void> is ill-formed.
+    while (std::optional<int> result = co_await coro::next(js))
         use(*result);
-});
-
-co_await coro::co_invoke([&]() -> coro::Coro<void> {
-    coro::JoinSet<void> js;
-    js.spawn(task_a());
-    js.spawn(task_b());
-    co_await js.drain();
 });
 ```
 
 ## join — concurrent fixed fan-out
 
 ```cpp
+// std::tuple<int, std::string>
 auto [a, b] = co_await coro::join(fetch_int(), fetch_string());
-auto [n, _] = co_await coro::join(fetch_int(), side_effect()); // void → VoidJoinBranch{}
+// std::tuple<int, VoidJoinBranch> — void results become VoidJoinBranch{}
+auto [n, _] = co_await coro::join(fetch_int(), side_effect());
 ```
 
 ## select — race futures
 
 ```cpp
 // first to complete wins; others cancelled
+// std::variant<SelectBranch<0,T0>, SelectBranch<1,T1>, ...>
 auto sel = co_await coro::select(fast(), slow());
-// sel is std::variant<SelectBranch<0,T0>, SelectBranch<1,T1>, ...>
 if (sel.index() == 0)
     use(std::get<0>(sel).value);
 
 // coro::ref — borrow without cancelling the losing branch
 coro::JoinHandle<int> task = coro::spawn(long_running());
 while (true) {
-    auto sel = co_await coro::select(coro::ref(task), coro::sleep_for(100ms));
+    auto sel = co_await coro::select(
+        coro::ref(task), coro::sleep_for(100ms));
     if (sel.index() == 0) { use(std::get<0>(sel).value); break; }
 }
 ```
@@ -134,7 +138,8 @@ using namespace std::chrono_literals;
 
 co_await coro::sleep_for(100ms);
 
-// equivalent to select(fetch_data(), sleep_for(500ms))
+// variant<SelectBranch<0,T>, SelectBranch<1,void>>
+// index 0 = result, index 1 = timed out
 auto result = co_await coro::timeout(500ms, fetch_data());
 if (result.index() == 0)
     use(std::get<0>(result).value);
@@ -146,41 +151,56 @@ else
 
 ```cpp
 coro::Mutex mtx;
-auto guard = co_await mtx.lock(); // suspends if locked; no thread is blocked
+// suspends if locked; no thread is blocked
+coro::MutexGuard guard = co_await mtx.lock();
 // guard releases on destruction — safe to co_await while holding
 ```
 
-## Channels
+## oneshot — single value, one sender, one receiver
 
 ```cpp
-// oneshot — single value, one sender, one receiver
-auto [tx, rx] = coro::oneshot::channel<int>();
-tx.send(42);                              // synchronous, any thread
-auto r = co_await rx;                     // std::expected<int, ChannelError>
+// OneshotSender<int>, OneshotReceiver<int>
+auto [tx, rx] = coro::oneshot_channel<int>();
+tx.send(42);                        // synchronous, any thread
+std::expected<int, ChannelError> r = co_await rx;
+```
 
-// mpsc — bounded queue, multiple producers, one consumer
-auto [tx, rx] = coro::mpsc::channel<int>(/*capacity=*/16);
-auto tx2 = tx.clone();                    // clone for additional producers
-co_await tx.send(v);                      // suspends if full
-tx.trySend(v);                            // non-blocking attempt
-while (auto v = co_await coro::next(rx))  // exits when all senders dropped
+## mpsc — bounded queue, multiple producers, one consumer
+
+```cpp
+// MpscSender<int>, MpscReceiver<int>
+auto [tx, rx] = coro::mpsc_channel<int>(/*capacity=*/16);
+MpscSender<int> tx2 = tx.clone(); // clone for additional producers
+co_await tx.send(v);               // suspends if full
+tx.try_send(v);                    // non-blocking attempt
+// exits when all senders dropped
+while (std::optional<int> v = co_await coro::next(rx))
     use(*v);
+```
 
-// watch — last-value broadcast, one sender, many receivers
-auto [tx, rx] = coro::watch::channel<int>(/*initial=*/0);
-tx.send(42);                              // synchronous, never suspends
-auto rx2 = rx.clone();                    // independent receiver
-auto r = co_await rx.changed();           // wait for next update
-if (!r) co_return;                        // sender dropped
-{ auto g = rx.borrow(); use(*g); }        // read under shared lock
-// do NOT hold BorrowGuard across co_await
+## watch — last-value broadcast, one sender, many receivers
+
+```cpp
+// WatchSender<int>, WatchReceiver<int>
+auto [tx, rx] = coro::watch_channel<int>(/*initial=*/0);
+tx.send(42);  // synchronous, never suspends
+WatchReceiver<int> rx2 = rx.clone(); // independent receiver
+// wait for next update; std::expected<void, ChannelError>
+std::expected<void, ChannelError> r = co_await rx.changed();
+if (!r) co_return;  // sender dropped
+// read under shared lock — do NOT hold across co_await
+{ WatchBorrowGuard<int> g = rx.borrow(); use(*g); }
+// write in place; version++ and receivers notified on drop
+{ WatchBorrowMutGuard<int> g = tx.borrow_mut(); *g = 99; }
 ```
 
 ## Capturing-lambda safety
 
 ```cpp
 // WRONG — closure destroyed before first co_await
-coro::spawn([x]() -> coro::Coro<void> { co_await f(); use(x); }());
+coro::spawn([x]() -> coro::Coro<void> {
+    co_await f(); use(x);
+}());
 
 // CORRECT — co_invoke keeps closure alive for the duration
 coro::spawn(coro::co_invoke([x]() -> coro::Coro<void> {
@@ -190,17 +210,19 @@ coro::spawn(coro::co_invoke([x]() -> coro::Coro<void> {
 // Borrow outer locals safely with co_invoke scope
 int shared = 42;
 co_await coro::co_invoke([&]() -> coro::Coro<void> {
-    auto h = coro::spawn(worker(&shared)); // shared outlives this scope
+    // shared outlives this scope
+    coro::JoinHandle<void> h = coro::spawn(worker(&shared));
     co_await h;
 });
 ```
 
-## Cancellation
+## Structured Cancellation
 
 ```cpp
 {
-    auto h = coro::spawn(long_running());
-} // drop → root cancelled → children cancelled recursively; no tokens needed
+    coro::JoinHandle<void> h = coro::spawn(long_running());
+// drop → root cancelled → children cancelled recursively
+}
 ```
 
 ## spawn_blocking — offload blocking code
@@ -208,8 +230,9 @@ co_await coro::co_invoke([&]() -> coro::Coro<void> {
 ```cpp
 #include <coro/task/spawn_blocking.h>
 
+// runs on thread pool, not executor
 int result = co_await coro::spawn_blocking([]() {
-    return expensive_sync_computation(); // runs on thread pool, not executor
+    return expensive_sync_computation();
 });
 ```
 
@@ -217,13 +240,17 @@ int result = co_await coro::spawn_blocking([]() {
 
 ```cpp
 // Client
-auto stream = co_await coro::TcpStream::connect("127.0.0.1", 8080);
-auto [n, buf] = co_await stream.read(std::vector<std::byte>(4096));
+coro::TcpStream stream =
+    co_await coro::TcpStream::connect("127.0.0.1", 8080);
+// std::pair<size_t, vector<byte>>
+auto& [n, buf] = co_await stream.read(std::vector<std::byte>(4096));
 buf.resize(n);
 co_await stream.write(std::move(buf));
 
 // Server
-auto listener = co_await coro::TcpListener::bind("0.0.0.0", 8080);
+coro::TcpListener listener =
+    co_await coro::TcpListener::bind("0.0.0.0", 8080);
+// std::optional<TcpStream>
 while (auto conn = co_await coro::next(listener))
     coro::spawn(handle(*conn)).detach();
 ```
@@ -231,14 +258,19 @@ while (auto conn = co_await coro::next(listener))
 ## File I/O
 
 ```cpp
-auto f = co_await coro::File::open("data.txt", coro::FileMode::Read);
-auto [n, buf] = co_await f.read(std::vector<std::byte>(4096));
+coro::File f =
+    co_await coro::File::open("data.txt", coro::FileMode::Read);
+// std::pair<size_t, vector<byte>>
+auto& [n, buf] = co_await f.read(std::vector<std::byte>(4096));
 buf.resize(n);
 
-auto out = co_await coro::File::open(
-    "out.txt", coro::FileMode::Write | coro::FileMode::Create | coro::FileMode::Truncate);
+coro::File out = co_await coro::File::open("out.txt",
+    coro::FileMode::Write | coro::FileMode::Create |
+    coro::FileMode::Truncate);
 co_await out.write(std::move(buf));
 
-auto [n2, buf2] = co_await f.read_at(std::vector<std::byte>(4096), /*offset=*/512);
-auto [n3, buf3] = co_await f.read(std::vector<std::byte>(4096), /*exact=*/true);
+auto& [n2, buf2] =
+    co_await f.read_at(std::vector<std::byte>(4096), /*offset=*/512);
+auto& [n3, buf3] =
+    co_await f.read(std::vector<std::byte>(4096), /*exact=*/true);
 ```
