@@ -13,6 +13,8 @@
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/single_threaded_executor.h>
 #include <coro/io/poll_stream.hpp>
+#include <coro/io/decoder_stream.h>
+#include <coro/io/byte_source.h>
 #include <coro/sync/sleep.h>
 #include <coro/task/spawn_blocking.h>
 
@@ -51,93 +53,31 @@ struct std::formatter<HexView> {
     }
 };
 
-class PacketDecoder {
-public:
-    using OutputType = Packet;
+coro::DecoderStream<Packet> packet_decoder(coro::ByteSource& src) {
+    for (;;) {
+        PacketHeader header;
+        if (co_await src.memcpy(&header, sizeof(header)) == 0) co_return;
 
-    PacketDecoder() = default;
+        if (header.magic != PacketHeader::MAGIC)
+            throw std::runtime_error(std::format("Invalid packet header {}", header));
 
-    /// Decode one packet from byte buffer.
-    ///
-    /// Accumulates bytes incrementally so consumed > 0 whenever any input bytes
-    /// are available. This is required because CircularByteBuffer::readable_span()
-    /// returns only the contiguous region up to the wrap point — returning
-    /// consumed=0 from a non-empty buffer would permanently stall PollStream's
-    /// decode loop when a large payload crosses the buffer's wrap boundary.
-    std::optional<Packet> decode(std::span<const std::byte> buffer, std::size_t& consumed)
-    {
-        consumed = 0;
-        while (!buffer.empty()) {
-            switch (m_state) {
-            case State::ReadingHeader: {
-                std::size_t take = std::min(sizeof(PacketHeader) - m_header_bytes, buffer.size());
-                std::memcpy(reinterpret_cast<std::byte*>(&m_packet.header) + m_header_bytes,
-                            buffer.data(), take);
-                m_header_bytes += take;
-                buffer = buffer.subspan(take);
-                consumed += take;
+        std::vector<std::byte> payload_buf(header.packet_size_bytes);
+        co_await src.memcpy(payload_buf.data(), header.packet_size_bytes);
 
-                if (m_header_bytes < sizeof(PacketHeader)) return std::nullopt;
-                m_header_bytes = 0;
+        PacketFooter footer;
+        co_await src.memcpy(footer.data(), sizeof(footer));
 
-                if (m_packet.header.magic != PacketHeader::MAGIC) {
-                    throw std::runtime_error(std::format("Invalid packet header {}", m_packet.header));
-                }
-                m_payload_buf.clear();
-                m_payload_buf.reserve(m_packet.header.packet_size_bytes);
-                m_state = State::ReadingPayload;
-                continue;
-            }
-            case State::ReadingPayload: {
-                std::size_t take = std::min(
-                    m_packet.header.packet_size_bytes - m_payload_buf.size(), buffer.size());
-                m_payload_buf.insert(m_payload_buf.end(), buffer.data(), buffer.data() + take);
-                buffer = buffer.subspan(take);
-                consumed += take;
+        if (footer[0] != PacketFooter::MAGIC[0] || footer[1] != PacketFooter::MAGIC[1])
+            throw std::runtime_error(std::format("Invalid packet footer {}", footer));
 
-                if (m_payload_buf.size() < m_packet.header.packet_size_bytes) return std::nullopt;
-
-                std::vector<std::size_t> shape = {m_packet.header.packet_size_bytes / 4, 2};
-                // xt::xtensor assignment copies the data out of m_payload_buf
-                m_packet.data = xt::adapt(reinterpret_cast<int16_t const*>(m_payload_buf.data()), shape);
-                m_state = State::ReadingFooter;
-                continue;
-            }
-            case State::ReadingFooter: {
-                std::size_t take = std::min(sizeof(PacketFooter) - m_footer_bytes, buffer.size());
-                std::memcpy(reinterpret_cast<std::byte*>(m_packet.footer.data()) + m_footer_bytes,
-                            buffer.data(), take);
-                m_footer_bytes += take;
-                buffer = buffer.subspan(take);
-                consumed += take;
-
-                if (m_footer_bytes < sizeof(PacketFooter)) return std::nullopt;
-                m_footer_bytes = 0;
-
-                if (m_packet.footer[0] != PacketFooter::MAGIC[0] || m_packet.footer[1] != PacketFooter::MAGIC[1]) {
-                    throw std::runtime_error(std::format("Invalid packet footer {}", m_packet.footer));
-                }
-                m_state = State::ReadingHeader;
-                return std::exchange(m_packet, Packet());
-            }}
-        }
-        return std::nullopt;
+        Packet pkt;
+        pkt.header = header;
+        pkt.footer = footer;
+        std::vector<std::size_t> shape = {header.packet_size_bytes / 4, 2};
+        pkt.data = xt::adapt(reinterpret_cast<int16_t const*>(payload_buf.data()), shape);
+        co_yield std::move(pkt);
     }
-    void reset();
-
-private:
-    enum class State {
-        ReadingHeader,
-        ReadingPayload,
-        ReadingFooter,
-    };
-
-    State                  m_state        = State::ReadingHeader;
-    Packet                 m_packet;
-    std::size_t            m_header_bytes = 0;
-    std::vector<std::byte> m_payload_buf;
-    std::size_t            m_footer_bytes = 0;
-};
+}
 
 template<std::invocable<> Fn>
 class Defer
@@ -201,8 +141,8 @@ public:
             }
             auto closeFile = defer([=]() { close(fd); });
 
-            auto stream = coro::PollStream<Packet, PacketDecoder>::open(
-                fd, PacketDecoder(), coro::PollStreamOptions{ .backpressure = coro::BackpressureMode::Overrun });
+            auto stream = coro::PollStream<Packet>::open(
+                fd, coro::PollStreamOptions{ .backpressure = coro::BackpressureMode::Overrun }, packet_decoder);
             
             LOG(INFO) << "Starting stream";
             while (true) {

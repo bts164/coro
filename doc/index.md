@@ -24,79 +24,71 @@ coro::Coro<std::string> fetch(std::string url) {
 }
 ```
 
-### Coroutines vs. threads
-
-The crucial difference from OS threads is what happens while a coroutine waits:
-
-| | OS Thread | Coroutine |
-|---|---|---|
-| Waiting for I/O | Thread **blocks** — OS parks it, stack stays allocated | Coroutine **suspends** — returns control to the runtime, stack frame is saved on the heap |
-| Switching cost | OS kernel context switch (~microseconds) | Function call (~nanoseconds) |
-| Memory per unit | ~1–8 MB stack (OS default) | A few hundred bytes on the heap |
-| Scheduling | Preemptive — OS can interrupt at any time | Cooperative — suspends only at `co_await` points |
-| Shared state | Needs locks for shared data | Single-threaded coroutines need no locks; multi-threaded ones still do |
-
-Because each suspended coroutine costs only its heap-allocated frame rather than a full OS
-stack, a single process can run **hundreds of thousands of concurrent coroutines** with the
-same resources that would support only a few thousand threads.
-
 ### The runtime and executor
 
-Coroutines do not run themselves — they need a **runtime** to drive them. The runtime's
-**executor** runs on one or more OS threads and is responsible for scheduling and resuming
-coroutines on those threads when the events they are waiting on fire. When all coroutines
-are suspended waiting for I/O or timers, the executor sleeps and the I/O reactor wakes it
-when something is ready.
-
-This library's `Runtime` manages the executor and a libuv I/O reactor for network and
-timer events. The default executor is **work-stealing**: tasks are distributed across worker
-threads automatically, and idle workers steal tasks from busy workers before going to
-sleep — keeping all cores utilized without manual load balancing.
-
-`Runtime::block_on()` is the entry point from synchronous code into the async world. It
-runs a single root coroutine to completion on the runtime, blocking the calling thread
-until it finishes. Everything else — spawning tasks, awaiting I/O, sleeping — happens
-from inside that root coroutine.
+Coroutines do not run themselves — each is an idle heap-allocated *"stack"* frame representing a value
+to be produced in the future, waiting for a **runtime** to schedule and resume it as
+events fire. `Runtime::block_on()` is the entry point from synchronous code into the
+async world; everything else happens from inside that root coroutine:
 
 ```cpp
-coro::Coro<int> async_main(int argc, char* argv[]) {
-    // Inside block_on: co_await, spawn(), I/O, timers are all available here.
-    ...
-    co_return 0;
-}
-
 int main(int argc, char* argv[]) {
+    // Calling async_main() produces an idle coroutine — nothing has run yet.
+    coro::Coro<int> work = async_main(argc, argv);
+
     coro::Runtime rt;
-    return rt.block_on(async_main(argc, argv));
+    return rt.block_on(std::move(work));  // execution starts here
 }
 ```
+
+### Tasks vs. threads
+
+*A task is a coroutine scheduled and driven by the runtime executor.* The crucial
+difference from OS threads is what happens while a task waits:
+
+| | OS Thread | Task |
+|---|---|---|
+| Waiting for I/O | Thread **blocks** — OS parks it, stack stays allocated | Task **suspends** — frame stays on the heap so it can resume later; control returns to the runtime immediately |
+| Switching cost | OS kernel context switch (~microseconds) | Executor resumes next task (~nanoseconds) |
+| Memory per unit | ~1–8 MB stack (OS default) | A few hundred bytes on the heap |
+| Scheduling | Preemptive — OS can interrupt at any time | Cooperative — suspends only at `co_await` points |
+| Practical scale | Thousands | Hundreds of thousands |
+
 ## Key features
 
-- **`Coro<T>`** — async function return type; compose with `co_await` like any other future.
-- **`CoroStream<T>`** — async generator; emit values with `co_yield`, consume with `next()`.
-- **`spawn()` / `JoinHandle`** — schedule background tasks; await their results or cancel them.
-- **`JoinSet<T>`** — fan out many tasks of the same type; collect results in completion order.
-- **`join()`** — run a fixed set of heterogeneous futures concurrently; wait for all.
-- **`select()`** — race futures; return the result of whichever completes first.
-- **`timeout()`** — race any future against a deadline.
-- **`sleep_for()`** — suspend a coroutine for a duration without blocking a thread.
-- **Channels** — `oneshot`, `mpsc`, and `watch` channels for inter-task communication.
+- **`Coro<T>` / `CoroStream<T>`** — async function and async generator return types; compose with `co_await` and `co_yield`.
+- **`spawn()` / `JoinHandle` / `JoinSet`** — spawn background tasks, await their results or cancel them, or fan out to many tasks and collect results in completion order.
+- **Channels** — thread-safe, typed, async channels for inter-task communication:
+    - **`oneshot`** — single-use, one value, one sender, one receiver; sender is synchronous.
+    - **`mpsc`** — bounded, backpressured queue; multiple producers, one consumer.
+    - **`watch`** — single latest value, multiple senders, multiple receivers.
+- **Concurrent combinators** — `join` (wait for all), `select` (first wins), `timeout` (deadline), `sleep_for` (non-blocking sleep).
 - **`spawn_blocking()`** — run blocking code on a dedicated thread pool without starving the executor.
-- **Multi-threaded work-stealing executor** — tasks are distributed across worker threads
-  automatically; idle workers steal from busy workers before parking.
+- **Async I/O** — `File`, `TcpStream`, `TcpListener`, `WsStream`, and `WsListener` for async file, TCP, and WebSocket I/O (backed by libuv).
+- **Multi-threaded executor** — tasks are distributed across worker threads automatically.
 
 ## Quick example
 
 The following is a common pattern in connection-based server communication: poll two
 redundant servers for a long-running result, send keepalives while waiting to detect
-disconnections, and enforce an overall deadline. The thread-and-callback version of this
-requires four things that have nothing to do with the logic: a state machine to track
-which phase you're in, a mutex protecting the shared result, a dedicated timer thread for
-keepalives, and a cancellation flag carefully threaded through every layer — with the
-constant risk that a blocking call somewhere never checks it. With coroutines, the
-structure maps directly to the intent. The three concurrent concerns (`poll_status`,
-`poll_status`, `keepalive`) are just three branches of a `select`. The deadline is one
-`timeout` wrapper. Cancellation is intrinsic — every `co_await` is already an exit point.
+disconnections, and enforce an overall deadline. The thread-and-callback version requires
+four things that have nothing to do with the logic:
+
+- A state machine to track which phase you're in
+- A mutex protecting the shared result
+- A dedicated timer thread for keepalives
+- A cancellation flag carefully threaded through every layer — with the constant risk that
+  a blocking call somewhere never checks it
+
+With coroutines, the structure maps directly to the intent. The three concurrent concerns
+(two redundant `poll_status` calls and `keepalive`) are just three branches of a `select`.
+The deadline is one `timeout` wrapper. Cancellation is intrinsic — every `co_await` is
+already an exit point.
+
+Under the hood the same four pieces are still there — the coroutine frame *is* the state
+machine (generated by the compiler from your sequential code), channels and `JoinHandle`
+manage the mutexes, the executor drives the timer callbacks, and every `co_await` is a
+built-in cancellation check. You just never have to explicitly write any of it.
 
 ```cpp
 #include <coro/coro.h>
@@ -131,26 +123,26 @@ coro::Coro<Result> poll_until_ready(Connection& primary, Connection& backup, int
     while (true) {
         // Race both servers against a keepalive tick.
         // select() drives all three concurrently; first to complete wins.
+        // select() returns a variant — index() tells you which branch won.
         auto sel = co_await coro::select(
-            poll_status(primary, id),
-            poll_status(backup,  id),
+            poll_status(primary, id),   // branch 0
+            poll_status(backup,  id),   // branch 1
             keepalive(primary, backup)  // branch 2: fires after 500ms of silence
         );
 
         if (sel.index() == 0 || sel.index() == 1) {
-            // A server responded — retrieve whichever answered first.
+            // A server responded — unwrap whichever branch won.
             Result& r = sel.index() == 0
-                ? std::get<0>(sel).value
+                ? std::get<0>(sel).value  // .value is the SelectBranch result field
                 : std::get<1>(sel).value;
 
             if (r.ready)
                 co_return r;
 
-            // Not ready yet — pause briefly before polling again.
-            co_await coro::sleep_for(100ms);
+            co_await coro::sleep_for(100ms);  // not ready yet — poll again shortly
         }
-        // sel.index() == 2: keepalive fired, connections verified — loop and poll again.
-        // A ping failure or timeout throws, propagating out through select before reaching here.
+        // branch 2: keepalive fired, connections verified — loop and poll again.
+        // A ping failure or timeout throws out of select() before reaching here.
     }
 }
 
@@ -159,10 +151,11 @@ coro::Coro<void> run(Connection& primary, Connection& backup) {
 
     // Enforce an overall deadline across the entire poll loop.
     // When it fires, both in-flight requests and any pending keepalive drain cleanly.
+    // timeout() returns a variant: index 0 = completed, index 1 = deadline fired.
     auto outcome = co_await coro::timeout(30s, poll_until_ready(primary, backup, 42));
 
     if (outcome.index() == 0)
-        std::cout << std::get<0>(outcome).value.value << "\n";
+        std::cout << std::get<0>(outcome).value.value << "\n";  // SelectBranch.value = Result
     else
         std::cout << "timed out\n";
 }
@@ -178,11 +171,10 @@ Structured cancellation composes for free at any granularity: spawn `run()` as a
 drop the `JoinHandle` at any point — every `co_await` in the entire tree (poll loop,
 keepalive, timeout) becomes a clean exit point automatically. No tokens to thread through
 every layer, no risk of getting stuck at a blocking call that never checks the flag.
-For cases where the canceller lives outside the task hierarchy, cooperative cancellation
-via `CancellationToken` is coming soon.
 
 ## Where to go next
 
 - [Getting Started](getting_started.md) — step-by-step introductory tour of all major features with examples.
+- [Patterns](patterns.md) — idiomatic solutions to recurring async programming problems: request-reply, actors, graceful shutdown, fan-out, pipelines, retry, and more.
 - [Library Usage Guidelines](guidelines.md) — [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines) style rules for writing correct, safe, and idiomatic code with this library
 - [Internal Design Details](architecture.md) — architecture, design decisions, and implementation reference.

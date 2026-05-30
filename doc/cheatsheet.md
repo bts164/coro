@@ -156,7 +156,7 @@ coro::MutexGuard guard = co_await mtx.lock();
 // guard releases on destruction — safe to co_await while holding
 ```
 
-## oneshot — single value, one sender, one receiver
+## oneshot — single-use, one value, one sender, one receiver
 
 ```cpp
 // OneshotSender<int>, OneshotReceiver<int>
@@ -178,7 +178,7 @@ while (std::optional<int> v = co_await coro::next(rx))
     use(*v);
 ```
 
-## watch — last-value broadcast, one sender, many receivers
+## watch — last-value broadcast, multiple senders, many receivers
 
 ```cpp
 // WatchSender<int>, WatchReceiver<int>

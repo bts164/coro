@@ -7,18 +7,17 @@
 namespace coro {
 
 /**
- * @brief Type alias for PCIe character device packet stream.
- *
- * Convenience alias for PollStream specialized for the PCIe character device protocol.
+ * @brief PollStream specialisation for the PCIe character device protocol.
  *
  * Usage:
- *   int fd = open("/dev/pcie_data", O_RDONLY | O_NONBLOCK);
- *   auto stream = PcieStream::open(fd, PcieDecoder{});
- *
- *   while (auto pkt = co_await stream.next()) {
- *       process_packet(*pkt);
- *   }
+ * @code
+ * int fd = open("/dev/pcie_data", O_RDONLY | O_NONBLOCK);
+ * auto stream = PcieStream::open(fd, pcie_decoder);
+ * while (auto pkt = co_await next(stream)) {
+ *     process(*pkt);
+ * }
+ * @endcode
  */
-using PcieStream = PollStream<PciePacket, PcieDecoder>;
+using PcieStream = PollStream<PciePacket>;
 
 } // namespace coro

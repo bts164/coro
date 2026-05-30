@@ -3,11 +3,12 @@
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/waker.h>
-#include <coro/io/circular_byte_buffer.h>
-#include <coro/io/decoder_concept.h>
+#include <coro/io/byte_source.h>
+#include <coro/io/decoder_stream.h>
 #include <coro/io/ring_buffer.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/runtime/uv_future.h>
+#include <coro/stream.h>
 #include <coro/task/spawn_on.h>
 #include <coro/coro.h>
 #include <uv.h>
@@ -56,15 +57,14 @@ enum class BackpressureMode {
  */
 class PollStreamOverrunError : public std::exception {
 public:
-    PollStreamOverrunError(std::size_t m) :
-        m_what(std::format("PollStreamOverrunError({})", m)),
-        m_missed(m)
-    {}
-    inline std::size_t missed() const noexcept { return m_missed; }
-    char const *what() const noexcept override { return m_what.c_str(); }
+    PollStreamOverrunError(std::size_t m)
+        : m_what(std::format("PollStreamOverrunError({})", m)), m_missed(m) {}
+    /// @brief Number of packets dropped since the last overrun notification.
+    std::size_t missed() const noexcept { return m_missed; }
+    char const* what() const noexcept override { return m_what.c_str(); }
 private:
-    std::string m_what;    
-    std::size_t m_missed; ///< Number of packets dropped since the last delivery
+    std::string m_what;
+    std::size_t m_missed;
 };
 
 /**
@@ -72,14 +72,16 @@ private:
  */
 struct PollStreamOptions {
     /// Number of decoded packets to hold in the packet ring buffer (default 64).
-    std::size_t packet_buffer_capacity = 64;
-
-    /// Raw byte buffer capacity in bytes (default 256 KB).
-    std::size_t byte_buffer_capacity = 256 * 1024;
-
+    std::size_t      packet_buffer_capacity = 64;
+    /// Raw byte accumulation buffer capacity in bytes (default 256 KB).
+    std::size_t      byte_buffer_capacity   = 256 * 1024;
     /// What to do when the packet buffer fills up.
-    BackpressureMode backpressure = BackpressureMode::Block;
+    BackpressureMode backpressure           = BackpressureMode::Block;
 };
+
+// ---------------------------------------------------------------------------
+// PollStream<T>
+// ---------------------------------------------------------------------------
 
 /**
  * @brief Event-driven Stream for pollable file descriptors with framed protocols.
@@ -91,41 +93,61 @@ struct PollStreamOptions {
  *
  * Key features:
  * - Event-driven via uv_poll_t (epoll notification when data ready)
- * - Two-level buffering (byte buffer + packet buffer)
- * - Pluggable Decoder for any framing protocol
+ * - Two-level buffering (byte accumulation buffer + decoded packet buffer)
+ * - Pluggable DecoderStream coroutine for any framing protocol
  * - Configurable backpressure policy (Block or Overrun) via PollStreamOptions
- * - Zero-copy payload support (for decoders implementing ZeroCopyDecoder)
+ * - Decoder runs inline on the libuv I/O thread — no executor scheduling per packet
  *
  * Thread safety: Not thread-safe. One consumer task per stream.
  *
  * @tparam T Decoded packet type
- * @tparam DecoderT Decoder implementing Decoder concept
  */
-template<typename T, Decoder DecoderT>
+template<typename T>
 class PollStream {
 public:
     using ItemType = T;
 
     /**
-     * @brief Open a pollable file descriptor as a Stream.
+     * @brief Open a pollable file descriptor as a Stream (default options).
      *
-     * @param fd          Open file descriptor (must support poll/epoll semantics)
-     * @param decoder     Decoder instance (moved into stream)
-     * @param options     Buffer sizes and backpressure policy (default: Block, 64 pkts, 256 KB)
-     * @param uv_exec     uv executor owning the loop (defaults to current thread's)
-     * @return PollStream instance
+     * @param fd              Open file descriptor (must support poll/epoll semantics).
+     * @param decoder_factory Callable with signature
+     *                        `DecoderStream<T>(ByteSource&, decoder_args...)`.
+     *                        Called once; the ByteSource reference is valid for the
+     *                        lifetime of the PollStream.
+     * @param decoder_args    Extra arguments forwarded verbatim to decoder_factory
+     *                        after the ByteSource reference:
+     * @code
+     * DecoderStream<Pkt> my_decoder(ByteSource& src, Config cfg) { ... }
+     *
+     * auto stream = PollStream<Pkt>::open(fd, my_decoder, cfg);
+     * @endcode
      *
      * The caller retains ownership of the fd. Close it after the stream is destroyed.
      */
-    [[nodiscard]] static PollStream open(
-        int fd,
-        DecoderT decoder,
-        PollStreamOptions options = {},
-        SingleThreadedUvExecutor* uv_exec = nullptr
-    );
+    template<typename DecoderFactory, typename... Args>
+        requires(!std::same_as<std::remove_cvref_t<DecoderFactory>, PollStreamOptions>)
+    [[nodiscard]] static PollStream open(int fd, DecoderFactory decoder_factory, Args&&... decoder_args);
 
     /**
-     * @brief Stream concept interface — poll for the next packet.
+     * @brief Open a pollable file descriptor as a Stream with explicit options.
+     *
+     * @param fd              Open file descriptor (must support poll/epoll semantics).
+     * @param options         Buffer sizes and backpressure policy.
+     * @param decoder_factory Callable with signature
+     *                        `DecoderStream<T>(ByteSource&, decoder_args...)`.
+     * @param decoder_args    Extra arguments forwarded to decoder_factory.
+     * @code
+     * auto stream = PollStream<Pkt>::open(fd,
+     *     PollStreamOptions{.backpressure = BackpressureMode::Overrun},
+     *     my_decoder, cfg);
+     * @endcode
+     */
+    template<typename DecoderFactory, typename... Args>
+    [[nodiscard]] static PollStream open(int fd, PollStreamOptions options, DecoderFactory decoder_factory, Args&&... decoder_args);
+
+    /**
+     * @brief Stream concept interface — poll for the next decoded packet.
      *
      * @return Ready(some(T))  - next packet available
      *         Ready(nullopt)  - stream exhausted (EOF)
@@ -137,75 +159,72 @@ public:
     PollResult<std::optional<T>> poll_next(detail::Context& ctx);
 
     /**
-     * @brief Close the fd and stop polling.
-     *
-     * Called automatically by destructor.
+     * @brief Close the fd and stop polling. Called automatically by destructor.
      */
     void close();
 
     PollStream(PollStream&&) noexcept;
     PollStream& operator=(PollStream&&) noexcept;
-    PollStream(const PollStream&) = delete;
+    PollStream(const PollStream&)            = delete;
     PollStream& operator=(const PollStream&) = delete;
-
     ~PollStream();
 
 private:
-    struct State; // forward declaration
+    struct State;
+
+    /// @brief Custom Waker that drives the decoder coroutine inline on the
+    /// libuv I/O thread. wake() is called from poll_cb; it polls decoder_next
+    /// until the decoder suspends (needs more bytes), the packet buffer fills,
+    /// or the decoder exhausts. Holds a raw pointer to State — valid for the
+    /// lifetime of State since LibuvWaker is owned by State.
+    struct LibuvWaker : detail::Waker {
+        State* owner;
+        explicit LibuvWaker(State* s) : owner(s) {}
+        void wake() override;
+        std::shared_ptr<detail::Waker> clone() override {
+            return std::make_shared<LibuvWaker>(owner);
+        }
+    };
 
     std::shared_ptr<State>    m_state;
-    SingleThreadedUvExecutor* m_uv_exec;
+    SingleThreadedUvExecutor* m_uv_exec = nullptr;
 
-    explicit PollStream(int fd, DecoderT decoder,
-                       PollStreamOptions options,
-                       SingleThreadedUvExecutor* uv_exec);
+    explicit PollStream(std::shared_ptr<State> state, SingleThreadedUvExecutor* uv_exec);
 
-    // libuv callback (runs on I/O thread)
     static void poll_cb(uv_poll_t* handle, int status, int events);
-
-    // Coroutine helpers dispatched to the I/O thread via with_context
     static Coro<void> ensure_polling_impl(std::shared_ptr<State> state);
     static Coro<void> close_impl(std::shared_ptr<State> state);
 };
 
 // ---------------------------------------------------------------------------
-// Internal State
+// State
 // ---------------------------------------------------------------------------
 
-template<typename T, Decoder DecoderT>
-struct PollStream<T, DecoderT>::State {
-    uv_poll_t                                   poll_handle;      // libuv poll handle
-    int                                         fd = -1;          // file descriptor
+template<typename T>
+struct PollStream<T>::State {
+    uv_poll_t                                   poll_handle;
+    int                                         fd          = -1;
+    ByteSource                                  byte_source;
+    LibuvWaker                                  libuv_waker{this};
+    std::optional<DecoderStream<T>>             decoder;
+    std::optional<NextFuture<DecoderStream<T>>> decoder_next;
 
-    // Two-level buffering
-    CircularByteBuffer                          byte_buffer;      // Raw bytes from fd
-    RingBuffer<T>                               packet_buffer;    // Decoded packets
+    RingBuffer<T>                               packet_buffer;
+    BackpressureMode                            backpressure_mode;
 
-    DecoderT                                    decoder;          // Stateful frame decoder
+    std::mutex                                  mutex;
+    std::size_t                                 overrun_count{0};
+    std::shared_ptr<detail::Waker>              waker;
+    std::exception_ptr                          error;
+    bool                                        eof         = false;
+    bool                                        polling     = false;
+    bool                                        closing     = false;
+    bool                                        initialized = false;
 
-    BackpressureMode                     backpressure_mode;
-
-    // mutex protects all mutable state shared between poll_cb (libuv I/O thread)
-    // and poll_next (executor thread): packet_buffer, overrun_count, error, eof,
-    // polling, closing, and waker. This eliminates TOCTOU races between overrun_count
-    // checks and packet_buffer pops in poll_next. waker->wake() must be called AFTER
-    // releasing the mutex to avoid deadlock with multi-threaded executors.
-    std::mutex                           mutex;
-    std::size_t                          overrun_count{0};
-    std::shared_ptr<detail::Waker>       waker;
-    std::exception_ptr                   error;               // fatal error
-    bool                                 eof         = false; // EOF seen on fd
-    bool                                 polling     = false; // uv_poll_start active?
-    bool                                 closing     = false; // CloseRequest submitted
-    // initialized is only ever read/written on the I/O thread (inside ensure_polling_impl),
-    // so it does not need mutex protection.
-    bool                                 initialized = false; // uv_poll_init done
-
-    State(int fd_, DecoderT decoder_, PollStreamOptions opts)
+    State(int fd_, PollStreamOptions opts)
         : fd(fd_)
-        , byte_buffer(opts.byte_buffer_capacity)
+        , byte_source(opts.byte_buffer_capacity)
         , packet_buffer(opts.packet_buffer_capacity)
-        , decoder(std::move(decoder_))
         , backpressure_mode(opts.backpressure)
     {
         poll_handle.data = this;
@@ -214,5 +233,4 @@ struct PollStream<T, DecoderT>::State {
 
 } // namespace coro
 
-// Include template implementation
 #include "poll_stream.hpp"

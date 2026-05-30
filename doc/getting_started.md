@@ -517,9 +517,9 @@ Three channel variants are provided:
 
 | Variant | Producers | Consumers | Notes |
 |---|---|---|---|
-| `oneshot` | 1 | 1 | Single value; send is synchronous |
+| `oneshot` | 1 | 1 | Single-use, one value; send is synchronous |
 | `mpsc`    | N (cloneable sender) | 1 | Bounded buffer; backpressured send |
-| `watch`   | 1 | N (cloneable receiver) | Last-value-wins; send never suspends |
+| `watch`   | N | N (cloneable receiver) | Last-value-wins; send never suspends |
 
 > *NOTE*: Tokio also provides a broadcast channel that is not implemented yet, but likely will be added in the near future
 
@@ -612,7 +612,7 @@ coro::Coro<void> run() {
 `send()` suspends the producer if the buffer is full, providing natural
 backpressure. Use `try_send()` for a non-blocking attempt.
 
-#### watch — last-value channel, one sender, many receivers
+#### watch — last-value channel, multiple senders, many receivers
 
 Use `watch` to broadcast configuration or state that multiple tasks need to observe.
 Unlike `mpsc`, receivers do not consume values — each receiver independently tracks
@@ -1952,6 +1952,9 @@ DMA controllers, hardware interrupt handlers, completion ports.
 
 ## Next steps
 
+- Browse the [Patterns](patterns.md) guide for idiomatic solutions to common async
+  programming problems: request-reply, actors, graceful shutdown, fan-out, pipelines,
+  retry with backoff, and more.
 - Read the [Library Usage Guidelines](guidelines.md) for rules on writing correct, safe,
   and idiomatic code with this library.
 - Read the [Internal Design Details](architecture.md) for a deeper explanation of the

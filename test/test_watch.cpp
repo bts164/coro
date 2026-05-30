@@ -35,6 +35,54 @@ TEST(WatchTest, ReceiverIsCloneable) {
     (void)tx; (void)rx2;
 }
 
+TEST(WatchTest, SenderIsCloneable) {
+    auto [tx, rx] = watch_channel<int>(0);
+    auto tx2 = tx.clone();
+    (void)tx2; (void)rx;
+}
+
+TEST(WatchTest, ClonedSenderCanSend) {
+    auto [tx, rx] = watch_channel<int>(0);
+    auto tx2 = tx.clone();
+    EXPECT_TRUE(tx2.send(99).has_value());
+    EXPECT_EQ(*rx.borrow(), 99);
+}
+
+TEST(WatchTest, ChannelRemainsOpenWhenOneSenderDropped) {
+    auto [tx, rx] = watch_channel<int>(0);
+    auto tx2 = tx.clone();
+    { auto dropped = std::move(tx); }  // first sender dropped — channel still open
+    EXPECT_TRUE(tx2.send(42).has_value());
+    EXPECT_EQ(*rx.borrow(), 42);
+}
+
+TEST(WatchTest, ChannelClosedWhenAllSendersDropped) {
+    auto [tx, rx] = watch_channel<int>(0);
+    auto tx2 = tx.clone();
+    { auto d1 = std::move(tx); }
+    { auto d2 = std::move(tx2); }
+    EXPECT_TRUE(rx.sender_dropped());
+}
+
+TEST(WatchTest, ChangedErrorOnlyAfterAllSendersDropped) {
+    Runtime rt;
+    rt.block_on([&]() -> Coro<void> {
+        auto [tx, rx] = watch_channel<int>(0);
+        auto tx2 = tx.clone();
+        { auto dropped = std::move(tx); }  // one sender dropped — channel still open
+
+        // tx2 still alive — send advances version, changed() must resolve with success
+        tx2.send(1);
+        auto r1 = co_await rx.changed();
+        EXPECT_TRUE(r1.has_value());  // not SenderDropped
+
+        { auto dropped = std::move(tx2); }  // last sender dropped
+        auto r2 = co_await rx.changed();
+        EXPECT_FALSE(r2.has_value());
+        EXPECT_EQ(r2.error(), ChannelError::SenderDropped);
+    }());
+}
+
 // --- Synchronous send / borrow ---
 
 TEST(WatchTest, SendSucceedsWithLiveReceiver) {

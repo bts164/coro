@@ -217,6 +217,85 @@ Until resolved, callers using `JoinSet` in fire-and-forget patterns (e.g. one ta
 connection) should periodically call `next()` or `drain()` to keep the completion queue
 bounded, or use `spawn(...).detach()` instead if results are not needed at all.
 
+## `JoinSet` — `CoroStream<T>` producer support
+
+Extend `JoinSet<T>` to accept `CoroStream<T>` producers alongside `Coro<T>` tasks,
+with `next()` forwarding individual `co_yield` values from any producer as they arrive.
+This makes `JoinSet` a heterogeneous set: a single set can hold a mix of one-shot tasks
+and streaming generators, all with their lifetimes managed together.
+
+```cpp
+auto js = JoinSet<Result>{};
+js.spawn(fetch_metadata(id));          // Coro<Result>     — one result at completion
+js.spawn(search_backend_a(query));     // CoroStream<Result> — yields results as found
+js.spawn(search_backend_b(query));     // CoroStream<Result> — yields results as found
+while (auto r = co_await js.next())
+    display(*r);                       // results from all three, interleaved as ready
+```
+
+From a user perspective this is identical to a dedicated "merged stream" type — the
+distinction is purely in how the implementation manages yields vs. completions. The
+heterogeneous capability is the key advantage over a stream-only type: tasks that
+produce a single terminal value (`Coro<T>`) and tasks that stream multiple values
+(`CoroStream<T>`) can coexist in the same set without the user needing two separate
+abstractions.
+
+This fills the "multiple producers, bundled task management" cell in the
+`CoroStream` vs `mpsc` decision matrix and is the high-level alternative to manually
+wiring producer tasks to a shared `MpscSender`.
+
+## `CoroStream` — buffered concurrent producer
+
+`CoroStream<T>` is pull-based: the generator resumes only when the consumer calls
+`next()`, so producer and consumer stay in step with no explicit backpressure needed.
+For cases where producing the next item is expensive enough that it should overlap with
+consumption of the current one, a `buffered(N)` adapter is needed.
+
+```cpp
+// Generator runs up to N items ahead of the consumer.
+auto stream = coro::buffered(search(query), /*capacity=*/16);
+while (auto result = co_await coro::next(stream))
+    display(*result);
+```
+
+**Design:** `buffered(stream, N)` spawns the generator as a task that drains
+`co_yield` values into an `MpscSender<T>` of capacity N, then returns a wrapper type
+that owns the `JoinHandle` (producer task) and exposes `MpscReceiver<T>` as a
+`Stream<T>`. Cancellation is automatic — dropping the wrapper drops the handle
+(cancels the producer) and the receiver (the producer's next `send()` returns an error,
+causing a clean exit).
+
+The `StreamSpawnBuilder` path (`build_stream().buffer(16).spawn(...)`) is an
+alternative API surface worth considering alongside the free-function adapter.
+
+**Effort:** low-to-medium. All primitives exist (mpsc, task spawning, `Stream`
+concept). The work is the bridge task, the wrapper type, and cancellation edge-case
+testing — particularly ensuring the producer exits promptly when the consumer is
+dropped while the buffer is full.
+
+## `PollStream` — coroutine-based decoder
+
+`PollStream` currently requires a decoder class implementing an explicit state machine
+— it receives available bytes, parses as much as it can, and signals whether more data
+is needed. This interface is expressive but requires the author to manage parser state
+manually.
+
+A coroutine is a compiler-generated state machine, so there is a natural
+correspondence: a coroutine-based decoder that suspends at a `co_await need_bytes(N)`
+point when it needs more data and resumes when they arrive would express the same logic
+as sequential code. The key design constraint is that the decoder coroutine must resume
+on the I/O (libuv) thread directly — bypassing the executor scheduler — to preserve
+the low-overhead property that motivates `PollStream` in the first place. The libuv
+thread would act as the executor for the decoder coroutine.
+
+This requires working out:
+- How the decoder coroutine suspends and signals "I need N more bytes"
+- How the libuv callback resumes it without going through the task queue
+- Whether this replaces the existing decoder class interface or sits alongside it
+
+No implementation until the design is resolved. See the buffered protocol reading
+entry in `doc/patterns.md` for user-facing context.
+
 ## Stream combinators
 
 The `Stream` concept and `next()` are implemented but there are no combinators. Without
@@ -233,24 +312,72 @@ All combinators are lazy (zero-cost wrappers satisfying `Stream`) and live in
 `include/coro/stream/` (new subdirectory). Each has a corresponding free function
 returning a `[[nodiscard]]` adaptor type.
 
-## `AbortHandle`
+## `CancellationSource` / `CancellationToken`
 
-Currently the only way to cancel a spawned task is to drop its `JoinHandle`, which also
-gives up the ability to observe the result. `AbortHandle` decouples cancellation from
-result collection:
+A cancellation primitive for cases where tasks are spawned independently and cannot
+share a common owner — for example, tasks registered from multiple call sites that all
+need to observe the same shutdown signal.
 
 ```cpp
-auto [handle, abort] = coro::spawn(task()).submit_with_abort();
-abort.abort();          // request cancellation
-co_await handle;        // still await completion (receives PollDropped / exception)
+auto [source, token] = coro::cancellation_source();
+
+// Pass token to any number of independently spawned tasks:
+coro::spawn(worker_a(token.clone())).detach();
+coro::spawn(worker_b(token.clone())).detach();
+
+// Signal all of them simultaneously:
+source.cancel();
 ```
 
-- `AbortHandle` — a lightweight cancellation token tied to one task; `abort()` marks the
-  underlying `TaskState::cancelled`.
-- `JoinHandle` — unchanged; still the only way to await the result.
-- `SpawnBuilder::submit_with_abort()` returns `pair<JoinHandle<T>, AbortHandle>`.
+Inside a task, `token.is_cancelled()` can be checked at any point, and
+`co_await token.cancelled()` suspends until the token fires — both without requiring
+the task to be in a parent–child ownership relationship with the canceller.
 
-Lives in `include/coro/task/abort_handle.h`.
+This is the idiomatic solution for cross-cutting cancellation that does not map cleanly
+to a task tree. Without it, the only alternative is manually threading a watch channel
+carrying a shutdown flag, which reimplements cancellation by hand and should be avoided.
+
+This primitive also subsumes the previously considered `AbortHandle` design. The only
+thing `AbortHandle` added over dropping a `JoinHandle` was the ability to cancel a task
+while still holding the handle to observe its result. That is equally achievable by
+passing a `CancellationToken` to the task at spawn time and cancelling the token while
+retaining the `JoinHandle` — no separate type needed. `SpawnBuilder` should accept an
+optional token via something like `build_task().with_cancel(token).spawn(...)`.
+
+Modelled on Tokio's `CancellationToken` (`tokio-util` crate). Lives in
+`include/coro/sync/cancellation_token.h`.
+
+## Signal handling
+
+libuv provides `uv_signal_t` for cross-platform OS signal delivery (SIGINT, SIGTERM,
+SIGHUP, etc.; mapped to `SetConsoleCtrlHandler` on Windows). The integration follows
+the same pattern as existing libuv I/O handles — wrap the handle, store a waker in the
+callback, wake the task when the signal fires.
+
+Two variants are needed, mirroring Tokio's `ctrl_c()` / `signal(SignalKind)` split:
+
+- **One-shot future** — `coro::signal(SIGINT)` resolves once and is done. Suitable for
+  shutdown triggers where you only need to know the signal arrived, not count repeats.
+- **Stream** — `coro::signal_stream(SIGHUP)` yields on every delivery. Suitable for
+  reload-on-SIGHUP and similar repeat-signal use cases.
+
+```cpp
+// Shutdown on SIGINT or SIGTERM, whichever arrives first:
+co_await coro::select(coro::signal(SIGINT), coro::signal(SIGTERM));
+begin_shutdown();
+
+// Combined OS signal + internal shutdown channel:
+co_await coro::select(coro::signal(SIGINT), shutdown_rx.changed());
+```
+
+**Effort:** low. The libuv plumbing is already established; this is a new handle type
+following the existing I/O handle pattern. Estimated one day of implementation plus
+tests.
+
+**Follow-up:** once implemented, add a "Shutdown on OS signal" pattern to
+`doc/patterns.md` covering the combined-conditions form (`select` over a signal future
+and an internal watch channel), which is the idiomatic way to support both operator
+interrupts and programmatic shutdown from the same code path.
 
 ## libuv I/O primitives
 

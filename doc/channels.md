@@ -7,7 +7,7 @@ deferred.
 |---|---|---|---|
 | `oneshot` | 1 | 1 | none — single value |
 | `mpsc` | N (cloneable sender) | 1 | bounded ring buffer |
-| `watch` | 1 | N (cloneable receiver) | 1 — last value only |
+| `watch` | N (cloneable sender) | N (cloneable receiver) | 1 — last value only |
 
 All three live under `include/coro/sync/`. The interface and internal design follows
 Tokio's implementation as closely as C++ allows.
@@ -352,7 +352,8 @@ track their own "last seen" version. No backpressure — send never suspends.
 ```cpp
 auto [tx, rx] = coro::watch_channel<int>(/*initial=*/0);
 
-// Sender:
+// Sender (cloneable — give each producer its own clone):
+auto tx2 = tx.clone();
 if (auto r = tx.send(42); !r)
     // all receivers dropped — r.error() contains the unsent value
 
@@ -364,8 +365,8 @@ auto rx2 = rx.clone();        // independent cursor for another task
 
 - `WatchSender<T>` — `send(T)` synchronous; returns `std::expected<void, T>` — error
   holds the unsent value if all receivers have been dropped. Last write wins among
-  successful sends. Dropping the sender closes the channel; receivers see an error on
-  the next `changed()` call.
+  successful sends. Cloneable via `clone()`; the channel closes only when the last
+  sender clone is dropped, at which point receivers see an error on the next `changed()` call.
 - `WatchReceiver<T>` — `changed()` returns `Future<std::expected<void, ChannelError>>`;
   `borrow()` returns a `WatchBorrowGuard<T>` that holds a shared read lock for its lifetime;
   `clone()` creates an independent receiver starting at version 0. Cloneable.
@@ -392,9 +393,9 @@ WatchShared<T>:
     std::shared_mutex value_mutex   // shared for borrow(), exclusive for send()
     T                 value
     uint64_t          version       // incremented on every send()
-    bool              sender_alive
+    size_t            sender_count    // number of live WatchSender handles
 
-    mutex             waker_mutex   // separate lock — guards waker list only
+    mutex             waker_mutex   // separate lock — guards waker list and counts
     IntrusiveList     receiver_waiters  // ReceiverNode list
 ```
 

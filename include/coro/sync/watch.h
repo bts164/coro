@@ -35,8 +35,8 @@ struct WatchReceiverNode : coro::detail::IntrusiveListNode {
  * and `changed()` waker registration:
  * - `value_mutex` — guards `value` and `version`; taken shared by `borrow()`,
  *   exclusive by `send()`.
- * - `waker_mutex` — guards `receiver_waiters` and `sender_alive`; taken briefly
- *   by `changed()` (register waker) and `send()` (drain wakers).
+ * - `waker_mutex` — guards `receiver_waiters`, `sender_count`, and `receiver_count`;
+ *   taken briefly by `changed()` (register waker) and `send()` (drain wakers).
  *
  * **Lock ordering:** always acquire `value_mutex` before `waker_mutex` to prevent
  * deadlocks. `send()` acquires both; `changed()` acquires only `waker_mutex`.
@@ -52,7 +52,7 @@ struct WatchShared {
     std::mutex                   waker_mutex;
     coro::detail::IntrusiveList<> receiver_waiters; ///< Suspended WatchChangedFuture nodes.
     size_t                       receiver_count = 0;
-    bool                         sender_alive   = true;
+    size_t                       sender_count   = 0; ///< Number of live WatchSender handles.
 
     explicit WatchShared(T initial) : value(std::move(initial)) {}
 };
@@ -216,11 +216,13 @@ private:
 };
 
 /**
- * @brief Sender half of a watch channel.
+ * @brief Sender half of a watch channel. Cloneable via `clone()`.
  *
- * `send()` synchronously overwrites the watched value. The sender is move-only.
+ * `send()` synchronously overwrites the watched value. Multiple senders may
+ * exist simultaneously — the channel closes only when the last sender is dropped.
  *
  * **Thread safety:** each instance must be used by at most one thread at a time.
+ * Give each thread its own clone.
  *
  * @tparam T The watched value type.
  */
@@ -228,7 +230,11 @@ template<typename T>
 class WatchSender {
 public:
     explicit WatchSender(std::shared_ptr<detail::WatchShared<T>> shared)
-        : m_shared(std::move(shared)) {}
+        : m_shared(std::move(shared))
+    {
+        std::lock_guard lock(m_shared->waker_mutex);
+        ++m_shared->sender_count;
+    }
 
     WatchSender(const WatchSender&)            = delete;
     WatchSender& operator=(const WatchSender&) = delete;
@@ -237,11 +243,11 @@ public:
 
     ~WatchSender() {
         if (!m_shared) return;
-        // Mark closed and wake all waiting receivers.
+        // Decrement sender count; only wake receivers when the last sender drops.
         std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
         {
             std::lock_guard wl(m_shared->waker_mutex);
-            m_shared->sender_alive = false;
+            if (--m_shared->sender_count != 0) return;
             while (auto* raw = m_shared->receiver_waiters.pop_front()) {
                 auto* node = static_cast<detail::WatchReceiverNode*>(raw);
                 if (node->waker) wakers.push_back(std::move(node->waker));
@@ -278,6 +284,16 @@ public:
         }
         for (auto& w : wakers) w->wake();
         return {};
+    }
+
+    /**
+     * @brief Creates an independent sender sharing the same channel.
+     *
+     * The channel remains open until all sender clones are dropped.
+     * Each clone must be used by at most one thread at a time.
+     */
+    [[nodiscard]] WatchSender<T> clone() const {
+        return WatchSender<T>(m_shared);
     }
 
     /**
@@ -384,7 +400,7 @@ public:
      */
     [[nodiscard]] bool sender_dropped() const {
         std::lock_guard lock(m_shared->waker_mutex);
-        return !m_shared->sender_alive;
+        return m_shared->sender_count == 0;
     }
 
     /**
@@ -480,7 +496,7 @@ WatchChangedFuture<T>::poll(coro::detail::Context& ctx) {
     // Check for sender dropped.
     {
         std::lock_guard wl(m_shared->waker_mutex);
-        if (!m_shared->sender_alive) {
+        if (m_shared->sender_count == 0) {
             if (m_node.is_linked())
                 m_shared->receiver_waiters.remove(&m_node);
             return OutputType(std::unexpected(ChannelError::SenderDropped));

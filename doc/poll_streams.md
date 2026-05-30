@@ -1,29 +1,29 @@
 # Poll-based Streams
 
-Design document for `PollStream<T>` — a buffered Stream adapter for pollable file
-descriptors (character devices, pipes, sockets) using `uv_poll_t`.
+Design document for `PollStream<T>` — a buffered `Stream<T>` adapter for pollable file
+descriptors (character devices, pipes, Unix sockets, serial ports) using `uv_poll_t`.
 
 ---
 
 ## Overview
 
-`PollStream<T, Decoder>` provides an efficient Stream interface for reading framed data from
-pollable file descriptors. It is designed for **event-driven I/O** on file descriptors
-that support `epoll()`/`poll()` semantics, as opposed to the threadpool-based `File`
-class which uses `uv_fs_read()` for regular disk files.
+`PollStream<T>` provides an efficient `Stream<T>` interface for reading framed data from
+pollable file descriptors. It is designed for **event-driven I/O** on fds that support
+`epoll()`/`poll()` semantics, as opposed to the threadpool-based `File` class which uses
+`uv_fs_read()` for regular disk files.
 
-Primary motivation: reading a continuous stream of **variable-length, multi-header packets**
-from a **PCIe character device** with minimal latency and executor overhead.
+Primary motivation: reading a continuous stream of variable-length, multi-header packets
+from a PCIe character device with minimal latency and executor overhead.
 
 ### Key Design Goals
 
-1. **Event-driven, not polled** — use `uv_poll_t` to get notified when data is ready
-2. **Zero threadpool overhead** — reads happen directly in the event loop callback
-3. **Amortize executor scheduling cost** — internal buffering allows one task resumption
-   to process multiple packets
-4. **Backpressure support** — stop polling when consumer falls behind
-5. **Generic framing protocol** — pluggable `Decoder` for variable-length, multi-stage protocols
-6. **Reusable for multiple fd types** — PCIe character devices, pipes, Unix sockets, serial ports, etc.
+1. **Event-driven, not polled** — `uv_poll_t` notification; no threadpool
+2. **Zero executor overhead for decoding** — decoder runs directly on the libuv I/O thread; no task wakeup per read
+3. **Amortised scheduling cost** — packet buffer allows one executor resumption to drain multiple decoded packets
+4. **Backpressure** — automatic flow control via `uv_poll_stop` / `uv_poll_start`
+5. **Expressive decoder interface** — decoder is a `DecoderStream<T>`; sequential coroutine code replaces explicit state machines
+6. **Type erasure** — `PollStream<T>` templates only on the packet type, not on the decoder
+7. **Extensible decoder** — decoder accepts arbitrary user-defined arguments via explicit parameters; factory lambda bridges open() to the decoder
 
 ---
 
@@ -32,303 +32,421 @@ from a **PCIe character device** with minimal latency and executor overhead.
 ### The PCIe Character Device Use Case
 
 The device streams variable-length packets through a PCIe character device
-(`/dev/pcie_data`). Each packet has a **multi-stage framing protocol**:
+(`/dev/pcie_data`). Each packet has a multi-stage framing protocol:
 
-1. **Primary header** (16 bytes, fixed) — contains packet type, flags, and payload length
+1. **Primary header** (16 bytes, fixed) — packet type, flags, payload length
 2. **Optional secondary header** (16 bytes, conditional) — present if flag set in primary header
-3. **Payload** (variable, 4KB - 128KB) — actual data, size specified in primary header
-4. **Footer** (16 bytes, fixed pattern) — synchronization marker to detect framing errors
+3. **Payload** (variable, 4 KB – 128 KB) — actual data, size specified in primary header
+4. **Footer** (16 bytes, fixed pattern) — synchronisation marker for framing error detection
 
 ```
 ┌─────────────┬──────────────┬──────────────┬─────────┐
 │ Header1     │ Header2?     │ Payload      │ Footer  │
-│ 16 bytes    │ 0 or 16 bytes│ 4KB - 128KB  │ 16 bytes│
-│ (has size)  │ (conditional)│ (variable)   │ (magic) │
+│ 16 bytes    │ 0 or 16 bytes│ 4KB – 128KB  │ 16 bytes│
 └─────────────┴──────────────┴──────────────┴─────────┘
 ```
 
-Application requirements:
+### Why `uv_fs_read` Is the Wrong Tool
 
-- Begin processing each packet as soon as it arrives (low latency requirement)
-- Handle continuous streams (no buffering between packets is acceptable at app level)
-- Detect and recover from framing errors (footer validation)
-- Avoid unnecessary overhead that adds latency to the processing pipeline
+The existing `File` class uses `uv_fs_read()`, which dispatches every read to libuv's
+threadpool. Each packet incurs a threadpool context switch plus executor scheduling
+overhead. For a stream producing thousands of packets per second this becomes the
+dominant cost.
 
-### Why `uv_fs_read` is the Wrong Tool
-
-The existing `File` class uses `uv_fs_read()`, which:
-
-1. **Goes through libuv's threadpool** — every read is dispatched to a worker thread
-2. **High per-operation overhead** — context switch to/from threadpool per packet
-3. **Polling-based** — must submit a new read request after each packet completes
-4. **Not event-driven** — cannot be notified when data arrives; must speculatively submit reads
-
-```
-With File + uv_fs_read per packet:
-  Packet arrives → eventually detected by pending read on threadpool
-              → worker thread completes read
-              → callback posts to event loop
-              → TaskBase::wake() → enqueue → schedule → resume
-              → process 1 packet
-              → submit next read → back to threadpool
-```
-
-**Per-packet cost:** threadpool round-trip + executor scheduling overhead
-
-### Why PCIe Character Devices Support Better Approaches
-
-PCIe character devices:
-
-- Are **pollable** — support `epoll()`, `poll()`, `select()`
-- Signal **`POLLIN`** when data is ready to read
-- Support **non-blocking reads** with `O_NONBLOCK` / `EAGAIN`
-
-This means we can use `uv_poll_t` to register the fd with libuv's event loop and get
-notified immediately when the device writes data — **no threadpool involved**.
+PCIe character devices are **pollable** — they support `epoll()`/`poll()` and signal
+`POLLIN` when data is ready. `uv_poll_t` can therefore notify us immediately when the fd
+is readable, allowing non-blocking reads directly in the event loop callback with no
+threadpool involved.
 
 ---
 
-## Solution: Event-Driven Polling with Stateful Frame Decoding
+## Architecture
 
-### Architecture
+### High-Level Design
+
+The central idea is that the **decoder is a `DecoderStream<T>`** driven directly on the
+libuv I/O thread by a custom `LibuvWaker`. The libuv thread acts as the executor for the
+decoder coroutine — no task scheduler involvement on the hot path.
+
+There are two distinct thread contexts with clearly separated state:
+
+- **libuv I/O thread** — owns `ByteSource`, `LibuvWaker`, and the decoder `DecoderStream`.
+  No locks needed for any of this state.
+- **Executor thread** — owns the consumer task. Shares only the decoded packet buffer,
+  `consumer_waker`, `eof`, and `error` with the I/O thread.
 
 ```mermaid
 sequenceDiagram
     box beige OS
-    participant PCIe@{ "type": "control", "alias": "PCIe/<br/>Mem Controller" }
-    participant fd@{ "type": "boundary", "alias": "PCIe char fd" }
+    actor PCIe as PCIe / Mem Controller
+    participant fd@{ "type" : "boundary" } as PCIe char fd
     end
-    box aliceblue Coro library internals
-    participant libuv@{ "type": "control", "alias": libuv (I/O thread)" }
-    participant cb@{ "type": "entity", "alias": "poll_cb" }
-    participant bb@{ "type": "queue", "alias": " Byte Buffer" }
-    participant dec@{ "type": "entity", "alias": "Decoder" }
-    participant pb@{ "type": "queue", "alias": "PacketBuffer"}
-    participant ex@{ "type": "control", "alias": "Executor" }
+    box aliceblue libuv_thread
+    participant libuv@{ "type" : "control" } as libuv (I/O thread)
+    participant cb@{ "type" : "control" } as poll_cb
+    participant bs@{ "type" : "queue" } as ByteSource
+    participant waker@{ "type" : "control" } as LibuvWaker
+    participant dec@{ "type" : "control" } as Decoder (DecoderStream)
     end
-    participant task@{ "type": "actor", "alias": "Task (user code)" }
+    box lavender Coro executor
+    participant ex@{ "type" : "control" } as Executor
+    participant pb@{ "type" : "boundary" } as PacketBuffer
+    end
+    actor task as Task (user code)
 
     activate libuv
     activate task
     note over task: co_await next(stream)
-    create participant pf@{ "type": "entity", "alias": "PollStreamFuture" }
-    task->>pf:
-    task->>+pf: poll_next
-    pb--|\pf: try pop — Empty
-    pf-->>-task: PollPending
+    task->>+pb: poll_next — empty
+    pb-->>-task: PollPending (stores consumer waker)
     task-->>ex: Suspend
-    deactivate task
-    note over task: Suspended until wake
-    note over ex: event loop continues<br/>— runs other tasks
-    loop
-        libuv->>fd: epoll
-        deactivate libuv
-        note over fd: some time passes
-        PCIe--)fd: write completes<br/>DMA interrupt
-        fd--)libuv: epoll event — fd readable
-        activate libuv
+
+    loop fd readable
+        libuv->>fd: epoll wait
+        PCIe--)fd: DMA write completes
+        fd--)libuv: POLLIN
         libuv->>cb: poll_cb()
         activate cb
-        loop until until EAGAIN (greedy)
-            cb->>fd: read()
-            note over fd: Drain DMA buffer ASAP —<br/>stalling here can<br/>cause hardware fault
-            fd--|\bb: dst — write bytes
-            note over bb: Userspace buffer —<br/>safe to stall from<br/>here on out
-            fd-->>cb: return
+        loop until EAGAIN
+            cb->>fd: read() — non-blocking
+            fd-->>bs: write to accum buffer
         end
-        loop until byte buffer exhausted
-            cb->>+dec: decode()
-            bb--|\dec: consume bytes
-            dec--|\pb: push complete packet
-            dec-->>-cb: return
+        cb->>waker: wake()
+        activate waker
+        loop until needs more bytes or packet buffer full
+            waker->>dec: poll NextFuture
+            activate dec
+            dec->>bs: co_await memcpy(dst, n)
+            bs-->>dec: Ready — bytes copied to dst
+            note over dec: parse, accumulate frame<br/>state in coroutine frame
+            dec-->>waker: co_yield packet
+            deactivate dec
+            waker->>pb: push packet (SPSC, no lock)
         end
-        cb--)ex: waker.wake() (enqueue Task)
+        waker->>ex: consumer_waker.wake() (atomic exchange)
+        deactivate waker
         cb-->>libuv: return
         deactivate cb
     end
-    deactivate libuv
-    note over libuv: libuv continues in the<br/>background — pushes<br/>N packets to PacketBuffer
-    note over ex: Eventually event<br/>loop pops Task
+
     ex->>task: resume
     activate task
-    task->>pf: poll_next
-    activate pf
-    pb--|\pf: not empty — pop packet
-    destroy pf
-    pf-->>task: PollReady(packet)
-    deactivate pf
-    note over task: Loops over remaining<br/>packets — reads all<br/>N packets in single burst<br/>before suspending
+    task->>pb: poll_next — pop packet
+    pb-->>task: PollReady(packet)
+    note over task: loops — drains N packets<br/>before suspending again
     task-->>ex: Suspend
-    deactivate task
-    Note over task,ex: N packets processed with<br/>1 executor scheduling overhead
+    note over task,ex: N packets processed with<br/>1 executor scheduling roundtrip
 ```
 
-**Two-level buffering:**
+### ByteSource — Byte Delivery to the Decoder
 
-1. **Byte buffer** (circular, ~256KB) — raw bytes from fd; managed by `poll_cb`
-2. **Packet buffer** (ring, ~32-64 packets) — decoded packets; consumed by `poll_next`
+`ByteSource` is the interface through which the decoder coroutine receives bytes. It is
+owned by `PollStream::State` and lives entirely on the libuv I/O thread.
 
-### Stateful Frame Decoding
+Internally it holds:
+- An **accumulation buffer** (ring buffer, e.g. 256 KB) — raw bytes from the fd. Written
+  by `poll_cb` via non-blocking `read()`. Read by the decoder via `src.read(n)` futures.
+  Private to the libuv thread; no locking.
+- A **stored decoder waker** — when `src.read(n)` returns Pending (no bytes available),
+  it stores the waker. This waker is always a `LibuvWaker` clone (see below), so calling
+  it is equivalent to re-driving the decoder.
 
-The **Decoder** is a pluggable component that implements the framing protocol. It maintains
-internal state across multiple `decode()` calls to handle packets that span multiple reads:
+For fixed-size reads (headers, footers, fixed-width fields) the decoder calls
+`co_await src.memcpy(dst, n)`, which copies exactly `n` bytes into `dst` and resolves
+only when all `n` bytes have been delivered — looping over ring-buffer wrap boundaries
+internally. For variable-length or large payloads where the destination is managed by the
+caller, `co_await src.read(n)` returns up to `n` contiguous bytes with `read(2)` semantics;
+the decoder calls `consume(n)` after use and loops as needed. `poll_cb` refills the buffer
+and calls `LibuvWaker::wake()`, which re-polls the decoder.
+
+### LibuvWaker — the libuv Thread as Executor
+
+`LibuvWaker` is a custom `Waker` subclass. Its `wake()` method is the mini-executor that
+drives the decoder coroutine inline on the libuv I/O thread:
+
+```
+LibuvWaker::wake():
+    if not on libuv thread:
+        uv_async_send(pending_wake_handle)  // dispatch to libuv thread; return
+        // async callback will call wake() again on the libuv thread
+
+    create Context containing a clone of this waker
+    loop:
+        result = decoder_next.poll(ctx)
+        case Ready(Some(packet)): push to packet_buffer (SPSC, no lock); continue
+        case Ready(None):         signal eof; break
+        case Pending:             break
+        case Error:               store error; break
+    if packets added, eof, or error:
+        atomically exchange consumer_waker; call waker->wake() outside any lock
+```
+
+No scheduler queue, no thread hop on the hot path. The decoder runs to completion or
+suspension inline. The final `consumer_waker->wake()` is the only cross-thread call.
+
+---
+
+## Thread Safety Model
+
+### Invariant
+
+**The decoder coroutine must only resume on the libuv I/O thread.** Since
+`LibuvWaker::wake()` is the only entity that drives `decoder_next.poll(ctx)`, and since
+`ByteSource` futures always store a `LibuvWaker` clone as their waker, the invariant holds
+automatically for decoders that only `co_await` ByteSource futures — the common and
+intended case.
+
+### What Happens if the Decoder Awaits a Non-ByteSource Future
+
+This is **not a supported use case** and will likely stall the decoder permanently.
+
+If a decoder coroutines `co_await`s something other than a `ByteSource` future (e.g. a
+channel receive, a timer), that future stores the `Context`'s waker — a `LibuvWaker`
+clone. When the future is fulfilled on another thread, it calls `LibuvWaker::wake()` from
+that thread. This violates the invariant and is not safe.
+
+The failure mode is not a crash or a small delay — it is a **permanent stall**:
+
+1. The foreign-thread `wake()` call has no way to drive the decoder safely. The decoder
+   is suspended, and `uv_poll_t` may be stopped (backpressure). There is no mechanism
+   outside of `poll_cb` to restart polling or deliver bytes.
+2. Even if a `uv_async_t` callback were used to bounce back to the libuv thread, the
+   decoder would resume and immediately hit the next `co_await src.memcpy(...)` —
+   which suspends again because the accumulation buffer is empty and polling is stopped.
+   `uv_poll_start` is only called from `poll_next` on the consumer side; nothing in the
+   async callback path can restart it.
+3. The decoder stalls indefinitely. It may eventually unblock if the consumer coincidentally
+   drains the packet buffer and restarts polling, but this is not guaranteed.
+
+In debug builds, `LibuvWaker::wake()` should assert that it is called on the libuv thread,
+turning the silent stall into an immediate assertion failure.
+
+### Enforcement: Compile-time via `await_transform`
+
+The `ByteSource`-only constraint is enforced at compile time using a dedicated coroutine
+return type `DecoderStream<T>`. Its promise type, `DecoderCoroPromise<T>`, overrides
+`await_transform` to accept only `ByteSource`-produced awaitables:
 
 ```cpp
-template<typename T>
-class Decoder {
-public:
-    // Try to extract one complete frame from the byte buffer
-    // Returns:
-    //   some(T)   - successfully decoded a complete packet
-    //   nullopt   - need more bytes (partial packet in buffer)
-    // Throws if framing error detected (e.g., invalid footer magic)
-    std::optional<T> decode(std::span<const std::byte> buffer, std::size_t& consumed);
+// In DecoderCoroPromise<T>:
+template<ByteSourceFuture F>
+auto await_transform(F&& f) { return base_promise::await_transform(std::forward<F>(f)); }
 
-    // Reset decoder state (e.g., after error recovery)
-    void reset();
-};
+template<typename F> requires (!ByteSourceFuture<std::remove_cvref_t<F>>)
+void await_transform(F&&) = delete;  // hard compile error for anything else
 ```
 
-The decoder tracks which stage of the multi-header packet it's currently reading and how
-many more bytes are needed.
+Because `DecoderCoroPromise<T>` defines `await_transform`, it hides all base class
+overloads via name hiding — no base `Future` overloads are visible inside a
+`DecoderStream` coroutine body. The explicit `= delete` catch-all ensures a clear
+diagnostic ("call to deleted function") rather than an ambiguous "no matching function"
+error.
 
-### Latency Amortization
+`open()` requires `DecoderFactory` to return `DecoderStream<T>`, enforcing the restriction
+at the call site. `CoroStream<T>` is unchanged and remains available for unrestricted use.
 
-**Scenario:** 10 packets arrive during the window between `wake()` and task resumption.
+`DecoderCoroPromise<T>` inherits `CoroStream<T>::promise_type` as its sole direct base.
+`get_return_object()` upcasts `*this` to the base and calls `from_promise` on it —
+valid because single non-virtual inheritance guarantees both share the same address. A
+`static_assert(!is_virtual_base_of_v<...>)` guards against future regressions in the
+inheritance hierarchy.
 
-| Approach | Overhead |
-|---|---|
-| `File` + per-packet `uv_fs_read` | 10 × (threadpool + executor scheduling) |
-| `PollStream` + buffering | 1 × (executor scheduling) + 10 × (buffer pop) |
+`DecoderStream<T>` publicly inherits `CoroStream<T>` with only a `promise_type` override
+and no added data members, so it can be move-constructed into a `CoroStream<T>` wherever
+the infrastructure expects one.
 
-The buffer **absorbs the burst** and allows the task to process multiple packets per
-resumption, amortizing the executor's scheduling cost.
+### SPSC Packet Buffer — Eliminating Locks on the Hot Path
 
-### Backpressure
+The packet buffer is written exclusively by the libuv I/O thread (`LibuvWaker::wake()`)
+and read exclusively by the executor thread (`poll_next()`). This is a classic
+**single-producer / single-consumer (SPSC)** queue; no mutex is needed for push/pop.
 
-`PollStream` supports two backpressure policies selected at construction time via
-`PollStreamOptions::backpressure`:
+The only remaining shared state requiring synchronisation is:
 
-**`BackpressureMode::Block` (default)** — If packets arrive faster than the consumer
-task processes them:
+| Field | Access pattern | Synchronisation |
+|---|---|---|
+| `consumer_waker` | Written by executor (`poll_next`), read-cleared by libuv (`wake()`) | `atomic<shared_ptr<Waker>>` or lock-free exchange |
+| `error` | Written by libuv (`poll_cb`/`wake()`), read once by executor | One-shot atomic flag + `std::exception_ptr` |
+| `eof` | Written by libuv, read by executor | `std::atomic<bool>` |
+| `polling` | Written and read by libuv only | No synchronisation needed |
 
-1. Packet buffer fills to capacity
-2. `poll_cb` calls `uv_poll_stop()` — stops receiving epoll events
-3. OS kernel buffers continue to fill (PCIe driver buffers in kernel)
-4. Task eventually resumes and drains the packet buffer
-5. `poll_next()` calls `uv_poll_start()` — resumes polling
-
-This provides **automatic flow control** without dropping packets (up to kernel buffer
-limits). It is the right choice when the fd source can tolerate backpressure.
-
-**`BackpressureMode::Overrun`** — The fd is drained unconditionally. When the packet
-buffer is full, the oldest buffered packet is evicted and the incoming packet takes its
-place. The number of dropped packets accumulates and is delivered to the consumer as a
-non-fatal `PollStreamOverrunError` before the next packet:
-
-```cpp
-while (auto item = co_await next(stream)) {
-    // item is std::variant-like; check for overrun inline
-}
-// or catch in error handler:
-// PollStreamOverrunError carries .missed count; stream stays open
-```
-
-Use Overrun mode when the fd source **cannot** tolerate backpressure (e.g. a DMA-backed
-character device where a stalled read causes a hardware fault) and occasional data loss is
-acceptable.
+All hot-path operations (push packet, pop packet) are therefore lock-free. A lock is only
+needed for the infrequent error/EOF path.
 
 ---
 
 ## API Design
 
-### Decoder Concept
-
-The `Decoder` abstraction handles framing protocol details:
+### ByteSource
 
 ```cpp
-template<typename T>
-concept Decoder = requires(T decoder, std::span<const std::byte> buf, std::size_t& consumed) {
-    // Try to extract one complete frame from the byte buffer
-    // Returns:
-    //   some(typename T::OutputType) - decoded complete packet, consumed bytes via ref param
-    //   nullopt                      - need more bytes (partial packet)
-    // Throws std::runtime_error if framing error detected
-    { decoder.decode(buf, consumed) } -> std::same_as<std::optional<typename T::OutputType>>;
+class ByteSource {
+public:
+    /// Copies exactly n bytes into dst. Resolves only after all n bytes have been
+    /// delivered, looping across ring-buffer wrap boundaries internally.
+    /// Use for fixed-size reads: headers, footers, fixed-width fields.
+    [[nodiscard]] MemcpyFuture memcpy(void* dst, std::size_t n);
 
-    // Output type of decoded packets
-    typename T::OutputType;
+    /// Returns a Future<std::span<const std::byte>> with up to max_bytes contiguous
+    /// bytes — identical semantics to a non-blocking read(2) syscall. Resolves with
+    /// [1, max_bytes] bytes when data is available; suspends when the buffer is empty.
+    /// May return fewer than max_bytes at a ring-buffer wrap boundary.
+    /// Call consume(n) after processing the returned span.
+    /// Use for variable-length or large reads where the caller manages the destination.
+    [[nodiscard]] ReadFuture read(std::size_t max_bytes);
 
-    // Reset decoder to initial state (e.g., after error recovery)
-    { decoder.reset() } -> std::same_as<void>;
+    /// Advance the read pointer by n bytes, releasing that space in the ring buffer.
+    void consume(std::size_t n);
 };
 ```
 
-### PollStream Class Template
+`ByteSource` is **not copyable or movable** after being passed to the decoder factory —
+the decoder coroutine frame holds a reference to it throughout its lifetime.
+
+### PollStream
 
 ```cpp
-template<typename T, Decoder DecoderT>
+template<typename T>
 class PollStream {
 public:
-    using ItemType = T;
-
-    /// Opens a pollable file descriptor and wraps it as a Stream.
-    /// fd:         open file descriptor (must support poll/epoll semantics)
-    /// decoder:    decoder instance (moved into stream)
-    /// options:    buffer sizes and backpressure policy (default: Block, 64 pkts, 256 KB)
-    /// io_service: the IoService managing the uv_loop (defaults to current thread's)
+    /// Opens a pollable file descriptor and wraps it as a Stream<T>.
+    ///
+    /// decoder_factory: any callable with signature DecoderStream<T>(ByteSource&)
+    ///   Called once during open(). The ByteSource reference is valid for the
+    ///   lifetime of the PollStream.
+    /// options:   buffer sizes and backpressure policy
+    /// uv_exec:   executor owning the uv_loop (defaults to current thread's)
+    template<typename DecoderFactory>
     [[nodiscard]] static PollStream open(
-        int fd,
-        DecoderT decoder,
-        PollStreamOptions options = {},
-        IoService* io_service = nullptr
+        int                       fd,
+        DecoderFactory            decoder_factory,
+        PollStreamOptions         options  = {},
+        SingleThreadedUvExecutor* uv_exec  = nullptr
     );
 
-    /// Stream concept interface — poll for the next item
+    /// Stream concept interface — poll for the next decoded packet.
     PollResult<std::optional<T>> poll_next(detail::Context& ctx);
 
-    /// Closes the fd and stops polling (called by destructor)
+    /// Stops polling and closes the fd. Called by destructor.
     void close();
 
     PollStream(PollStream&&) noexcept;
     PollStream& operator=(PollStream&&) noexcept;
-    PollStream(const PollStream&) = delete;
+    PollStream(const PollStream&)            = delete;
     PollStream& operator=(const PollStream&) = delete;
-
     ~PollStream();
 
 private:
-    struct State; // forward declaration
-    std::shared_ptr<State> m_state;
-    IoService*             m_io_service;
-
-    explicit PollStream(int fd, DecoderT decoder,
-                       std::size_t pkt_buf_cap, std::size_t byte_buf_cap,
-                       IoService* io_service);
-
-    static void poll_cb(uv_poll_t* handle, int status, int events);
-    static void close_cb(uv_handle_t* handle);
+    struct State;
+    std::shared_ptr<State>    m_state;
+    SingleThreadedUvExecutor* m_uv_exec = nullptr;
 };
 ```
 
-### Example: PcieDecoder for Multi-Stage Frame Protocol
+`DecoderFactory` is any callable with signature `DecoderStream<T>(ByteSource&)`. It is
+called once inside `open()`, receives the `ByteSource` owned by `State`, and returns the
+decoder. The factory is not stored after `open()` completes.
 
-**Note:** `PcieDecoder` is provided as an example in `test/pcie_decoder.h`
-to demonstrate a complex, multi-stage decoder with zero-copy support. It is **not**
-part of the core library.
-
-For the PCIe character device protocol, a specialized decoder handles the four-stage framing:
+### DecoderStream and DecoderCoroPromise
 
 ```cpp
-// In test/pcie_decoder.h
+/// Tag base inherited by all ByteSource-produced future types.
+struct ByteSourceFutureTag {};
 
-/// PCIe character device packet structure
+/// Concept satisfied by MemcpyFuture, ReadFuture, and any future ByteSource futures.
+template<typename F>
+concept ByteSourceFuture =
+    std::is_base_of_v<ByteSourceFutureTag, std::remove_cvref_t<F>>;
+
+/// Promise for DecoderStream<T>. Inherits all of CoroStream<T>::promise_type
+/// except get_return_object() and await_transform().
+template<typename T>
+struct DecoderCoroPromise : CoroStream<T>::promise_type {
+    using base_promise = typename CoroStream<T>::promise_type;
+
+    DecoderStream<T> get_return_object();   // returns DecoderStream<T> via base upcast
+
+    template<ByteSourceFuture F>
+    auto await_transform(F&& f) { return base_promise::await_transform(std::forward<F>(f)); }
+
+    template<typename F> requires (!ByteSourceFuture<std::remove_cvref_t<F>>)
+    void await_transform(F&&) = delete;     // co_await of non-ByteSource future: compile error
+};
+
+/// Coroutine return type for PollStream decoders.
+/// Identical to CoroStream<T> except its promise restricts co_await to ByteSource futures.
+/// Can be move-constructed into CoroStream<T> (no added data members).
+template<typename T>
+class DecoderStream : public CoroStream<T> {
+public:
+    using promise_type = DecoderCoroPromise<T>;
+    using CoroStream<T>::CoroStream;
+};
+```
+
+### PollStreamOptions
+
+```cpp
+struct PollStreamOptions {
+    BackpressureMode backpressure   = BackpressureMode::Block;
+    std::size_t      packet_buf_cap = 64;       // decoded packets (SPSC ring buffer)
+    std::size_t      accum_buf_cap  = 256'384;  // raw bytes (~256 KB)
+};
+
+enum class BackpressureMode { Block, Overrun };
+```
+
+---
+
+## Decoder with Custom Arguments
+
+The decoder coroutine accepts any extra arguments as **explicit parameters**. The factory
+(a regular, non-coroutine lambda) captures those values and passes them at call time.
+Because the factory is not a coroutine, capturing by value is safe — the closure is not
+subject to the dangling-capture rules that apply to coroutine lambdas.
+
+```cpp
+// Decoder with user-defined configuration passed as an explicit parameter.
+// The parameter lives in the coroutine frame — safe across suspension points.
+coro::DecoderStream<PciePacket> pcie_decoder(coro::ByteSource& src, PcieConfig cfg) {
+    for (;;) {
+        PciePacket::Header1 h1;
+        co_await src.memcpy(&h1, sizeof(h1));
+        // ...use cfg for protocol-specific decisions...
+        co_yield make_packet(h1, cfg);
+    }
+}
+
+// The factory is an ordinary (non-coroutine) lambda that captures cfg by value.
+// It calls pcie_decoder with the captured config, which is then moved into
+// the decoder coroutine's frame as a parameter.
+PcieConfig cfg = load_config();
+auto stream = coro::PollStream<PciePacket>::open(
+    fd,
+    [cfg](coro::ByteSource& src) { return pcie_decoder(src, cfg); }
+);
+```
+
+**Multiple custom arguments** work the same way — add parameters to the decoder function
+and capture them in the factory closure.
+
+---
+
+## Example: PCIe Decoder as a DecoderStream
+
+The decoder is ordinary sequential coroutine code. The coroutine frame implicitly carries
+all partial-frame state across `co_await` suspension points — there is no explicit state
+machine enum to manage.
+
+```cpp
+// In examples/io/pcie_decoder.h
+
 struct PciePacket {
     struct Header1 {
-        uint32_t magic;           // Protocol magic number
-        uint16_t flags;           // Bit 0: has_header2
-        uint16_t payload_length;  // 4KB - 128KB
-        uint64_t timestamp;       // timestamp
+        uint32_t magic;
+        uint16_t flags;           // bit 0: has_header2
+        uint16_t payload_length;  // bytes, 4 KB – 128 KB
+        uint64_t timestamp;
     } header1;
 
     std::optional<struct Header2 {
@@ -336,60 +454,58 @@ struct PciePacket {
         uint64_t reserved;
     }> header2;
 
-    std::vector<std::byte> payload;  // Variable length
+    std::vector<std::byte> payload;
 
     struct Footer {
-        uint64_t magic1;          // Expected: 0xDEADBEEFCAFEBABE
-        uint64_t magic2;          // Expected: 0x0123456789ABCDEF
+        uint64_t magic1;  // expected: 0xDEADBEEFCAFEBABE
+        uint64_t magic2;  // expected: 0x0123456789ABCDEF
     } footer;
 };
 
-static constexpr uint64_t FOOTER_MAGIC1 = 0xDEADBEEFCAFEBABE;
-static constexpr uint64_t FOOTER_MAGIC2 = 0x0123456789ABCDEF;
+coro::DecoderStream<PciePacket> pcie_decoder(coro::ByteSource& src) {
+    for (;;) {
+        PciePacket pkt;
 
-/// Stateful decoder for multi-stage PCIe character device packets
-class PcieDecoder {
-public:
-    using OutputType = PciePacket;
+        co_await src.memcpy(&pkt.header1, sizeof(pkt.header1));
 
-    PcieDecoder() = default;
+        if (pkt.header1.payload_length < 4096 ||
+            pkt.header1.payload_length > 128 * 1024)
+            throw std::runtime_error("invalid payload length");
 
-    /// Decode one packet from byte buffer
-    std::optional<PciePacket> decode(std::span<const std::byte> buffer,
-                                     std::size_t& consumed);
+        if (pkt.header1.flags & 0x01) {
+            pkt.header2.emplace();
+            co_await src.memcpy(&*pkt.header2, sizeof(PciePacket::Header2));
+        }
 
-    /// Reset to initial state (e.g., after framing error recovery)
-    void reset();
+        // Payload — pre-allocate destination; memcpy loops internally across wrap boundaries
+        pkt.payload.resize(pkt.header1.payload_length);
+        co_await src.memcpy(pkt.payload.data(), pkt.header1.payload_length);
 
-private:
-    enum class State {
-        ReadingHeader1,   // Need 16 bytes
-        ReadingHeader2,   // Need 16 bytes (conditional)
-        ReadingPayload,   // Need N bytes (from header1)
-        ReadingFooter,    // Need 16 bytes
-    };
+        co_await src.memcpy(&pkt.footer, sizeof(pkt.footer));
 
-    State      m_state = State::ReadingHeader1;
-    PciePacket m_packet;  // Packet being assembled
-    std::size_t m_payload_length = 0;
-    bool        m_has_header2 = false;
-};
-```
+        if (pkt.footer.magic1 != 0xDEADBEEFCAFEBABEULL ||
+            pkt.footer.magic2 != 0x0123456789ABCDEFULL)
+            throw std::runtime_error("footer magic mismatch — frame sync lost");
 
-### Example: PcieStream Type Alias
+        co_yield std::move(pkt);
+    }
+}
 
-```cpp
-// In test/pcie_stream.h
-using PcieStream = PollStream<PciePacket, PcieDecoder>;
+// Type alias for convenience:
+using PcieStream = coro::PollStream<PciePacket>;
 
 // Usage:
-#include "pcie_stream.h"  // from examples/io/
-
 auto stream = PcieStream::open(
-    open("/dev/pcie_data", O_RDONLY | O_NONBLOCK),
-    PcieDecoder{}
+    ::open("/dev/pcie_data", O_RDONLY | O_NONBLOCK),
+    pcie_decoder
 );
 ```
+
+The coroutine replaces the explicit `ReadingHeader1 / ReadingHeader2 / ReadingPayload /
+ReadingFooter` state machine. Each `co_await src.memcpy(...)` is a potential suspension
+point — if no bytes are buffered the decoder suspends and resumes when `poll_cb`
+delivers more. Ring-buffer wrap boundaries are handled transparently inside `memcpy`;
+the coroutine frame carries all partial-copy state across suspensions.
 
 ---
 
@@ -397,1056 +513,268 @@ auto stream = PcieStream::open(
 
 ### Internal State
 
-```cpp
-template<typename T, Decoder DecoderT>
-struct PollStream<T, DecoderT>::State {
-    uv_poll_t                                   poll_handle;      // libuv poll handle
-    int                                         fd;               // file descriptor
+```
+PollStream<T>::State:
+    // libuv I/O thread only — no synchronisation needed
+    uv_poll_t                          poll_handle
+    int                                fd
+    ByteSource                         byte_source
+    LibuvWaker                         libuv_waker
+    NextFuture<DecoderStream<T>>       decoder_next
 
-    // Two-level buffering
-    CircularByteBuffer                          byte_buffer;      // Raw bytes from fd (e.g., 256KB)
-    RingBuffer<T>                               packet_buffer;    // Decoded packets (e.g., 64 packets)
+    // Shared: written by libuv, read by executor
+    SpscRingBuffer<T>                  packet_buffer   // lock-free SPSC
+    std::atomic<std::shared_ptr<Waker>> consumer_waker // atomic exchange
+    std::atomic<bool>                  eof{ false }
 
-    DecoderT                                    decoder;          // Stateful frame decoder
-
-    std::atomic<std::shared_ptr<detail::Waker>> waker;            // stored waker for wake()
-    std::exception_ptr                          error;            // captured error
-    bool                                        eof = false;      // EOF seen on fd
-    bool                                        polling = false;  // uv_poll_start active?
-};
+    // Shared: error path only (infrequent)
+    std::mutex                         error_mutex
+    std::exception_ptr                 error
 ```
 
-**Two-level buffering rationale:**
-
-- **Byte buffer** (circular, 256KB default) — holds raw bytes between `read()` calls;
-  handles partial packets that span multiple reads
-- **Packet buffer** (ring, 64 packets default) — holds decoded, validated packets ready
-  for consumption; provides executor scheduling amortization
-
-**Ownership model:** `State` is held via `shared_ptr` so it outlives the `PollStream`
-instance if a callback is in-flight when the stream is moved or destroyed.
+```
+ByteSource:
+    CircularBuffer                     accum_buffer   // libuv thread only
+```
 
 **Thread safety:**
+- `byte_source`, `decoder_next`, `poll_handle` are exclusively accessed on the libuv
+  thread.
+- `packet_buffer` (push side) is written on the libuv thread; (pop side) on the executor.
+  SPSC semantics eliminate the lock.
+- `consumer_waker` uses atomic shared_ptr operations for lock-free exchange.
+- `eof` uses `std::atomic<bool>`.
+- `error` is written at most once (fatal path) and protected by a simple mutex.
 
-`poll_cb` (libuv I/O thread) and `poll_next` (executor thread) can run concurrently on a
-multi-threaded executor. A `std::mutex` protects all shared mutable state: `packet_buffer`,
-`overrun_count`, `error`, `eof`, `polling`, and `waker`. The mutex is taken in small,
-targeted critical sections to minimise contention.
+### Two-Phase Initialisation of decoder_next
 
-- `byte_buffer` and `decoder` are private to `poll_cb` — never accessed by `poll_next`
-- `waker->wake()` is called **after** releasing the mutex to prevent deadlock with
-  multi-threaded executors that may immediately resume the consumer task
-- In Block mode the pre-decode full-check is safe without double-checking after decode:
-  `poll_next` only pops from `packet_buffer`, so capacity can only increase between the
-  check and the push — never decrease
+`decoder_next` holds a reference `DecoderStream<T>& m_stream`. It cannot be initialised
+until the `DecoderStream` returned by the factory has a stable heap address. `State` is
+always allocated via `shared_ptr` and never moved, so the address of `State::decoder` is
+stable from construction.
 
-### State Machine
+The sequence in `open()`:
 
-The state machine differs slightly between Block and Overrun backpressure modes.
+1. Allocate `State` via `make_shared` (gives `byte_source` a stable address).
+2. Call `decoder_factory(state->byte_source)` → `DecoderStream<T>`. Emplace into
+   `State::decoder` (via `std::optional<DecoderStream<T>>`).
+3. Emplace `State::decoder_next` with a reference to `*state->decoder`.
 
-**Block mode (default):**
+Because `State` is never moved after allocation, the reference in `decoder_next` remains
+valid for the lifetime of the `PollStream`.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle : open()
-    Idle --> Polling : uv_poll_start()
-    Polling --> Polling : poll_cb fires, buffer not full
-    Polling --> Backpressure : poll_cb fires, buffer full
-    Backpressure --> Polling : poll_next() drains buffer
-    Polling --> EOF : read() returns 0
-    Polling --> Error : I/O error or decoder throw
-    EOF --> [*]
-    Error --> [*]
-```
+### The `poll_cb` Callback
 
-**Overrun mode:**
+Runs on the libuv I/O thread when the fd signals `POLLIN`:
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle : open()
-    Idle --> Polling : uv_poll_start()
-    Polling --> Polling : poll_cb fires (overrun: evict oldest, ++overrun_count)
-    Polling --> EOF : read() returns 0
-    Polling --> Error : I/O error or decoder throw
-    EOF --> [*]
-    Error --> [*]
-```
+1. **Greedy read** — loop calling non-blocking `read()` until `EAGAIN`, writing into
+   `byte_source.accum_buffer`. On fd EOF or error: store to atomic flags; stop polling.
+2. **Drive decoder** — call `libuv_waker.wake()`. Since we are already on the libuv
+   thread, no dispatch is needed; the decoder runs inline.
 
-In Overrun mode the stream never leaves the Polling state due to backpressure. Overrun
-notifications are delivered to the consumer as non-fatal `PollError(PollStreamOverrunError{n})`
-values between successive packets; the stream remains open after them.
+Phase 2 always runs even after a Phase 1 error, so that bytes already in the accumulation
+buffer are decoded and delivered to the consumer before the error surfaces.
 
-| State | Description | uv_poll active? |
-|---|---|---|
-| **Idle** | Stream created but not yet polled | No |
-| **Polling** | Registered with event loop; waiting for `POLLIN` | Yes |
-| **Backpressure** | (Block mode only) Buffer full; polling stopped | No |
-| **EOF** | `read()` returned 0; stream exhausted | No |
-| **Error** | Fatal I/O error or protocol violation; stream faulted | No |
+### The `poll_next` Method
 
-### The poll_cb Callback — Read + Decode Loop
+Called by the executor thread when the consumer task is polled. No locks in the hot path:
 
-The callback runs on the I/O thread when the fd becomes readable. It performs two phases:
-
-1. **Greedy read (Phase 1)** — fill the byte buffer with raw data from the fd; no lock held
-2. **Greedy decode (Phase 2)** — extract packets; fine-grained locks only around buffer updates, not during `decode()` which may do large memcpy's
-
-Phase 2 **always runs**, even if Phase 1 encountered an error or EOF. This ensures that
-any bytes which arrived before the fault are decoded into packets and delivered to the
-consumer before the error surfaces.
-
-```cpp
-template<typename T, Decoder DecoderT>
-void PollStream<T, DecoderT>::poll_cb(uv_poll_t* handle, int status, int events) {
-    auto* state = static_cast<State*>(handle->data);
-    std::shared_ptr<detail::Waker> waker_to_wake;
-
-    // uv_poll error (e.g., fd closed externally) — no new bytes, nothing to decode
-    if (status < 0) {
-        std::lock_guard lock(state->mutex);
-        state->error = std::make_exception_ptr(
-            std::system_error(-status, std::system_category(), "uv_poll error")
-        );
-        uv_poll_stop(&state->poll_handle);
-        state->polling = false;
-        waker_to_wake = std::exchange(state->waker, nullptr);
-    }
-    else if (events & UV_READABLE) {
-        bool should_wake = false;
-
-        // PHASE 1: GREEDY READ — byte_buffer is private to poll_cb; no lock needed.
-        // EOF and error paths take a brief lock only to update the shared flags.
-        while (state->byte_buffer.writable_bytes() > 0) {
-            auto writable_span = state->byte_buffer.writable_span();
-            ssize_t n = ::read(state->fd, writable_span.data(), writable_span.size());
-
-            if (n > 0) {
-                state->byte_buffer.commit_write(n);
-            }
-            else if (n == 0) {
-                std::lock_guard lock(state->mutex);
-                state->eof = true;
-                uv_poll_stop(&state->poll_handle);
-                state->polling = false;
-                should_wake = true;
-                break;
-            }
-            else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                std::lock_guard lock(state->mutex);
-                state->error = std::make_exception_ptr(
-                    std::system_error(errno, std::system_category(), "read failed")
-                );
-                uv_poll_stop(&state->poll_handle);
-                state->polling = false;
-                should_wake = true;
-                break;
-            }
-            else {
-                break; // EAGAIN — no more data right now
-            }
-        }
-
-        // PHASE 2: GREEDY DECODE — always runs (even after a Phase 1 error) so that
-        // any bytes already in the byte buffer are decoded and queued before the error
-        // surfaces to the consumer. decode() is called without the lock; only the
-        // push/pop/overrun_count updates are protected.
-        bool decode_error = false;
-        try {
-            while (true) {
-                // Block mode: verify room exists before committing to a decode.
-                if (state->backpressure_mode == BackpressureMode::Block) {
-                    std::lock_guard lock(state->mutex);
-                    if (state->packet_buffer.full()) break;
-                }
-
-                auto readable_span = state->byte_buffer.readable_span();
-                if (readable_span.empty()) break;
-
-                std::size_t consumed = 0;
-                // No lock — decode may involve expensive memcpy of large payloads.
-                auto packet = state->decoder.decode(readable_span, consumed);
-
-                if (consumed > 0) {
-                    state->byte_buffer.consume(consumed);
-                }
-
-                if (packet) {
-                    std::lock_guard lock(state->mutex);
-                    if (state->backpressure_mode == BackpressureMode::Overrun) {
-                        if (state->packet_buffer.full()) {
-                            state->packet_buffer.pop(); // drop oldest
-                            ++state->overrun_count;
-                        }
-                    }
-                    state->packet_buffer.push(std::move(*packet));
-                    should_wake = true;
-                } else {
-                    if (consumed == 0) break; // incomplete packet, no progress
-                }
-            }
-        } catch (...) {
-            std::lock_guard lock(state->mutex);
-            state->error = std::current_exception();
-            uv_poll_stop(&state->poll_handle);
-            state->polling = false;
-            decode_error = true;
-            should_wake = true;
-        }
-
-        // Only extract the waker if something actually changed (packet pushed,
-        // error set, EOF reached, or overrun counted). Avoids spurious wakeups.
-        if (should_wake) {
-            std::lock_guard lock(state->mutex);
-            // Block mode: stop polling when buffers are full
-            if (!decode_error && state->backpressure_mode == BackpressureMode::Block) {
-                if ((state->packet_buffer.full() ||
-                     state->byte_buffer.writable_bytes() == 0) && state->polling) {
-                    uv_poll_stop(&state->poll_handle);
-                    state->polling = false;
-                }
-            }
-            waker_to_wake = std::exchange(state->waker, nullptr);
-        }
-    }
-
-    // Wake outside the mutex to prevent deadlock on multi-threaded executors.
-    if (waker_to_wake) {
-        waker_to_wake->wake();
-    }
-}
-```
+1. Check `packet_buffer.pop()` (SPSC, lock-free). If a packet is ready, return it.
+   In Block mode, if the buffer has been drained below the restart threshold, submit a
+   coroutine to the uv thread to call `uv_poll_start`.
+2. Check `eof.load()` and `error` (lock on error only).
+3. If nothing ready: atomically store `consumer_waker`; request polling start.
 
 **Key properties:**
-
-- **Two-phase processing** — read raw bytes (Phase 1), then decode packets (Phase 2)
-- **Phase 2 always runs** — bytes decoded from the fd before a Phase 1 error are delivered to the consumer before the error surfaces
-- **Fine-grained locking** — mutex held only around buffer state updates; `decode()` runs without the lock
-- **Conditional wake** — consumer is woken only when a packet was decoded, an error was set, or EOF was reached; EAGAIN with no decoded packets does not wake
-- **Backpressure modes** — Block stops polling when buffers fill; Overrun evicts the oldest packet and increments `overrun_count`
-
-### The poll_next Method — Hot Path
-
-Called by the worker thread when the task resumes or explicitly polls. The mutex is held
-for the entire check-and-return sequence to prevent TOCTOU races with `poll_cb`.
-
-```cpp
-template<typename T, Decoder DecoderT>
-PollResult<std::optional<T>> PollStream<T, DecoderT>::poll_next(detail::Context& ctx) {
-    std::unique_lock lock(m_state->mutex);
-
-    // Deliver pending overrun notification before the next surviving packet so
-    // the consumer knows exactly how many packets were dropped immediately before it.
-    if (m_state->backpressure_mode == BackpressureMode::Overrun &&
-        m_state->overrun_count > 0) {
-        return PollError(std::make_exception_ptr(
-            PollStreamOverrunError{std::exchange(m_state->overrun_count, 0)}
-        ));
-    }
-
-    // HOT PATH: deliver buffered packets before surfacing errors.
-    // Any packets decoded from bytes that arrived before an error are returned first;
-    // the error only surfaces once the packet buffer is empty.
-    if (auto packet = m_state->packet_buffer.pop()) {
-        // Block mode: re-enable polling now that there is space in the buffer.
-        if (m_state->backpressure_mode == BackpressureMode::Block &&
-            !m_state->polling && !m_state->eof) {
-            int result = uv_poll_start(&m_state->poll_handle, UV_READABLE, poll_cb);
-            if (result == 0) m_state->polling = true;
-        }
-        return std::move(packet);
-    }
-
-    // Packet buffer drained — now surface any pending error or EOF.
-    if (m_state->error) {
-        return PollError(std::exchange(m_state->error, nullptr));
-    }
-
-    if (m_state->eof && m_state->byte_buffer.readable_bytes() == 0) {
-        return std::optional<T>(std::nullopt); // stream exhausted
-    }
-
-    // Register waker and suspend until poll_cb has something new to deliver.
-    m_state->waker = ctx.getWaker();
-
-    if (!m_state->polling && !m_state->eof) {
-        int result = uv_poll_start(&m_state->poll_handle, UV_READABLE, poll_cb);
-        if (result == 0) m_state->polling = true;
-    }
-
-    return PollPending;
-}
-```
-
-**Hot path characteristics:**
-
-- **Mutex-protected** — prevents TOCTOU races between `overrun_count` checks and `packet_buffer` pops when `poll_cb` runs concurrently on a multi-threaded executor
-- **Packets before errors** — error check comes *after* the packet pop; pre-error bytes reach the consumer in order
-- **Overrun notification first** — `PollStreamOverrunError` is delivered before the next surviving packet so the consumer knows exactly how many were dropped
-- **Zero-copy buffer pop** — move semantics transfer ownership directly to caller
-- **Backpressure release** — Block mode restarts polling when the packet buffer drains
-- **EOF with partial data** — only signals exhaustion when both EOF seen and byte buffer empty
-
-### PcieDecoder Implementation
-
-The decoder maintains state across multiple `decode()` calls to handle packets that span
-multiple `read()` operations:
-
-```cpp
-std::optional<PciePacket> PcieDecoder::decode(std::span<const std::byte> buffer,
-                                               std::size_t& consumed) {
-    consumed = 0;
-
-    while (true) {
-        switch (m_state) {
-        case State::ReadingHeader1: {
-            if (buffer.size() < 16) {
-                return std::nullopt; // Need more bytes
-            }
-
-            // Parse primary header
-            std::memcpy(&m_packet.header1, buffer.data(), 16);
-            buffer = buffer.subspan(16);
-            consumed += 16;
-
-            // Extract flags and payload length
-            m_has_header2 = (m_packet.header1.flags & 0x01) != 0;
-            m_payload_length = m_packet.header1.payload_length;
-
-            // Validate payload length
-            if (m_payload_length < 4096 || m_payload_length > 128 * 1024) {
-                throw std::runtime_error("Invalid payload length in header1");
-            }
-
-            // Transition to next state
-            m_state = m_has_header2 ? State::ReadingHeader2 : State::ReadingPayload;
-            continue; // Try next state immediately
-        }
-
-        case State::ReadingHeader2: {
-            if (buffer.size() < 16) {
-                return std::nullopt; // Need more bytes
-            }
-
-            // Parse secondary header
-            PciePacket::Header2 header2;
-            std::memcpy(&header2, buffer.data(), 16);
-            m_packet.header2 = header2;
-
-            buffer = buffer.subspan(16);
-            consumed += 16;
-
-            m_state = State::ReadingPayload;
-            continue;
-        }
-
-        case State::ReadingPayload: {
-            if (buffer.size() < m_payload_length) {
-                return std::nullopt; // Need more bytes
-            }
-
-            // Copy payload
-            m_packet.payload.resize(m_payload_length);
-            std::memcpy(m_packet.payload.data(), buffer.data(), m_payload_length);
-
-            buffer = buffer.subspan(m_payload_length);
-            consumed += m_payload_length;
-
-            m_state = State::ReadingFooter;
-            continue;
-        }
-
-        case State::ReadingFooter: {
-            if (buffer.size() < 16) {
-                return std::nullopt; // Need more bytes
-            }
-
-            // Parse footer
-            std::memcpy(&m_packet.footer, buffer.data(), 16);
-            consumed += 16;
-
-            // Validate footer magic numbers
-            if (m_packet.footer.magic1 != FOOTER_MAGIC1 ||
-                m_packet.footer.magic2 != FOOTER_MAGIC2) {
-                throw std::runtime_error("Invalid footer magic — frame sync lost");
-            }
-
-            // Packet complete — reset state and return
-            m_state = State::ReadingHeader1;
-            auto completed_packet = std::move(m_packet);
-            m_packet = PciePacket{}; // Reset for next packet
-            return completed_packet;
-        }
-
-        default:
-            std::abort(); // Bug — unknown state
-        }
-    }
-}
-
-void PcieDecoder::reset() {
-    m_state = State::ReadingHeader1;
-    m_packet = PciePacket{};
-    m_payload_length = 0;
-    m_has_header2 = false;
-}
-```
-
-**Decoder state machine:**
-
-1. **ReadingHeader1** — accumulate 16 bytes, parse flags and payload length
-2. **ReadingHeader2** — if flag set, accumulate 16 more bytes
-3. **ReadingPayload** — accumulate N bytes (from header1)
-4. **ReadingFooter** — accumulate 16 bytes, validate magic pattern
-
-**Key properties:**
-
-- **Incremental parsing** — returns `nullopt` when more bytes needed; picks up where it left off on next call
-- **Zero-copy when possible** — uses `std::memcpy` for headers/footer, `resize + memcpy` for payload
-- **Validation** — throws on invalid payload length or footer mismatch
-- **State carries across reads** — if a 64KB packet spans 5 `read()` calls, decoder maintains state through all 5
+- Packets are returned before errors — bytes decoded before a fault reach the consumer.
+- No mutex on the hot path (SPSC pop + atomic waker store).
+- `consumer_waker->wake()` is called on the libuv thread, outside any critical section.
 
 ---
 
-## Usage Example: PCIe Character Device Packet Stream
+## Backpressure
 
-### Application Context
+`PollStreamOptions::backpressure` selects one of two policies:
 
-An external device streams variable-length packets via a PCIe character device:
+**`Block` (default)** — When the SPSC packet buffer is full, `LibuvWaker::wake()` stops
+polling the decoder (returns from the drive loop without restarting). After the consumer
+drains the buffer, `poll_next` submits a coroutine to the uv thread to call
+`uv_poll_start`. Correct for sources that can tolerate backpressure.
 
-- Device: `/dev/pcie_data`
-- Packet structure: multi-stage (header1 + optional header2 + payload + footer)
-- Payload size range: 4KB - 128KB per packet
-- Arrival rate: ~1,000 packets/sec (limited by payload size)
-- Requirement: low-latency processing pipeline with frame sync validation
+**`Overrun`** — The fd is drained unconditionally. When the packet buffer is full, the
+oldest packet is evicted and an overrun counter is incremented. A
+`PollStreamOverrunError{n}` is delivered to the consumer as a non-fatal error before the
+next surviving packet. Use when a stalled read would cause a hardware fault.
 
-### Opening the Stream
+---
 
-```cpp
-#include "pcie_stream.h"  // from examples/io/
-#include <fcntl.h>
+## State Machine
 
-Coro<void> pcie_reader() {
-    // Open PCIe character device in non-blocking mode
-    int fd = ::open("/dev/pcie_data", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        throw std::system_error(errno, std::system_category(),
-                                "Failed to open PCIe character device");
-    }
-
-    // Create PcieStream with decoder
-    auto stream = PcieStream::open(fd, PcieDecoder{});
-
-    // Process packets as they arrive
-    try {
-        while (auto pkt = co_await stream.next()) {
-            // pkt is PciePacket with validated footer
-            std::cout << "Received packet: timestamp=" << pkt->header1.timestamp
-                      << " payload_size=" << pkt->payload.size() << "\n";
-
-            if (pkt->header2) {
-                std::cout << "  sequence=" << pkt->header2->sequence_number << "\n";
-            }
-
-            process_payload(pkt->payload);
-        }
-    } catch (const std::exception& e) {
-        // Framing error (e.g., invalid footer magic) or I/O error
-        std::cerr << "Stream error: " << e.what() << "\n";
-    }
-
-    std::cout << "PCIe stream closed\n";
-}
+```mermaid
+stateDiagram-v2
+    [*] --> Idle : open()
+    Idle --> Polling : uv_poll_start() on first poll_next()
+    Polling --> Polling : poll_cb fires, packet buffer not full
+    Polling --> Backpressure : packet buffer full (Block mode only)
+    Backpressure --> Polling : poll_next() drains buffer → uv_poll_start()
+    Polling --> EOF : read() returns 0 or decoder DecoderStream exhausted
+    Polling --> Error : I/O error or decoder throws
+    EOF --> [*]
+    Error --> [*]
 ```
 
-### Processing Pipeline with CoroStream
-
-```cpp
-// Stage 1: Raw packet stream from device (framing already handled by PcieDecoder)
-CoroStream<PciePacket> raw_packets(std::string device_path) {
-    int fd = ::open(device_path.c_str(), O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        throw std::system_error(errno, std::system_category());
-    }
-
-    auto stream = PcieStream::open(fd, PcieDecoder{});
-
-    while (auto pkt = co_await stream.next()) {
-        co_yield std::move(*pkt); // Move to avoid copying large payloads
-    }
-}
-
-// Stage 2: Filter and transform packets
-CoroStream<ProcessedData> process_packets(CoroStream<PciePacket> raw) {
-    while (auto pkt = co_await raw.next()) {
-        // Check packet type in header1
-        uint8_t pkt_type = (pkt->header1.flags >> 8) & 0xFF;
-
-        if (pkt_type == 0x01) {
-            // Process type 0x01 packets
-            co_yield process_type1(*pkt);
-        } else if (pkt_type == 0x02) {
-            // Process type 0x02 packets differently
-            co_yield process_type2(*pkt);
-        } else {
-            // Log and skip unknown packet type
-            std::cerr << "Unknown packet type: 0x"
-                      << std::hex << (int)pkt_type << "\n";
-        }
-    }
-}
-
-// Stage 3: Batch processing
-Coro<void> process_stream() {
-    auto raw = raw_packets("/dev/pcie_data");
-    auto processed = process_packets(std::move(raw));
-
-    std::vector<ProcessedData> batch;
-    batch.reserve(16); // Smaller batch due to larger payloads
-
-    while (auto data = co_await processed.next()) {
-        batch.push_back(std::move(*data));
-
-        if (batch.size() >= 16) {
-            process_batch(batch);
-            batch.clear();
-        }
-    }
-
-    // Process remaining
-    if (!batch.empty()) {
-        process_batch(batch);
-    }
-}
-```
-
-### Performance Characteristics
-
-With 1,000 packets/sec (avg 64KB payloads) and packet buffer size 64:
-
-- **Average burst size:** ~2-5 packets per task resumption (depends on executor load and payload sizes)
-- **Executor overhead amortization:** 1 task scheduling per 2-5 packets = 2-5× reduction
-- **Byte buffer utilization:** 256KB byte buffer holds ~4 complete packets' worth of raw data (handles read/decode pipeline)
-- **Backpressure activation:** only if processing falls behind by >64 packets OR byte buffer fills (e.g., during large payload decode)
-- **Latency breakdown:**
-  - First packet in burst: epoll notification + decode + 1 executor scheduling = ~100-500μs
-  - Subsequent packets in burst: buffer pop + payload move = ~1-10μs per packet
-- **Footer validation:** every packet validated; framing errors caught immediately and stream faulted
-
-### Multiple Simultaneous Streams
-
-Applications may need to open multiple PCIe character devices simultaneously (e.g., up to 8
-independent data streams). The recommended approach is to create **independent `PollStream`
-instances** for each device:
-
-```cpp
-std::vector<PcieStream> streams;
-for (int i = 0; i < 8; ++i) {
-    std::string device = "/dev/pcie_data_" + std::to_string(i);
-    int fd = ::open(device.c_str(), O_RDONLY | O_NONBLOCK);
-    streams.push_back(PcieStream::open(fd, PcieDecoder{}));
-}
-```
-
-**Efficiency:** libuv uses `epoll` (Linux) or equivalent multiplexing under the hood, so registering
-8 separate `uv_poll_t` handles is essentially free — the OS efficiently waits on all 8 fds with a
-single syscall. Each stream maintains independent buffers and backpressure, providing isolation
-(errors in one stream don't affect others) while still being highly efficient. There is no need for
-a custom multiplexing layer; libuv already provides optimal fd multiplexing.
+| State | uv_poll active |
+|---|---|
+| **Idle** | No |
+| **Polling** | Yes |
+| **Backpressure** | No |
+| **EOF** | No |
+| **Error** | No |
 
 ---
 
 ## Comparison: PollStream vs File
 
-| | `File` (regular files) | `PollStream` (character devices) |
+| | `File` | `PollStream` |
 |---|---|---|
-| **Underlying API** | `uv_fs_read` | `uv_poll_t` + `read()` |
-| **Execution model** | Threadpool | Event loop callback |
-| **Per-operation overhead** | High (context switch to/from worker thread) | Low (callback on I/O thread) |
-| **Notification** | Completion callback after threadpool finishes | `epoll` event when data ready |
-| **Buffering** | None (each read is one future) | Internal ring buffer |
-| **Suitable for** | Disk files, random access | Character devices, pipes, sockets, streaming data |
-| **Backpressure** | Not applicable (disk files don't produce data) | Automatic via `uv_poll_stop()` |
-| **Concurrency model** | One read future at a time per file | One consumer task at a time per stream |
+| **API** | `uv_fs_read` | `uv_poll_t` + `read()` |
+| **Execution** | Threadpool | Event loop callback |
+| **Per-read cost** | High — threadpool round-trip | Low — inline callback |
+| **Buffering** | None | Accumulation buffer + packet buffer |
+| **Framing** | None | `DecoderStream<T>` decoder |
+| **Backpressure** | N/A | `uv_poll_stop` / `uv_poll_start` |
+| **Suitable for** | Disk files, random access | Character devices, pipes, sockets |
 
 ---
 
-## Generalization: Other Pollable fd Types
+## Generalisation: Other fd Types and Protocols
 
-`PollStream<T, Decoder>` works for any pollable
-fd with any framing protocol — just implement a custom `Decoder`.
+`PollStream<T>` works for any pollable fd. The decoder factory determines the framing
+protocol. Simple examples:
 
-### Fixed-Size Message Decoder
-
-For simple fixed-size messages (e.g., 32-byte packets):
+**Fixed-size messages:**
 
 ```cpp
 template<typename T>
-class FixedSizeDecoder {
-public:
-    using OutputType = T;
-
-    std::optional<T> decode(std::span<const std::byte> buffer, std::size_t& consumed) {
-        if (buffer.size() < sizeof(T)) {
-            return std::nullopt; // Need more bytes
-        }
-
+coro::DecoderStream<T> fixed_size_decoder(coro::ByteSource& src) {
+    for (;;) {
         T item;
-        std::memcpy(&item, buffer.data(), sizeof(T));
-        consumed = sizeof(T);
-        return item;
+        co_await src.memcpy(&item, sizeof(T));
+        co_yield item;
     }
-
-    void reset() {} // Stateless — no-op
-};
-
-// Usage:
-auto stream = PollStream<Message, FixedSizeDecoder<Message>>::open(sock_fd, FixedSizeDecoder<Message>{});
+}
 ```
 
-### Length-Prefixed Decoder (like Protocol Buffers)
-
-For variable-length messages with a 4-byte length prefix:
+**Length-prefixed (e.g. Protocol Buffers):**
 
 ```cpp
-class LengthPrefixedDecoder {
-public:
-    using OutputType = std::vector<std::byte>;
+coro::DecoderStream<std::vector<std::byte>> length_prefixed_decoder(coro::ByteSource& src) {
+    for (;;) {
+        uint32_t len;
+        co_await src.memcpy(&len, sizeof(len));
+        len = ntohl(len);
 
-    std::optional<std::vector<std::byte>> decode(std::span<const std::byte> buffer,
-                                                  std::size_t& consumed) {
-        if (m_state == State::ReadingLength) {
-            if (buffer.size() < 4) return std::nullopt;
-
-            std::memcpy(&m_length, buffer.data(), 4);
-            m_length = ntohl(m_length); // Network byte order
-
-            if (m_length > MAX_MESSAGE_SIZE) {
-                throw std::runtime_error("Message too large");
-            }
-
-            buffer = buffer.subspan(4);
-            consumed = 4;
-            m_state = State::ReadingData;
-        }
-
-        // State::ReadingData
-        if (buffer.size() < m_length) return std::nullopt;
-
-        std::vector<std::byte> data(m_length);
-        std::memcpy(data.data(), buffer.data(), m_length);
-        consumed += m_length;
-
-        m_state = State::ReadingLength;
-        return data;
+        std::vector<std::byte> payload(len);
+        co_await src.memcpy(payload.data(), len);
+        co_yield std::move(payload);
     }
-
-    void reset() {
-        m_state = State::ReadingLength;
-        m_length = 0;
-    }
-
-private:
-    enum class State { ReadingLength, ReadingData };
-    State m_state = State::ReadingLength;
-    uint32_t m_length = 0;
-    static constexpr uint32_t MAX_MESSAGE_SIZE = 16 * 1024 * 1024; // 16MB
-};
+}
 ```
 
-### Newline-Delimited Decoder (e.g., JSON-RPC)
-
-For text protocols with newline delimiters:
+**Newline-delimited:**
 
 ```cpp
-class NewlineDelimitedDecoder {
-public:
-    using OutputType = std::string;
-
-    std::optional<std::string> decode(std::span<const std::byte> buffer,
-                                      std::size_t& consumed) {
-        // Find newline in buffer
-        auto* begin = reinterpret_cast<const char*>(buffer.data());
-        auto* end = begin + buffer.size();
-        auto* newline = std::find(begin, end, '\n');
-
-        if (newline == end) {
-            return std::nullopt; // No complete line yet
+coro::DecoderStream<std::string> line_decoder(coro::ByteSource& src) {
+    std::string line;
+    for (;;) {
+        auto chunk = co_await src.read(4096);
+        for (std::byte b : chunk) {
+            if (b == std::byte{'\n'}) { co_yield std::move(line); line.clear(); }
+            else                      { line += static_cast<char>(b); }
         }
-
-        // Extract line (excluding newline)
-        std::string line(begin, newline);
-        consumed = (newline - begin) + 1; // +1 to skip the '\n'
-
-        return line;
+        src.consume(chunk.size());
     }
-
-    void reset() {} // Stateless
-};
-
-// Usage for JSON-RPC over Unix socket:
-auto stream = PollStream<std::string, NewlineDelimitedDecoder>::open(sock_fd, NewlineDelimitedDecoder{});
-while (auto line = co_await stream.next()) {
-    auto json = nlohmann::json::parse(*line);
-    handle_rpc_call(json);
 }
 ```
 
 ---
 
-## Zero-Copy Payload Optimization
+## Zero-Copy Payload
 
-### Motivation
+`src.memcpy(dst, n)` copies bytes from the ring buffer into `dst` — one copy from the
+accumulation buffer to the packet struct. For most fields (headers, footers) this is
+negligible. For large payloads (e.g. 64 KB PCIe packets at 1,000/sec ≈ 64 MB/sec) it
+represents ~64 MB/sec of memory bandwidth.
 
-The current design copies large payloads twice:
-1. **Kernel → byte_buffer** — `read()` syscall
-2. **byte_buffer → PciePacket::payload** — `memcpy` in `decoder.decode()`
-
-For 64KB payloads at 1,000 packets/sec, this is **~120 MB/sec** of unnecessary memory bandwidth.
-
-### Zero-Copy Strategy
-
-Pre-allocate the destination `PciePacket::payload` vector and read directly into it:
-
-```
-Current:  kernel → byte_buffer → decoder memcpy → packet.payload → move to user
-Zero-copy: kernel → packet.payload (direct) → move to user
-```
-
-The byte buffer is still needed for small, fixed-size headers and footer (~48 bytes per packet).
-
-### Modified Decoder Interface
-
-Add methods for zero-copy payload handling:
+A zero-copy path is achievable using `src.read(n)` + `consume(n)` directly into a
+pre-allocated destination, bypassing the intermediate copy into the accumulation buffer
+by reading from the fd directly:
 
 ```cpp
-class PcieDecoder {
-public:
-    // Existing decode method for headers/footer (small data)
-    std::optional<PciePacket> decode(std::span<const std::byte> buffer,
-                                     std::size_t& consumed);
-
-    // Zero-copy payload methods
-
-    /// Returns true if decoder is ready to receive payload bytes directly
-    bool is_reading_payload() const { return m_state == State::ReadingPayload; }
-
-    /// Get writable span into the work-in-progress packet's payload
-    /// Returns: span starting at current payload write position
-    std::span<std::byte> get_payload_write_target();
-
-    /// Notify decoder that N bytes were written directly to payload
-    void commit_payload_bytes(std::size_t n);
-
-    /// Check if payload is complete (all bytes received)
-    bool payload_complete() const {
-        return m_payload_bytes_read >= m_packet.payload.size();
-    }
-
-private:
-    State m_state = State::ReadingHeader1;
-    PciePacket m_packet;
-    std::size_t m_payload_bytes_read = 0;  // Track progress within payload
-};
-```
-
-### Modified Decoder State Machine
-
-```cpp
-std::optional<PciePacket> PcieDecoder::decode(std::span<const std::byte> buffer,
-                                               std::size_t& consumed) {
-    consumed = 0;
-
-    while (true) {
-        switch (m_state) {
-        case State::ReadingHeader1: {
-            if (buffer.size() < 16) return std::nullopt;
-
-            std::memcpy(&m_packet.header1, buffer.data(), 16);
-            buffer = buffer.subspan(16);
-            consumed += 16;
-
-            m_has_header2 = (m_packet.header1.flags & 0x01) != 0;
-            std::size_t payload_length = m_packet.header1.payload_length;
-
-            if (payload_length < 4096 || payload_length > 128 * 1024) {
-                throw std::runtime_error("Invalid payload length");
-            }
-
-            // PRE-ALLOCATE payload vector for zero-copy writes
-            m_packet.payload.resize(payload_length);
-            m_payload_bytes_read = 0;
-
-            m_state = m_has_header2 ? State::ReadingHeader2 : State::ReadingPayload;
-            continue;
-        }
-
-        case State::ReadingHeader2: {
-            if (buffer.size() < 16) return std::nullopt;
-
-            PciePacket::Header2 header2;
-            std::memcpy(&header2, buffer.data(), 16);
-            m_packet.header2 = header2;
-
-            buffer = buffer.subspan(16);
-            consumed += 16;
-
-            m_state = State::ReadingPayload;
-            continue;
-        }
-
-        case State::ReadingPayload: {
-            // NOTE: This path is only used if poll_cb didn't read directly
-            // (e.g., if payload data was already in byte_buffer from previous read)
-            std::size_t remaining = m_packet.payload.size() - m_payload_bytes_read;
-
-            if (buffer.size() < remaining) return std::nullopt;
-
-            std::memcpy(m_packet.payload.data() + m_payload_bytes_read,
-                       buffer.data(), remaining);
-            buffer = buffer.subspan(remaining);
-            consumed += remaining;
-            m_payload_bytes_read = m_packet.payload.size();
-
-            m_state = State::ReadingFooter;
-            continue;
-        }
-
-        case State::ReadingFooter: {
-            if (buffer.size() < 16) return std::nullopt;
-
-            std::memcpy(&m_packet.footer, buffer.data(), 16);
-            consumed += 16;
-
-            if (m_packet.footer.magic1 != FOOTER_MAGIC1 ||
-                m_packet.footer.magic2 != FOOTER_MAGIC2) {
-                throw std::runtime_error("Invalid footer magic");
-            }
-
-            m_state = State::ReadingHeader1;
-            auto completed = std::move(m_packet);
-            m_packet = PciePacket{};
-            return completed;
-        }
-        }
-    }
-}
-
-std::span<std::byte> PcieDecoder::get_payload_write_target() {
-    assert(m_state == State::ReadingPayload);
-    return std::span<std::byte>(
-        m_packet.payload.data() + m_payload_bytes_read,
-        m_packet.payload.size() - m_payload_bytes_read
-    );
-}
-
-void PcieDecoder::commit_payload_bytes(std::size_t n) {
-    assert(m_state == State::ReadingPayload);
-    m_payload_bytes_read += n;
-    assert(m_payload_bytes_read <= m_packet.payload.size());
+pkt.payload.resize(len);
+std::size_t received = 0;
+while (received < len) {
+    auto chunk = co_await src.read(len - received);
+    std::memcpy(pkt.payload.data() + received, chunk.data(), chunk.size());
+    src.consume(chunk.size());
+    received += chunk.size();
 }
 ```
 
-### Modified poll_cb with Zero-Copy
-
-```cpp
-template<typename T, Decoder DecoderT>
-void PollStream<T, DecoderT>::poll_cb(uv_poll_t* handle, int status, int events) {
-    auto* state = static_cast<State*>(handle->data);
-
-    if (status < 0 || !(events & UV_READABLE)) { /* error handling */ return; }
-
-    // PHASE 1: GREEDY READ with zero-copy routing
-    while (true) {
-        // Route read based on decoder state
-        if (state->decoder.is_reading_payload() && !state->decoder.payload_complete()) {
-            // ZERO-COPY PATH: read directly into packet payload
-            auto write_target = state->decoder.get_payload_write_target();
-
-            ssize_t n = ::read(state->fd, write_target.data(), write_target.size());
-
-            if (n > 0) {
-                state->decoder.commit_payload_bytes(n);
-
-                // Continue reading if payload not complete
-                if (!state->decoder.payload_complete()) {
-                    continue;
-                }
-                // Payload complete — fall through to decode footer from byte_buffer
-            } else if (n == 0) {
-                state->eof = true;
-                break;
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;  // No more data
-            } else {
-                state->error = std::make_exception_ptr(
-                    std::system_error(errno, std::system_category(), "read failed")
-                );
-                uv_poll_stop(&state->poll_handle);
-                state->polling = false;
-                wake_consumer(state);
-                return;
-            }
-        }
-
-        // NORMAL PATH: read headers/footer into byte_buffer
-        if (state->byte_buffer.writable_bytes() == 0) break;
-
-        auto writable_span = state->byte_buffer.writable_span();
-        ssize_t n = ::read(state->fd, writable_span.data(), writable_span.size());
-
-        if (n > 0) {
-            state->byte_buffer.commit_write(n);
-        } else if (n == 0) {
-            state->eof = true;
-            break;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-        } else {
-            state->error = std::make_exception_ptr(
-                std::system_error(errno, std::system_category(), "read failed")
-            );
-            uv_poll_stop(&state->poll_handle);
-            state->polling = false;
-            wake_consumer(state);
-            return;
-        }
-    }
-
-    // PHASE 2: GREEDY DECODE (same as before)
-    try {
-        while (!state->packet_buffer.full()) {
-            auto readable_span = state->byte_buffer.readable_span();
-            if (readable_span.empty()) break;
-
-            std::size_t consumed = 0;
-            auto packet = state->decoder.decode(readable_span, consumed);
-
-            if (packet) {
-                state->packet_buffer.push(std::move(*packet));
-                state->byte_buffer.consume(consumed);
-            } else {
-                break;
-            }
-        }
-    } catch (const std::exception& e) {
-        state->error = std::current_exception();
-        uv_poll_stop(&state->poll_handle);
-        state->polling = false;
-        wake_consumer(state);
-        return;
-    }
-
-    // Backpressure and wake (same as before)
-    if (state->packet_buffer.full() && state->polling) {
-        uv_poll_stop(&state->poll_handle);
-        state->polling = false;
-    }
-
-    wake_consumer(state);
-}
-```
-
-### Safety Properties
-
-1. **Pre-allocation safety** — payload vector is resized to exact size from header1; no reallocation during reads
-2. **Bounds checking** — `commit_payload_bytes()` asserts it doesn't exceed allocated size
-3. **Partial read handling** — `m_payload_bytes_read` tracks progress; multiple `read()` calls accumulate correctly
-4. **Fallback path** — if payload data lands in byte_buffer (e.g., small packet read in one syscall), `decode()` handles it via memcpy
-5. **Move semantics** — completed packet moved to packet_buffer, then moved to user; no deep copies
-
-### Performance Impact
-
-**Before (with memcpy):**
-
-- 1,000 packets/sec × 64KB avg = 64 MB/sec
-- Copy overhead: 64 MB/sec memcpy = ~10-20ms CPU time @ 3-6 GB/sec memory bandwidth
-
-**After (zero-copy):**
-
-- Payload bytes only copied once (kernel → packet.payload)
-- Saves ~10-20ms CPU + ~64 MB/sec memory bandwidth
-- Headers/footer still use byte_buffer (48 bytes/packet = 48 KB/sec, negligible)
-
-### Trade-offs
-
-**Pros:**
-
-- Eliminates one full payload copy
-- Significant savings for large payloads (64KB+)
-- No change to user-facing API
-
-**Cons:**
-
-- More complex poll_cb logic (two read paths)
-- Decoder must pre-allocate payload (can't defer until full packet received)
-- Slightly more decoder state to track (`m_payload_bytes_read`)
+This reduces payload copies from 2 (kernel → accum_buffer → pkt.payload) to 1 (kernel →
+pkt.payload) by reading directly from whatever contiguous slice the ring buffer exposes.
+The PCIe example uses `src.memcpy` for simplicity; switch to `read` + `consume` here
+when payload bandwidth is measured to be a bottleneck.
 
 ---
 
-## Future Enhancements
+## EOF and Error Signalling
 
-### 1. Write Support (Bidirectional Streams)
+There are two distinct error sources: the fd (EOF or I/O error) and the decoder itself
+(framing error, validation failure, explicit throw).
 
-Add `UV_WRITABLE` polling and a `write()` method for bidirectional communication:
+### fd EOF or I/O Error
 
-```cpp
-co_await stream.write(packet);
-```
+When the fd closes mid-packet, the decoder's pending `memcpy` or `read` future cannot
+be satisfied. `ByteSource` maintains an `eof` flag. When `poll_cb` observes `read() == 0`
+or an fd error, it sets this flag before calling `libuv_waker.wake()`.
+`MemcpyFuture::poll()` checks the flag: if set mid-copy (destination not yet fully
+written), it returns `PollError` wrapping a `std::runtime_error("unexpected EOF")`. The
+decoder observes this as a thrown exception, which propagates as an unhandled exception
+and is stored in the `DecoderStream` promise. On the next `decoder_next.poll()`,
+`LibuvWaker::wake()` sees a `PollError` result, stores it as the stream's fatal error,
+and wakes the consumer.
 
-### 2. Cancellation Support
+**`read()` at EOF:** Returns an empty span. The decoder can detect this and call
+`co_return` to signal clean stream exhaustion (as opposed to a mid-packet truncation).
 
-Integrate with `CancellationToken` so the stream can be aborted mid-flight:
+### Decoder-Thrown Exceptions
 
-```cpp
-auto stream = PollStream<T>::open(fd, buffer_capacity, token);
-```
+When the decoder throws explicitly (e.g. framing error, footer magic mismatch,
+out-of-range field), the exception is caught by `CoroStream`'s `unhandled_exception()`
+promise hook, which stores it in `m_exception` and allows the coroutine to reach
+`final_suspend`. On the next `decoder_next.poll()`, `CoroStream::poll_next()` sees
+`m_handle.done()` with `m_exception` set and returns `PollError`. `LibuvWaker::wake()`
+propagates this to `State::error` and wakes the consumer, which receives the original
+exception via `PollStream::poll_next()` returning `PollError`.
 
-### 3. Metrics and Observability
-
-Expose buffer utilization, backpressure events, and throughput stats:
-
-```cpp
-auto stats = stream.stats();
-std::cout << "Buffer utilization: " << stats.avg_buffer_fill << "\n";
-```
-
----
-
-## Open Questions
-
-1. **Buffer size tuning:** Current defaults (256KB byte buffer, 64 packet buffer) are
-   reasonable for PCIe character devices with 4-128KB payloads. Should these be:
-    - Exposed as template parameters for compile-time optimization?
-    - Dynamically adjustable at runtime via `stream.set_buffer_capacity()`?
-    - Auto-tuned based on observed payload sizes?
-
-2. **Decoder error recovery:** When a decoder throws (framing error), the stream faults
-   after delivering any packets already decoded from bytes that arrived before the fault.
-   Should there be a "recovery mode" where:
-    - `decoder.reset()` is called automatically
-    - Stream attempts to resync (e.g., scan for footer magic in byte buffer)
-    - Consumer can call `stream.recover()` to clear error and continue?
-
-3. **Zero-copy payload delivery:** Currently payloads are copied from the byte buffer into
-   `PciePacket::payload`. For large payloads (4KB-128KB), this copy is expensive. A zero-copy
-   approach is possible by having the decoder pre-allocate the payload vector and `poll_cb`
-   read directly into it. See "Zero-Copy Payload Optimization" section below for details.
-
-4. **Multi-consumer support:** Current design assumes one consumer task. Could multiple
-   tasks await the same stream (with internal coordination)? Probably not needed — use
-   a `Channel` to fan-out if multiple consumers are required.
-
-5. **Partial packet at EOF:** If EOF arrives mid-packet (incomplete payload, no footer),
-   should the stream:
-    - Throw an error (current behavior: `eof && byte_buffer.readable_bytes() > 0` is ignored)?
-    - Call `decoder.decode()` one final time and let decoder decide?
-    - Provide partial data to consumer via a special `incomplete_packet()` method?
+No special handling is needed in `LibuvWaker` or `PollStream` for this case — it flows
+through the existing `CoroStream` exception propagation machinery.
 
 ---
 
-## References
+## Design Questions
 
-- [libuv documentation: uv_poll_t](http://docs.libuv.org/en/v1.x/poll.html)
-- Linux PCIe character device driver documentation
-- Rust `tokio::io::unix::AsyncFd` — similar event-driven wrapper for pollable fds
-- Linux `epoll(7)` man page — underlying kernel mechanism
+1. **Decoder error recovery** — when the decoder throws (framing error), the stream
+   faults and is closed. For protocols where resync is possible (e.g. scan for next
+   frame delimiter), an optional recovery path could be provided: `stream.reset()`
+   re-calls the decoder factory to obtain a fresh `DecoderStream`. This requires storing
+   the factory in `State`. Opt-in via `PollStreamOptions::allow_reset = true`.
+
+2. **Write support** — bidirectional fds (pipes, Unix sockets) need a write path. Add
+   `UV_WRITABLE` polling and a `co_await stream.write(data)` method.
+
+3. **Multiple simultaneous streams** — each `PollStream` registers an independent
+   `uv_poll_t` with the event loop. libuv multiplexes all registered handles under a
+   single `epoll` call, so opening 8 simultaneous `PollStream` instances on 8 fds is
+   essentially free at the OS level.
