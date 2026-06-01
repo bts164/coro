@@ -13,6 +13,7 @@ extra_css:
   - extra.css
 markdown_extensions:
   - footnotes
+  - admonition
 
 plugins:
   - search

@@ -18,6 +18,28 @@ Tokio's implementation as closely as C++ allows.
 
 These requirements apply to all three channel variants.
 
+### Allocation model
+
+Each channel type makes one heap allocation at creation for its shared inner state (ring
+buffer, value slot, waker lists, reference counts). Beyond that initial allocation, **no
+additional heap allocation occurs per operation**, including when a task suspends to wait.
+
+Waker queues use intrusive linked lists: each suspended future contributes a node that
+lives inside its own coroutine frame (which is already heap-allocated as part of the
+task). Linking and unlinking a waiter is pointer manipulation only — no allocator calls
+on the hot path. Each future's destructor is responsible for unlinking its node if it is
+dropped while suspended (cancelled, lost branch of `select()`, timeout), preventing
+dangling pointers in the waiter list.
+
+Oneshot is a special case: it stores a single waker slot directly in the shared state
+rather than an intrusive list, since at most one receiver can ever be waiting.
+
+For the vast majority of use cases this allocation model is the right choice — the cost is
+one allocation at channel creation, amortised across all subsequent operations. If a
+workload requires finer control over allocation timing or memory layout, channels are
+likely the wrong abstraction at that point; lower-level primitives with explicit memory
+management will serve better.
+
 ### Error handling
 
 All fallible operations return `std::expected<T, ChannelError>` rather than throwing.

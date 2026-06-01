@@ -177,6 +177,16 @@ private:
  * consuming the `MpscReceiver`, so the receiver can produce further futures after
  * a `select()` branch is cancelled.
  *
+ * **Zero-copy fast path:** if a sender is already suspended waiting to send when
+ * `poll()` runs, the value is moved directly from the sender's intrusive node into
+ * the receiver without touching the ring buffer. The sender's waker is then invoked
+ * to resume it.
+ *
+ * **Cancellation:** the receiver waiter is stored as a plain `MpscReceiverNode`
+ * (waker + optional destination) in the shared state, not as an intrusive list node.
+ * Since at most one receiver can be waiting at a time, the destructor simply clears
+ * this slot under the channel mutex — no list unlinking required.
+ *
  * @tparam T The value type to receive.
  */
 template<typename T>

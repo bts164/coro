@@ -1,10 +1,9 @@
 # Getting Started
 
-This guide walks through the core concepts of the library with working examples. It is
-organized in six groups: the coroutine keywords (`co_return`, `co_await`, `co_yield`),
-the runtime and executor, spawning parallel tasks, thread-safe communication and
-synchronization, `JoinSet` for dynamic fan-out, and the concurrent combinators
-(`join`, `select`, `timeout`).
+This guide walks you through the core concepts of the library by building a TCP echo server
+from the ground up. Each section introduces a feature as the server needs it — so you always
+have a concrete reason for every abstraction you encounter. Sections 1–11 introduce all the
+features; sections 12 and 13 are complete, self-contained examples that bring them together.
 
 ## Setup
 
@@ -93,21 +92,30 @@ A coroutine is a function that can suspend and resume. Calling a coroutine funct
 be produced sometime in the future. Nothing in the body runs until something drives it;
 the typical entry point is `Runtime::block_on()`.
 
+We are going to build a TCP echo server. This is the skeleton we will build on through
+the rest of this guide:
+
 ```cpp
 #include <coro/coro.h>
 #include <coro/runtime/runtime.h>
-#include <iostream>
+#include <cstdio>
 
-coro::Coro<void> say_hello() {
-    std::cout << "Hello from a coroutine!\n";
-    co_return;
+coro::Coro<int> run_server() {
+    std::printf("server starting\n");
+    co_return 0;  // stub — we'll fill this in section by section
 }
 
 int main() {
     coro::Runtime rt;
-    rt.block_on(say_hello());
+    return rt.block_on(run_server());
 }
 ```
+
+`run_server` is a coroutine: its return type is `Coro<int>` and it contains `co_return 0`.
+The `int` is the exit code — `block_on` drives the coroutine to completion and returns its
+value to `main`. Calling `run_server()` **does not** print anything — it constructs and
+returns an idle `Coro<int>` object. `block_on` takes that object and drives it to
+completion, which is when the printf actually executes.
 
 The compiler recognizes a coroutine by two things together: a coroutine return type
 (`Coro<T>`, `CoroStream<T>`) *and* at least one `co_return`, `co_await`, or `co_yield`
@@ -117,15 +125,16 @@ without any `co_*` keywords is just a factory:
 ```cpp
 // Coroutine — co_return triggers the compiler to generate suspend/resume machinery.
 // The body does not execute until the returned Coro<int> is driven by an executor.
-coro::Coro<int> compute() {
-    co_return 6 * 7;
+coro::Coro<int> run_server() {
+    std::printf("server starting\n");
+    co_return 0;
 }
 
 // Regular function — no co_* keywords, so not a coroutine.
-// It calls compute(), which constructs and returns an idle Coro<int> object,
-// then returns that object to the caller. Nothing inside compute() has run yet.
-coro::Coro<int> make_compute() {
-    return compute();
+// It calls run_server(), which constructs and returns an idle Coro<int> object,
+// then returns that object to the caller. Nothing inside run_server() has run yet.
+coro::Coro<int> make_server() {
+    return run_server();
 }
 ```
 
@@ -136,32 +145,55 @@ or name it before running it:
 int main() {
     coro::Runtime rt;
 
-    coro::Coro<int> task = make_compute();  // idle — nothing has run yet
+    coro::Coro<int> task = run_server();   // idle — nothing has run yet
     // task can be stored, passed to another function, etc.
-    int result = rt.block_on(std::move(task));  // now it runs
-    std::cout << result << "\n";  // 42
+    return rt.block_on(std::move(task));   // now it runs; returns the exit code
 }
 ```
 
-`block_on` is the simplest way to drive a coroutine from synchronous code — section 4
-covers how the runtime and executor work, and section 5 shows how to run coroutines in
-parallel with `spawn()`.
+`block_on` is the simplest way to drive a coroutine from synchronous code — section 5
+covers how the runtime and executor work in detail, and section 6 shows how to run
+coroutines in parallel with `spawn()`.
 
 ---
 
 ## 2. Awaiting another coroutine
 
-`co_await` is the keyword that makes async useful. It suspends the current coroutine
-until the awaited value is ready, then resumes it with the result unwrapped directly
-into a variable. Crucially, suspending does **not** block the OS thread — control
-returns to the executor, which is free to run other coroutines in the meantime. The
-thread is never parked waiting; it is always doing useful work.
+The server stub immediately returns. Let's give it a real first step: binding to a port.
+This is also where `co_await` first appears.
 
-Recall from section 1 that calling a coroutine function produces an idle object —
-nothing has run. `co_await` is how a running coroutine starts a child: the child begins
-executing immediately on the current thread, and if it reaches a point where it needs to
-wait (I/O, a channel, a sleep), *that* suspension propagates up and the executor picks up
-something else. When the child eventually completes, the parent resumes with the result.
+```cpp
+#include <coro/coro.h>
+#include <coro/runtime/runtime.h>
+#include <coro/io/tcp_listener.h>  // TcpListener — covered in full in section 4
+#include <cstdio>
+
+coro::Coro<int> run_server() {
+    // Think of TcpListener::bind as a coroutine that returns a TcpListener once the
+    // port is bound and ready to accept connections. I/O types are covered in section 4.
+    coro::TcpListener listener = co_await coro::TcpListener::bind("127.0.0.1", 8080);
+    std::printf("listening on 127.0.0.1:8080\n");
+    co_return 0;  // we'll accept connections in section 4
+}
+
+int main() {
+    coro::Runtime rt;
+    return rt.block_on(run_server());
+}
+```
+
+`co_await` suspends `run_server()` until the socket is bound, then resumes it with the
+`TcpListener` unwrapped directly into `listener`. Crucially, suspending does **not** block
+the OS thread — control returns to the executor, which is free to run other coroutines in
+the meantime. The thread is never parked waiting; it is always doing useful work.
+
+Recall from section 1 that calling a coroutine function produces an idle object — nothing
+has run. `co_await` is how a running coroutine starts a child: the child begins executing
+immediately on the current thread, and if it reaches a point where it needs to wait (I/O,
+a channel, a sleep), *that* suspension propagates up and the executor picks up something
+else. When the child eventually completes, the parent resumes with the result.
+
+To see the mechanics with a simpler example:
 
 ```cpp
 coro::Coro<int> fetch_value() {
@@ -177,20 +209,24 @@ coro::Coro<void> run() {
 }
 ```
 
-`co_await` works on anything that produces a value asynchronously — not just `Coro<T>`.
-Channel receives, I/O operations, timers, and combinators like `select` and `join` are
-all awaitable the same way. (These types satisfy the [`Future` concept](future_and_stream.md), which the
-reference docs cover in detail — you rarely need to think about it directly.)
+!!! info
+    `co_await` works on anything that produces a value asynchronously — not just `Coro<T>`.
+    As we go we will introduce many other primitives such as channel receives, I/O operations, timers,
+    and combinators like `select` and `join` that are all awaitable the same way. These types satisfy
+    the [`Future` concept](future_and_stream.md), which the reference docs cover in detail, but you rarely
+    need to think about it directly.
 
 ---
 
 ## 3. Async generators
 
-`CoroStream<T>` introduces the third coroutine keyword: `co_yield`. Where `co_return`
-produces a single value and exits, `co_yield` emits a value and suspends — the generator
-resumes from the next `co_yield` when the consumer asks for another item. Consume it with
-`co_await coro::next(stream)` in a loop; `next()` returns `std::nullopt` when the
-generator is exhausted.
+The echo server won't use async generators, but `co_yield` is the third coroutine keyword
+and follows naturally from the other two. It's worth understanding as a related concept.
+
+`CoroStream<T>` introduces `co_yield`: where `co_return` produces a single value and exits,
+`co_yield` emits a value and suspends — the generator resumes from the next `co_yield` when
+the consumer asks for another item. Consume it with `co_await coro::next(stream)` in a
+loop; `next()` returns `std::nullopt` when the generator is exhausted.
 
 ```cpp
 #include <coro/coro_stream.h>
@@ -204,11 +240,14 @@ coro::CoroStream<int> range(int n) {
         co_yield i;
 }
 
+coro::Coro<int> double_it(int x) { co_return x * 2; }
+
 coro::Coro<void> consume() {
     auto stream = range(5);
-    while (auto item = co_await coro::next(stream))
-        std::cout << *item << " ";  // 0 1 2 3 4
-    std::cout << "\n";
+    while (auto item = co_await coro::next(stream)) {
+        int result = co_await double_it(*item);  // range stays suspended while this runs
+        std::cout << result << " ";              // 0 2 4 6 8
+    }
 }
 
 int main() {
@@ -217,13 +256,142 @@ int main() {
 }
 ```
 
+At the moment `double_it` is executing, three coroutine frames exist simultaneously:
+
+```mermaid
+graph TD
+    main["main()"]
+    consume["consume() — suspended\nawaiting double_it()"]
+    range["range(n=5) — suspended\nat co_yield, i=2 preserved"]
+    dbl["double_it(2) — active"]
+
+    main --> consume
+    consume --> dbl
+    consume -. "stream (owns frame)" .-> range
+
+    style main fill:#f5f5f5,stroke:#bbb,color:#333
+    style consume fill:#aaa,stroke:#777,color:#eee
+    style range fill:#aaa,stroke:#777,color:#eee
+    style dbl fill:#4a9eff,stroke:#2266cc,color:#fff
+```
+
+In synchronous code this would be impossible: `double_it`'s stack frame would occupy the
+same memory that `range`'s frame previously used, overwriting it. Since `range` co_yielded
+rather than returned, its frame is still live — it can't be overwritten. Each coroutine
+frame is heap-allocated at its own independent address, so `double_it` and `range` coexist
+without conflict, and `consume` can re-enter `range` as soon as `double_it` returns.
+
 A generator can also `co_await` futures internally, suspending the stream until the
 awaited future resolves. The `next()` pattern also appears with `JoinSet` and `mpsc`
 channels later in this guide — any type satisfying `Stream<T>` is consumed the same way.
 
 ---
 
-## 4. The Runtime and Executor
+## 4. Async I/O
+
+In section 2 we co_awaited `TcpListener::bind()` to get a listening socket. Now we add
+`listener.accept()` — which suspends until a client connects and returns a `TcpStream`,
+the read/write handle for that client — and an echo loop to send their data back.
+
+`TcpStream::read()` and `TcpStream::write()` suspend the coroutine rather than blocking
+the thread, freeing the executor to run other tasks in the meantime. When the operation
+completes, `run_server` resumes on the next line — exactly as if the call had blocked.
+Both `read` and `write` use owned buffers: the buffer is moved into the operation and returned with the
+result, tying its lifetime to the coroutine frame and making dangling-pointer bugs
+impossible at the type-system level.
+
+```cpp
+#include <coro/coro.h>
+#include <coro/runtime/runtime.h>
+#include <coro/io/tcp_listener.h>
+#include <coro/io/tcp_stream.h>
+#include <cstdio>
+#include <string>
+
+coro::Coro<int> run_server() {
+    coro::TcpListener listener = co_await coro::TcpListener::bind("127.0.0.1", 8080);
+    std::printf("listening on 127.0.0.1:8080\n");
+
+    coro::TcpStream stream = co_await listener.accept();
+    std::printf("client connected\n");
+    for (;;) {
+        auto [n, buf] = co_await stream.read(std::string(4096, '\0'));
+        if (n == 0) {
+            std::printf("EOF\n");
+            co_return 0;
+        }
+        buf.resize(n);
+        co_await stream.write(std::move(buf));
+    }
+}
+
+int main() {
+    coro::Runtime rt;
+    return rt.block_on(run_server());
+}
+```
+
+The server as is handles only one connection before it exits — section 6 extends it to handle many concurrently.
+
+To test it, a client connects with `TcpStream::connect` — the same read/write interface from the other end:
+
+```cpp
+coro::Coro<void> run_client() {
+    coro::TcpStream stream = co_await coro::TcpStream::connect("127.0.0.1", 8080);
+    co_await stream.write(std::string("hello"));
+    auto [n, reply] = co_await stream.read(std::string(4096, '\0'));
+    reply.resize(n);
+    std::printf("received: %.*s\n", (int)n, reply.c_str());
+}
+```
+
+The library provides several other I/O types that follow the same suspend-not-block pattern.
+
+### File — async file I/O
+
+`File` provides async read and write on the local filesystem. The interface is the same
+owned-buffer pattern as `TcpStream` — open, read, write, and the coroutine suspends
+rather than blocking while the operation runs.
+
+```cpp
+#include <coro/io/file.h>
+
+coro::Coro<void> run() {
+    auto f = co_await coro::File::open("data.txt", coro::FileMode::Read);
+    auto [n, buf] = co_await f.read(std::vector<std::byte>(4096));
+    buf.resize(n);
+
+    auto out = co_await coro::File::open(
+        "output.txt", coro::FileMode::Write | coro::FileMode::Create | coro::FileMode::Truncate);
+    co_await out.write(std::move(buf));
+}
+```
+
+### WsStream / WsListener — WebSocket
+
+`WsStream` and `WsListener` are the WebSocket equivalents of `TcpStream` and `TcpListener`.
+`WsStream::connect()` handles the handshake and returns a stream with `send()` and
+`receive()` methods; `WsListener::bind()` accepts incoming connections and hands out a
+`WsStream` per client.
+
+```cpp
+#include <coro/io/ws_stream.h>
+
+coro::Coro<void> run() {
+    coro::WsStream ws = co_await coro::WsStream::connect("ws://localhost:9001/");
+    co_await ws.send("hello");
+    coro::WsStream::Message reply = co_await ws.receive();
+    std::cout << reply.as_text() << "\n";  // "hello"
+}
+```
+
+---
+
+## 5. The Runtime and Executor
+
+We've been creating a `Runtime` and calling `block_on()` without much explanation. Now
+that the server can accept connections, here's what's been driving it. The `Runtime` owns
+a configurable **executor** — the component that schedules and runs coroutine tasks.
 
 `Runtime::block_on()` is the bridge between synchronous and async code. It takes a
 single root coroutine, drives it to completion on the executor, and returns its result
@@ -233,7 +401,7 @@ inside that root coroutine.
 ```cpp
 int main() {
     coro::Runtime rt;
-    return rt.block_on(async_main());  // blocks until async_main() completes
+    return rt.block_on(run_server());  // blocks until run_server() completes
 }
 ```
 
@@ -267,77 +435,131 @@ coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
 coro::Runtime rt(std::in_place_type<coro::WorkSharingExecutor>, 4);
 ```
 
-**Work-stealing** is the right default for most applications. Tasks are distributed
+- **Work-stealing** is the right default for most applications. Tasks are distributed
 across worker threads; when a thread exhausts its local queue it steals tasks from
 other threads, keeping all cores busy without manual load balancing.
-
-**Single-threaded** is ideal for tests and deterministic environments. All coroutines
+- **Single-threaded** is ideal for tests and deterministic environments. All coroutines
 run on the calling thread — no synchronization is needed for shared state between
 coroutines, and execution order is reproducible.
-
-**Work-sharing** predates work-stealing in this library and exists because it was
+- **Work-sharing** predates work-stealing in this library and exists because it was
 simpler to implement initially. It uses a single global FIFO queue protected by a mutex, which
 becomes a contention bottleneck under any significant task load. It is occasionally
 useful when debugging to help isolate whether a bug is specific to the work-stealing
 scheduler, but work-stealing should be preferred in virtually every other situation.
-Only reach for it if you understand the trade-offs and have a concrete reason.
+Only reach for this if you understand the trade-offs and have a concrete reason to.
 
----
-
-## 5. Spawning parallel tasks
-
-`spawn()` creates a **parallel** task: the executor schedules it independently and, on a
-multi-threaded runtime, may run it on a different thread at the same time as the spawning
-task. A task can migrate between threads between suspensions, but it never executes on
-more than one thread at once. The returned `JoinHandle` is a `Future` — `co_await` it to
-retrieve the result.
-
-> **A task is the coroutine analogue of an OS thread.** A thread takes a function as its
-> entry point; everything it calls runs sequentially on that thread — no two callees on
-> the same thread overlap. A task works the same way: it takes a coroutine as its entry
-> point, that coroutine `co_await`s other coroutines instead of calling functions, and
-> everything in the resulting *"stack"* (a chain of suspended awaiters — not a true call
-> stack, but the closest analogue) runs sequentially. Only coroutines in *different* tasks
-> can execute simultaneously.
->
-> The difference is cost. `std::thread` requires a kernel stack (8 MiB by default on
-> Linux) and an OS scheduler registration — a round-trip into the kernel. A task allocates
-> only a coroutine frame (typically a few hundred bytes) and a small scheduler entry, with
-> no system call. The work-stealing executor is designed to support hundreds of thousands
-> of concurrent tasks, in the same ballpark as Tokio, on which the scheduler is modelled.
+The server code itself is unchanged regardless of which executor you use — the runtime
+is a pure deployment knob. Because the choice is just a constructor argument, it can
+even be a runtime decision based on a command-line flag:
 
 ```cpp
-#include <coro/coro.h>
-#include <coro/runtime/runtime.h>
+int main(int argc, char* argv[]) {
+    bool single = argc > 1 && std::string_view(argv[1]) == "--single-threaded";
 
-coro::Coro<int> fetch(int id) {
-    co_return id * 10;
-}
-
-coro::Coro<void> run() {
-    // Spawn both tasks before awaiting either — they may run in parallel.
-    // .name() is optional; it tags the task for debugging.
-    auto h1 = coro::build_task().name("fetch-1").spawn(fetch(1));
-    auto h2 = coro::build_task().name("fetch-2").spawn(fetch(2));
-
-    int a = co_await h1;  // 10
-    int b = co_await h2;  // 20
-    std::cout << a + b << "\n";  // 30
-}
-
-int main() {
-    coro::Runtime rt;
-    rt.block_on(run());
+    if (single) {
+        coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
+        return rt.block_on(run_server());
+    } else {
+        coro::Runtime rt(std::in_place_type<coro::WorkStealingExecutor>);
+        return rt.block_on(run_server());
+    }
 }
 ```
 
-> **Key takeaways** — This rest of this section covers cancellation, task lifetimes, and reference hazards. The behaviour is deliberate and the rules are few, but they may not be obvious to first time users and getting them wrong can lead to subtle bugs. It is worth reading this section in full before writing code that spawns tasks, but if you do decide to skip ahead for now at minimum keep these points in mind:
->
-> - Dropping a `JoinHandle` **cancels** the task and the parent waits for it to drain — no dangling tasks, ever.
-> - `detach()` — fire and forget; parent never waits.
-> - `cancelOnDestroy(false)` — no cancel signal; parent waits for natural completion.
-> - After cancellation, **no user code runs again** — only destructors, in order.
-> - **Reference hazard:** do not let a spawned task hold a reference to a local in the spawning scope. Use `co_invoke` to create an inner scope instead (see below).
+`run_server()` is called identically in both branches — nothing inside it changes.
+
+---
+
+## 6. Spawning parallel tasks
+
+The server in section 4 accepts one connection, handles it, and exits. We could wrap the
+echo loop in an outer `for` loop to keep accepting, but connections would then be handled
+sequentially — the next `accept()` only runs after the current client disconnects. What we
+need is for each connection to run in parallel: a separate instance of the echo loop per
+client, all active at the same time. That means moving the echo loop into its own coroutine
+that can be instantiated once per connection:
+
+```cpp
+static coro::Coro<void> handle_connection(coro::TcpStream stream, int id) {
+    std::printf("[%d] connected\n", id);
+    for (;;) {
+        auto [n, buf] = co_await stream.read(std::string(4096, '\0'));
+        if (n == 0) {
+            std::printf("[%d] EOF\n", id);
+            co_return;
+        }
+        buf.resize(n);
+        co_await stream.write(std::move(buf));
+    }
+}
+```
+
+`handle_connection` takes `TcpStream` by value — the stream is moved into the task's
+frame so each connection owns its socket independently, with no shared state between them.
+
+To launch a separate instance of `handle_connection` per connection we use `coro::spawn()`,
+which schedules a coroutine as an independent parallel task. A useful mental model is
+launching an OS thread — the task executes concurrently with the caller, but no new thread
+is actually created; spawning is lightweight and the task runs on the existing executor
+threads. This also means the executor's thread count doesn't limit how many tasks you can
+have — a single-threaded executor can run thousands of tasks, interleaving them
+cooperatively rather than truly simultaneously. `spawn()` returns a `JoinHandle` that can
+be `co_await`ed just like any other coroutine to retrieve the result or wait for
+completion.
+
+!!! info "Tasks and OS threads"
+    A task is the coroutine analogue of an OS thread. A thread takes a function as its
+    entry point; everything it calls runs sequentially on that thread — no two callees on
+    the same thread overlap. A task works the same way: it takes a coroutine as its entry
+    point, that coroutine `co_await`s other coroutines instead of calling functions, and
+    everything in the resulting *"stack"* (a chain of suspended awaiters — not a true call
+    stack, but the closest analogue) runs sequentially. Only coroutines in *different* tasks
+    can execute simultaneously.
+
+    The difference is cost. `std::thread` requires a kernel stack (8 MiB by default on
+    Linux) and an OS scheduler registration — a round-trip into the kernel. A task allocates
+    only a coroutine frame (typically a few hundred bytes) and a small scheduler entry, with
+    no system call. The work-stealing executor is designed to support hundreds of thousands
+    of concurrent tasks, in the same ballpark as Tokio, on which the scheduler is modelled.
+
+```cpp
+coro::Coro<int> run_server() {
+    coro::TcpListener listener = co_await coro::TcpListener::bind("127.0.0.1", 8080);
+    std::printf("listening on 127.0.0.1:8080\n");
+
+    constexpr int max_connections = 5;  // fixed limit just to demonstrate joining
+    std::vector<coro::JoinHandle<void>> handles;
+    for (int i = 0; i < max_connections; ++i) {
+        coro::TcpStream stream = co_await listener.accept();
+        handles.push_back(coro::spawn(handle_connection(std::move(stream), i)));
+    }
+
+    for (auto& h : handles)
+        co_await h;
+
+    co_return 0;
+}
+```
+
+To demonstrate joining here, the server accepts a fixed number of connections and runs them
+all in parallel while we wait in the accept loop. Each `co_await h` waits for that session to
+finish and join before the server exits. The limitation is that we have to know the count
+upfront and we wait for sessions in spawn order rather than completion order — a client that
+disconnects first still waits behind a slower one. Section 7 will cover how to extend this to
+handle a dynamic number of connections and deliver results in completion order.
+
+!!! warning "Key takeaways"
+    The rest of this section covers cancellation, task lifetimes, and reference hazards.
+    The behaviour is deliberate and the rules are few, but they may not be obvious to first
+    time users and getting them wrong can lead to subtle bugs. It is worth reading this
+    section in full before writing code that spawns tasks, but if you do decide to skip
+    ahead for now at minimum keep these points in mind:
+
+    - Dropping a `JoinHandle` **cancels** the task and the parent waits for it to drain — no dangling tasks, ever.
+    - `handle.detach()` — fire and forget; parent never waits.
+    - `handle.cancelOnDestroy(false)` — no cancel signal; parent waits for natural completion. Use this when a task needs to keep running during error cleanup — for example, a collector that must finish draining a channel even after sibling tasks have been cancelled.
+    - After cancellation, **no user code runs again** — only destructors, in order.
+    - **Reference hazard:** do not let a spawned task hold a reference to a local in the spawning scope. Use `co_invoke` to create an inner scope instead (see below).
 
 ### The coroutine scope mechanism
 
@@ -361,38 +583,36 @@ destroyed in order, at the right time, even when the destruction path itself inv
 asynchronous steps.
 
 ```cpp
-std::atomic_bool fetch_frame_destroyed = false;
+std::atomic_bool handler_frame_destroyed = false;
 
-coro::Coro<void> fetch() {
-    // This local's destructor (⑤) fires when fetch's frame is cleaned up —
-    // whether fetch completed normally or was cancelled.
-    struct OnDestroy { ~OnDestroy() { fetch_frame_destroyed.store(true); } } probe;
+coro::Coro<void> handle_connection() {
+    // This local's destructor (④) fires when handle_connection's frame is cleaned up —
+    // whether it completed normally or was cancelled.
+    struct OnDestroy { ~OnDestroy() { handler_frame_destroyed.store(true); } } probe;
 
-    // ② fetch suspends here — this is where it waits when ④ fires
-    co_await coro::sleep_for(10s);
-    std::cout << "response received\n";  // never executes — still suspended at ② when cancelled
-
-    // ⑤ drain: fetch's frame is destroyed here — each local's destructor runs in order.
-    //    ~OnDestroy fires, setting fetch_frame_destroyed = true.
+    // ② handle_connection suspends here waiting for client data.
+    co_await coro::sleep_for(10s);  // stands in for a long-running read
+    std::cout << "data received\n";  // never executes — cancelled at ②
 }
 
-coro::Coro<void> run() {
-    // ① fetch is spawned and immediately starts executing, reaching ②
-    auto handle = coro::spawn(fetch());
+coro::Coro<void> run_server() {
+    // ① handle_connection is spawned and immediately starts executing, reaching ②.
+    auto handle = coro::spawn(handle_connection());
 
-    co_await coro::sleep_for(1s);
-    // ③ run()'s 1s sleep ends — fetch is still suspended with ~9s remaining on ②
+    co_await coro::sleep_for(1s);  // server shuts down after 1s for this example
     co_return;
-    // ④ handle goes out of scope after ~1s — cancellation signal sent to fetch cancelling ②
-    // ⑥ run() only completes once fetch's frame is fully destroyed (⑤ has fired)
+    // ③ handle goes out of scope — cancellation signal sent to handle_connection, interrupting ②.
+    // ④ drain: handle_connection's frame is destroyed; ~OnDestroy fires.
+    // ⑤ run_server() only completes after ④ — no dangling connections.
 }
 
 coro::Coro<void> parent() {
-    co_await run();
-    // ⑦ resumes after ~1s, not ~10s — fetch's sleep was cancelled before it completed
-    assert(fetch_frame_destroyed.load());  // drain rules guarantee ⑤ fired before ⑦
+    co_await run_server();
+    // ⑥ resumes after ~1s, not ~10s — handle_connection was cancelled before it completed.
+    assert(handler_frame_destroyed.load());  // drain rules guarantee ④ fired before ⑥
 }
 ```
+
 
 To opt out of cancellation, two options are available. `detach()` fully severs the task
 from the scope — the parent continues immediately and never waits for the child.
@@ -445,37 +665,52 @@ after the locals are gone, leaving a window where a child holding a reference to
 reads dangling memory.
 
 C++ also has no compile-time check to catch this — there is no borrow checker to reject
-a spawn that captures a reference to a local:
+a spawn that captures a reference to a local. To make the hazard concrete, imagine a
+`worker` that suspends briefly before using the pointer:
 
 ```cpp
+coro::Coro<void> worker(int* ptr) {
+    co_await coro::sleep_for(std::chrono::milliseconds(10)); // ③ suspended here
+    std::printf("%d\n", *ptr);  // ④ USE-AFTER-FREE: local_data is already gone
+}
+
 coro::Coro<void> unsafe_example() {
-    int local_data = 42;
-    // Dangerous — child captures a pointer to local_data.
-    auto h = coro::spawn(worker(&local_data));
-    co_return;  // local_data destroyed here; child may still be running
+    int local_data = 42;                        // ① lives in the coroutine frame
+    auto h = coro::spawn(worker(&local_data));  // ② child starts, holds &local_data
+    co_return;
+    // ③ local_data is DESTROYED as part of frame teardown.
+    //    h's destructor fires: it cannot co_await, so it records the drain as
+    //    pending and signals cancellation to worker.
+    // ④ The deferred drain runs after the frame is gone — worker wakes from
+    //    sleep_for and dereferences a dangling pointer.
 }
 ```
+
+The drain wait is deferred past the point where C++ has already torn down the frame's
+locals, so there is always a window where the child can read destroyed memory.
 
 **The safe patterns are:**
 
 1. **Pass owned data** — move values into the child instead of capturing references.
-2. **Use `co_invoke` to create a nested scope** — `co_invoke` (covered in section 9) introduces
+2. **Use `co_invoke` to create a nested scope** — `co_invoke` (covered in section 10) introduces
    a new coroutine scope inside the current one. Placing the `JoinHandle` (or `JoinSet`) inside that
    nested scope — while the referenced variable stays in the outer frame — guarantees
-   that the outer frame outlives the spawned task. When `co_invoke` completes, the inner
-   scope has fully drained; the outer locals are still alive throughout.
+   that the outer frame outlives the spawned task. The numbered steps below mirror the
+   unsafe example so you can see exactly where the hazard is closed:
 
 ```cpp
 coro::Coro<void> safe_example() {
-    int shared_value = 42;  // lives in the outer coroutine frame
+    int shared_value = 42;          // ① lives in the outer coroutine frame
 
     co_await coro::co_invoke([&]() -> coro::Coro<void> {
-        // JoinHandle lives here, in the inner scope.
-        // shared_value is in the outer frame, so it outlives this entire co_invoke.
-        auto h = coro::spawn(worker(&shared_value));
-        co_await h;  // inner scope drains before co_invoke returns
+        auto h = coro::spawn(worker(&shared_value)); // ② child starts, holds &shared_value
+        co_await h;
+        // ③ co_await suspends here — outer frame is still alive.
+        //    worker wakes from sleep_for and reads *ptr safely.
+        // ④ h goes out of scope; inner scope drains synchronously before
+        //    co_invoke returns.
     });
-    // shared_value still alive here
+    // ⑤ shared_value is destroyed here — the child finished at step ④.
 }
 ```
 
@@ -497,11 +732,244 @@ the implicit scope mechanism, its limits, and how it compares to Rust's `'static
 
 ---
 
-## 6. Thread-safe communication
+## 7. Fan-out with `JoinSet`
+
+Back to the server. In section 6 we spawned a `handle_connection` task per connection and
+collected the `JoinHandle`s in a vector, but that required knowing the connection count
+upfront. `JoinSet` removes that constraint: it accepts tasks as they arrive and tracks them
+internally without a fixed size. We can `co_await coro::next(sessions)` at any point to
+receive the next completed result or propagate an error.
+
+```cpp
+#include <coro/task/join_set.h>
+
+coro::Coro<int> run_server() {
+    coro::TcpListener listener = co_await coro::TcpListener::bind("127.0.0.1", 8080);
+    std::printf("listening on 127.0.0.1:8080\n");
+
+    coro::JoinSet<void> sessions;
+    for (int i = 0; ; ++i) {
+        // What we really want here is:
+        //   await listener.accept()  -- OR --  coro::next(sessions)
+        // whichever happens first, handle it, then loop.
+        // For now we can only do one at a time:
+        coro::TcpStream stream = co_await listener.accept();
+        sessions.spawn(handle_connection(std::move(stream), i));
+        co_await coro::next(sessions);  // wait for a session to complete
+    }
+}
+```
+
+Dropping `sessions` at any point — whether `run_server` returns normally, throws, or is
+cancelled — cancels every in-flight connection simultaneously and drains them before the
+frame is freed.
+
+The loop still alternates sequentially: accept a connection, spawn it, wait for it to
+finish, then accept the next. If we could instead react to whichever of those two operations
+completes first — a new connection arriving or an existing session finishing — `sessions`
+would grow and shrink dynamically, results and errors would surface in the order sessions
+complete, and no client would ever block another from being accepted. Section 8 shows how
+to achieve exactly that.
+
+---
+
+## 8. Concurrent combinators
+
+**Concurrent** means multiple operations can make progress without waiting for each other
+to complete — no ordering guarantees on when each starts or finishes. **Parallel** extends
+this to include simultaneous execution on multiple cores.
+
+`spawn()` creates parallel tasks. The combinators in this section — `join`, `select`,
+`timeout`, and `sleep_for` — are concurrent but not parallel: they drive multiple futures
+within the current task, advancing one at a time. No two branches within a single Task ever
+execute simultaneously, even on a multi-threaded executor.
+
+The server has two remaining problems: (1) the accept loop is stuck waiting in
+`listener.accept()` and never drains completed sessions from the `JoinSet`; (2) a stalled
+client that stops sending or receiving holds its connection slot indefinitely, blocking that
+handler task forever. Both are solved with combinators.
+
+!!! info "Concurrent vs parallel — tasks vs combinators"
+    A plain `co_await` chain is linear: each coroutine waits for the one below it, just
+    like a call stack. Combinators fan a single task out into multiple live branches at
+    once — the task's execution structure becomes a tree, not a stack. All branches in
+    that tree are interleaved cooperatively on a single thread at a time; none of them
+    run truly simultaneously. A second *task* (spawned with `spawn()`) is a second
+    independent tree, and those two trees are what the executor runs in parallel across
+    threads. Combinators are concurrent; `spawn()` is parallel.
+
+### Racing futures — `select()`
+
+```mermaid
+graph TD
+    run["run()"] --> S["select()"]
+    S --> W["branch A  ✓ wins"]
+    S --> L["branch B  ✗ cancelled"]
+    style L stroke-dasharray:4 4,color:#999
+```
+
+`select()` races two or more futures and returns as soon as one completes.
+The result is a `std::variant` of `SelectBranch<N, T>` values identifying which
+branch won and carrying its result. All other branches are cancelled and drained.
+
+This is exactly what the section 7 loop was missing. Instead of awaiting `accept()` then
+`next(sessions)` sequentially, we race them — whichever fires first is handled and the loop
+continues immediately, keeping new connections and completed sessions serviced without
+either starving the other:
+
+```cpp
+coro::Coro<int> run_server() {
+    coro::TcpListener listener = co_await coro::TcpListener::bind("127.0.0.1", 8080);
+    std::printf("listening on 127.0.0.1:8080\n");
+
+    coro::JoinSet<void> sessions;
+    for (int i = 0; ; ++i) {
+        try {
+            // variant<SelectBranch<0, TcpStream>, SelectBranch<1, bool>>
+            auto sel = co_await coro::select(
+                listener.accept(),    // branch 0: new connection ready
+                coro::next(sessions)  // branch 1: a session completed (throws if it threw)
+            );
+            if (sel.index() == 0) {
+                coro::TcpStream& stream = std::get<0>(sel).value;
+                sessions.spawn(handle_connection(std::move(stream), i));
+            }
+            // branch 1: session completed normally — loop and accept more connections
+        } catch (const std::exception& e) {
+            std::printf("session error: %s — shutting down\n", e.what());
+            co_return 1;
+        }
+    }
+}
+```
+
+#### Keeping a future alive across a losing branch — `coro::ref()`
+
+By default `select()` takes its futures by value and cancels any branch that loses. Sometimes
+you want to re-enter the same future across multiple `select()` rounds — for example,
+polling a long-running task while checking back periodically.
+
+`coro::ref(f)` wraps an lvalue future in a non-owning reference. When that branch loses,
+only the wrapper is discarded; the underlying future is untouched and can be passed to
+`select()` again:
+
+```cpp
+using namespace std::chrono_literals;
+
+coro::Coro<int> slow_task() {
+    co_await coro::sleep_for(5s);
+    co_return 42;
+}
+
+coro::Coro<void> run() {
+    auto task = slow_task();  // lvalue — coro::ref() requires this
+
+    // Check every second whether the task has finished.
+    while (true) {
+        auto sel = co_await coro::select(coro::ref(task), coro::sleep_for(1s));
+        if (sel.index() == 0) {
+            std::printf("done: %d\n", std::get<0>(sel).value);
+            break;
+        }
+        std::printf("still waiting...\n");  // timer fired, loop and check again
+    }
+}
+```
+
+!!! warning "Key points"
+    - `coro::ref()` only accepts lvalues — store the future in a named variable first.
+      `coro::ref(slow_task())` is a compile error.
+    - If the `coro::ref(f)` branch wins and delivers a result, the result is moved out of `f`.
+      Do not await `f` again — it is logically consumed even though it was not moved.
+
+### Joining futures — `join()`
+
+```mermaid
+graph TD
+    run["run()"] --> J["join()"]
+    J --> A["fetch_int()"]
+    J --> B["fetch_string()"]
+```
+
+`join()` is the complement of `select()`: it runs a fixed set of futures concurrently and
+waits for **all** of them to complete. The number and types of branches are fixed at compile
+time and results are returned as a `std::tuple` in branch order.
+
+```cpp
+#include <coro/sync/join.h>
+
+coro::Coro<int>         fetch_int()    { co_return 42; }
+coro::Coro<std::string> fetch_string() { co_return "hello"; }
+
+coro::Coro<void> run() {
+    auto [n, s] = co_await coro::join(fetch_int(), fetch_string());
+    std::cout << n << " " << s << "\n";  // 42 hello
+}
+```
+
+If any branch throws, the remaining branches are cancelled and the exception re-thrown.
+Use `JoinSet` instead when the number of branches is dynamic.
+
+### Suspending — `sleep_for()`
+
+`sleep_for()` suspends the current coroutine for a duration without blocking any worker
+thread. Other tasks continue to run on the executor while a coroutine sleeps.
+
+```cpp
+#include <coro/sync/sleep.h>
+#include <chrono>
+
+coro::Coro<void> run() {
+    using namespace std::chrono_literals;
+    co_await coro::sleep_for(100ms);
+}
+```
+
+### Timeouts — `timeout()`
+
+`timeout(duration, future)` is a convenience wrapper around `select` that races a future
+against a `sleep_for` timer — the pattern from the `coro::ref()` example above, expressed
+in one call. The second remaining server problem was stalled clients holding connection
+slots indefinitely; we fix that by wrapping each read and write in `handle_connection`:
+
+```cpp
+static coro::Coro<void> handle_connection(coro::TcpStream stream, int id) {
+    std::printf("[%d] connected\n", id);
+    using namespace std::chrono_literals;
+    for (;;) {
+        auto recv = co_await coro::timeout(20s, stream.read(std::string(4096, '\0')));
+        if (recv.index() != 0) {
+            std::printf("[%d] receive timed out\n", id);
+            co_return;
+        }
+        auto& [n, buf] = std::get<0>(recv).value;
+        if (n == 0) {
+            std::printf("[%d] EOF\n", id);
+            co_return;
+        }
+        buf.resize(n);
+        auto send = co_await coro::timeout(2s, stream.write(std::move(buf)));
+        if (send.index() != 0) {
+            std::printf("[%d] send timed out\n", id);
+            co_return;
+        }
+    }
+}
+```
+
+The return type mirrors `select(F, SleepFuture)`:
+- `SelectBranch<0, T>` — the future completed in time.
+- `SelectBranch<1, void>` — the deadline elapsed first.
+
+---
+
+## 9. Thread-safe communication
 
 When tasks run in parallel they need to safely exchange data. Channels transfer ownership
 between tasks so only one task holds a piece of data at a time, eliminating whole classes
-of data races at the design level.
+of data races at the design level. The client in section 12 uses `mpsc` heavily — each
+concurrent connection holds a cloned sender and forwards replies to a single collector task
+— so the patterns introduced here appear directly in that example.
 
 ### Channels
 
@@ -521,7 +989,8 @@ Three channel variants are provided:
 | `mpsc`    | N (cloneable sender) | 1 | Bounded buffer; backpressured send |
 | `watch`   | N | N (cloneable receiver) | Last-value-wins; send never suspends |
 
-> *NOTE*: Tokio also provides a broadcast channel that is not implemented yet, but likely will be added in the near future
+!!! note
+    Tokio also provides a broadcast channel that is not implemented yet, but likely will be added in the near future.
 
 #### RAII handles and disconnection
 
@@ -559,7 +1028,7 @@ Use `oneshot` to hand a single result from one task to another.
 coro::Coro<void> run() {
     auto [tx, rx] = coro::oneshot_channel<int>();
 
-    // Spawn a task that sends the result back.
+    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 10
     auto h = coro::spawn(coro::co_invoke(
         [tx = std::move(tx)]() mutable -> coro::Coro<void> {
             tx.send(42);
@@ -582,35 +1051,39 @@ so consume it with `next()` in a loop.
 
 ```cpp
 coro::Coro<void> run() {
-    co_await coro::co_invoke([&]() -> coro::Coro<void> {
-        auto [tx, rx] = coro::mpsc_channel<int>(/*capacity=*/16);
+    auto [tx, rx] = coro::mpsc_channel<int>(/*capacity=*/16);
 
-        // Spawn two producers — each holds a copy of the sender.
-        // When both complete, their senders are dropped, closing the channel.
-        auto h1 = coro::spawn(coro::co_invoke(
-            [tx = tx.clone()]() mutable -> coro::Coro<void> {
-                for (int j = 0; j < 3; ++j)
-                    co_await tx.send(j);
-            }));
-        auto h2 = coro::spawn(coro::co_invoke(
-            [tx = std::move(tx)]() mutable -> coro::Coro<void> {
-                for (int j = 0; j < 3; ++j)
-                    co_await tx.send(10 + j);
-            }));
+    // Spawn two producers — each holds a copy of the sender.
+    // When both complete, their senders are dropped, closing the channel.
+    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 10
+    auto h1 = coro::spawn(coro::co_invoke(
+        [tx = tx.clone()]() mutable -> coro::Coro<void> {
+            for (int j = 0; j < 3; ++j)
+                co_await tx.send(j);
+        }));
+    auto h2 = coro::spawn(coro::co_invoke(
+        [tx = std::move(tx)]() mutable -> coro::Coro<void> {
+            for (int j = 0; j < 3; ++j)
+                co_await tx.send(10 + j);
+        }));
 
-        // Consume until all senders are dropped.
-        while (auto v = co_await coro::next(rx))
-            std::cout << *v << " ";
-        std::cout << "\n";
+    // Consume until all senders are dropped.
+    while (auto v = co_await coro::next(rx))
+        std::cout << *v << " ";
+    std::cout << "\n";
 
-        co_await h1;
-        co_await h2;
-    });
+    co_await h1;
+    co_await h2;
 }
 ```
 
 `send()` suspends the producer if the buffer is full, providing natural
 backpressure. Use `try_send()` for a non-blocking attempt.
+
+A common pattern for signalling completion without an explicit flag: clone the sender into
+each spawned task and drop the original immediately. When the last task exits — whether
+normally, by throwing, or by cancellation — the last clone is dropped, the channel closes,
+and the receiver's `next()` loop exits naturally.
 
 #### watch — last-value channel, multiple senders, many receivers
 
@@ -621,26 +1094,24 @@ until the next update, then `borrow()` to read the current value.
 
 ```cpp
 coro::Coro<void> run() {
-    co_await coro::co_invoke([&]() -> coro::Coro<void> {
-        auto [tx, rx] = coro::watch_channel<int>(/*initial=*/0);
+    auto [tx, rx] = coro::watch_channel<int>(/*initial=*/0);
 
-        // Spawn a watcher.
-        auto h = coro::spawn(coro::co_invoke(
-            [rx = std::move(rx)]() mutable -> coro::Coro<void> {
-                while (true) {
-                    auto r = co_await rx.changed();
-                    if (!r) co_return;          // sender dropped — channel closed
-                    std::cout << *rx.borrow() << "\n";
-                }
-            }));
+    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 10
+    auto h = coro::spawn(coro::co_invoke(
+        [rx = std::move(rx)]() mutable -> coro::Coro<void> {
+            while (true) {
+                auto r = co_await rx.changed();
+                if (!r) co_return;          // sender dropped — channel closed
+                std::cout << *rx.borrow() << "\n";
+            }
+        }));
 
-        tx.send(1);
-        tx.send(2);
-        tx.send(3);
-        // Explicitly drop tx — closes the channel so the watcher's changed() returns an error.
-        { auto _ = std::move(tx); }
-        co_await h;
-    });
+    tx.send(1);
+    tx.send(2);
+    tx.send(3);
+    // Explicitly drop tx — closes the channel so the watcher's changed() returns an error.
+    { auto _ = std::move(tx); }
+    co_await h;
 }
 ```
 
@@ -666,11 +1137,12 @@ co_await rx.changed();
 tx.send(new_config);           // fine — no WatchBorrowGuard alive, write lock available
 ```
 
-> **Note:** do not hold a `WatchBorrowGuard` across a `co_await` point. If the coroutine
-> suspends while the guard is alive, the read lock is held for the entire suspension —
-> blocking every `send()` call until the coroutine is resumed and the guard finally
-> goes out of scope. Always copy the value out or scope the guard tightly before
-> any suspension point.
+!!! warning
+    Do not hold a `WatchBorrowGuard` across a `co_await` point. If the coroutine
+    suspends while the guard is alive, the read lock is held for the entire suspension —
+    blocking every `send()` call until the coroutine is resumed and the guard finally
+    goes out of scope. Always copy the value out or scope the guard tightly before
+    any suspension point.
 
 ```cpp
 // WRONG — read lock held across suspension
@@ -716,258 +1188,10 @@ quick reference.
 
 ---
 
-## 7. Fan-out with `JoinSet`
+## 10. Capturing-lambda pitfall and `co_invoke`
 
-`JoinSet<T>` combines the best of `spawn` and channels: it fans out many parallel tasks
-of the same type and delivers their results as a `Stream<T>` in completion order, with
-built-in cancellation and error propagation. It is cleaner than managing individual
-`JoinHandle`s when the task count is dynamic.
-
-```cpp
-#include <coro/task/join_set.h>
-#include <coro/co_invoke.h>
-
-coro::Coro<int> compute(int x) { co_return x * x; }
-
-coro::Coro<void> run() {
-    co_await coro::co_invoke([&]() -> coro::Coro<void> {
-        coro::JoinSet<int> js;
-        for (int i = 1; i <= 5; ++i)
-            js.spawn(compute(i));
-
-        while (auto result = co_await coro::next(js))
-            std::cout << *result << " ";  // prints squares in completion order
-        std::cout << "\n";
-    });
-}
-```
-
-For `void` tasks, use `JoinSet<void>` and `drain()` to wait for all to finish:
-
-```cpp
-coro::Coro<void> run() {
-    co_await coro::co_invoke([&]() -> coro::Coro<void> {
-        coro::JoinSet<void> js;
-        js.spawn(task_a());
-        js.spawn(task_b());
-        co_await js.drain();  // waits for both; rethrows first exception if any
-    });
-}
-```
-
-Dropping a `JoinSet` without calling `drain()` cancels all pending tasks. The enclosing
-`co_invoke` scope ensures they finish draining before the coroutine returns.
-
-> **Note:** When spawning tasks that capture references to locals, wrap the fan-out in
-> `co_invoke` to keep the captures alive for the full duration of the `JoinSet` (see section 9).
-
----
-
-## 8. Concurrent combinators
-
-**Concurrent** means multiple operations can make progress without waiting for each other
-to complete — no ordering guarantees on when each starts or finishes. **Parallel** extends
-this to include simultaneous execution on multiple cores.
-
-`spawn()` creates parallel tasks. The combinators in this section — `join`, `select`,
-`timeout`, and `sleep_for` — are concurrent but not parallel: they drive multiple futures
-within the current task, advancing one at a time. No two branches ever execute
-simultaneously, even on a multi-threaded executor.
-
-This is also the point where the *"stack"* analogy from section 5 breaks down.
-Ordinary functions must complete and return before the caller can resume — every frame on
-the call stack is blocked waiting for the one below it. Coroutines can suspend without
-returning, which means multiple branches can exist simultaneously within a single task.
-A plain `co_await` chain is linear and still stack-like; combinators fan a single task
-out into multiple live branches at once, each able to deepen independently. The task's
-execution structure is a tree, not a stack. The entire tree belongs to one task — all
-branches are interleaved cooperatively on a single thread at a time, never truly
-simultaneous. A second task is a second independent tree; those two trees are what the
-executor runs in parallel across threads.
-
-### Joining futures — `join()`
-
-```mermaid
-graph TD
-    run["run()"] --> J["join()"]
-    J --> A["fetch_int()"]
-    J --> B["fetch_string()"]
-```
-
-`join()` runs a fixed set of heterogeneous futures concurrently and waits for **all** of
-them to complete. Unlike `JoinSet`, the number and types of branches are fixed at compile
-time. Results are returned as a `std::tuple` in branch order.
-
-```cpp
-#include <coro/sync/join.h>
-
-coro::Coro<int>         fetch_int()    { co_return 42; }
-coro::Coro<std::string> fetch_string() { co_return "hello"; }
-
-coro::Coro<void> run() {
-    auto [n, s] = co_await coro::join(fetch_int(), fetch_string());
-    std::cout << n << " " << s << "\n";  // 42 hello
-}
-```
-
-`void`-returning branches contribute a `VoidJoinBranch{}` placeholder in the tuple:
-
-```cpp
-coro::Coro<void> side_effect() { co_return; }
-
-coro::Coro<void> run() {
-    auto [n, _] = co_await coro::join(fetch_int(), side_effect());
-    std::cout << n << "\n";  // 42
-}
-```
-
-If any branch throws, the remaining branches are cancelled and drained, then the first
-exception is re-thrown. Use `JoinSet` instead when the number of branches is dynamic.
-
-### Suspending — `sleep_for()`
-
-`sleep_for()` suspends the current coroutine for a duration without blocking any worker
-thread. Other tasks continue to run on the executor while a coroutine sleeps.
-
-```cpp
-#include <coro/sync/sleep.h>
-#include <chrono>
-
-coro::Coro<void> run() {
-    using namespace std::chrono_literals;
-    co_await coro::sleep_for(100ms);
-}
-```
-
-### Racing futures — `select()`
-
-```mermaid
-graph TD
-    run["run()"] --> S["select()"]
-    S --> W["branch A  ✓ wins"]
-    S --> L["branch B  ✗ cancelled"]
-    style L stroke-dasharray:4 4,color:#999
-```
-
-`select()` races two or more futures and returns as soon as one completes.
-The result is a `std::variant` of `SelectBranch<N, T>` values identifying which
-branch won and carrying its result. All other branches are cancelled and drained.
-
-```cpp
-#include <coro/coro.h>
-#include <coro/sync/select.h>
-#include <coro/runtime/runtime.h>
-#include <iostream>
-
-coro::Coro<int> fast() { co_return 1; }
-coro::Coro<int> slow() { co_return 2; }
-
-coro::Coro<void> run() {
-    auto result = co_await coro::select(fast(), slow());
-
-    // Branch 0 (fast) won — branch 1 (slow) is cancelled and drained.
-    std::visit([](auto branch) {
-        std::cout << "branch " << branch.index << " won\n";
-    }, result);
-}
-
-int main() {
-    coro::Runtime rt;
-    rt.block_on(run());
-}
-```
-
-#### Keeping a future alive across a losing branch — `coro::ref()`
-
-By default `select()` takes its futures by value and cancels any branch that loses. Sometimes
-you want the underlying work to keep running regardless of which branch wins — for example,
-polling a long-running task while also watching for an external event.
-
-`coro::ref(f)` wraps any lvalue future in a non-owning `FutureRef<F>` that delegates `poll()`
-to `f` without taking ownership. When the `FutureRef` branch loses, only the wrapper is
-discarded; the underlying future is untouched and can be used again.
-
-```cpp
-#include <coro/coro.h>
-#include <coro/sync/select.h>
-#include <coro/sync/sleep.h>
-#include <chrono>
-#include <iostream>
-
-using namespace std::chrono_literals;
-
-coro::Coro<void> run() {
-    // Task is spawned once and reused across every select round.
-    coro::JoinHandle<int> task = coro::spawn(long_running_work());
-
-    while (true) {
-        // sleep_for fires every 100 ms so we can do periodic work.
-        // coro::ref(task) borrows the handle — the task keeps running if the
-        // timer branch wins.
-        auto sel = co_await coro::select(coro::ref(task), coro::sleep_for(100ms));
-
-        if (std::holds_alternative<coro::SelectBranch<0, int>>(sel)) {
-            // Task completed first.
-            int result = std::get<coro::SelectBranch<0, int>>(sel).value;
-            std::cout << "result: " << result << "\n";
-            break;
-        }
-
-        // Timer fired — task still running.  Do periodic work, then loop.
-        check_progress();
-    }
-}
-```
-
-**Key points:**
-
-- `coro::ref()` only accepts lvalues — store the future in a named variable first.
-  `coro::ref(spawn(f()))` is a compile error.
-- If the `coro::ref(f)` branch wins and delivers a result, the result is moved out of `f`.
-  Do not await `f` again — it is logically consumed even though it was not moved.
-
-### Timeouts — `timeout()`
-
-`timeout(duration, future)` is a convenience wrapper around `select` that races your
-future against a `sleep_for` timer.
-
-```cpp
-#include <coro/coro.h>
-#include <coro/sync/timeout.h>
-#include <coro/runtime/runtime.h>
-#include <chrono>
-#include <iostream>
-
-coro::Coro<int> fetch_data() {
-    co_return 42;
-}
-
-coro::Coro<void> run() {
-    using namespace std::chrono_literals;
-
-    auto result = co_await coro::timeout(500ms, fetch_data());
-
-    if (result.index() == 0)
-        std::cout << "got " << std::get<0>(result).value << "\n";  // fetch_data won
-    else
-        std::cout << "timed out\n";
-}
-
-int main() {
-    coro::Runtime rt;
-    rt.block_on(run());
-}
-```
-
-The return type of `timeout(d, F)` is the same as `select(F, SleepFuture)`:
-- `SelectBranch<0, T>` — the future completed in time.
-- `SelectBranch<1, void>` — the deadline elapsed first.
-
----
-
-## 9. Capturing-lambda pitfall and `co_invoke`
-
-A capturing lambda that returns `Coro<T>` has a subtle use-after-free when used as an
+In section 9 the channel examples used `co_invoke` with a comment pointing here. This is
+why. A capturing lambda that returns `Coro<T>` has a subtle use-after-free when used as an
 rvalue. The compiler lowers the lambda to an anonymous struct; `operator()` — being a member
 function — captures `this` into the coroutine frame. The struct is a temporary and is
 destroyed at the end of the full expression, before the coroutine is ever polled.
@@ -1036,7 +1260,9 @@ The safe patterns are the same `co_invoke` scope approach, or making the member 
 static and passing `std::shared_ptr<T>` explicitly to tie the object's lifetime to the
 task. See [Library Usage Guidelines](guidelines.md#cs4) for both patterns in full.
 
-## 10. Running blocking code with `spawn_blocking`
+---
+
+## 11. Running blocking code with `spawn_blocking`
 
 Some work is inherently blocking — legacy library calls, CPU-intensive computation,
 or synchronous file I/O. Calling these directly from a coroutine would park an executor
@@ -1077,186 +1303,24 @@ co_await coro::spawn_blocking([]() -> int {
 });  // exception propagates to the awaiting coroutine
 ```
 
-**Ownership rules:** the callable must own all its data — do not capture references or
-pointers into the spawning coroutine's locals. The blocking thread may outlive the
-spawning coroutine if the `BlockingHandle` is dropped without awaiting.
-
----
-
-## 11. Async I/O
-
-The runtime integrates a libuv event loop so that I/O suspends a coroutine without
-blocking any worker thread. Several I/O abstractions are provided, including `File` for
-async file I/O, `TcpStream` for raw TCP, and `WsStream`/`WsListener` for WebSocket.
-
-All I/O operations require a running `Runtime` — they are not usable from plain
-synchronous code.
-
-### File — async file I/O
-
-`File` provides async read and write operations backed by libuv's thread pool. From the
-coroutine's perspective it behaves identically to network I/O — the coroutine suspends
-and the executor thread is freed while the operation runs in the background.
-
-```cpp
-#include <coro/io/file.h>
-
-coro::Coro<void> run() {
-    // Open for reading
-    auto f = co_await coro::File::open("data.txt", coro::FileMode::Read);
-    auto [n, buf] = co_await f.read(std::vector<std::byte>(4096));
-    buf.resize(n);
-
-    // Open for writing (create or truncate)
-    auto out = co_await coro::File::open(
-        "output.txt", coro::FileMode::Write | coro::FileMode::Create | coro::FileMode::Truncate);
-    co_await out.write(std::move(buf));
-}
-```
-
-`read()` and `write()` follow the same owned-buffer contract as `TcpStream` — the buffer
-is moved in and returned with the byte count, so lifetime is tied to the coroutine frame.
-Pass `exact = true` to loop until the full buffer is filled or written. Random-access
-variants `read_at()` and `write_at()` accept an additional byte offset.
-
-### TcpStream — raw TCP
-
-`TcpStream` is a connected, async TCP socket. Connect with `co_await
-TcpStream::connect(host, port)`, then read and write using owned buffers.
-
-```cpp
-#include <coro/io/tcp_stream.h>
-#include <coro/runtime/runtime.h>
-#include <iostream>
-#include <string>
-#include <vector>
-#include <cstddef>
-
-coro::Coro<void> run() {
-    coro::TcpStream tcp = co_await coro::TcpStream::connect("example.com", 80);
-
-    // Write: pass buffer by value; it is returned after the write completes.
-    auto [written, req] = co_await tcp.write(
-        std::string("GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"));
-
-    // Read: pass buffer by value; returned with the byte count.
-    // Returns 0 bytes on EOF.
-    while (true) {
-        auto [n, buf] = co_await tcp.read(std::vector<std::byte>(4096));
-        if (n == 0) break;
-        std::cout << std::string_view(reinterpret_cast<const char*>(buf.data()), n);
-    }
-}
-
-int main() {
-    coro::Runtime rt;
-    rt.block_on(run());
-}
-```
-
-`read()` and `write()` accept any type satisfying `ByteBuffer` — `std::string`,
-`std::vector<std::byte>`, `std::array<std::byte, N>`, etc. The buffer is moved into
-the operation and returned with the result, so its lifetime is tied to the coroutine
-frame and dangling-pointer bugs are impossible at the type-system level.
-
-### WsStream — WebSocket client
-
-`WsStream` is a connected async WebSocket stream. `connect()` parses the URL,
-performs the opening handshake, and returns a ready-to-use stream.
-
-```cpp
-#include <coro/io/ws_stream.h>
-#include <coro/runtime/runtime.h>
-#include <iostream>
-
-coro::Coro<void> run() {
-    // Connect to a WebSocket server.  ws:// and wss:// (TLS) are both supported.
-    coro::WsStream ws = co_await coro::WsStream::connect("ws://localhost:9001/");
-
-    // Send a text frame — string_view overload picks Text opcode automatically.
-    co_await ws.send("hello");
-
-    // Receive the echo.
-    coro::WsStream::Message reply = co_await ws.receive();
-    std::cout << reply.as_text() << "\n";  // "hello"
-
-    // Destructor sends a WebSocket Close frame automatically.
-}
-
-int main() {
-    coro::Runtime rt;
-    rt.block_on(run());
-}
-```
-
-`receive()` returns a `Message` with a `data` byte vector, an `is_text` flag, and a
-convenience `as_text()` accessor. `send()` accepts either a `string_view` (text frame) or
-a byte span with an explicit `OpCode` (binary frame).
-
-Use `timeout()` to guard individual operations against a stalled peer:
-
-```cpp
-using namespace std::chrono_literals;
-
-auto result = co_await coro::timeout(2s, ws.receive());
-if (result.index() != 0) { /* timed out */ }
-coro::WsStream::Message& msg = std::get<0>(result).value;
-```
-
-To request specific subprotocols, pass them as a third argument to `connect()`:
-
-```cpp
-coro::WsStream ws = co_await coro::WsStream::connect(
-    "ws://localhost:9001/", coro::WsStream::FrameMode::Full, {"my-protocol"});
-```
-
-### WsListener — WebSocket server
-
-`WsListener` binds a port and accepts incoming WebSocket connections. Each accepted
-connection is a `WsStream` with the same API as the client side.
-
-```cpp
-#include <coro/io/ws_listener.h>
-#include <coro/io/ws_stream.h>
-#include <coro/task/join_set.h>
-#include <coro/runtime/runtime.h>
-#include <iostream>
-
-static coro::Coro<void> handle(coro::WsStream ws) {
-    for (;;) {
-        coro::WsStream::Message msg = co_await ws.receive();
-        if (msg.data.empty()) co_return;  // client closed
-        co_await ws.send(msg.data, msg.is_text ? coro::WsStream::OpCode::Text
-                                               : coro::WsStream::OpCode::Binary);
-    }
-}
-
-coro::Coro<void> run_server() {
-    coro::WsListener listener = co_await coro::WsListener::bind("127.0.0.1", 9001);
-
-    coro::JoinSet<void> sessions;
-    for (int i = 0;; ++i) {
-        coro::WsStream ws = co_await listener.accept();
-        sessions.spawn(handle(std::move(ws)));
-    }
-}
-
-int main() {
-    coro::Runtime rt;
-    rt.block_on(run_server());
-}
-```
-
-Dropping `WsListener` destroys the server context; active `WsStream`s that were
-already accepted are unaffected.
+!!! warning "Ownership"
+    The callable must own all its data — do not capture references or pointers into the
+    spawning coroutine's locals. The blocking thread may outlive the spawning coroutine
+    if the `BlockingHandle` is dropped without awaiting.
 
 ---
 
 ## 12. Putting it all together example 1 — TCP echo server and client
 
-The following is a complete, runnable TCP echo server. It brings together most of the
-concepts from this guide: the runtime entry point, async I/O, spawning a task per
-connection, `JoinSet` for dynamic fan-out, and `timeout` to evict stalled clients.
+We've now introduced every feature used in the server we've been building section by
+section. Here it is in full — along with the companion client that exercises it — with
+nothing new introduced.
+
+The server brings together the runtime entry point, async I/O, a task per connection,
+`JoinSet` for dynamic fan-out, `select` to interleave accepting and draining, and
+`timeout` to evict stalled clients.
+
+### Server
 
 ```cpp
 #include <coro/coro.h>
@@ -1274,25 +1338,20 @@ connection, `JoinSet` for dynamic fan-out, and `timeout` to evict stalled client
 using namespace coro;
 using namespace std::chrono_literals;
 
-// Owns one TcpStream for the lifetime of a single client connection.
-// Reads up to 4 KiB at a time and writes the same bytes back until EOF,
-// a read error, or either end of the operation times out.
 static Coro<void> handle_connection(TcpStream stream, int id) {
     std::printf("[%d] connected\n", id);
     for (;;) {
-        // variant<SelectBranch<0, pair<size_t,string>>, SelectBranch<1, void>>
         auto recv = co_await timeout(20s, stream.read(std::string(4096, '\0')));
         if (recv.index() != 0) {
             std::printf("[%d] receive timed out\n", id);
             co_return;
         }
-        auto& [n, buf] = std::get<0>(recv).value; // std::pair<size_t, std::string>
+        auto& [n, buf] = std::get<0>(recv).value;
         if (n == 0) {
             std::printf("[%d] EOF\n", id);
             co_return;
         }
         buf.resize(n);
-        // variant<SelectBranch<0, pair<size_t,string>>, SelectBranch<1, void>>
         auto send = co_await timeout(2s, stream.write(std::move(buf)));
         if (send.index() != 0) {
             std::printf("[%d] send timed out\n", id);
@@ -1301,33 +1360,24 @@ static Coro<void> handle_connection(TcpStream stream, int id) {
     }
 }
 
-// Binds a TcpListener on localhost:8080 and accepts connections in a loop.
-// select() races the listener against the JoinSet so that both new connections
-// and completed sessions are serviced without either starving the other.
-static Coro<void> run_server() {
+static Coro<int> run_server() {
     TcpListener listener = co_await TcpListener::bind("127.0.0.1", 8080);
     std::printf("listening on 127.0.0.1:8080\n");
 
     JoinSet<void> sessions;
     for (int i = 0;; ++i) {
         try {
-            // variant<SelectBranch<0, TcpStream>, SelectBranch<1, bool>>
             auto sel = co_await coro::select(
-                listener.accept(),    // branch 0: new connection ready
-                coro::next(sessions)  // branch 1: a session completed (throws if it threw)
+                listener.accept(),
+                coro::next(sessions)
             );
             if (sel.index() == 0) {
                 TcpStream& stream = std::get<0>(sel).value;
                 sessions.spawn(handle_connection(std::move(stream), i));
             }
-            // branch 1: session completed normally — loop and accept more connections
         } catch (const std::exception& e) {
-            // A session threw. Here we choose to treat any session error as fatal —
-            // log it and exit. We could equally log and continue (remove the co_return)
-            // to let the remaining sessions run. Either way, dropping `sessions` on
-            // exit cancels every remaining connection and drains them cleanly.
             std::printf("session error: %s — shutting down\n", e.what());
-            co_return;
+            co_return 1;
         }
     }
 }
@@ -1336,40 +1386,15 @@ int main(int argc, char* argv[]) {
     int threads = (argc > 1) ? std::stoi(argv[1]) : 0;
 
     if (threads == 1) {
-        // Potentially thousands of connections scheduled cooperatively on one OS thread.
         Runtime rt(std::in_place_type<SingleThreadedExecutor>);
-        rt.block_on(run_server());
+        return rt.block_on(run_server());
     } else {
-        // Same code, now distributed across N worker threads — nothing else changes.
         int n = threads > 1 ? threads : (int)std::thread::hardware_concurrency();
         Runtime rt(std::in_place_type<WorkStealingExecutor>, n);
-        rt.block_on(run_server());
+        return rt.block_on(run_server());
     }
 }
 ```
-
-Test it with `echo "hello" | nc localhost 8080`.
-
-A few things worth noting:
-
-- **Ownership by value.** `handle_connection` takes `TcpStream` by value. The stream is
-  moved into the task's frame; no `shared_ptr`, no reference hazard. When the task
-  finishes the stream goes out of scope and the socket closes automatically.
-- **Bounded completion queue.** `select` races the listener against the `JoinSet` so
-  completed sessions are drained from the set on every iteration. The set never accumulates
-  unbounded results even under sustained load.
-- **Error propagation and instant shutdown.** If any session throws, the exception
-  propagates through `co_await select(...)` into the catch block. Dropping `sessions`
-  at that point cancels every remaining connection simultaneously — their destructors
-  run in order and the sockets close cleanly — before the server exits. No explicit
-  shutdown logic, no cancellation tokens, no coordination between sessions required.
-- **Clean shutdown.** If `run_server` were cancelled (e.g. by dropping its `JoinHandle`),
-  `sessions` would go out of scope, cancelling every in-flight session and draining them
-  before the server frame is freed.
-- **No threads.** The entire server, including all concurrent connections, runs on the
-  work-stealing executor. Worker threads are never parked waiting for a single connection —
-  each suspension point (`read`, `write`, `accept`) immediately frees the thread to
-  run other tasks.
 
 The full source with timestamps and structured logging is in
 [examples/io/tcp_echo_server.cpp](../examples/io/tcp_echo_server.cpp).
@@ -1824,13 +1849,25 @@ int main(int argc, char* argv[]) {
 ### Extending to GPU compute
 
 Replacing `compute_worker` with a GPU kernel is the same pipeline problem applied one
-level deeper. GPUs operate on their own memory, separate from the CPU's address space —
-before a kernel can run, input data must be explicitly copied from host memory to device
-memory (H2D), and results copied back afterward (D2H). The kernel itself becomes the
-compute loop; those transfers become the I/O surrounding it. In a real application the
-outer pipeline carries more than just memcpy — preprocessing, format conversion,
-validation — but the structure is identical: async I/O feeds a compute stage that cannot
-be interrupted, results flow back out through a channel.
+level deeper. Most discrete GPU architectures operate on their own memory, separate from
+the CPU's address space — before a kernel can run, input data must be explicitly copied
+from host memory to device memory (H2D), and results copied back afterward (D2H). Not all
+architectures require explicit transfers, but it is the common case for discrete GPUs from
+NVIDIA, AMD, and Intel.
+
+!!! note "Unified memory"
+    NVIDIA's unified memory (`cudaMallocManaged`), some integrated GPUs, and certain
+    unified-memory designs appear to eliminate explicit transfers. They do not — the
+    transfers become demand-paged, triggered when the device first accesses the memory.
+    The result is timing much closer to the sequential pipeline below: the transfer stalls
+    the kernel rather than happening ahead of time. Explicit prefetching with
+    `cudaMemPrefetchAsync` (or the equivalent for your architecture) before the kernel runs
+    restores the pipelined behaviour and the full performance improvement.
+
+The kernel itself becomes the compute loop; those transfers become the I/O surrounding it.
+In a real application the outer pipeline carries more than just memcpy — preprocessing,
+format conversion, validation — but the structure is identical: async I/O feeds a compute
+stage that cannot be interrupted, results flow back out through a channel.
 
 Run sequentially, the transfers are dead time: the GPU sits idle while data is being
 copied in and the CPU sits idle while the kernel runs.
@@ -1920,13 +1957,15 @@ co_await h2d_transfer(d_block, host_block.data(), bytes, stream);
 co_await iq_tx.send(GpuRequest{d_block, reply_tx.clone()});
 ```
 
-The CUDA API itself is not async in the coro sense, but bridging it is straightforward:
-create a oneshot channel, pass the sender to the CUDA stream callback, and `co_await`
-the receiver. The sender lives on the coroutine frame and remains valid until the
-`co_await` completes:
+The GPU's async API is not async in the coro sense, but bridging it is straightforward:
+create a oneshot channel, pass the sender to a completion callback, and `co_await` the
+receiver. The sender lives on the coroutine frame and remains valid until the `co_await`
+completes. The following uses CUDA as a concrete example — AMD (HIP) and Intel (SYCL/Level
+Zero) follow the same pattern with different API names:
 
 ```cpp
 // Wraps a CUDA async H2D transfer in a coro awaitable.
+// AMD HIP and Intel SYCL/Level Zero follow the same pattern with different API names.
 static Coro<void> h2d_transfer(void* dst, const void* src,
                                 size_t bytes, cudaStream_t stream) {
     auto [tx, rx] = oneshot_channel<void>();
