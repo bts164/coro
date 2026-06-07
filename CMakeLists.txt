@@ -47,8 +47,15 @@ target_link_libraries(coro PUBLIC
     $<$<BOOL:${WITH_GPERFTOOLS}>:gperftools::gperftools>
     websockets)
 
-install(TARGETS coro PUBLIC_HEADER DESTINATION include/coro)
+install(TARGETS coro)
+# include/coro/pico/ is intentionally excluded from the installed package.
+# Those headers require CORO_PICO and the Pico SDK — they have no use on
+# desktop platforms and would fail to compile without the SDK headers.
+# The pico unit tests (test/pico/) are a source-build-only artifact: anyone
+# running them is building from source and has the headers directly. Consumers
+# of the installed Conan package never need them.
 install(DIRECTORY include/coro
     DESTINATION include
     FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+    PATTERN "pico" EXCLUDE
 )

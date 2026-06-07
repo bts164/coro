@@ -9,11 +9,11 @@ client and server I/O on bare metal.
 
 | Included | Excluded |
 |---|---|
-| `Coro<T>` / `JoinHandle<T>` — coroutine return types | `WorkSharingExecutor` / `WorkStealingExecutor` |
+| `Coro<T>` / `JoinHandle<T>` / `JoinSet<T>` — coroutine return types | `WorkSharingExecutor` / `WorkStealingExecutor` |
 | `spawn()` / `JoinHandle` — task spawning and joining | `File` / `WsStream` |
 | `PicoExecutor` — single-threaded run loop | `spawn_blocking` (no thread pool) |
 | `PicoTcpStream` — async TCP client | `sleep_for` / `timeout` (no timer integration) |
-| `PicoTcpListener` — async TCP server | `WorkStealing` executor |
+| `PicoTcpListener` — async TCP server | |
 | `mpsc`, `oneshot`, `watch`, `select`, `join` — sync primitives | |
 
 All coroutine machinery in `include/coro/detail/` and `include/coro/sync/` is
@@ -35,11 +35,11 @@ portable C++20 with no platform dependencies and compiles as-is.
 
 ### Event loop
 
-`PicoExecutor::wait_for_completion()` drives everything:
+`PicoExecutor::block_on()` drives everything:
 
 ```mermaid
 flowchart TD
-    Start([wait_for_completion]) --> Check{state.terminated?}
+    Start([block_on]) --> Check{state.terminated?}
     Check -->|yes| End([return])
     Check -->|no| Poll[poll_ready_tasks]
     Poll --> UV[cyw43_arch_poll]
@@ -48,8 +48,9 @@ flowchart TD
 
 `cyw43_arch_poll()` processes pending WiFi chip events and fires any pending lwIP
 callbacks (TCP recv, sent, err) synchronously on the calling thread before returning.
-This means wakers stored by `PicoFuture` or `PicoTcpContext` are always called on
-the same thread as the executor — no locking is needed anywhere in the I/O path.
+This means wakers stored by `PicoCallbackResult` or `PicoTcpContext` are always
+called on the same thread as the executor — no locking is needed anywhere in the
+I/O path.
 
 ### Why no mutex in `PicoCallbackResult`
 
@@ -111,13 +112,37 @@ The raw pointer stored in `void* arg` is therefore always valid when the callbac
 Identical CAS state machine as `SingleThreadedExecutor` (Notified → Running → Idle /
 RunningAndNotified). Differences:
 
+- **`block_on(future)`** — convenience entry point analogous to `Runtime::block_on()`.
+  Constructs a `detail::TaskImpl<F>`, schedules it, and drives the event loop until the
+  task completes. Users never touch `detail::` internals directly. Sets a thread-local
+  `Executor*` for the duration of the call (see below) so that `coro::spawn()` works
+  transparently inside coroutines without a `Runtime`.
 - **No remote injection queue.** `enqueue()` pushes directly to `m_ready` — always
   called from the executor thread.
 - **No `std::thread` / `std::condition_variable` in the executor itself.** The condvar
-  that exists in `detail::TaskStateBase` (shared state between Task and JoinHandle) is
-  never *waited on* by `PicoExecutor` — it polls `state.terminated` in a loop instead.
+  in `detail::TaskStateBase` is never *waited on* by `PicoExecutor` — it polls
+  `state.terminated` in a loop instead.
 - **`cyw43_arch_poll()` replaces blocking.** When the ready queue is empty, the
   executor calls `cyw43_arch_poll()` rather than blocking on a condvar.
+
+### `coro::spawn()` compatibility
+
+`coro::spawn()` currently calls `current_runtime()`, which reads a thread-local
+`Runtime*` set by `Runtime::block_on()`. `PicoExecutor` is not a `Runtime`, so
+without changes the free `coro::spawn()` would throw inside pico coroutines.
+
+The fix is a small addition to the core library shared by all executors:
+
+1. **Add `thread_local Executor* g_current_executor`** in `executor.cpp`, alongside
+   the existing `thread_local Runtime*` in `runtime.cpp`.
+2. **`Runtime::block_on()` sets both** — the current runtime *and* the current executor.
+   No behaviour change for non-pico code.
+3. **`PicoExecutor::block_on()` sets only the executor** thread-local (no Runtime).
+4. **`coro::spawn()` checks the executor thread-local as a fallback**: if no Runtime is
+   registered, it constructs a `SpawnBuilder` from `current_executor()` directly.
+
+From user code there is no visible difference — `coro::spawn(future)` works the same
+whether called from inside `Runtime::block_on()` or `PicoExecutor::block_on()`.
 
 ### `PicoTcpContext`
 
@@ -274,8 +299,6 @@ synchronously from `cyw43_arch_poll()`.
 #include <coro/pico/pico_executor.h>
 #include <coro/pico/pico_tcp_stream.h>
 #include <coro/coro.h>
-#include <coro/detail/task.h>
-#include <coro/detail/task_state.h>
 #include <pico/stdlib.h>
 #include <pico/cyw43_arch.h>
 #include <string>
@@ -288,8 +311,7 @@ coro::Coro<void> http_get(const char* host, uint16_t port) {
     req += "\r\n\r\n";
     co_await stream.write(std::move(req));
 
-    std::string resp(1024, '\0');
-    auto [n, buf] = co_await stream.read(std::move(resp));
+    auto [n, buf] = co_await stream.read(std::string(1024, '\0'));
     buf.resize(n);
 
     // use buf ...
@@ -301,11 +323,8 @@ int main() {
     cyw43_arch_enable_sta_mode();
     cyw43_arch_wifi_connect_blocking("SSID", "password", CYW43_AUTH_WPA2_AES_PSK);
 
-    auto task_state = std::make_shared<coro::detail::TaskState<void>>();
     coro::PicoExecutor exec;
-    exec.schedule(std::make_unique<coro::detail::Task>(
-        http_get("example.com", 80), task_state));
-    exec.wait_for_completion(*task_state);
+    exec.block_on(http_get("example.com", 80));
 
     cyw43_arch_deinit();
 }
@@ -318,7 +337,7 @@ int main() {
 ### `std::condition_variable` dependency
 
 `detail::TaskStateBase` contains a `std::condition_variable` (used by
-`wait_until_done()` for multi-threaded executors). `PicoExecutor` never calls
+`wait_until_done()` for multi-threaded executors). `PicoExecutor::block_on()` never calls
 `wait_until_done()` — it polls `state.terminated` in a loop — but the condvar must
 be *linkable*.
 

@@ -206,6 +206,24 @@ the caller is not a worker of the executor, so the first enqueue always takes th
 injection/remote path. This is correct and expected — the poll thread or first worker
 will drain it on its first iteration.
 
+!!! tip "TODO: merge `schedule()` into `enqueue()`"
+    `schedule()` and `enqueue()` follow identical routing logic. The only difference today is
+    that `schedule()` explicitly sets `scheduling_state = Notified` before pushing, because new
+    tasks start at `Idle` and no waker exists yet to do the CAS transition.
+
+    That responsibility belongs at task construction, not in the executor interface. If new
+    tasks are initialized with `scheduling_state = Notified` directly — which is correct, since
+    they are created explicitly to run — `schedule()` and `enqueue()` become identical and can
+    be merged into a single `enqueue()` method on `Executor`.
+
+    The "remote spawn from a non-worker thread" case that might otherwise justify separate
+    treatment does not exist in this library: `spawn()` is only callable from within a running
+    coroutine, which is always polled by a worker. First-time submission and re-wakeup always
+    originate from the same class of caller and warrant the same routing logic. Removing
+    `schedule()` also opens the door to the LIFO-slot optimization: since spawned tasks come
+    from a worker, they can go directly to the local queue (or LIFO slot) rather than
+    passing through the injection queue, matching Tokio's behaviour.
+
 ### Worker loop integration
 
 After `poll()` returns `Pending`, the worker attempts to transition `Running → Idle`. If
@@ -398,13 +416,14 @@ wait_for_completion(state):
     m_poll_thread_id = {}
 ```
 
-> **Note — task budget:** if tasks continuously wake each other, `poll_ready_tasks()`
-> always returns `true` and the outer loop never yields. `m_incoming_wakes` is drained at
-> the start of each `poll_ready_tasks()` call so timer wakeups are still serviced, but
-> remote wakes may be delayed by an arbitrary number of local iterations. Tokio addresses
-> this with a per-turn task budget (default 61): after processing that many tasks the
-> worker unconditionally yields to drain the injection queue regardless of whether the
-> local queue is empty. A similar bound should be applied here.
+!!! tip "PERF: add per-turn task budget"
+    If tasks continuously wake each other, `poll_ready_tasks()` always returns `true` and
+    the outer loop never yields. `m_incoming_wakes` is drained at the start of each
+    `poll_ready_tasks()` call so timer wakeups are still serviced, but remote wakes may be
+    delayed by an arbitrary number of local iterations. Tokio addresses this with a per-turn
+    task budget (default 61): after processing that many tasks the worker unconditionally
+    yields to drain the injection queue regardless of whether the local queue is empty. A
+    similar bound should be applied here.
 
 ---
 
@@ -580,11 +599,11 @@ enqueue(task):
         m_cv.notify_one()
 ```
 
-> **Note — task budget:** a worker that continuously receives local wakes will never
-> yield to check the injection queue, starving remote wakes. Tokio uses a per-turn budget
-> (default 61 tasks from the local queue) after which the worker unconditionally checks
-> the injection queue before continuing. A similar bound should be applied to the local
-> queue drain loop here.
+!!! tip "PERF: add per-turn task budget"
+    A worker that continuously receives local wakes will never yield to check the injection
+    queue, starving remote wakes. Tokio uses a per-turn budget (default 61 tasks from the
+    local queue) after which the worker unconditionally checks the injection queue before
+    continuing. A similar bound should be applied to the local queue drain loop here.
 
 ---
 
@@ -598,6 +617,145 @@ enqueue(task):
 | **Local enqueue path** | Direct to `m_ready`, no lock (poll thread only) | Direct to `m_local_queue[t_worker_index]`, no lock (owning worker only) |
 | **Remote enqueue path** | `m_incoming_wakes` + `m_remote_cv.notify_one()` | `m_injection_queue` + `m_cv.notify_one()` |
 | **wait_for_completion** | Drives poll loop; blocks on `m_remote_cv` when ready queue empty | Delegates entirely to `state.wait_until_done()` |
+
+---
+
+## Future Direction: Unified Current-Thread Poll Loop
+
+!!! tip "TODO: absorb UV reactor into SingleThreadedExecutor"
+    The current design treats the task executor and the I/O reactor as separate peers.
+    `Runtime::block_on()` sets both `t_current_runtime` and `t_current_uv_executor` as
+    independent thread-locals, and `SingleThreadedExecutor::wait_for_completion()` interleaves
+    task polling with UV ticks by blocking on `m_remote_cv` when the ready queue is empty and
+    relying on the UV thread to signal it when I/O events arrive.
+
+    The Pico port exposes a cleaner model: `PicoExecutor` is a **current-thread executor** with
+    no worker threads at all. The calling thread IS the scheduler. `wait_for_completion()` drives
+    both the coroutine ready queue and the hardware I/O event loop (`cyw43_arch_poll()`) in a
+    tight alternating loop with no blocking. Because there are no other threads, `Runtime::poll()`
+    — a single call to `poll_ready_tasks()` — is safe to expose to the caller for use in a
+    manually-driven firmware event loop.
+
+    `SingleThreadedExecutor` could adopt the same model for the standard build:
+
+    - Replace the `m_remote_cv` blocking wait with a `uv_run(UV_RUN_NOWAIT)` tick when the
+      ready queue is empty, giving libuv a turn without yielding the thread.
+    - This eliminates the need for a separate UV thread in single-threaded mode and the
+      `t_current_uv_executor` thread-local, since the UV loop is now owned by the executor
+      itself rather than `Runtime`.
+    - `poll_ready_tasks()` would become a meaningful virtual method on `Executor` (with a
+      default no-op), allowing `Runtime::poll()` to be exposed unconditionally rather than
+      only under `#ifdef CORO_PICO`.
+
+    **Key constraint:** libuv is thread-affine — `uv_run()` must be called from the thread
+    that owns the loop. This integration therefore only applies to `SingleThreadedExecutor`.
+    `WorkSharingExecutor` must keep UV on a dedicated thread as it does today, because tasks
+    migrate across worker threads and there is no single thread that can own the UV loop.
+
+    The practical consequence is a three-way executor taxonomy:
+
+    | Executor | UV ownership | `poll()` safe from caller? |
+    |---|---|---|
+    | `PicoExecutor` | `cyw43_arch_poll()` called by caller alongside `poll()` | Yes — current-thread model |
+    | `SingleThreadedExecutor` (future) | UV loop owned by executor, ticked inside `poll_ready_tasks()` | Yes — current-thread model |
+    | `WorkSharingExecutor` | Dedicated UV thread; no caller-visible poll | No — worker threads own scheduling |
+
+    This redesign is non-trivial: it requires `SingleThreadedExecutor` to own the UV loop
+    (currently owned by `SingleThreadedUvExecutor` as a separate `Runtime` member), restructure
+    `wait_for_completion()`, and add `poll_ready_tasks()` to the `Executor` base interface.
+    It should be tackled as a dedicated phase with its own design document.
+
+### Current ownership model
+
+```mermaid
+classDiagram
+    class Runtime {
+        -m_uv_executor: SingleThreadedUvExecutor
+        -m_executor: unique_ptr~Executor~
+        +block_on(F)
+        +spawn(F)
+        +poll()¹
+    }
+    class SingleThreadedUvExecutor {
+        -m_uv_loop: uv_loop_t
+        -m_uv_thread: thread
+    }
+    class Executor {
+        <<abstract>>
+        +schedule(task)*
+        +enqueue(task)*
+        +wait_for_completion(state)*
+    }
+    class SingleThreadedExecutor {
+        -m_ready: queue
+        -m_remote_cv: condition_variable
+        +poll_ready_tasks() bool
+    }
+    class WorkSharingExecutor {
+        -m_workers: vector~thread~
+        -m_injection_queue: deque
+    }
+    class PicoExecutor {
+        -m_ready: queue
+        +poll_ready_tasks() bool
+    }
+
+    Runtime *-- SingleThreadedUvExecutor : owns separately
+    Runtime *-- Executor : owns
+    Executor <|-- SingleThreadedExecutor
+    Executor <|-- WorkSharingExecutor
+    Executor <|-- PicoExecutor
+```
+
+¹ `Runtime::poll()` is `#ifdef CORO_PICO` only — delegates to `PicoExecutor::poll_ready_tasks()`.
+UV is a separate peer of the task executor; `block_on()` must set both as independent thread-locals.
+
+### Future ownership model
+
+```mermaid
+classDiagram
+    class Runtime {
+        -m_executor: unique_ptr~Executor~
+        +block_on(F)
+        +spawn(F)
+        +poll() bool
+    }
+    class Executor {
+        <<abstract>>
+        +schedule(task)*
+        +enqueue(task)*
+        +wait_for_completion(state)*
+        +poll_ready_tasks() bool
+    }
+    class SingleThreadedExecutor {
+        -m_uv_loop: uv_loop_t
+        -m_ready: queue
+        +poll_ready_tasks() bool
+        note: "ticks uv_run(NOWAIT) + drains task queue"
+    }
+    class WorkSharingExecutor {
+        -m_uv_thread: thread
+        -m_workers: vector~thread~
+        -m_injection_queue: deque
+        +poll_ready_tasks() bool
+        note: "returns false — UV on dedicated thread"
+    }
+    class PicoExecutor {
+        -m_ready: queue
+        +poll_ready_tasks() bool
+        note: "drains task queue only — caller drives cyw43_arch_poll()"
+    }
+
+    Runtime *-- Executor : owns
+    Executor <|-- SingleThreadedExecutor
+    Executor <|-- WorkSharingExecutor
+    Executor <|-- PicoExecutor
+```
+
+`SingleThreadedUvExecutor` is absorbed into `SingleThreadedExecutor`. `Runtime` owns a single
+executor pointer in all builds. `poll_ready_tasks()` is a virtual method with a default `return false`
+no-op, making `Runtime::poll()` unconditionally available — meaningful for single-threaded and
+Pico runtimes, a safe no-op for multi-threaded ones.
 
 ---
 

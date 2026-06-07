@@ -1,6 +1,10 @@
 #include <coro/runtime/runtime.h>
+#ifdef CORO_PICO
+#include <coro/pico/pico_executor.h>
+#else
 #include <coro/runtime/single_threaded_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
+#endif
 #include <stdexcept>
 
 namespace coro {
@@ -9,6 +13,17 @@ namespace {
     thread_local Runtime* t_current_runtime = nullptr;
 } // namespace
 
+#ifdef CORO_PICO
+Runtime::Runtime() {
+    auto pico = std::make_unique<PicoExecutor>();
+    m_pico_executor = pico.get();
+    m_executor = std::move(pico);
+}
+
+bool Runtime::poll() {
+    return m_pico_executor->poll_ready_tasks();
+}
+#else
 Runtime::Runtime(std::size_t num_threads)
     : m_blocking_pool(this)
 {
@@ -25,6 +40,7 @@ Runtime::~Runtime() {
     //   3. m_uv_executor — stops the uv thread and closes the loop last.
     // No explicit action needed here; member destructors fire in the right order.
 }
+#endif
 
 void set_current_runtime(Runtime* rt) {
     t_current_runtime = rt;

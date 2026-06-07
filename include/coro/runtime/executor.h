@@ -14,6 +14,7 @@ namespace coro {
  * Concrete implementations:
  * - @ref SingleThreadedExecutor — runs all tasks on the calling thread (deterministic, good for tests).
  * - @ref WorkSharingExecutor — multi-threaded, single shared queue.
+ * - @ref PicoExecutor — cooperative single-threaded executor for the Pico port (`CORO_PICO`).
  */
 class Executor {
 public:

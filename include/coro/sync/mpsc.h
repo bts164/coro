@@ -127,6 +127,12 @@ public:
      * 4. Buffer full → link node into sender_waiters, return Pending.
      */
     PollResult<OutputType> poll(coro::detail::Context& ctx) {
+        // The zero-copy receive path may have moved our value out of m_node and
+        // then woken us. If so, the send already completed — return Ready without
+        // touching the buffer.
+        if (!m_node.value.has_value())
+            return OutputType{};
+
         std::unique_lock lock(m_shared->mutex);
 
         // Woken because receiver was dropped while we were suspended.
@@ -231,6 +237,7 @@ public:
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             T val = std::move(*node->value);
+            node->value.reset();  // mark consumed so MpscSendFuture::poll() returns Ready on re-poll
             auto waker = std::move(node->waker);
             m_shared->cv.notify_all();
             lock.unlock();
@@ -252,6 +259,7 @@ private:
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             m_shared->buffer.push_back(std::move(*node->value));
+            node->value.reset();  // mark consumed so MpscSendFuture::poll() returns Ready on re-poll
             return std::move(node->waker);
         }
         return nullptr;
@@ -475,6 +483,7 @@ public:
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             T val = std::move(*node->value);
+            node->value.reset();  // mark consumed so MpscSendFuture::poll() returns Ready on re-poll
             auto waker = std::move(node->waker);
             m_shared->cv.notify_all();
             lock.unlock();
@@ -528,6 +537,7 @@ public:
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             T val = std::move(*node->value);
+            node->value.reset();  // mark consumed so MpscSendFuture::poll() returns Ready on re-poll
             auto waker = std::move(node->waker);
             lock.unlock();
             if (waker) waker->wake();
@@ -547,6 +557,7 @@ private:
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             m_shared->buffer.push_back(std::move(*node->value));
+            node->value.reset();  // mark consumed so MpscSendFuture::poll() returns Ready on re-poll
             return std::move(node->waker);
         }
         return nullptr;

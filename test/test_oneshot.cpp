@@ -7,6 +7,7 @@
 #include <coro/runtime/runtime.h>
 #include <coro/task/spawn_blocking.h>
 #include <memory>
+#include <string>
 
 using namespace coro;
 
@@ -259,6 +260,118 @@ TEST(OneshotVoidTest, BlockingRecvGetsSignal) {
             });
     }(got_signal));
     EXPECT_TRUE(got_signal);
+}
+
+// ---------------------------------------------------------------------------
+// Double-receive prevention
+//
+// OneshotRecvFuture::poll() must reset the slot after moving from it.
+// Without the reset, a second recv() call would find has_value() == true
+// and return the stale (moved-from) value instead of ChannelError::Closed.
+// ---------------------------------------------------------------------------
+
+TEST(OneshotTest, SecondRecvReturnsClosedInt) {
+    Runtime rt(1);
+    rt.block_on([]() -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<int>();
+        tx.send(42);
+        auto r1 = co_await rx.recv();
+        EXPECT_TRUE(r1.has_value());
+        EXPECT_EQ(*r1, 42);
+        // Slot consumed — sender already dropped — second recv must be Closed.
+        auto r2 = co_await rx.recv();
+        EXPECT_FALSE(r2.has_value());
+        EXPECT_EQ(r2.error(), ChannelError::Closed);
+    }());
+}
+
+TEST(OneshotTest, SecondRecvReturnsClosedString) {
+    Runtime rt(1);
+    rt.block_on([]() -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<std::string>();
+        tx.send("hello");
+        auto r1 = co_await rx.recv();
+        EXPECT_TRUE(r1.has_value());
+        EXPECT_EQ(*r1, "hello");
+        auto r2 = co_await rx.recv();
+        EXPECT_FALSE(r2.has_value());
+        EXPECT_EQ(r2.error(), ChannelError::Closed);
+    }());
+}
+
+TEST(OneshotVoidTest, SecondRecvReturnsClosed) {
+    Runtime rt(1);
+    rt.block_on([]() -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<void>();
+        tx.send();
+        auto r1 = co_await rx.recv();
+        EXPECT_TRUE(r1.has_value());
+        auto r2 = co_await rx.recv();
+        EXPECT_FALSE(r2.has_value());
+    }());
+}
+
+TEST(OneshotTest, BlockingRecvTwiceSecondClosed) {
+    auto [tx, rx] = oneshot_channel<int>();
+    tx.send(99);
+    auto r1 = rx.blocking_recv();
+    EXPECT_TRUE(r1.has_value());
+    EXPECT_EQ(*r1, 99);
+    // Slot must be reset; second blocking_recv sees Closed immediately.
+    auto r2 = rx.blocking_recv();
+    EXPECT_FALSE(r2.has_value());
+}
+
+TEST(OneshotTest, BlockingRecvTwiceClosedString) {
+    auto [tx, rx] = oneshot_channel<std::string>();
+    tx.send("world");
+    auto r1 = rx.blocking_recv();
+    EXPECT_TRUE(r1.has_value());
+    EXPECT_EQ(*r1, "world");
+    auto r2 = rx.blocking_recv();
+    EXPECT_FALSE(r2.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// sender_dropped() observer
+//
+// Returns true only when the sender was dropped WITHOUT sending — i.e. when
+// the next recv() would yield ChannelError::Closed. It returns false both when
+// the sender is still alive AND when the sender has sent (slot has a value).
+// ---------------------------------------------------------------------------
+
+TEST(OneshotTest, SenderDroppedReturnsFalseWhenSenderAlive) {
+    auto [tx, rx] = oneshot_channel<int>();
+    EXPECT_FALSE(rx.sender_dropped());
+    (void)tx;
+}
+
+TEST(OneshotTest, SenderDroppedReturnsTrueAfterDropWithoutSend) {
+    auto [tx, rx] = oneshot_channel<int>();
+    { auto dropped = std::move(tx); }
+    EXPECT_TRUE(rx.sender_dropped());
+}
+
+TEST(OneshotTest, SenderDroppedReturnsFalseAfterSend) {
+    // After send(), sender_alive is set to false but slot has a value —
+    // sender_dropped() must return false because recv() will succeed.
+    auto [tx, rx] = oneshot_channel<int>();
+    tx.send(42);
+    EXPECT_FALSE(rx.sender_dropped());
+}
+
+TEST(OneshotTest, SenderDroppedReturnsTrueAfterValueConsumed) {
+    // Once the slot is consumed, sender_alive is false and slot is empty —
+    // sender_dropped() returns true.
+    Runtime rt(1);
+    bool dropped_after_recv = false;
+    rt.block_on([](bool& out) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<int>();
+        tx.send(99);
+        co_await rx.recv();
+        out = rx.sender_dropped();
+    }(dropped_after_recv));
+    EXPECT_TRUE(dropped_after_recv);
 }
 
 TEST(OneshotVoidTest, BlockingRecvReturnsClosedWhenSenderDropped) {

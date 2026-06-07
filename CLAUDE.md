@@ -97,6 +97,39 @@ sequence diagrams, state machines, flowcharts, and class diagrams. Fall back to 
 only when no Mermaid chart type fits naturally and ASCII would produce a simpler or
 clearer result.
 
+### Use MkDocs admonitions for side comments that must stand out
+
+When a design document needs a callout — a note, warning, future-direction remark, or
+caveat — that must be visually distinct from the surrounding prose, use a MkDocs admonition:
+
+```markdown
+!!! note "Title in quotes"
+    Body indented with 4 spaces.
+
+!!! warning "Title in quotes"
+    Body indented with 4 spaces.
+```
+
+Common types: `note`, `warning`, `tip`, `danger`.
+
+Do **not** use bold-text "headers" (`**Note —**`) or plain blockquotes (`> **Future ...**`)
+for this purpose.
+
+Admonition titles are free-form. Optionally prefix the title with a searchable keyword when
+the admonition represents actionable or trackable work:
+
+| Prefix | Type | When to use |
+|---|---|---|
+| `TODO:` | `tip` | Planned improvement, non-urgent |
+| `FIXME:` | `warning` | Known deficiency that needs fixing |
+| `WARNING:` | `danger` | Hard correctness constraint — violating it causes bugs |
+| `PERF:` | `tip` | Performance concern or optimization opportunity |
+| `NOTE:` | `note` | Informational context worth calling out explicitly |
+
+Prefixes are opt-in — omit them for pure explanatory context that does not represent work
+or a constraint to track. When used, they make admonitions grep-able:
+`grep -r "TODO:\|FIXME:\|WARNING:" doc/`
+
 ### Guidelines titles are actionable; descriptions may reference internals
 
 When adding or editing rules in `doc/guidelines.md`, the rule title must describe an

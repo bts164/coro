@@ -224,7 +224,7 @@ public:
             std::lock_guard lock(m_state->mutex);
             m_state->pending_handles.push_back(&task->m_node);
         }
-        coro::current_runtime().schedule_task(std::move(task_base));
+        coro::schedule_task(std::move(task_base));
     }
 
 private:

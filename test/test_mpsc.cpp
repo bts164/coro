@@ -382,3 +382,277 @@ TEST(MpscTest, BlockingWorkerPipeline) {
     }(results));
     EXPECT_EQ(results, (std::vector<int>{2, 4, 6}));
 }
+
+// ---------------------------------------------------------------------------
+// Zero-copy correctness
+//
+// When a sender is waiting in sender_waiters and the receiver consumes its
+// value (either directly or via _tryPromoteSender), the sender is woken and
+// re-polled by the executor's spurious-wake guard. The re-poll must return
+// Ready immediately without pushing the already-consumed value a second time.
+//
+// These tests catch bugs where node->value is not reset after the zero-copy
+// handoff, causing duplicate delivery.
+// ---------------------------------------------------------------------------
+
+// capacity=1: tight buffer forces both the _tryPromoteSender and direct
+// zero-copy paths. Each value must appear exactly once.
+TEST(MpscTest, ZeroCopyNoDoubleSendInt) {
+    Runtime rt(1);
+    std::vector<int> received;
+    rt.block_on([](std::vector<int>& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+        auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            for (int i = 0; i < 5; ++i)
+                co_await tx.send(i);
+        }(std::move(tx)));
+        while (auto v = co_await next(rx))
+            out.push_back(*v);
+        co_await producer;
+    }(received));
+    EXPECT_EQ(received, (std::vector<int>{0, 1, 2, 3, 4}));
+}
+
+// Non-primitive type: a moved-from std::string is distinct from its original,
+// so duplicates show up as empty strings rather than correct values.
+TEST(MpscTest, ZeroCopyNoDoubleSendString) {
+    Runtime rt(1);
+    std::vector<std::string> received;
+    rt.block_on([](std::vector<std::string>& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<std::string>(1);
+        auto producer = coro::spawn([](MpscSender<std::string> tx) -> Coro<void> {
+            for (int i = 0; i < 5; ++i)
+                co_await tx.send("value_" + std::to_string(i));
+        }(std::move(tx)));
+        while (auto v = co_await next(rx))
+            out.push_back(std::move(*v));
+        co_await producer;
+    }(received));
+    EXPECT_EQ(received, (std::vector<std::string>{
+        "value_0", "value_1", "value_2", "value_3", "value_4"}));
+}
+
+// Verify item count is exactly N — catches duplicates even if values happen
+// to be identical.
+TEST(MpscTest, ZeroCopyExactItemCount) {
+    Runtime rt(1);
+    int count = 0;
+    rt.block_on([](int& cnt) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+        auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            for (int i = 0; i < 10; ++i)
+                co_await tx.send(i);
+        }(std::move(tx)));
+        while (co_await next(rx))
+            ++cnt;
+        co_await producer;
+    }(count));
+    EXPECT_EQ(count, 10);
+}
+
+// capacity=0: buffer-less channel — every send goes directly to sender_waiters,
+// exercising the direct zero-copy path in poll_next on every receive.
+TEST(MpscTest, CapacityZeroDirectZeroCopyPath) {
+    Runtime rt(1);
+    std::vector<int> received;
+    rt.block_on([](std::vector<int>& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(0);
+        auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            for (int i = 0; i < 5; ++i)
+                co_await tx.send(i);
+        }(std::move(tx)));
+        while (auto v = co_await next(rx))
+            out.push_back(*v);
+        co_await producer;
+    }(received));
+    EXPECT_EQ(received, (std::vector<int>{0, 1, 2, 3, 4}));
+}
+
+// Multiple senders at capacity=1: every sender that suspends in sender_waiters
+// must deliver its value exactly once.
+TEST(MpscTest, MultipleSendersCapacity1NoDuplicates) {
+    Runtime rt(1);
+    int sum = 0, count = 0;
+    rt.block_on([](int& s, int& c) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+        auto tx2 = tx.clone();
+        auto tx3 = tx.clone();
+
+        auto s1 = coro::spawn([](MpscSender<int> t) -> Coro<void> {
+            co_await t.send(10); co_await t.send(11);
+        }(std::move(tx)));
+        auto s2 = coro::spawn([](MpscSender<int> t) -> Coro<void> {
+            co_await t.send(20); co_await t.send(21);
+        }(std::move(tx2)));
+        auto s3 = coro::spawn([](MpscSender<int> t) -> Coro<void> {
+            co_await t.send(30); co_await t.send(31);
+        }(std::move(tx3)));
+
+        while (auto v = co_await next(rx)) { s += *v; ++c; }
+        co_await s1; co_await s2; co_await s3;
+    }(sum, count));
+    EXPECT_EQ(count, 6);
+    EXPECT_EQ(sum, 10 + 11 + 20 + 21 + 30 + 31);
+}
+
+// ---------------------------------------------------------------------------
+// MpscRecvFuture (rx.recv()) code paths
+//
+// Most tests above use coro::next(rx) which routes through MpscReceiver::poll_next().
+// The following tests exercise MpscRecvFuture::poll() via co_await rx.recv().
+//
+// Three distinct paths in MpscRecvFuture::poll():
+//   (a) Buffer non-empty  → take from buffer, call _tryPromoteSender.
+//   (b) sender_waiters non-empty → direct zero-copy from suspended sender.
+//   (c) Both empty, sender alive → set receiver_waiter, return Pending.
+//
+// Path (b) requires the sender to already be suspended when the receiver polls.
+// In a single-threaded executor this is achieved by spawning a quick no-op task
+// between the sender spawn and the recv call, which yields execution to the
+// sender (letting it suspend in sender_waiters) before the receiver polls.
+// ---------------------------------------------------------------------------
+
+// Path (b): direct zero-copy from sender_waiters. Without node->value.reset() in
+// MpscRecvFuture::poll(), the woken sender re-polls and pushes the moved-from
+// value a second time — same double-delivery bug fixed elsewhere.
+TEST(MpscTest, RecvFutureDirectZeroCopyNoDuplicates) {
+    Runtime rt(1);
+    std::vector<int> received;
+    rt.block_on([](std::vector<int>& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(0);  // capacity=0: sender always suspends
+
+        auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            for (int i = 0; i < 3; ++i)
+                co_await tx.send(i);
+        }(std::move(tx)));
+
+        // Yield so producer runs first and suspends in sender_waiters before recv.
+        auto noop = coro::spawn([](int n) -> Coro<int> { co_return n; }(0));
+        co_await noop;
+
+        // producer is now in sender_waiters; rx.recv() hits path (b).
+        while (auto v = co_await rx.recv())
+            out.push_back(*v);
+        co_await producer;
+    }(received));
+    EXPECT_EQ(received, (std::vector<int>{0, 1, 2}));
+}
+
+// Path (c) → path (b): receiver suspends first (receiver_waiter set), then spawned
+// sender sends and observes receiver_waiter inside MpscSendFuture::poll().
+// That path pushes the value to the buffer and wakes the receiver; receiver then
+// takes it via path (a). Exercises the receiver_waiter branch of MpscSendFuture.
+TEST(MpscTest, ReceiverSuspendsBeforeSenderSends) {
+    Runtime rt(1);
+    int received = -1;
+    rt.block_on([](int& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(4);
+
+        // Sender is queued but hasn't run yet.
+        auto sender = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            co_await tx.send(42);
+        }(std::move(tx)));
+
+        // recv() on empty channel → path (c): receiver_waiter set, parent suspends.
+        // Executor now runs the sender, which sees receiver_waiter → wakes parent.
+        auto v = co_await rx.recv();
+        EXPECT_TRUE(v.has_value());
+        out = v.value_or(-1);
+        co_await sender;
+    }(received));
+    EXPECT_EQ(received, 42);
+}
+
+// try_send() must also wake an async-suspended receiver via receiver_waiter.
+TEST(MpscTest, TrySendWakesAsyncReceiver) {
+    Runtime rt(1);
+    int received = -1;
+    rt.block_on([](int& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(4);
+
+        auto sender = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            tx.try_send(77);  // non-async; sees receiver_waiter → wakes parent
+            co_return;
+        }(std::move(tx)));
+
+        auto v = co_await rx.recv();  // sets receiver_waiter → suspends
+        out = v.value_or(-1);
+        co_await sender;
+    }(received));
+    EXPECT_EQ(received, 77);
+}
+
+// ~MpscReceiver() must wake all senders suspended in sender_waiters. The woken
+// sender re-polls, sees !receiver_alive, and returns the unsent value as an error.
+TEST(MpscTest, ReceiverDroppedWhileSenderInWaiters) {
+    Runtime rt(1);
+    bool got_error = false;
+    rt.block_on([](bool& err) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+        co_await tx.send(1);  // fill buffer (capacity=1)
+
+        auto h = coro::spawn([](MpscSender<int> tx, bool& err) -> Coro<void> {
+            auto r = co_await tx.send(2);  // buffer full → suspends in sender_waiters
+            err = !r.has_value() && r.error() == 2;
+        }(tx.clone(), err));
+
+        // Yield so h runs and suspends in sender_waiters before rx is dropped.
+        auto noop = coro::spawn([](int n) -> Coro<int> { co_return n; }(0));
+        co_await noop;
+
+        // h is now in sender_waiters; dropping rx wakes it with an error.
+        { auto dropped = std::move(rx); }
+        co_await h;
+    }(got_error));
+    EXPECT_TRUE(got_error);
+}
+
+// ---------------------------------------------------------------------------
+// State observer methods
+// ---------------------------------------------------------------------------
+
+TEST(MpscTest, IsClosed) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    EXPECT_FALSE(tx.is_closed());
+    { auto dropped = std::move(rx); }
+    EXPECT_TRUE(tx.is_closed());
+}
+
+TEST(MpscTest, AllSendersDropped) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    EXPECT_FALSE(rx.all_senders_dropped());
+    auto tx2 = tx.clone();
+    { auto dropped = std::move(tx); }
+    EXPECT_FALSE(rx.all_senders_dropped());  // tx2 still alive
+    { auto dropped = std::move(tx2); }
+    EXPECT_TRUE(rx.all_senders_dropped());
+}
+
+// blocking_recv: zero-copy path (buffer empty, sender in sender_waiters) must
+// not cause the woken sender to push its already-consumed value again.
+TEST(MpscTest, BlockingRecvZeroCopyNoDuplicates) {
+    Runtime rt(1);
+    std::vector<int> received;
+    rt.block_on([](std::vector<int>& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+
+        // Async producer: first send fills the buffer, subsequent sends suspend.
+        auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            for (int i = 0; i < 4; ++i)
+                co_await tx.send(i);
+        }(std::move(tx)));
+
+        auto worker = coro::spawn_blocking(
+            [rx = std::move(rx)]() mutable -> std::vector<int> {
+                std::vector<int> vals;
+                while (auto v = rx.blocking_recv())
+                    vals.push_back(*v);
+                return vals;
+            });
+
+        out = co_await std::move(worker);
+        co_await producer;
+    }(received));
+    EXPECT_EQ(received.size(), 4u);
+    EXPECT_EQ(received, (std::vector<int>{0, 1, 2, 3}));
+}

@@ -76,9 +76,12 @@ public:
 
         if (m_shared->slot.has_value()) {
             if constexpr (std::is_void_v<T>) {
+                m_shared->slot.reset();
                 return OutputType{};
             } else {
-                return OutputType(std::move(*m_shared->slot));
+                auto result = OutputType(std::move(*m_shared->slot));
+                m_shared->slot.reset();  // prevent double-receive if future is re-polled
+                return result;
             }
         }
         if (!m_shared->sender_alive) {
@@ -263,10 +266,14 @@ public:
             return m_shared->slot.has_value() || !m_shared->sender_alive;
         });
         if (m_shared->slot.has_value()) {
-            if constexpr (std::is_void_v<T>)
+            if constexpr (std::is_void_v<T>) {
+                m_shared->slot.reset();
                 return {};
-            else
-                return std::move(*m_shared->slot);
+            } else {
+                auto result = std::move(*m_shared->slot);
+                m_shared->slot.reset();  // prevent double-receive on second blocking_recv
+                return result;
+            }
         }
         return std::unexpected(ChannelError::Closed);
     }
