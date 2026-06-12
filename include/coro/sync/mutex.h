@@ -5,7 +5,7 @@
 #include <coro/detail/waker.h>
 #include <deque>
 #include <memory>
-#include <mutex>
+#include <coro/detail/mutex.h>
 
 namespace coro {
 
@@ -170,7 +170,7 @@ private:
         next_waker->wake();
     }
 
-    std::mutex                              m_mutex;
+    detail::Mutex                           m_mutex;
     T                                       m_value{};
     bool                                    m_locked = false;
     std::deque<std::shared_ptr<detail::Waker>> m_waiters;

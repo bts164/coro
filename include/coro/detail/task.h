@@ -128,7 +128,11 @@ public:
 
     /// @brief The task currently being polled on this thread, or nullptr if outside a poll.
     /// Set by the executor before each poll() call and cleared afterward.
+#ifdef CORO_PICO
+    static TaskBase* current;
+#else
     static thread_local TaskBase* current;
+#endif
 
     /// @brief Returns the name of the currently-polling task, or "" if none.
     static std::string_view current_name() {

@@ -1,5 +1,100 @@
 #pragma once
 
+#ifdef CORO_TCP_BACKEND_LWIP
+
+// ---------------------------------------------------------------------------
+// lwIP-backed TcpStream (CORO_TCP_BACKEND_LWIP)
+//
+// Backed by the lwIP raw TCP API in NO_SYS mode. All callbacks fire
+// synchronously on the executor thread during cyw43_arch_poll() /
+// sys_check_timeouts(). No lwIP headers appear here — the implementation
+// is compiled separately via src/io/lwip/tcp_stream_lwip.cpp.
+//
+// To integrate in a project:
+//   target_sources(my_app PRIVATE ${CORO_ROOT}/src/io/lwip/tcp_stream_lwip.cpp)
+//   target_link_libraries(my_app PRIVATE coro::coro lwip)
+// ---------------------------------------------------------------------------
+
+#include <coro/coro.h>
+#include <coro/io/byte_buffer.h>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <ranges>
+#include <string>
+#include <utility>
+
+namespace coro {
+
+class TcpListener;
+namespace detail { struct LwipTcpCtx; }
+
+/**
+ * @brief Async TCP connection. Move-only; obtain via `co_await TcpStream::connect()`.
+ *
+ * Uses the lwIP raw TCP API; all callbacks fire synchronously from the executor's
+ * I/O tick (cyw43_arch_poll() on Pico, sys_check_timeouts() on host test builds).
+ *
+ * **Concurrency:** do not co_await read() and write() simultaneously from two tasks.
+ * **Destruction:** destroying a TcpStream while a read() or write() is in flight is UB.
+ */
+class TcpStream {
+public:
+    TcpStream(TcpStream&&) noexcept;
+    TcpStream& operator=(TcpStream&&) noexcept;
+    TcpStream(const TcpStream&)            = delete;
+    TcpStream& operator=(const TcpStream&) = delete;
+
+    ~TcpStream();
+
+    /**
+     * @brief Resolves host (dotted-decimal or hostname via lwIP DNS) and connects to port.
+     * @throws std::runtime_error on DNS failure or connection refusal.
+     */
+    [[nodiscard]] static Coro<TcpStream> connect(std::string host, uint16_t port);
+
+    /**
+     * @brief Reads up to buf.size() bytes. Returns {bytes_read, buf}; 0 bytes on EOF.
+     * @tparam Buf Any type satisfying ByteBuffer.
+     */
+    template<ByteBuffer Buf>
+    [[nodiscard]] Coro<std::pair<std::size_t, Buf>> read(Buf buf) {
+        std::size_t n = co_await read_impl(
+            reinterpret_cast<std::byte*>(std::ranges::data(buf)),
+            std::ranges::size(buf));
+        co_return std::pair<std::size_t, Buf>{n, std::move(buf)};
+    }
+
+    /**
+     * @brief Writes all bytes in buf to the stream. Returns buf after completion.
+     * @tparam Buf Any type satisfying ByteBuffer.
+     * @throws std::runtime_error on connection error.
+     */
+    template<ByteBuffer Buf>
+    [[nodiscard]] Coro<Buf> write(Buf buf) {
+        co_await write_impl(
+            reinterpret_cast<const std::byte*>(std::ranges::data(buf)),
+            std::ranges::size(buf));
+        co_return std::move(buf);
+    }
+
+private:
+    friend class TcpListener;
+
+    explicit TcpStream(std::shared_ptr<detail::LwipTcpCtx> impl);
+
+    // Defined in tcp_stream_lwip.cpp (or a stub). Never inline — keeps lwIP
+    // headers out of this file.
+    [[nodiscard]] Coro<std::size_t> read_impl(std::byte* buf, std::size_t size);
+    [[nodiscard]] Coro<void>        write_impl(const std::byte* buf, std::size_t size);
+
+    std::shared_ptr<detail::LwipTcpCtx> m_impl;
+};
+
+} // namespace coro
+
+#else // !CORO_TCP_BACKEND_LWIP — libuv-backed implementation
+
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
 #include <coro/io/byte_buffer.h>
@@ -89,3 +184,5 @@ private:
 } // namespace coro
 
 #include <coro/io/tcp_stream.hpp>
+
+#endif // CORO_TCP_BACKEND_LWIP

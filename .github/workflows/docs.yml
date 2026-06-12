@@ -24,7 +24,7 @@ jobs:
         run: sudo apt-get update
 
       - name: Install Doxygen
-        run: sudo apt-get install -y doxygen
+        run: sudo apt-get install -y doxygen graphviz
 
       - name: Set up Python
         uses: actions/setup-python@v5

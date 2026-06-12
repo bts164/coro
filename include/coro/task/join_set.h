@@ -11,8 +11,8 @@
 #include <exception>
 #include <list>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <coro/detail/mutex.h>
 #include <set>
 #include <type_traits>
 #include <utility>
@@ -49,7 +49,7 @@ struct JoinSetSharedState {
         Node *next = nullptr;
         Node *prev = nullptr;
     };
-    std::mutex                                mutex;
+    detail::Mutex                             mutex;
     std::shared_ptr<Waker>                    consumer_waker;
     IntrusiveList<Node*>                      pending_handles; ///< Running tasks (lifetime anchors).
     std::deque<std::shared_ptr<TaskState<T>>> idle_handles;    ///< Completed tasks awaiting consumption.

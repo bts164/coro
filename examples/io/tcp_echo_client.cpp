@@ -1,14 +1,11 @@
 // tcp_echo_client.cpp
 //
-// Connects to the TCP echo server on localhost:8080, sends a
-// message, receives the echo, and prints it.
-//
-// This example exercises the fully implemented TcpStream client path and
-// should compile and run once Phase 3 is complete.
+// Connects to a TCP echo server, sends messages, and prints the replies.
 //
 // Usage:
-//   ./tcp_echo_client [message]
-//   ./tcp_echo_client "hello, world"
+//   ./tcp_echo_client [host [port [message]]]
+//   ./tcp_echo_client 192.168.1.42 8080 "hello pico"   # connect to Pico
+//   ./tcp_echo_client                                   # defaults: 127.0.0.1 8080
 
 #include <coro/coro.h>
 #include <coro/runtime/runtime.h>
@@ -49,20 +46,16 @@ using namespace coro;
 
 // ---------------------------------------------------------------------------
 // run_client
-//
-// Connects to the local echo server, sends one message, receives the echo,
-// and prints it. Demonstrates the full connect → send → receive → close cycle.
 // ---------------------------------------------------------------------------
-static Coro<void> run_client(int id, std::string message) {
+static Coro<void> run_client(int id, std::string host, uint16_t port, std::string message) {
     using namespace std::chrono_literals;
-    // connect() resolves the address and performs an async TCP connect.
     struct Defer {
         Defer(int id) : id_(id) {}
         ~Defer() { LOG(id_, "Connection %d closed", id_); }
         int id_;
     } defer(id);
 
-    TcpStream stream = co_await TcpStream::connect("127.0.0.1", 8080);
+    TcpStream stream = co_await TcpStream::connect(host, port);
 
     LOG(id, "Connected. Sending: %.*s", static_cast<int>(message.size()), message.data());
 
@@ -102,10 +95,12 @@ static Coro<void> run_client(int id, std::string message) {
 // main
 // ---------------------------------------------------------------------------
 coro::Coro<int> async_main(int argc, char* argv[]) {
-    std::string message = (argc > 1) ? argv[1] : "hello, world";
+    std::string host    = (argc > 1) ? argv[1] : "127.0.0.1";
+    uint16_t    port    = (argc > 2) ? static_cast<uint16_t>(std::stoi(argv[2])) : 8080;
+    std::string message = (argc > 3) ? argv[3] : "hello, world";
     coro::JoinSet<void> clients;
     for (int i = 0; i < 10; ++i) {
-        clients.spawn(run_client(i, message));
+        clients.spawn(run_client(i, host, port, message));
     }
     co_await clients.drain();
     LOG(-1, "All clients completed");

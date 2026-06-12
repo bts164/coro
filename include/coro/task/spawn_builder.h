@@ -140,14 +140,19 @@ public:
     template<Stream S>
     StreamHandle<typename S::ItemType> spawn(S stream) {
         auto channel = std::make_shared<detail::Channel<typename S::ItemType>>(m_buffer_size);
+        detail::OwnedTask driver;
         if (m_executor) {
             using Driver = detail::StreamDriver<S>;
             auto impl = std::make_shared<detail::TaskImpl<Driver>>(
                 Driver{std::move(stream), channel, std::nullopt});
             impl->name = std::move(m_name);
+            // Keep a persistent strong ref in OwnedTask before moving impl into schedule().
+            // The work-stealing executor stores raw pointers in its run queues and relies on
+            // an external owner to keep the task alive between enqueue and pickup.
+            driver = detail::OwnedTask{std::shared_ptr<detail::TaskBase>(impl)};
             m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
         }
-        return StreamHandle<typename S::ItemType>(std::move(channel));
+        return StreamHandle<typename S::ItemType>(std::move(channel), std::move(driver));
     }
 
 private:

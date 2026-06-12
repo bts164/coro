@@ -9,9 +9,8 @@
 #include <cassert>
 #include <expected>
 #include <memory>
-#include <mutex>
-#include <shared_mutex>
 #include <utility>
+#include <coro/detail/mutex.h>
 
 namespace coro {
 
@@ -45,11 +44,11 @@ struct WatchReceiverNode : coro::detail::IntrusiveListNode {
  */
 template<typename T>
 struct WatchShared {
-    std::shared_mutex            value_mutex;
+    detail::SharedMutex            value_mutex;
     T                            value;
     uint64_t                     version = 0;    ///< Incremented on every send().
 
-    std::mutex                   waker_mutex;
+    detail::Mutex                waker_mutex;
     coro::detail::IntrusiveList<> receiver_waiters; ///< Suspended WatchChangedFuture nodes.
     size_t                       receiver_count = 0;
     size_t                       sender_count   = 0; ///< Number of live WatchSender handles.
@@ -79,7 +78,7 @@ template<typename T>
 class WatchBorrowGuard {
 public:
     WatchBorrowGuard(std::shared_ptr<detail::WatchShared<T>> shared,
-                     std::shared_lock<std::shared_mutex> lock)
+                     std::shared_lock<detail::SharedMutex> lock)
         : m_shared(std::move(shared)), m_lock(std::move(lock)) {}
 
     WatchBorrowGuard(const WatchBorrowGuard&)            = delete;
@@ -92,7 +91,7 @@ public:
 
 private:
     std::shared_ptr<detail::WatchShared<T>> m_shared;
-    std::shared_lock<std::shared_mutex>     m_lock;
+    std::shared_lock<detail::SharedMutex>     m_lock;
 };
 
 /**
@@ -116,7 +115,7 @@ template<typename T>
 class WatchBorrowMutGuard {
 public:
     WatchBorrowMutGuard(std::shared_ptr<detail::WatchShared<T>> shared,
-                        std::unique_lock<std::shared_mutex> lock)
+                        std::unique_lock<detail::SharedMutex> lock)
         : m_shared(std::move(shared)), m_lock(std::move(lock)) {}
 
     WatchBorrowMutGuard(const WatchBorrowMutGuard&)            = delete;
@@ -145,7 +144,7 @@ public:
 
 private:
     std::shared_ptr<detail::WatchShared<T>> m_shared;
-    std::unique_lock<std::shared_mutex>     m_lock;
+    std::unique_lock<detail::SharedMutex>     m_lock;
 };
 
 /**
@@ -322,7 +321,7 @@ public:
      */
     [[nodiscard]] WatchBorrowMutGuard<T> borrow_mut() {
         return WatchBorrowMutGuard<T>(m_shared,
-            std::unique_lock<std::shared_mutex>(m_shared->value_mutex));
+            std::unique_lock<detail::SharedMutex>(m_shared->value_mutex));
     }
 
     /**
@@ -430,7 +429,7 @@ public:
      */
     [[nodiscard]] WatchBorrowGuard<T> borrow() {
         return WatchBorrowGuard<T>(m_shared,
-            std::shared_lock<std::shared_mutex>(m_shared->value_mutex));
+            std::shared_lock<detail::SharedMutex>(m_shared->value_mutex));
     }
 
     /**
@@ -443,7 +442,7 @@ public:
      * @warning Do not hold the returned guard across a `co_await` point.
      */
     [[nodiscard]] WatchBorrowGuard<T> borrow_and_update() {
-        std::shared_lock<std::shared_mutex> lock(m_shared->value_mutex);
+        std::shared_lock<detail::SharedMutex> lock(m_shared->value_mutex);
         m_last_seen = m_shared->version;
         return WatchBorrowGuard<T>(m_shared, std::move(lock));
     }

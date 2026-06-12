@@ -6,10 +6,11 @@
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/waker.h>
+#include <coro/detail/task.h>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <coro/detail/mutex.h>
 #include <queue>
 
 namespace coro {
@@ -20,7 +21,7 @@ namespace detail {
 // Protected by mutex so it is safe for the multi-threaded executor.
 template<typename T>
 struct Channel {
-    std::mutex             mutex;
+    detail::Mutex          mutex;
     std::queue<T>          buffer;
     std::size_t            capacity;
     bool                   closed   = false;
@@ -54,8 +55,17 @@ public:
 
     StreamHandle() = default;
 
-    explicit StreamHandle(std::shared_ptr<detail::Channel<T>> channel)
-        : m_channel(std::move(channel)) {}
+    explicit StreamHandle(std::shared_ptr<detail::Channel<T>> channel,
+                          detail::OwnedTask driver = {})
+        : m_channel(std::move(channel)), m_driver(std::move(driver)) {}
+
+    // Cancel the driver task if the handle is dropped before the stream is exhausted.
+    // Mirrors JoinHandle's cancel-on-destroy so the producer doesn't run indefinitely
+    // after the consumer is gone, and ensures the driver task is never left with no owner.
+    ~StreamHandle() {
+        if (auto task = m_driver.get())
+            task->cancel_task();
+    }
 
     StreamHandle(const StreamHandle&)            = delete;
     StreamHandle& operator=(const StreamHandle&) = delete;
@@ -89,6 +99,10 @@ public:
 
 private:
     std::shared_ptr<detail::Channel<T>> m_channel;
+    // Lifetime anchor for the background StreamDriver task (mirrors OwnedTask in JoinHandle).
+    // Without this, the work-stealing executor's raw-pointer queue has no persistent owner,
+    // and the task can be freed before a worker calls shared_from_this() on it.
+    detail::OwnedTask m_driver;
 };
 
 } // namespace coro

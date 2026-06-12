@@ -4,11 +4,11 @@
 // Shared ref-counted state between an executor-held Task and its JoinHandle.
 
 #include <atomic>
-#include <condition_variable>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <coro/detail/mutex.h>
 
 #include <coro/detail/waker.h>
 
@@ -51,8 +51,8 @@ enum class SchedulingState : uint8_t {
  * section, so `wait_until_done()` can never miss the wakeup.
  */
 struct TaskStateBase {
-    mutable std::mutex      mutex;
-    std::condition_variable cv;
+    mutable detail::Mutex   mutex;
+    detail::CondVar         cv;
     bool                    terminated{false};
 
     // Self-reference for detached tasks. Set by JoinHandle::detach() before releasing

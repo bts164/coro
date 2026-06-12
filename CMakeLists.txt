@@ -27,6 +27,7 @@ add_library(coro
     src/context.cpp
     src/executor.cpp
     src/single_threaded_executor.cpp
+    src/current_thread_executor.cpp
     src/work_sharing_executor.cpp
     src/work_stealing_executor.cpp
     src/single_threaded_uv_executor.cpp

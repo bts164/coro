@@ -4,7 +4,7 @@
 #include <coro/detail/poll_result.h>
 #include <coro/detail/waker.h>
 #include <memory>
-#include <mutex>
+#include <coro/detail/mutex.h>
 
 namespace coro {
 
@@ -167,7 +167,7 @@ public:
     }
 
 private:
-    mutable std::mutex             m_mutex;
+    mutable detail::Mutex          m_mutex;
     bool                           m_set   = false;
     WaitFuture*                    m_wait_future = nullptr;
     std::shared_ptr<detail::Waker> m_waker;

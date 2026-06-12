@@ -3,13 +3,69 @@
 #include <coro/detail/poll_result.h>
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
+#include <chrono>
+
+// ---------------------------------------------------------------------------
+// Pico port — timer-queue based sleep, no libuv
+// ---------------------------------------------------------------------------
+#ifdef CORO_PICO
+
+#include <coro/runtime/runtime.h>
+
+namespace coro {
+
+/**
+ * @brief Future that completes once a wall-clock duration has elapsed.
+ *
+ * On the first `poll()` call the deadline is registered with the CurrentThreadExecutor's
+ * timer queue. `check_expired_timers()` in the executor's poll loop fires the
+ * waker when `time_us_64() >= deadline_us`, re-enqueueing the task.
+ * The next `poll()` then sees the deadline has passed and returns PollReady.
+ *
+ * Timer resolution is bounded by the poll loop iteration time (sub-millisecond
+ * in practice since the loop is tight). No ISR or hardware alarm is used.
+ */
+class SleepFuture {
+public:
+    using OutputType = void;
+
+    explicit SleepFuture(std::chrono::nanoseconds duration)
+        : m_deadline_us(current_runtime().now_us() + static_cast<uint64_t>(
+              std::max<int64_t>(0,
+                  std::chrono::duration_cast<std::chrono::microseconds>(duration).count())))
+    {}
+
+    PollResult<void> poll(detail::Context& cx) {
+        if (current_runtime().now_us() >= m_deadline_us) return PollReady;
+        if (!m_registered) {
+            current_runtime().schedule_timer(m_deadline_us, cx.getWaker());
+            m_registered = true;
+        }
+        return PollPending;
+    }
+
+private:
+    uint64_t m_deadline_us;
+    bool     m_registered = false;
+};
+
+[[nodiscard]] inline SleepFuture sleep_for(std::chrono::nanoseconds duration) {
+    return SleepFuture(duration);
+}
+
+} // namespace coro
+
+// ---------------------------------------------------------------------------
+// Desktop / libuv port
+// ---------------------------------------------------------------------------
+#else
+
 #include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/runtime/uv_future.h>
 #include <coro/task/spawn_on.h>
 #include <coro/coro.h>
 #include <uv.h>
 #include <atomic>
-#include <chrono>
 #include <memory>
 
 namespace coro {
@@ -35,9 +91,6 @@ namespace coro {
  *
  * @note `SleepFuture` must not be shared across threads. It is intended to
  *       live inside a coroutine frame and be polled by a single executor thread.
- *
- * All libuv state, request types, and callbacks are private implementation
- * details of this class.
  *
  * Prefer the @ref sleep_for factory function over constructing this directly.
  */
@@ -117,64 +170,35 @@ public:
     }
 
 private:
-    // -----------------------------------------------------------------------
-    // State — shared between SleepFuture (worker thread) and the I/O thread.
-    // Heap-allocated and reference-counted so either side can outlive the other.
-    //
-    // RACE: waker is written by the worker thread (poll()) and read by the I/O
-    // thread (timer_cb). It is therefore std::atomic<shared_ptr<Waker>> (C++20).
-    // fired is written by the I/O thread (timer_cb / CancelRequest::execute())
-    // and read by the worker thread (poll()). Atomic exchange prevents double-close.
-    // -----------------------------------------------------------------------
     struct State : std::enable_shared_from_this<State> {
-        uv_timer_t                                  handle;  // must remain first field
+        uv_timer_t                                  handle;
         std::atomic<std::shared_ptr<detail::Waker>> waker;
         std::atomic<bool>                           fired{false};
     };
 
-    // -----------------------------------------------------------------------
-    // libuv callbacks — static so they satisfy the C function-pointer ABI.
-    // Both run exclusively on the I/O thread.
-    // -----------------------------------------------------------------------
-
-    /// Fired by libuv when the timer deadline expires.
     static void timer_cb(uv_timer_t* handle) {
         auto* sp    = static_cast<std::shared_ptr<State>*>(handle->data);
         auto* state = sp->get();
-        // Atomically claim uv_close. CancelRequest::execute() uses the same
-        // exchange, so only one side will call uv_close.
         if (!state->fired.exchange(true)) {
             state->waker.load()->wake();
             uv_close(reinterpret_cast<uv_handle_t*>(handle), close_cb);
         }
     }
 
-    /// Fired by libuv after uv_close() completes. Deletes the shared_ptr wrapper
-    /// stored in handle->data, decrementing the State ref count.
     static void close_cb(uv_handle_t* handle) {
         delete static_cast<std::shared_ptr<State>*>(handle->data);
     }
 
-    // -----------------------------------------------------------------------
-    // SleepFuture data members
-    // -----------------------------------------------------------------------
-    // Stored in whole milliseconds, ceiled at construction. This makes the
-    // timer resolution explicit regardless of the platform's steady_clock
-    // precision, and means no rounding decisions are deferred to execute().
     std::chrono::time_point<std::chrono::steady_clock,
                             std::chrono::milliseconds> m_deadline;
-    std::shared_ptr<State>                m_state;       // null until first poll()
-    SingleThreadedUvExecutor*             m_uv_exec = nullptr;  // cached on first poll()
+    std::shared_ptr<State>                m_state;
+    SingleThreadedUvExecutor*             m_uv_exec = nullptr;
 };
 
-
-/**
- * @brief Returns a @ref SleepFuture that completes after `duration` has elapsed.
- *
- * Timer resolution is milliseconds; see @ref SleepFuture for details.
- */
 [[nodiscard]] inline SleepFuture sleep_for(std::chrono::nanoseconds duration) {
     return SleepFuture(duration);
 }
 
 } // namespace coro
+
+#endif // CORO_PICO

@@ -23,7 +23,7 @@
 namespace coro {
 
 #ifdef CORO_PICO
-class PicoExecutor;  // forward declaration for Runtime::m_pico_executor
+class CurrentThreadExecutor;  // forward declaration for Runtime::m_current_thread_executor
 #endif
 
 // Forward declarations — must be visible inside template bodies below because
@@ -41,15 +41,23 @@ Runtime& current_runtime();
  *
  * `Runtime` is not copyable or movable.
  *
- * In the Pico port (`CORO_PICO`), the Runtime owns a @ref PicoExecutor and
+ * In the Pico port (`CORO_PICO`), the Runtime owns a @ref CurrentThreadExecutor and
  * exposes `poll()` to service the ready queue from the firmware event loop.
  */
 class Runtime {
 public:
 #ifdef CORO_PICO
-    /// @brief Constructs a Runtime backed by PicoExecutor.
+    /// @brief Constructs a Runtime backed by CurrentThreadExecutor.
     explicit Runtime();
     ~Runtime() = default;
+
+    /// @brief Returns the current time in microseconds from the executor's clock.
+    /// Used by SleepFuture to read and compare deadlines consistently.
+    uint64_t now_us() const;
+
+    /// @brief Registers a one-shot timer that fires `waker` at `deadline_us`
+    /// microseconds since the clock epoch. Used by sleep_for().
+    void schedule_timer(uint64_t deadline_us, std::shared_ptr<detail::Waker> waker);
 
     /// @brief Drains the coroutine ready queue once. Returns true if any task was polled.
     ///
@@ -160,7 +168,7 @@ public:
 
 private:
 #ifdef CORO_PICO
-    PicoExecutor*             m_pico_executor = nullptr;
+    CurrentThreadExecutor*    m_current_thread_executor = nullptr;
     std::unique_ptr<Executor> m_executor;
 #else
     // Declaration order matters for destruction (members destroyed in reverse order):

@@ -7,12 +7,11 @@
 #include <coro/sync/channel_error.h>
 
 #include <cassert>
-#include <condition_variable>
 #include <deque>
 #include <expected>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <coro/detail/mutex.h>
 #include <utility>
 #include <vector>
 
@@ -53,8 +52,8 @@ struct MpscReceiverNode {
  */
 template<typename T>
 struct MpscShared {
-    std::mutex                      mutex;
-    std::condition_variable         cv;              ///< Notified on every push, pop, and close; used by blocking_recv / blocking_send.
+    detail::Mutex                   mutex;
+    detail::CondVar                 cv;              ///< Notified on every push, pop, and close; used by blocking_recv / blocking_send.
     std::deque<T>                   buffer;          ///< Bounded queue.
     size_t                          capacity;        ///< Maximum buffered values.
     size_t                          sender_count  = 0;

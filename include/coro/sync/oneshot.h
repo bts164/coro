@@ -5,11 +5,10 @@
 #include <coro/detail/poll_result.h>
 #include <coro/sync/channel_error.h>
 
-#include <condition_variable>
 #include <expected>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <coro/detail/mutex.h>
 #include <utility>
 
 namespace coro {
@@ -22,8 +21,8 @@ using OneshotSlotType = std::conditional_t<std::is_void_v<T>, std::monostate, T>
 
 template<typename T>
 struct OneshotShared {
-    std::mutex                           mutex;
-    std::condition_variable              cv;             ///< Notified on send() and sender drop; used by blocking_recv.
+    detail::Mutex                        mutex;
+    detail::CondVar                      cv;             ///< Notified on send() and sender drop; used by blocking_recv.
     std::optional<OneshotSlotType<T>>    slot;           ///< Filled by send().
     bool                                 sender_alive   = true;
     bool                                 receiver_alive = true;

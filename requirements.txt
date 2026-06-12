@@ -2,3 +2,4 @@ mkdocs
 #mkdocs-readthedocs
 mkdoxy
 mkdocs-mermaid2-plugin
+mkdocs-graphviz

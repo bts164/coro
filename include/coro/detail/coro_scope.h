@@ -8,8 +8,8 @@
 #include <coro/detail/waker.h>
 #include <algorithm>
 #include <memory>
-#include <mutex>
 #include <vector>
+#include <coro/detail/mutex.h>
 
 namespace coro::detail {
 
@@ -116,7 +116,7 @@ public:
     }
 
 private:
-    std::mutex             m_mutex;
+    detail::Mutex          m_mutex;
     std::vector<OwnedTask> m_pending;
 };
 
@@ -127,7 +127,14 @@ private:
  * destructors read this to identify which scope to register with. Null outside of
  * a coroutine `poll()` context.
  */
+#ifdef CORO_PICO
+// Cortex-M0+ has no hardware TLS — thread_local requires __aeabi_read_tp which
+// is unavailable in bare-metal newlib. A plain global is equivalent on the
+// single-threaded CurrentThreadExecutor.
+inline CoroutineScope* t_current_coro = nullptr;
+#else
 inline thread_local CoroutineScope* t_current_coro = nullptr;
+#endif
 
 /**
  * @brief RAII guard that sets `t_current_coro` for the duration of a `poll()` call.

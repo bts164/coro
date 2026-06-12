@@ -1,5 +1,63 @@
 #pragma once
 
+#ifdef CORO_TCP_BACKEND_LWIP
+
+// ---------------------------------------------------------------------------
+// lwIP-backed TcpListener (CORO_TCP_BACKEND_LWIP)
+// ---------------------------------------------------------------------------
+
+#include <coro/coro.h>
+#include <coro/io/tcp_stream.h>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace coro {
+
+namespace detail { struct LwipListenCtx; }
+
+/**
+ * @brief Async TCP server. Obtain via `co_await TcpListener::bind(host, port)`.
+ *
+ * Each call to accept() waits for the next incoming connection and returns a
+ * TcpStream. Only one accept() may be in flight at a time.
+ *
+ * **Destruction:** aborts any queued pending connections and wakes a suspended
+ * accept() with a closed error.
+ */
+class TcpListener {
+public:
+    TcpListener(TcpListener&&) noexcept;
+    TcpListener& operator=(TcpListener&&) noexcept;
+    TcpListener(const TcpListener&)            = delete;
+    TcpListener& operator=(const TcpListener&) = delete;
+
+    ~TcpListener();
+
+    /**
+     * @brief Binds to host:port and starts listening.
+     *
+     * host must be a dotted-decimal IPv4 string or "0.0.0.0".
+     * @throws std::runtime_error on bind or listen failure.
+     */
+    [[nodiscard]] static Coro<TcpListener> bind(std::string host, uint16_t port);
+
+    /**
+     * @brief Waits for the next incoming connection.
+     * @throws std::runtime_error if the listener has been closed.
+     */
+    [[nodiscard]] Coro<TcpStream> accept();
+
+private:
+    explicit TcpListener(std::shared_ptr<detail::LwipListenCtx> impl);
+
+    std::shared_ptr<detail::LwipListenCtx> m_impl;
+};
+
+} // namespace coro
+
+#else // !CORO_TCP_BACKEND_LWIP — libuv-backed implementation
+
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
@@ -83,3 +141,5 @@ private:
 };
 
 } // namespace coro
+
+#endif // CORO_TCP_BACKEND_LWIP
