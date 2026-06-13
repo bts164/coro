@@ -23,50 +23,104 @@ enable_testing()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # PCIe character device PollStream example — decoder, tests, and usage example
-add_library(pcie_decoder pcie_decoder.cpp)
-target_include_directories(pcie_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(pcie_decoder misc/pcie_decoder.cpp)
+target_include_directories(pcie_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/misc)
 target_link_libraries(pcie_decoder PUBLIC coro::coro)
 
-set(TEST_TARGETS
+set(TEST_NAMES
+    # detail/
     test_poll_result
     test_waker_context
+    test_intrusive_list
+    # flat (foundational types — coro.h, future.h, stream.h, co_invoke.h)
     test_future
     test_future_ref
     test_stream
     test_coro
     test_coro_stream
-    test_join_handle
-    test_executor_task
-    test_runtime
-    test_stream_handle
-    test_coro_scope
-    test_select
     test_co_invoke
-    test_join_set
+    # runtime/
+    test_runtime
+    test_executor_task
     test_work_sharing_executor
     test_work_stealing_executor
-    test_sleep
     test_single_threaded_uv_executor
+    test_uv_future
+    test_spawn_on
+    test_local_run_queue
+    # task/
+    test_join_handle
+    test_join_set
+    test_stream_handle
+    test_coro_scope
+    test_spawn_blocking
+    # sync/
+    test_event
+    test_select
+    test_sleep
     test_oneshot
     test_mpsc
     test_watch
+    # io/
     test_file
-    #test_pipe
-    test_spawn_blocking
-    test_poll_stream
+    # test_pipe  # disabled — see io/test_pipe.cpp
     test_circular_byte_buffer
-    test_spawn_on
-    test_uv_future
-    test_event
+    test_poll_stream
+    # stress/
     test_skynet
+    # misc/
     test_pcie_decoder
     test_pcie_stream_integration
-    test_intrusive_list
-    test_local_run_queue
 )
 
-foreach(t ${TEST_TARGETS})
-    add_executable(${t} ${t}.cpp)
+set(TEST_SRCS
+    # detail/
+    detail/test_poll_result.cpp
+    detail/test_waker_context.cpp
+    detail/test_intrusive_list.cpp
+    # flat
+    test_future.cpp
+    test_future_ref.cpp
+    test_stream.cpp
+    test_coro.cpp
+    test_coro_stream.cpp
+    test_co_invoke.cpp
+    # runtime/
+    runtime/test_runtime.cpp
+    runtime/test_executor_task.cpp
+    runtime/test_work_sharing_executor.cpp
+    runtime/test_work_stealing_executor.cpp
+    runtime/test_single_threaded_uv_executor.cpp
+    runtime/test_uv_future.cpp
+    runtime/test_spawn_on.cpp
+    runtime/test_local_run_queue.cpp
+    # task/
+    task/test_join_handle.cpp
+    task/test_join_set.cpp
+    task/test_stream_handle.cpp
+    task/test_coro_scope.cpp
+    task/test_spawn_blocking.cpp
+    # sync/
+    sync/test_event.cpp
+    sync/test_select.cpp
+    sync/test_sleep.cpp
+    sync/test_oneshot.cpp
+    sync/test_mpsc.cpp
+    sync/test_watch.cpp
+    # io/
+    io/test_file.cpp
+    # io/test_pipe.cpp  # disabled
+    io/test_circular_byte_buffer.cpp
+    io/test_poll_stream.cpp
+    # stress/
+    stress/test_skynet.cpp
+    # misc/
+    misc/test_pcie_decoder.cpp
+    misc/test_pcie_stream_integration.cpp
+)
+
+foreach(t src IN ZIP_LISTS TEST_NAMES TEST_SRCS)
+    add_executable(${t} ${src})
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(${t} PRIVATE coro::coro GTest::gtest GTest::gtest_main GTest::gmock)
     add_test(NAME ${t} COMMAND ${t})
@@ -91,13 +145,13 @@ target_link_libraries(test_pcie_stream_integration PRIVATE pcie_decoder)
 # compiled directly from the source tree.
 set(CORO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_library(coro_pico_core STATIC
-    ${CORO_SRC}/waker.cpp
-    ${CORO_SRC}/task.cpp
-    ${CORO_SRC}/cancellation_token.cpp
-    ${CORO_SRC}/context.cpp
-    ${CORO_SRC}/executor.cpp
-    ${CORO_SRC}/runtime.cpp
-    ${CORO_SRC}/current_thread_executor.cpp
+    ${CORO_SRC}/task/waker.cpp
+    ${CORO_SRC}/task/task.cpp
+    ${CORO_SRC}/task/context.cpp
+    ${CORO_SRC}/sync/cancellation_token.cpp
+    ${CORO_SRC}/runtime/executor.cpp
+    ${CORO_SRC}/runtime/runtime.cpp
+    ${CORO_SRC}/runtime/current_thread_executor.cpp
     pico/stub/cyw43_arch_stub.cpp
 )
 target_include_directories(coro_pico_core PUBLIC
@@ -112,17 +166,17 @@ target_compile_features(coro_pico_core PUBLIC cxx_std_20)
 # is exercised. Desktop-only code (spawn_blocking, timeout, etc.) is guarded with
 # #ifndef CORO_PICO in each test file.
 add_executable(test_pico_suite
-    test_stream_handle.cpp
-    test_watch.cpp
+    sync/test_watch.cpp
+    sync/test_event.cpp
+    sync/test_select.cpp
+    sync/test_mpsc.cpp
+    sync/test_oneshot.cpp
+    sync/test_isr_event.cpp
+    task/test_join_set.cpp
+    task/test_stream_handle.cpp
+    test_co_invoke.cpp
     test_future_ref.cpp
     test_stream.cpp
-    test_event.cpp
-    test_select.cpp
-    test_co_invoke.cpp
-    test_join_set.cpp
-    test_mpsc.cpp
-    test_oneshot.cpp
-    test_isr_event.cpp
 )
 target_include_directories(test_pico_suite PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_pico_suite PRIVATE

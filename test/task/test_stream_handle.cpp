@@ -4,7 +4,7 @@
 #include <coro/coro_stream.h>
 #include <coro/runtime/runtime.h>
 #include <coro/task/spawn_builder.h>
-#include <coro/sync/stream_handle.h>
+#include <coro/task/stream_handle.h>
 #include <stdexcept>
 #include <vector>
 

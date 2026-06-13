@@ -175,6 +175,6 @@ every layer, no risk of getting stuck at a blocking call that never checks the f
 ## Where to go next
 
 - [Getting Started](getting_started.md) — step-by-step introductory tour of all major features with examples.
-- [Patterns](patterns.md) — idiomatic solutions to recurring async programming problems: request-reply, actors, graceful shutdown, fan-out, pipelines, retry, and more.
+- [Patterns](notes/patterns.md) — idiomatic solutions to recurring async programming problems: request-reply, actors, graceful shutdown, fan-out, pipelines, retry, and more.
 - [Library Usage Guidelines](guidelines.md) — [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines) style rules for writing correct, safe, and idiomatic code with this library
-- [Internal Design Details](architecture.md) — architecture, design decisions, and implementation reference.
+- [Internal Design Details](design/architecture.md) — architecture, design decisions, and implementation reference.

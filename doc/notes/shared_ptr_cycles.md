@@ -176,7 +176,7 @@ reference) and sweeps it once `is_complete()` returns true.
 ## Ownership redesign
 
 The strategies described in this section have been superseded. See
-[task_ownership.md](task_ownership.md) for the adopted design: `OwnedTask` (a
+[task_ownership.md](../design/task_ownership.md) for the adopted design: `OwnedTask` (a
 move-only wrapper that is the sole persistent strong reference to a task) combined
 with `WeakWaker` (a `weak_ptr`-backed waker used for pure notification). This
 eliminates Cycle 3 structurally and Cycle 2B as a consequence, without requiring a
@@ -272,9 +272,9 @@ would be UB. The correct fix is to ensure the Runtime outlives all JoinHandles.
 | 2 | `JoinSetSharedState → pending_handles → JoinSetTask → JoinSetSharedState` | **Eliminated** | `JoinSetTask::m_set_state` is `weak_ptr<JoinSetSharedState>`; no strong back-reference exists |
 | 3 | `CoroutineScope → TaskState_child → waker → TaskBase_parent → TaskImpl_parent` | **Eliminated** | `TaskState::waker` is `weak_ptr<Waker>`; weak edge does not close the cycle |
 | 4 | `TaskImpl → TaskState::self_waker → shared_ptr<Waker> → TaskImpl` | **Eliminated** | Removed `self_waker`; structurally prevented by `weak_ptr` waker storage |
-| Detached self-ref | `TaskImpl → self_owned → TaskImpl` | Intentional | Breaks at task completion; see [task_ownership.md](task_ownership.md) |
+| Detached self-ref | `TaskImpl → self_owned → TaskImpl` | Intentional | Breaks at task completion; see [task_ownership.md](../design/task_ownership.md) |
 
-See [task_ownership.md](task_ownership.md) for the ownership model that eliminates
+See [task_ownership.md](../design/task_ownership.md) for the ownership model that eliminates
 Cycles 2B and 3. Any new future or scope adaptor that stores a `shared_ptr<Waker>`
 derived from `ctx.getWaker()` should be audited against the ownership graph in that
 document before merging.

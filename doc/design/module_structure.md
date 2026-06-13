@@ -22,27 +22,30 @@ include/coro/
 ├── runtime/            tokio::runtime — executor and event loop
 │   ├── runtime.h
 │   ├── executor.h
-│   ├── io_service.h            libuv I/O reactor integration
+│   ├── single_threaded_uv_executor.h   libuv I/O reactor + task queue (dedicated thread)
+│   ├── current_thread_executor.h       polling executor — runs on calling thread (MCU)
 │   ├── single_threaded_executor.h
 │   ├── work_sharing_executor.h
-│   └── work_stealing_executor.h
+│   ├── work_stealing_executor.h
+│   └── uv_future.h         UvCallbackResult / UvFuture — libuv callback bridges
 │
 ├── task/               tokio::task — task spawning and handles
 │   ├── join_handle.h
 │   ├── join_set.h          JoinSet<T> — dynamic collection of homogeneous tasks
+│   ├── stream_handle.h     StreamHandle<T> — consumer end of a spawned stream
 │   ├── spawn_blocking.h    spawn_blocking() + BlockingHandle + BlockingPool
 │   └── spawn_builder.h     SpawnBuilder + StreamSpawnBuilder
 │
 ├── sync/               tokio::sync — synchronization primitives and channels
 │   ├── cancellation_token.h
 │   ├── channel_error.h     SendError / RecvError shared by all channel types
+│   ├── event.h             Event — one-shot signal (any-thread set, coroutine wait)
 │   ├── join.h              join() — wait for a fixed heterogeneous set of futures
 │   ├── mpsc.h              mpsc_channel — bounded multi-producer single-consumer
 │   ├── oneshot.h           oneshot_channel — single-value, single-use channel
 │   ├── select.h            select() — race futures, return first ready
 │   ├── sleep.h             sleep_for() / SleepFuture
 │   ├── isr_event.h         IsrEvent / IsrChannel<T> — ISR-to-coroutine primitives (CORO_PICO only)
-│   ├── stream_handle.h     StreamHandle<T> — consumer end of a spawned stream
 │   ├── timeout.h           timeout() — race any future against a deadline
 │   └── watch.h             watch_channel — single latest-value, multi-consumer
 │
@@ -61,6 +64,36 @@ include/coro/
     ├── task.h              purely internal
     ├── task_state.h        purely internal
     └── work_stealing_deque.h  purely internal — Chase-Lev work-stealing deque
+
+src/
+├── runtime/
+│   ├── runtime.cpp
+│   ├── executor.cpp
+│   ├── single_threaded_uv_executor.cpp
+│   ├── single_threaded_executor.cpp
+│   ├── current_thread_executor.cpp
+│   ├── work_sharing_executor.cpp
+│   └── work_stealing_executor.cpp
+├── task/
+│   ├── task.cpp                 detail::Task + detail::TaskBase
+│   ├── waker.cpp                detail::Waker + Context
+│   ├── blocking_pool.cpp
+│   └── context.cpp              t_current_coro + CoroutineScope helpers
+├── sync/
+│   └── cancellation_token.cpp
+├── io/
+│   ├── tcp_stream.cpp
+│   ├── tcp_listener.cpp
+│   ├── ws_stream.cpp
+│   ├── ws_listener.cpp
+│   ├── file.cpp
+│   ├── pipe.cpp
+│   ├── circular_byte_buffer.cpp
+│   └── lwip/                    Pico lwIP TCP backend (CORO_PICO)
+│       ├── tcp_stream_lwip.cpp
+│       └── tcp_listener_lwip.cpp
+└── pico/
+    └── hal/dma.cpp              RP2040 DMA helpers (CORO_PICO)
 ```
 
 ## Placement rules for new headers
@@ -79,7 +112,9 @@ Anything that drives tasks to completion or owns I/O infrastructure goes here. T
 - The `Runtime` class (entry point for `block_on` and `spawn`)
 - The abstract `Executor` interface
 - Concrete executor implementations: `SingleThreadedExecutor`, `WorkSharingExecutor`, `WorkStealingExecutor`
-- `IoService` — libuv I/O reactor integration
+- `SingleThreadedUvExecutor` — libuv event loop + task queue on a dedicated thread
+- `CurrentThreadExecutor` — polling executor for MCU targets; runs on the calling thread
+- `uv_future.h` — `UvCallbackResult` / `UvFuture` bridge libuv callbacks to coroutines
 
 ### `task/` — task spawning and handles
 
@@ -87,22 +122,23 @@ Types that represent the *handle* to a running or completed task, and the builde
 configure and submit tasks. This includes:
 - `JoinHandle<T>` — `co_await` to retrieve a spawned task's result
 - `JoinSet<T>` — fan out many homogeneous tasks; collect results in completion order
+- `StreamHandle<T>` — consumer end of the bounded channel that backs `spawn(stream)`
 - `SpawnBuilder` — returned by `build_task()`, configure name/buffer before calling `.spawn(f)`
 - `BlockingHandle<T>` / `spawn_blocking()` — run blocking code on a dedicated thread pool
 
 ### `sync/` — synchronization primitives and channels
 
 Types that coordinate between concurrently running tasks. This includes:
+- `Event` — one-shot signal; `set()` from any thread, `co_await wait()` in a coroutine
 - **Channels**: `oneshot` (single-value), `mpsc` (bounded multi-producer), `watch` (latest-value multi-consumer)
 - **Combinators**: `join()`, `select()`, `timeout()`, `sleep_for()`
-- `StreamHandle<T>` — consumer end of the bounded channel that backs `spawn(stream)`
 - `CancellationToken` — cooperative cancellation signal passed via `Context`
 - `IsrEvent` / `IsrChannel<T>` — ISR-to-coroutine primitives; MCU platforms only (`CORO_PICO`)
 
 ### `io/` — async I/O
 
 Types that provide async access to network resources. I/O types are built on top of
-`IoService` (the libuv reactor in `runtime/`) and satisfy `Future` or `Stream`.
+`SingleThreadedUvExecutor` (the libuv reactor in `runtime/`) and satisfy `Future` or `Stream`.
 
 - `TcpStream` — async TCP connection
 - `WsStream` — async WebSocket client connection

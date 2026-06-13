@@ -29,24 +29,29 @@ find_package(Libwebsockets REQUIRED)
 file(GLOB_RECURSE CORO_PUBLIC_HEADERS "include/coro/*.h" "include/coro/*.hpp")
 message(STATUS ${CORO_PUBLIC_HEADERS})
 add_library(coro
-    src/waker.cpp
-    src/task.cpp
-    src/blocking_pool.cpp
-    src/cancellation_token.cpp
-    src/context.cpp
-    src/executor.cpp
-    src/single_threaded_executor.cpp
-    src/current_thread_executor.cpp
-    src/work_sharing_executor.cpp
-    src/work_stealing_executor.cpp
-    src/single_threaded_uv_executor.cpp
-    src/runtime.cpp
-    src/tcp_stream.cpp
-    src/tcp_listener.cpp
-    src/ws_stream.cpp
-    src/ws_listener.cpp
-    src/file.cpp
-    src/circular_byte_buffer.cpp
+    # runtime/
+    src/runtime/runtime.cpp
+    src/runtime/executor.cpp
+    src/runtime/single_threaded_uv_executor.cpp
+    src/runtime/single_threaded_executor.cpp
+    src/runtime/current_thread_executor.cpp
+    src/runtime/work_sharing_executor.cpp
+    src/runtime/work_stealing_executor.cpp
+    # task/
+    src/task/task.cpp
+    src/task/waker.cpp
+    src/task/blocking_pool.cpp
+    src/task/context.cpp
+    # sync/
+    src/sync/cancellation_token.cpp
+    # io/
+    src/io/tcp_stream.cpp
+    src/io/tcp_listener.cpp
+    src/io/ws_stream.cpp
+    src/io/ws_listener.cpp
+    src/io/file.cpp
+    #src/io/pipe.cpp
+    src/io/circular_byte_buffer.cpp
 )
 if(CORO_USE_LOCAL_RUN_QUEUE)
     target_compile_definitions(coro PUBLIC CORO_USE_LOCAL_RUN_QUEUE)

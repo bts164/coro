@@ -67,7 +67,7 @@ Common headers:
 #include <coro/sync/timeout.h>            // timeout()
 #include <coro/sync/event.h>              // Event — single-waiter set/wait primitive
 #include <coro/sync/mutex.h>              // Mutex — async mutex
-#include <coro/sync/stream_handle.h>      // StreamHandle<T>
+#include <coro/task/stream_handle.h>      // StreamHandle<T>
 
 // Channels
 #include <coro/sync/oneshot.h>            // oneshot_channel<T>
@@ -213,7 +213,7 @@ coro::Coro<void> run() {
     `co_await` works on anything that produces a value asynchronously — not just `Coro<T>`.
     As we go we will introduce many other primitives such as channel receives, I/O operations, timers,
     and combinators like `select` and `join` that are all awaitable the same way. These types satisfy
-    the [`Future` concept](future_and_stream.md), which the reference docs cover in detail, but you rarely
+    the [`Future` concept](design/future_and_stream.md), which the reference docs cover in detail, but you rarely
     need to think about it directly.
 
 ---
@@ -727,7 +727,7 @@ co_await coro::co_invoke([&]() -> coro::Coro<void> {
 });
 ```
 
-See the [Coroutine Scope design document](coroutine_scope.md) for a full explanation of
+See the [Coroutine Scope design document](design/coroutine_scope.md) for a full explanation of
 the implicit scope mechanism, its limits, and how it compares to Rust's `'static` bound.
 
 ---
@@ -1991,12 +1991,12 @@ DMA controllers, hardware interrupt handlers, completion ports.
 
 ## Next steps
 
-- Browse the [Patterns](patterns.md) guide for idiomatic solutions to common async
+- Browse the [Patterns](notes/patterns.md) guide for idiomatic solutions to common async
   programming problems: request-reply, actors, graceful shutdown, fan-out, pipelines,
   retry with backoff, and more.
 - Read the [Library Usage Guidelines](guidelines.md) for rules on writing correct, safe,
   and idiomatic code with this library.
-- Read the [Internal Design Details](architecture.md) for a deeper explanation of the
+- Read the [Internal Design Details](design/architecture.md) for a deeper explanation of the
   `Future`/`Stream` model, the executor architecture, and the coroutine scope lifetime
   guarantees.
-- Browse the [Examples](examples.md) for self-contained programs covering common patterns.
+- Browse the [Examples](tutorials/examples.md) for self-contained programs covering common patterns.

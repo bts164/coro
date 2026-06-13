@@ -213,7 +213,7 @@ to be passed somewhere that doesn't own the task.
 
 The "multiple producers, bundled task management" cell — spawning N `CoroStream`
 producers and consuming their merged output through a single stream handle — is planned
-but not yet implemented. See the [roadmap](roadmap.md) for details. Until then, use
+but not yet implemented. See the [roadmap](../roadmap.md) for details. Until then, use
 `mpsc` with N cloned senders for this case.
 
 > **Concurrent buffering:** if producing the next item is expensive enough that you want
@@ -545,7 +545,7 @@ The decoder passed to `PollStream` is a state machine — it receives available 
 returns as much as it parsed, and signals whether it needs more data. This maps
 naturally to the same accumulate-and-try-parse structure above; `PollStream` just
 drives it at a lower level to eliminate the per-read wakeup cost. See
-[Poll Streams](poll_streams.md) for the full interface.
+[Poll Streams](../design/poll_streams.md) for the full interface.
 
 > **Future direction:** the decoder interface of `PollStream` is a state machine
 > expressed as a class. A coroutine is a compiler-generated state machine, so there is

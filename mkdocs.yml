@@ -79,36 +79,35 @@ nav:
     - Namespaces: coro/namespaces.md
     - Files: coro/files.md
   - Internal Design Details:
-    - Architecture Overview: architecture.md
+    - Architecture Overview: design/architecture.md
     - Foundational Model:
-      - Futures and Streams: future_and_stream.md
-      - Tasks, Wakers, and Context: waker_and_context_propagation.md
-      - Coroutine Frame Lifetime: coroutine_scope.md
-      - Task Ownership Model: task_ownership.md
-      - Cancellation Token: cancellation_token.md
+      - Futures and Streams: design/future_and_stream.md
+      - Tasks, Wakers, and Context: design/waker_and_context_propagation.md
+      - Coroutine Frame Lifetime: design/coroutine_scope.md
+      - Task Ownership Model: design/task_ownership.md
+      - Cancellation Token: design/cancellation_token.md
     - Runtime & Scheduling:
-      - Runtime, Tasks, and Executors: task_and_executor.md
-      - Executor Scheduling Design: executor_design.md
-      - Work-Stealing Scheduler: work_stealing_executor.md
-      - Blocking Thread Pool: spawn_blocking.md
+      - Runtime, Tasks, and Executors: design/task_and_executor.md
+      - Executor Scheduling Design: design/executor_design.md
+      - Work-Stealing Scheduler: design/work_stealing_executor.md
+      - Blocking Thread Pool: design/spawn_blocking.md
     - I/O Subsystem:
-      - libuv Integration: libuv_integration.md
-      - I/O Coroutines: io_coroutine.md
-      - File I/O: file_io.md
-      - TCP & WebSocket: websocket_stream.md
-      - Poll Streams: poll_streams.md
-      - Pipelined I/O: pipe_streaming.md
-      - Shared Memory Stream: shm_stream.md
+      - libuv Integration: design/libuv_integration.md
+      - I/O Coroutines: design/io_coroutine.md
+      - File I/O: design/file_io.md
+      - TCP & WebSocket: design/websocket_stream.md
+      - Poll Streams: design/poll_streams.md
+      - Pipelined I/O: design/pipe_streaming.md
     - Synchronization & Combinators:
-      - Channels: channels.md
-      - JoinSet: join_set.md
-      - Select: select.md
+      - Channels: design/channels.md
+      - JoinSet: design/join_set.md
+      - Select: design/select.md
     - Platform & Integration:
-      - Raspberry Pi Pico Port: pico_port.md
-      - ISR Safety: isr_safety.md
-    - Module Structure: module_structure.md
+      - Raspberry Pi Pico Port: design/pico_port.md
+      - ISR Safety: design/isr_safety.md
+    - Module Structure: design/module_structure.md
   - Examples & Tutorials:
-    - Examples: examples.md
-    - gRPC Tutorial: grpc_tutorial.md
+    - Examples: tutorials/examples.md
+    - gRPC Tutorial: tutorials/grpc_tutorial.md
   - Roadmap and Future Plans:
     - Roadmap Overview: roadmap.md

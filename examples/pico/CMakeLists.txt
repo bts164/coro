@@ -51,3 +51,21 @@ target_link_libraries(pico_tcp_echo_client PRIVATE coro_pico pico_stdlib pico_cy
 pico_enable_stdio_usb(pico_tcp_echo_client 1)
 pico_enable_stdio_uart(pico_tcp_echo_client 0)
 pico_add_extra_outputs(pico_tcp_echo_client)
+
+# ---------------------------------------------------------------------------
+# pico_ws2812_tcp
+# ---------------------------------------------------------------------------
+pico_generate_pio_header(coro_pico ${CMAKE_CURRENT_SOURCE_DIR}/ws2812.pio)
+add_executable(pico_ws2812_tcp pico_ws2812_tcp.cpp)
+target_compile_definitions(pico_ws2812_tcp PRIVATE
+    WIFI_SSID="${WIFI_SSID}"
+    WIFI_PASSWORD="${WIFI_PASSWORD}"
+)
+target_include_directories(pico_ws2812_tcp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pico_ws2812_tcp PRIVATE
+    coro_pico pico_stdlib pico_cyw43_arch_lwip_poll
+    hardware_pio hardware_clocks
+)
+pico_enable_stdio_usb(pico_ws2812_tcp 1)
+pico_enable_stdio_uart(pico_ws2812_tcp 0)
+pico_add_extra_outputs(pico_ws2812_tcp)

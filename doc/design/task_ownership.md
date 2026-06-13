@@ -300,7 +300,7 @@ been freed, `lock()` returns null and the call is a safe no-op.
 point.** Using `shared_ptr<Waker>` instead creates an ownership cycle because
 `TaskBase IS the Waker` — storing a strong waker clone inside an object transitively
 owned by the same `TaskImpl` forms a cycle that prevents the task from ever being freed.
-See [shared_ptr_cycles.md](shared_ptr_cycles.md) for the full cycle analysis.
+See [shared_ptr_cycles.md](../notes/shared_ptr_cycles.md) for the full cycle analysis.
 
 ---
 
