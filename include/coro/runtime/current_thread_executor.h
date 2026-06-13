@@ -112,6 +112,18 @@ public:
     /// Called from wait_for_completion() on every loop iteration.
     void check_expired_timers();
 
+    /// @brief Registers a volatile ISR flag to be polled once per event loop iteration.
+    ///
+    /// When the flag becomes true, the waker is fired and the entry is removed.
+    /// Called by IsrWaitFuture on its first poll() to park a coroutine awaiting an
+    /// IsrEvent without busy-polling. Safe to call from the executor thread only
+    /// (not from an ISR — registration happens inside the coroutine, not the ISR).
+    void add_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker);
+
+    /// @brief Scans registered ISR event flags; fires wakers for any that are set.
+    /// Called from wait_for_completion() on every loop iteration, after m_poll().
+    void check_isr_events();
+
 private:
     ClockFn m_clock;
     PollFn  m_poll;
@@ -137,6 +149,14 @@ private:
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
     detail::Mutex                                                               m_owned_mutex;
     std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
+
+    struct IsrPollEntry {
+        const volatile bool*           flag;  // volatile: each check reads actual memory
+        std::shared_ptr<detail::Waker> waker;
+    };
+    // Written from coroutine context (executor thread) only; read and cleared
+    // from check_isr_events() on the same thread. No synchronisation needed.
+    std::vector<IsrPollEntry> m_isr_polls;
 };
 
 } // namespace coro

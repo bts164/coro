@@ -126,9 +126,10 @@ The **only supported** way to signal a coroutine from an ISR is via `IsrEvent` o
 
 `IsrEvent` signals that something happened (DMA complete, GPIO edge, timer tick).
 `IsrChannel<T>` additionally transfers a trivially-copyable value (ADC reading, byte
-received, encoder count). Both work by writing a `volatile` flag in the ISR and polling
-that flag in the coroutine via `sleep_for(0)` yields — the ISR never touches the
-scheduler, wakers, or `shared_ptr` ref-counts.
+received, encoder count). The ISR writes a `volatile` flag (and for `IsrChannel<T>`,
+the value with a `__DMB()` release fence) and returns immediately — it never touches
+the scheduler, wakers, or `shared_ptr` ref-counts. The executor discovers the flag
+once per event loop iteration and wakes the waiting coroutine.
 
 ```cpp
 // Shared between ISR and coroutine — must outlive both.
@@ -619,6 +620,62 @@ Incoming data is eagerly copied from pbufs into a `std::vector<uint8_t>`. On a b
 stream this allocation grows until `read()` drains it. For memory-constrained
 applications consider capping `rx_buf` at a fixed size and pausing `tcp_recv` (by
 returning `ERR_WOULDBLOCK`) when it fills.
+
+### Busy-poll loop — no CPU idle / WFI
+
+`CurrentThreadExecutor::wait_for_completion()` spins unconditionally:
+
+```cpp
+while (!done) {
+    poll_ready_tasks();
+    check_expired_timers();
+    cyw43_arch_poll();
+}
+```
+
+The RP2040 core runs at 125 MHz and never enters a low-power state, even when every
+task is parked and no network or timer events are pending. On USB- or wall-powered
+devices this is usually acceptable, but **battery-powered applications will see
+significantly reduced runtime** compared to an executor that sleeps between events.
+
+The fix is to call `__wfi()` (Wait For Interrupt) at the bottom of the loop when the
+ready queue is empty, no timers are near-expiry, and no ISR events are pending. The
+CYW43 WiFi chip drives a GPIO IRQ that wakes the CPU when a network event arrives, so
+the executor would be woken promptly. Key implementation considerations:
+
+- The "nothing pending" check must be atomic with the decision to sleep — a waker
+  enqueue between the check and `__wfi()` must not be lost. On single-core this is
+  solved by disabling IRQs briefly during the check, then using `__wfi()` which
+  re-enables them atomically.
+- The nearest timer deadline gives the maximum sleep duration; a hardware alarm
+  (`add_alarm_at()`) should wake the CPU at that deadline if no earlier IRQ fires.
+- `cyw43_arch_poll()` must still be called at least once after every wakeup to drain
+  any buffered WiFi events before re-evaluating the idle condition.
+
+**Single-core implementation (simple):** When the executor runs exclusively on core 0
+and ISRs communicate only via `IsrEvent::signal_from_isr()` (a volatile write — no
+`wake()` call), nothing can enqueue a task to the ready queue from outside the executor
+loop. If the loop reaches the idle check and the queue is empty, it stays empty until a
+hardware IRQ fires and wakes the CPU. No special atomicity is required:
+
+```cpp
+if (ready_queue_empty() && no_timers_near() && no_isr_events_pending()) {
+    __wfi();   // safe: nothing can enqueue between this check and the sleep
+}
+```
+
+**Dual-core implementation (requires doorbell):** If core 1 runs user code that calls
+`wake()` on core 0 tasks, a lost-wakeup race exists: core 1 may enqueue a task between
+core 0's "queue is empty" check and the `__wfi()` instruction. The RP2040 fix is the
+**SIO inter-processor FIFO** — writing to `sio_hw->fifo_wr` raises `SIO_IRQ_PROC0` on
+core 0, waking it from WFI. `CurrentThreadExecutor::enqueue()` would write the doorbell
+after pushing to the ready queue, mirroring what `uv_async_send()` does in libuv.
+
+!!! tip "TODO: Implement WFI idle in CurrentThreadExecutor"
+    Implementing this would materially reduce power consumption on battery-powered
+    Pico W projects. Single-core change is confined to `CurrentThreadExecutor::wait_for_completion()`.
+    Dual-core additionally requires a SIO FIFO doorbell write in `CurrentThreadExecutor::enqueue()`.
+    No changes to coroutine user code are needed in either case.
 
 ### Timer resolution
 

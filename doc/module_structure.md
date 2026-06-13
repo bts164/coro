@@ -41,6 +41,7 @@ include/coro/
 │   ├── oneshot.h           oneshot_channel — single-value, single-use channel
 │   ├── select.h            select() — race futures, return first ready
 │   ├── sleep.h             sleep_for() / SleepFuture
+│   ├── isr_event.h         IsrEvent / IsrChannel<T> — ISR-to-coroutine primitives (CORO_PICO only)
 │   ├── stream_handle.h     StreamHandle<T> — consumer end of a spawned stream
 │   ├── timeout.h           timeout() — race any future against a deadline
 │   └── watch.h             watch_channel — single latest-value, multi-consumer
@@ -96,6 +97,7 @@ Types that coordinate between concurrently running tasks. This includes:
 - **Combinators**: `join()`, `select()`, `timeout()`, `sleep_for()`
 - `StreamHandle<T>` — consumer end of the bounded channel that backs `spawn(stream)`
 - `CancellationToken` — cooperative cancellation signal passed via `Context`
+- `IsrEvent` / `IsrChannel<T>` — ISR-to-coroutine primitives; MCU platforms only (`CORO_PICO`)
 
 ### `io/` — async I/O
 

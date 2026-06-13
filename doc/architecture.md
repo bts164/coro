@@ -4,27 +4,6 @@ A detailed reference for the library's design, internals, and implementation pat
 
 ---
 
-## Table of Contents
-
-1. [Motivation and Goals](#motivation-and-goals)
-2. [What Is Implemented](#what-is-implemented)
-3. [Key Design Decisions](#key-design-decisions)
-4. [Core Abstractions](#core-abstractions)
-5. [Poll Model](#poll-model)
-6. [Runtime and Executors](#runtime-and-executors)
-7. [Coroutine Types](#coroutine-types)
-8. [Task Lifecycle](#task-lifecycle)
-9. [Cancellation and Structured Concurrency](#cancellation-and-structured-concurrency)
-10. [I/O Reactor](#io-reactor)
-11. [Blocking Thread Pool](#blocking-thread-pool)
-12. [Channels](#channels)
-13. [Combinators](#combinators)
-14. [Error Handling Policy](#error-handling-policy)
-15. [Threading and Synchronization](#threading-and-synchronization)
-16. [Header Layout](#header-layout)
-
----
-
 ## Motivation and Goals
 
 The library brings Rust's async/await model to C++20 without requiring the borrow checker.
@@ -48,12 +27,18 @@ Dependencies are managed with Conan.
 - **Work-sharing executor** — shared injection queue, multiple worker threads
 - **Work-stealing executor** — per-worker `WorkStealingDeque` with CAS-based
   `SchedulingState` transitions; Tokio-style injection budget enforcement
+- **`CurrentThreadExecutor`** — polling loop on the calling thread; no extra threads;
+  interleaves task scheduling with an injected `PollFn`; primary executor on MCU targets
 - `Runtime` selects executor by thread count at construction; `block_on()` drives the
   top-level coroutine to completion
 
 ### I/O Reactor
-- **`IoService`** — owns a `uv_loop_t` on a dedicated I/O thread; worker threads submit
-  `IoRequest` commands via a thread-safe queue and a `uv_async_t` doorbell
+- **`SingleThreadedUvExecutor`** — a full `Executor` that also owns a `uv_loop_t` on a
+  dedicated thread; alternates between draining its coroutine task queue and
+  `uv_run(UV_RUN_ONCE)`; woken from any thread via `uv_async_t` doorbell
+- I/O operations run on the uv thread via `with_context(*uv_exec, coro)`; inside that
+  coroutine, `UvCallbackResult<Args...>` + `UvFuture` provide awaitable bridges to
+  libuv callbacks with no heap allocation in the common case
 - **`SleepFuture` / `sleep_for()`** — millisecond-resolution one-shot timers via libuv
 - **`TcpStream`** — async connect, read, write
 - **`WsStream` / `WsListener`** — async WebSocket client and server via libwebsockets
@@ -79,12 +64,14 @@ Dependencies are managed with Conan.
 - **`timeout(duration, future)`** — wraps `select` + `sleep_for`
 - **`next(stream)`** — advance any `Stream<T>` by one item
 
-### Channels (`include/coro/sync/`)
+### Channels and Synchronization (`include/coro/sync/`)
+- **`Event`** — one-shot signal; `set()` from any thread, `co_await ev.wait()` in a
+  coroutine; latch semantics; single waiter; `clear()` to reset
 - **`oneshot`** — single value; synchronous send, async receive
 - **`mpsc`** — bounded ring buffer; cloneable sender, single `Stream<T>` receiver;
-  intrusive waiter nodes; zero-copy direct-handoff paths
+  intrusive waiter nodes; zero-copy direct-handoff paths; `blocking_recv()` for OS threads
 - **`watch`** — latest-value; synchronous overwrite; `changed()` + `borrow()` (returns
-  `WatchBorrowGuard<T>` holding a shared read lock); cloneable receiver
+  `WatchBorrowGuard<T>` holding a shared read lock); cloneable sender and receiver
 
 All channels use `std::expected<T, ChannelError>` for fallible operations; `try_send`
 returns `std::expected<void, TrySendError<T>>` so the caller recovers unsent values on
@@ -106,9 +93,13 @@ explicit scope object required in the common case.
 for the `SchedulingState` CAS machine and a handful of documented cross-thread waker
 stores where a mutex would introduce lock-ordering issues.
 
-**`IoService` command pattern.** Worker threads never touch libuv directly. Each I/O
-operation is an `IoRequest` subclass executed on the I/O thread; `IoService` is
-completely ignorant of concrete request types, keeping each I/O subsystem self-contained.
+**`with_context` + `UvCallbackResult` for I/O bridging.** All libuv API calls happen on
+the `SingleThreadedUvExecutor`'s dedicated thread. I/O operations are implemented as
+coroutines that run on this thread via `with_context(*uv_exec, coro)`. Inside those
+coroutines, `UvCallbackResult<Args...>` is declared on the coroutine frame; its pointer
+is stored in the libuv handle's `data` field; and `co_await wait(result)` suspends until
+the callback fires and calls `result.complete(args...)`. No heap allocation, no command
+queue — the libuv callback writes directly into the suspended coroutine frame.
 
 **`std::expected` error policy.** Fallible operations return `std::expected<T, E>` rather
 than throwing. `.value()` is the exception-throwing escape hatch for callers that prefer it.
@@ -201,10 +192,15 @@ alive long enough for the wake call to complete, then it is freed.
 
 ## Runtime and Executors
 
-`Runtime` is the top-level object. It owns:
-- An `Executor` (pluggable; selected by thread count)
-- An `IoService` (libuv event loop on a dedicated I/O thread)
+`Runtime` is the top-level object. On desktop it owns:
+- A `SingleThreadedUvExecutor` (`m_uv_executor`) — dedicated thread running the libuv
+  event loop and all I/O callbacks; also a full `Executor` for I/O-facing coroutines
+- An `Executor` (`m_executor`) — user-facing task scheduler; `SingleThreadedExecutor` or
+  `WorkStealingExecutor` selected by thread count at construction
 - A `BlockingPool` (thread pool for blocking work)
+
+On MCU targets (`CORO_PICO`), `Runtime` owns only a `CurrentThreadExecutor` — no libuv
+thread, no blocking pool. See [MCU Platforms](#mcu-platforms).
 
 ```cpp
 Runtime rt;           // work-stealing, hardware_concurrency threads
@@ -214,13 +210,43 @@ Runtime rt(4);        // work-stealing, 4 threads
 rt.block_on(my_coro());  // drives the top-level coroutine to completion
 ```
 
-Thread-locals `t_current_runtime`, `t_current_io_service`, and `t_worker_index` are set
-on each worker thread at startup so that `spawn()`, `sleep_for()`, and `spawn_blocking()`
-can access runtime services without passing them through call stacks.
+Thread-locals `t_current_runtime` and `t_worker_index` are set on each worker thread at
+startup so that `spawn()`, `sleep_for()`, and `spawn_blocking()` can access runtime
+services without passing them through call stacks.
+
+### `SingleThreadedUvExecutor`
+
+Owns the libuv event loop and a dedicated thread. Its poll loop alternates between
+draining its coroutine task queue and calling `uv_run(UV_RUN_ONCE)`. Remote wakeups
+(from worker threads, blocking pool threads, or I/O callbacks) push tasks into an
+injection queue and ring `uv_async_send()` to unblock the next `uv_run` call.
+
+All libuv and libwebsockets API calls happen on this thread. `with_context(*uv_exec, coro)`
+schedules a coroutine to run on the uv thread; `UvCallbackResult` + `UvFuture` bridge
+libuv callbacks back into suspended coroutine frames.
+
+### `CurrentThreadExecutor`
+
+A polling executor that runs its task loop directly on the calling thread with no extra
+threads of its own. Its `wait_for_completion()` loop alternates between draining the task
+ready queue and calling an injected `PollFn`:
+
+```
+loop:
+  poll_ready_tasks()      // drain ready coroutines
+  check_expired_timers()  // fire sleep_for / timeout wakers
+  m_poll()                // cyw43_arch_poll() on Pico W; no-op elsewhere
+```
+
+The `ClockFn` and `PollFn` are injected at construction, making the scheduling loop
+platform-agnostic. This is the executor for MCU targets, where a dedicated I/O thread
+is undesirable and the I/O poll function (`cyw43_arch_poll()`) must interleave with task
+scheduling on a single thread.
 
 ### Single-threaded executor
 
-Simple round-robin queue. Deterministic and useful for unit tests.
+Simple round-robin queue with condition-variable idle sleep. Deterministic and useful for
+unit tests.
 
 ### Work-sharing executor
 
@@ -413,59 +439,67 @@ checker), but is required for correctness in C++.
 
 ## I/O Reactor
 
-### `IoService`
+### `SingleThreadedUvExecutor`
 
 libuv is not thread-safe: nearly all API calls must come from the thread that owns the
-event loop. `IoService` solves this with a dedicated I/O thread:
+event loop. `SingleThreadedUvExecutor` solves this by running both its coroutine task
+queue and the libuv event loop on a single dedicated thread:
 
 ```
-Worker thread                      I/O thread (owns uv_loop_t)
-─────────────────────────────      ────────────────────────────────
-SleepFuture::poll():
-  allocate shared State
-  push StartRequest to queue ───►  io_async_cb fires:
-  uv_async_send(&m_async)            process_queue():
-                                       req->execute(&m_uv_loop)
-                                         uv_timer_init(...)
-                                         uv_timer_start(...)
+Worker / blocking thread            uv thread (SingleThreadedUvExecutor)
+────────────────────────            ──────────────────────────────────────
+waker->wake():
+  push task to m_incoming_wakes
+  uv_async_send(&m_async) ───────►  io_async_cb fires:
+                                      drain_incoming_wakes()  // → m_ready
+                                      drain_ready_tasks()     // poll coroutines
+                                      uv_run(UV_RUN_ONCE)     // drive I/O events
 
-                                   ... deadline expires ...
-                                   timer_cb:
-                                     state->waker->wake() ────────► executor->enqueue(task)
+                                    ... timer fires, TCP data arrives, etc. ...
+                                      libuv callback:
+                                        result.complete(args) // wakes UvFuture
+                                        uv_async_send(...)    // schedule next poll
 ```
 
-`uv_async_t` is the only thread-safe libuv primitive. `IoService::submit()` pushes an
-`IoRequest` onto a mutex-protected queue and calls `uv_async_send()`. The I/O thread's
-`io_async_cb` drains the queue and calls `execute()` on each request.
+`uv_async_t` is the only thread-safe libuv primitive. All other libuv calls happen
+exclusively on the uv thread, inside coroutines scheduled via `with_context`.
 
-Multiple `uv_async_send()` calls before the callback fires are coalesced — the callback
-fires at least once but the queue drain processes all pending requests.
+### `with_context` + `UvCallbackResult` pattern
 
-### `IoRequest` command pattern
+I/O operations are implemented as coroutines that run on the uv thread. The pattern
+avoids heap allocation by storing callback state directly in the coroutine frame:
 
-`IoRequest` is an abstract base with a single `execute(uv_loop_t*)` virtual method.
-`IoService` has zero knowledge of concrete request types. Each I/O subsystem owns its
-request types privately:
+```cpp
+// Conceptual sketch of how TcpStream::read() is implemented:
+Coro<void> tcp_read_impl(uv_tcp_t* handle, ...) {
+    UvCallbackResult<ssize_t> result;   // lives in the coroutine frame on the uv thread
+    handle->data = &result;
+    uv_read_start(handle, alloc_cb, [](uv_stream_t* s, ssize_t n, ...) {
+        static_cast<UvCallbackResult<ssize_t>*>(s->data)->complete(n);
+    });
+    ssize_t n = co_await wait(result);  // suspends until callback fires on the same thread
+    // ...
+}
+```
 
-- `SleepFuture` privately defines `StartRequest` and `CancelRequest`
-- `TcpStream` privately defines its connect/read/write requests
-- `WsStream` privately defines its connect/send/close requests
-
-This keeps `io_service.h` minimal and each subsystem fully self-contained.
+`UvFuture` (returned by `wait(result)`) registers a waker on first poll. The libuv
+callback calls `result.complete(args...)`, which stores the result and fires the waker.
+Because the callback always runs on the same uv thread as the coroutine, no
+synchronization is needed between the callback and the coroutine frame.
 
 ### `SleepFuture` / `sleep_for()`
 
 Millisecond resolution (libuv timer granularity). Deadline is converted with
 `std::chrono::ceil<milliseconds>` so the timer never fires before the deadline.
 
-Each `SleepFuture` holds a `shared_ptr<State>` shared with the I/O thread. The state
-contains a `std::atomic<std::shared_ptr<Waker>>` (C++20 atomic shared_ptr) so the worker
-thread can store a new waker on re-poll concurrently with the I/O thread reading it in
-`timer_cb` — no mutex needed on this hot path.
+`SleepFuture` schedules a `uv_timer_t` on the uv thread via `with_context`. The timer
+state holds a `std::atomic<std::shared_ptr<Waker>>` (C++20 atomic shared_ptr) so the
+worker thread can store a new waker on re-poll concurrently with the uv thread reading it
+in `timer_cb` — no mutex needed on this hot path.
 
-Cancellation: the destructor submits a `CancelRequest`. Both `timer_cb` and
-`CancelRequest::execute()` claim `uv_close()` via `fired.exchange(true)` — whichever
-wins owns the close; the other is a no-op.
+Cancellation: the destructor posts a cancel request to the uv thread. Both `timer_cb`
+and the cancel handler claim `uv_close()` via `fired.exchange(true)` — whichever wins
+owns the close; the other is a no-op.
 
 ### `TcpStream`
 
@@ -497,14 +531,14 @@ but required by the lws API.
 
 ```
 Runtime::~Runtime():
-  1. m_executor.reset()      // join workers — no more waker->wake() calls
-  2. m_io_service.stop()     // signal I/O thread, join it
-  3. uv_loop_close()
+  1. m_executor.reset()       // join worker threads — no more waker->wake() calls
+  2. m_blocking_pool.reset()  // join blocking pool threads
+  3. m_uv_executor.stop()     // signal uv thread, join it; close uv_loop and lws context
 ```
 
-`m_io_service` is declared before `m_executor` in `Runtime` so it is destroyed after
-(C++ reverse-declaration-order destruction). This guarantees the executor is gone before
-the I/O loop is closed.
+`m_uv_executor` is declared last in `Runtime` so it is destroyed last (C++ reverse-
+declaration-order destruction). This guarantees all worker and blocking threads have
+stopped before the uv loop is closed — no waker can fire into the uv thread after it exits.
 
 ---
 
@@ -662,10 +696,10 @@ profiling justifies the complexity:
 | Location | Mechanism | Reason |
 |---|---|---|
 | `SchedulingState` | `std::atomic` + CAS | Hot path; mutex would serialize all wakeups |
-| `SleepFuture::State::waker` | `std::atomic<shared_ptr<Waker>>` | Written by worker, read by I/O thread; no shared lock available |
+| `SleepFuture::State::waker` | `std::atomic<shared_ptr<Waker>>` | Written by worker, read by uv thread; no shared lock available |
 | `BlockingState` | `std::mutex` | Low contention; protocol clarity outweighs cost |
 | Channel shared state | `std::mutex` | Multiple fields updated together; mutex makes invariants obvious |
-| `IoService` queue | `std::mutex` | Drain requires moving the entire queue; mutex simplest |
+| `SingleThreadedUvExecutor` injection queue | `std::mutex` | Drain requires moving the entire queue; mutex simplest |
 | `JoinSetSharedState` | `std::mutex` | List splice + counter + waker update must be atomic together |
 
 **Known concurrency concerns are documented inline** with comments in the source. When in
@@ -678,52 +712,112 @@ annotation turns silent bugs into compile-time warnings.
 
 ---
 
+## MCU Platforms
+
+The library supports Raspberry Pi Pico / Pico W (RP2040, Cortex-M0+) via the `CORO_PICO`
+preprocessor flag. The MCU build replaces the desktop runtime model with a single-thread,
+poll-driven model that requires no RTOS, no libuv, and no blocking pool.
+
+### `Runtime` on Pico
+
+`Runtime` owns only a `CurrentThreadExecutor`. There is no `SingleThreadedUvExecutor`,
+no dedicated libuv thread, and no `BlockingPool`. Networking I/O (TCP, if used) is
+handled by lwIP + CYW43, polled by `cyw43_arch_poll()` injected as the executor's
+`PollFn`.
+
+The firmware main loop drives the executor by calling `rt.poll()` alongside the
+platform's own event dispatchers:
+
+```cpp
+coro::Runtime rt;
+// ... install handlers, spawn tasks ...
+while (true) {
+    rt.poll();
+    cyw43_arch_poll();
+    // other platform event handling
+}
+```
+
+`rt.block_on(coro)` is an alternative entry point that loops until the given coroutine
+completes.
+
+### ISR safety
+
+The `CORO_PICO` build adds `IsrEvent` and `IsrChannel<T>` (`coro/sync/isr_event.h`) —
+the only two coro API calls safe to make from an interrupt service routine. Everything
+else touches `shared_ptr` ref-counts, atomic scheduling state, or `detail::Mutex`, which
+on Cortex-M0+ all route through the `pico_atomic` global spin-lock — ISR-deadlock-prone.
+
+The design keeps the ISR path minimal: the ISR writes a `volatile` flag (and for
+`IsrChannel<T>`, a value with a `__DMB()` release fence) and returns immediately. The
+executor discovers the signal once per poll iteration and wakes the waiting coroutine
+from safe executor context.
+
+See `doc/isr_safety.md` for the complete policy and implementation details.
+
+### Conditional compilation
+
+Headers and source files gate MCU-specific code on `#ifdef CORO_PICO`. Desktop code is
+unaffected. The Pico CMake build sets this flag; it is not defined in standard desktop
+builds.
+
+---
+
 ## Header Layout
 
 ```
 include/coro/
   coro.h                    Coro<T> — primary coroutine return type
   coro_stream.h             CoroStream<T> — async generator
+  co_invoke.h               co_invoke() — lambda-coroutine lifetime helper
   future.h                  Future concept; NextFuture adapter
   stream.h                  Stream concept; next() free function
 
   runtime/
-    runtime.h               Runtime — owns executor, IoService, BlockingPool
-    executor.h              Executor interface; executor factory
-    io_service.h            IoService, IoRequest, current_io_service()
+    runtime.h               Runtime — owns executor, SingleThreadedUvExecutor, BlockingPool
+    executor.h              Executor interface
+    single_threaded_uv_executor.h   SingleThreadedUvExecutor — uv thread + task queue
+    single_threaded_executor.h      SingleThreadedExecutor — calling-thread poll loop
+    current_thread_executor.h       CurrentThreadExecutor — MCU polling executor
+    work_sharing_executor.h         WorkSharingExecutor
+    work_stealing_executor.h        WorkStealingExecutor
+    uv_future.h             UvCallbackResult<Args...>, UvFuture — uv callback bridges
 
   task/
-    join_handle.h           JoinHandle<T>, SpawnBuilder
+    join_handle.h           JoinHandle<T>
     join_set.h              JoinSet<T>
+    spawn_builder.h         SpawnBuilder, StreamSpawnBuilder
     spawn_blocking.h        BlockingHandle<T>, BlockingPool, spawn_blocking()
 
   sync/
+    event.h                 Event — one-shot signal, any-thread set, coroutine wait
     sleep.h                 SleepFuture, sleep_for()
     oneshot.h               oneshot_channel<T>
     mpsc.h                  mpsc_channel<T>
     watch.h                 watch_channel<T>
+    isr_event.h             IsrEvent, IsrChannel<T> — ISR-to-coroutine (CORO_PICO only)
+    mutex.h                 Mutex, MutexGuard
+    join.h                  join() combinator
+    select.h                select() combinator
+    timeout.h               timeout() combinator
 
   io/
     tcp_stream.h            TcpStream
-    ws_stream.h             WsStream, WsListener
+    tcp_listener.h          TcpListener
+    ws_stream.h             WsStream
+    ws_listener.h           WsListener
 
   detail/
     poll_result.h           PollResult<T>
     waker.h                 Waker, Context
     task_state.h            TaskState<T>, SchedulingState
-    coroutine_scope.h       CoroutineScope, t_current_coro
+    coro_scope.h            CoroutineScope, t_current_coro
     intrusive_list.h        IntrusiveList, IntrusiveListNode
+    work_stealing_deque.h   Chase-Lev deque for WorkStealingExecutor
 
-src/
-  runtime.cpp
-  executor.cpp
-  io_service.cpp
-  blocking_pool.cpp
-  sleep.cpp
-  ws_stream.cpp
-  ...
-
+src/                        Implementation files (one per header where non-trivial)
 test/                       gtest unit tests — one file per module
+test/pico/                  MCU-specific tests using hardware stubs
 doc/                        Design documents (Markdown)
 ```
 

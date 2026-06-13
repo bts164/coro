@@ -9,22 +9,28 @@ each rule has a short title, a rationale, and concrete examples.
 ## Table of Contents
 
 - [Coroutine Scope](#coroutine-scope)
-  - CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
-  - CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
-  - CS.3 — Never invoke a capturing lambda coroutine directly; use `co_invoke`
-  - CS.4 — Be careful when spawning member function coroutines; `this` is implicitly captured
-  - CS.5 — Detached tasks must own all their data
+    - CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
+    - CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
+    - CS.3 — Never invoke a capturing lambda coroutine directly; use `co_invoke`
+    - CS.4 — Be careful when spawning member function coroutines; `this` is implicitly captured
+    - CS.5 — Detached tasks must own all their data
 - [Spawning and Ownership](#spawning-and-ownership)
 - [Cancellation Safety](#cancellation-safety)
-  - CA.1 — Use RAII for all resources owned by a coroutine frame
-  - CA.2 — Do not assume cancelled futures stop immediately; they drain before completing
-  - CA.3 — Check for cancellation in long-running loops
-  - CA.4 — Do not put blocking destructors in futures that may be cancelled as a losing branch
+    - CA.1 — Use RAII for all resources owned by a coroutine frame
+    - CA.2 — Do not assume cancelled futures stop immediately; they drain before completing
+    - CA.3 — Check for cancellation in long-running loops
+    - CA.4 — Do not put blocking destructors in futures that may be cancelled as a losing branch
 - [Blocking Work](#blocking-work)
+    - BL.5 — Do not call `MpscReceiver::blocking_recv()` from a coroutine
 - [Channels](#channels)
+    - CH.5 — Do not await `Event::wait()` from more than one coroutine at a time
 - [Select and Timeout](#select-and-timeout)
 - [Silent Cancellation](#silent-cancellation)
 - [Error Handling](#error-handling)
+- [ISR Safety](#isr-safety-mcu-platforms--coro_pico-only)
+    - IS.1 — Only call `signal_from_isr()` or `send_from_isr()` from an interrupt handler
+    - IS.2 — Keep interrupt handlers minimal: write a flag or value and return immediately
+    - IS.3 — Declare `IsrEvent` and `IsrChannel<T>` at static or class scope; never as coroutine locals
 
 ---
 
@@ -551,23 +557,74 @@ Coro<void> good() {
 }
 ```
 
-### BL.4 — Use a nested `Runtime` inside `spawn_blocking` to run async code in isolation
+### BL.5 — Do not call `MpscReceiver::blocking_recv()` from a coroutine
+
+**Reason:** `blocking_recv()` is a synchronous, thread-blocking receive designed for plain
+OS threads that cannot `co_await`. Calling it from a coroutine running on an executor
+worker thread blocks that worker until an item arrives — starving every other task
+scheduled on that thread, identical to any other blocking call (BL.1). Use
+`co_await next(rx)` from coroutines; reserve `blocking_recv()` for `std::thread` bodies
+or `spawn_blocking` callables.
+
+```cpp
+// BAD — blocks the executor worker until an item arrives
+Coro<void> bad(MpscReceiver<int> rx) {
+    std::optional<int> v = rx.blocking_recv();  // blocks the worker thread
+}
+
+// GOOD — suspends the coroutine; executor thread stays free
+Coro<void> good(MpscReceiver<int> rx) {
+    while (std::optional<int> v = co_await coro::next(rx))
+        use(*v);
+}
+
+// ALSO GOOD — blocking_recv() from a plain OS thread or spawn_blocking
+std::thread([rx = std::move(rx)]() mutable {
+    while (std::optional<int> v = rx.blocking_recv())
+        use(*v);
+}).detach();
+```
+
+### BL.4 — Use a nested `Runtime` with `CurrentThreadExecutor` inside `spawn_blocking` to run async code in isolation
 
 **Reason:** Occasionally a third-party library requires its own event loop, or you need
 to drive a `Coro<T>` completely independently of the outer runtime (separate I/O state,
 separate timer state). Nesting a `Runtime` inside `spawn_blocking` keeps the outer
-executor free — the blocking thread pays the cost of `block_on`, not a worker — while
-giving the inner code full access to `co_await`, I/O, timers, and `spawn`. The two
-runtimes share nothing; this is an explicit and visible boundary.
+executor free — the blocking pool thread pays the cost of `block_on`, not a worker —
+while giving the inner code full access to `co_await`, timers, and `spawn`.
+
+Prefer `CurrentThreadExecutor` for the nested runtime: it runs its poll loop directly on
+the calling (blocking pool) thread with no extra threads of its own. `SingleThreadedExecutor`
+and `WorkStealingExecutor` both spawn additional worker threads — wasteful when the
+blocking pool thread is already dedicated to this work and allowed to block.
 
 ```cpp
 Coro<void> run() {
     std::string result = co_await spawn_blocking([]() -> std::string {
-        Runtime inner(1);                     // its own uv loop, its own threads
+        // CurrentThreadExecutor: poll loop runs on this thread; no extra threads spawned.
+        Runtime inner(std::in_place_type<CurrentThreadExecutor>);
         return inner.block_on(isolated_work());
     });
 }
 ```
+
+!!! tip "TODO: CurrentThreadExecutor needs desktop defaults"
+    `CurrentThreadExecutor` currently requires explicit `ClockFn` and `PollFn` arguments
+    (designed for Pico, where `time_us_64` and `cyw43_arch_poll` are injected at
+    construction). Two changes are needed before the example above compiles on desktop:
+
+    1. **Default desktop constructor** — add a no-arg (or desktop-defaulted) constructor
+       to `CurrentThreadExecutor` that supplies `std::chrono::steady_clock` for the clock
+       and a no-op for the poll function.
+    2. **Lightweight `Runtime` path** — the desktop `Runtime` constructor currently always
+       creates a dedicated libuv thread (`m_uv_executor`) and a blocking pool, because
+       `SingleThreadedExecutor` and `WorkStealingExecutor` have no hook for interleaving
+       an I/O poll function. `CurrentThreadExecutor` was designed around the opposite
+       model: one thread, everything interleaved — the injected `PollFn` is called on
+       every loop iteration alongside task polling (on Pico: `cyw43_arch_poll()`; on
+       desktop: `uv_run(loop, UV_RUN_NOWAIT)`). When the executor is
+       `CurrentThreadExecutor`, the `Runtime` should skip the dedicated libuv thread and
+       blocking pool and instead pass a `uv_run(UV_RUN_NOWAIT)` tick as the `PollFn`.
 
 ---
 
@@ -658,6 +715,30 @@ auto r = co_await rx.recv();
 if (!r) { /* transport error: channel closed */ }
 if (!*r) { /* application error: sender sent an error value */ }
 int value = **r;
+```
+
+### CH.5 — Do not await `Event::wait()` from more than one coroutine at a time
+
+**Reason:** `Event` supports exactly one waiting coroutine. If a second coroutine calls
+`wait()` while another is already suspended, the first coroutine's waker is silently
+overwritten. When `set()` fires, only the second waiter is woken; the first is parked
+indefinitely with no error signal. If multiple tasks need to react to the same signal,
+funnel through a single waiting coroutine that then notifies the others via a normal
+channel or second-level event.
+
+```cpp
+// BAD — two coroutines both await the same event
+coro::Event ev;
+coro::spawn([]() -> coro::Coro<void> { co_await ev.wait(); /* may never wake */ }());
+coro::spawn([]() -> coro::Coro<void> { co_await ev.wait(); /* overwrites first waker */ }());
+
+// GOOD — one waiter fans out via a channel
+coro::Coro<void> dispatcher(coro::Event& ev, coro::MpscSender<Signal> tx1,
+                             coro::MpscSender<Signal> tx2) {
+    co_await ev.wait();
+    co_await tx1.send(Signal{});
+    co_await tx2.send(Signal{});
+}
 ```
 
 ### CH.4 — Do not share a `Sender` or `Receiver` instance between threads
@@ -906,6 +987,98 @@ try {
         use(*r);
 } catch (const MyError& e) {
     // task's exception rethrown here
+}
+```
+
+---
+
+## ISR Safety (MCU platforms — `CORO_PICO` only)
+
+On MCU platforms (`CORO_PICO` builds), coroutine tasks sometimes need to respond to
+hardware interrupts. Nearly every coro operation touches `shared_ptr` ref-counts, atomic
+scheduling state, or `detail::Mutex` — on Cortex-M0+ (RP2040/RP2350) all of these route
+through a global spin-lock that disables IRQs, making them deadlock-prone from ISR context.
+The rules below define the safe boundary between ISR code and the coroutine executor.
+
+See `doc/isr_safety.md` for a detailed explanation of why these restrictions exist.
+
+### IS.1 — Only call `signal_from_isr()` or `send_from_isr()` from an interrupt handler
+
+**Reason:** These are the only two coro API calls explicitly designed and verified to be
+ISR-safe on Cortex-M0+. They write a `volatile` flag (and, for `IsrChannel<T>`, a value
+with a `__DMB()` release fence) and return immediately — no spin-lock, no allocation, no
+`shared_ptr`. Everything else — `spawn`, `Event::set`, channel `send`, `wake()`, any
+`shared_ptr` copy — is undefined behavior from ISR context, regardless of whether it
+appears to work on a specific hardware configuration.
+
+```cpp
+coro::IsrEvent g_dma_done;
+
+void dma_irq_handler() {
+    dma_irqn_acknowledge_channel(0, MY_DMA_CHANNEL);
+    g_dma_done.signal_from_isr();   // GOOD — ISR-safe
+
+    // BAD — undefined behavior from ISR context on RP2040:
+    // g_event.set();               // touches std::atomic + mutex
+    // co_await_tx.send(value);     // std::atomic spin-lock → deadlock
+    // coro::spawn(some_task());    // allocation + shared_ptr
+}
+```
+
+### IS.2 — Keep interrupt handlers minimal: write a flag or value and return immediately
+
+**Reason:** The ISR/executor protocol is designed around a strict division of labor: the
+ISR does one write and exits; the executor discovers the result on its next polling pass
+and schedules the coroutine normally. Any additional work in the ISR — branching, I/O,
+complex logic — increases interrupt latency and raises the risk of calling into unsafe
+API territory. The entire ISR body should typically be two or three lines.
+
+```cpp
+// GOOD — minimal; write one value and return
+void uart_rx_isr() {
+    g_uart_channel.send_from_isr(uart_read_byte());
+}
+
+// BAD — too much work in the ISR; increased latency and risk
+void uart_rx_isr() {
+    uint8_t byte = uart_read_byte();
+    if (byte == FRAME_START) {
+        g_frame_started = true;
+        // ... any coro call here is UB ...
+    } else if (g_frame_started) {
+        g_uart_channel.send_from_isr(byte);
+    }
+}
+```
+
+Push any non-trivial logic into the waiting coroutine, which runs in executor context
+where all coro operations are safe.
+
+### IS.3 — Declare `IsrEvent` and `IsrChannel<T>` at static or class scope; never as coroutine locals
+
+**Reason:** The ISR and the waiting coroutine share the same flag object. Both must be
+alive for the entire communication window: an interrupt can fire at any time, including
+after the coroutine has returned or been cancelled. A coroutine-local `IsrEvent` or
+`IsrChannel<T>` is destroyed when the coroutine exits — any ISR that fires after that
+point writes to freed memory.
+
+```cpp
+// GOOD — global scope; outlives all coroutines and all ISRs
+coro::IsrChannel<uint32_t> g_dma_result;
+
+// ALSO GOOD — class member; tied to the owning object's lifetime
+struct DmaController {
+    coro::IsrChannel<uint32_t> transfer_result;
+    void install_isr();
+    coro::Coro<uint32_t> run_transfer();
+};
+
+// BAD — destroyed when the coroutine returns or is cancelled
+coro::Coro<void> bad() {
+    coro::IsrEvent local_event;          // DO NOT DO THIS
+    install_isr_handler(&local_event);
+    co_await local_event.wait();
+    // local_event destroyed here; ISR may still fire after this point
 }
 ```
 

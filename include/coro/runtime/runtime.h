@@ -59,6 +59,13 @@ public:
     /// microseconds since the clock epoch. Used by sleep_for().
     void schedule_timer(uint64_t deadline_us, std::shared_ptr<detail::Waker> waker);
 
+    /// @brief Registers a volatile ISR flag to be polled once per event loop iteration.
+    ///
+    /// When *flag becomes true the waker is fired and the registration is removed.
+    /// Called by IsrWaitFuture — do not call directly. Must be called from the
+    /// executor thread (i.e. from inside a coroutine), never from an ISR.
+    void register_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker);
+
     /// @brief Drains the coroutine ready queue once. Returns true if any task was polled.
     ///
     /// Call this from the firmware main loop alongside `cyw43_arch_poll()`:

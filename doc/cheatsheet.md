@@ -17,8 +17,11 @@
 #include <coro/sync/oneshot.h>      // oneshot_channel<T>
 #include <coro/sync/mpsc.h>         // mpsc_channel<T>
 #include <coro/sync/watch.h>        // watch_channel<T>
+#include <coro/sync/event.h>         // Event
 #include <coro/io/tcp_stream.h>     // TcpStream
 #include <coro/io/tcp_listener.h>   // TcpListener
+#include <coro/io/ws_stream.h>      // WsStream
+#include <coro/io/ws_listener.h>    // WsListener
 #include <coro/io/file.h>           // File
 ```
 
@@ -102,6 +105,9 @@ co_await coro::co_invoke([&]() -> coro::Coro<void> {
     while (std::optional<int> result = co_await coro::next(js))
         use(*result);
 });
+
+// wait for all tasks; discard results
+co_await js.drain();
 ```
 
 ## join — concurrent fixed fan-out
@@ -156,6 +162,15 @@ coro::MutexGuard guard = co_await mtx.lock();
 // guard releases on destruction — safe to co_await while holding
 ```
 
+## Event — one-shot signal, any thread to coroutine
+
+```cpp
+coro::Event ev;
+ev.set();              // synchronous, any thread; latch semantics
+ev.clear();            // reset for reuse
+co_await ev.wait();    // suspends until set(); returns immediately if already set
+```
+
 ## oneshot — single-use, one value, one sender, one receiver
 
 ```cpp
@@ -176,6 +191,8 @@ tx.try_send(v);                    // non-blocking attempt
 // exits when all senders dropped
 while (std::optional<int> v = co_await coro::next(rx))
     use(*v);
+// for plain OS threads (not coroutines): blocks the calling thread
+std::optional<int> v = rx.blocking_recv();
 ```
 
 ## watch — last-value broadcast, multiple senders, many receivers
@@ -184,6 +201,7 @@ while (std::optional<int> v = co_await coro::next(rx))
 // WatchSender<int>, WatchReceiver<int>
 auto [tx, rx] = coro::watch_channel<int>(/*initial=*/0);
 tx.send(42);  // synchronous, never suspends
+WatchSender<int> tx2 = tx.clone();   // independent sender
 WatchReceiver<int> rx2 = rx.clone(); // independent receiver
 // wait for next update; std::expected<void, ChannelError>
 std::expected<void, ChannelError> r = co_await rx.changed();
@@ -234,6 +252,25 @@ co_await coro::co_invoke([&]() -> coro::Coro<void> {
 int result = co_await coro::spawn_blocking([]() {
     return expensive_sync_computation();
 });
+```
+
+## WebSocket I/O
+
+```cpp
+// Client
+coro::WsStream ws = co_await coro::WsStream::connect("ws://localhost:8080/path");
+// WsStream::Message { std::vector<std::byte> data; bool is_text; bool is_final; }
+coro::WsStream::Message msg = co_await ws.receive();
+co_await ws.send(std::span<const std::byte>(msg.data), /*is_text=*/false);
+co_await ws.send("hello");  // text frame
+
+// Server
+coro::WsListener listener =
+    co_await coro::WsListener::bind("0.0.0.0", 8080);
+while (true) {
+    coro::WsStream conn = co_await listener.accept();
+    coro::spawn(handle(std::move(conn))).detach();
+}
 ```
 
 ## TCP I/O

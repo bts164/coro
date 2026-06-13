@@ -105,11 +105,10 @@ nav:
       - Select: select.md
     - Platform & Integration:
       - Raspberry Pi Pico Port: pico_port.md
-      - Real-Time Scheduling: preempt_rt_producer.md
+      - ISR Safety: isr_safety.md
     - Module Structure: module_structure.md
   - Examples & Tutorials:
     - Examples: examples.md
     - gRPC Tutorial: grpc_tutorial.md
   - Roadmap and Future Plans:
     - Roadmap Overview: roadmap.md
-    - ISR Safety: isr_safety.md

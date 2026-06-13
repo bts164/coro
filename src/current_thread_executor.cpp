@@ -120,6 +120,36 @@ void CurrentThreadExecutor::check_expired_timers() {
     }
 }
 
+void CurrentThreadExecutor::add_isr_poll(const volatile bool*           flag,
+                                         std::shared_ptr<detail::Waker> waker) {
+    m_isr_polls.push_back({flag, std::move(waker)});
+}
+
+void CurrentThreadExecutor::check_isr_events() {
+    // Volatile dereference on each iteration forces a real LDRB from memory —
+    // the compiler cannot cache the flag value in a register across loop
+    // iterations or hoist it above the loop.
+    //
+    // No __DMB() here: we are only deciding whether to fire the waker. The
+    // ordering barrier between the ISR's payload write and the receiver's
+    // payload read is enforced by __DMB() in IsrChannel::receive() after
+    // co_await returns — at the point where the payload is actually consumed,
+    // not at the point where we first notice the flag.
+    //
+    // Swap-and-pop removes the entry without shifting the remaining vector,
+    // keeping the per-iteration cost O(1).
+    for (std::size_t i = 0; i < m_isr_polls.size(); ) {
+        if (*m_isr_polls[i].flag) {
+            auto waker = std::move(m_isr_polls[i].waker);
+            m_isr_polls[i] = std::move(m_isr_polls.back());
+            m_isr_polls.pop_back();
+            waker->wake();
+        } else {
+            ++i;
+        }
+    }
+}
+
 void CurrentThreadExecutor::wait_for_completion(detail::TaskStateBase& state) {
     while (true) {
         {
@@ -129,6 +159,7 @@ void CurrentThreadExecutor::wait_for_completion(detail::TaskStateBase& state) {
         poll_ready_tasks();
         check_expired_timers();
         m_poll();
+        check_isr_events();
     }
 }
 

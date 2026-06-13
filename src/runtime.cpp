@@ -40,6 +40,10 @@ uint64_t Runtime::now_us() const {
 void Runtime::schedule_timer(uint64_t deadline_us, std::shared_ptr<detail::Waker> waker) {
     m_current_thread_executor->schedule_timer(deadline_us, std::move(waker));
 }
+
+void Runtime::register_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker) {
+    m_current_thread_executor->add_isr_poll(flag, std::move(waker));
+}
 #else
 Runtime::Runtime(std::size_t num_threads)
     : m_blocking_pool(this)

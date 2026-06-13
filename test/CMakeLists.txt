@@ -122,11 +122,40 @@ add_executable(test_pico_suite
     test_join_set.cpp
     test_mpsc.cpp
     test_oneshot.cpp
+    test_isr_event.cpp
 )
 target_include_directories(test_pico_suite PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(test_pico_suite PRIVATE
     coro_pico_core GTest::gtest GTest::gtest_main GTest::gmock)
 add_test(NAME test_pico_suite COMMAND test_pico_suite)
+
+# ---------------------------------------------------------------------------
+# AsyncDmaTransfer tests — coro_pico_hal layer with DMA hardware stubs.
+#
+# Compiles src/pico/hal/dma.cpp against coro_pico_core + hardware/dma.h stub.
+# CORO_PICO_TEST exposes coro_pico_hal_dma_fire_irq0() for test use.
+# Tests use std::thread to simulate IRQ completion.
+# ---------------------------------------------------------------------------
+add_library(coro_pico_hal_core STATIC
+    ${CORO_SRC}/../src/pico/hal/dma.cpp
+    pico/stub/hardware/dma.cpp
+)
+target_include_directories(coro_pico_hal_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    pico/stub
+)
+target_link_libraries(coro_pico_hal_core PUBLIC coro_pico_core)
+target_compile_definitions(coro_pico_hal_core PUBLIC CORO_PICO CORO_PICO_TEST)
+target_compile_features(coro_pico_hal_core PUBLIC cxx_std_20)
+
+add_executable(test_async_dma pico/test_async_dma.cpp)
+target_include_directories(test_async_dma PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    pico/stub
+)
+target_link_libraries(test_async_dma PRIVATE
+    coro_pico_hal_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_test(NAME test_async_dma COMMAND test_async_dma)
 
 # ---------------------------------------------------------------------------
 # TCP stream tests — lwIP backend, stub networking.
