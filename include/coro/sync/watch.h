@@ -261,6 +261,9 @@ public:
      * Wakes all receivers suspended in `changed()`. Returns
      * `std::unexpected(value)` if all receivers have been dropped.
      *
+     * NOT ISR-SAFE: calls waker->wake() which touches shared_ptr ref-counts and
+     * the executor queue. Use IsrChannel<T>::send_from_isr() from ISR context instead.
+     *
      * @param value New value to publish.
      * @return `{}` on success; `std::unexpected(std::move(value))` if no receivers remain.
      */

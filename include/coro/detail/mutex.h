@@ -10,25 +10,31 @@
 //     a libuv I/O callback, or any external thread that receives a waker.
 //     std::mutex provides the necessary cross-thread serialisation.
 //
-//   CORO_PICO (single-threaded, bare-metal):
-//     There are no OS threads, so cross-thread races cannot occur. The only
-//     source of concurrency is ISR preemption — e.g. OneshotSender::send()
-//     called from a DMA completion IRQ handler. std::mutex is unavailable in
-//     bare-metal newlib, so Mutex and SharedMutex are implemented as
-//     IRQ-disabling critical sections via save_and_disable_interrupts() /
-//     restore_interrupts().
+//   CORO_PICO (RP2040 bare-metal):
+//     Two sources of concurrency exist: ISR preemption on the same core, and
+//     code running on core 1 (e.g. a sensor driver calling a waker or sending
+//     on a channel). std::mutex is unavailable in bare-metal newlib, so Mutex
+//     and SharedMutex use spin_lock_blocking() / spin_unlock() from the Pico
+//     SDK, which both disable IRQs and acquire a hardware spin lock. A single
+//     shared spin lock (number 16) is used for all instances — see the
+//     k_coro_spin_lock_num comment for the reasoning.
 //
-// CORO_PICO design tradeoff: using IRQ-disabling critical sections for every
-// mutex instance is stronger than strictly necessary for intra-coroutine state
-// that never leaves the executor thread. This is accepted because:
+// CORO_PICO design tradeoff: using a full critical section (IRQ disable + spin
+// lock) for every lock/unlock is stronger than strictly necessary for
+// intra-coroutine state that never leaves the executor thread. This is accepted
+// because:
 //
-//   1. The overhead is negligible — CPSID I / CPSIE I is 2 CPU cycles (~16 ns
-//      at 125 MHz), and all critical sections protect only a handful of
-//      instructions (a queue push, a flag write, a CAS).
+//   1. The overhead is small — CPSID I + spin lock acquire is a handful of
+//      cycles at 125 MHz, and all critical sections protect only a few
+//      instructions (a queue push, a flag write, a waker swap).
 //
-//   2. Correctness is uniform — users are encouraged to call channel senders
-//      from IRQ handlers to bridge hardware events into coroutines. Uniform
-//      ISR safety means the right mutex is always used without per-site thought.
+//   2. Correctness is uniform — users are expected to call channel senders
+//      from ISR handlers and from core 1. Uniform full-critical-section
+//      protection means the right mutex is always used without per-site
+//      reasoning about which protection level is needed.
+//
+//   3. Only one hardware spin lock is consumed for the entire coro runtime,
+//      regardless of how many channels, wakers, or tasks exist.
 //
 // Usage:
 //   #include <coro/detail/mutex.h>
@@ -52,22 +58,34 @@
 
 namespace coro::detail {
 
-// IRQ-disabling critical section. See file-level comment for tradeoff rationale.
+// Spin lock number reserved for coro. Uses spin lock 16 — the first in the
+// user-available range (SDK reserves 0-15). Spin locks are in the released
+// state after reset, so no explicit init call is required.
+static constexpr uint k_coro_spin_lock_num = 16;
+
+// A single spin lock shared by all Mutex and SharedMutex instances.
+// This is correct because without preemptive scheduling each core can hold
+// at most one coro mutex at a time: IRQs are disabled while the lock is held
+// (preventing ISR preemption on the same core), and there are no OS threads.
+// One spin lock therefore suffices to arbitrate between core 0, core 1, and
+// any ISR on either core — and consumes only 1 of the 32 hardware spin locks
+// regardless of how many channel or waker objects exist.
 class Mutex {
 public:
-    void lock()     { m_save = save_and_disable_interrupts(); }
-    void unlock()   { restore_interrupts(m_save); }
+    void lock()     { m_save = spin_lock_blocking(spin_lock_instance(k_coro_spin_lock_num)); }
+    void unlock()   { spin_unlock(spin_lock_instance(k_coro_spin_lock_num), m_save); }
     bool try_lock() { lock(); return true; }
 private:
     uint32_t m_save = 0;
 };
 
-// Shared reads and exclusive writes both disable interrupts — on a single-core
-// executor there are no concurrent readers, so the distinction is moot.
+// Shared reads and exclusive writes both take the full critical section —
+// on RP2040 there are no concurrent readers within a single executor thread,
+// so the shared/exclusive distinction is moot.
 class SharedMutex {
 public:
-    void lock()            { m_save = save_and_disable_interrupts(); }
-    void unlock()          { restore_interrupts(m_save); }
+    void lock()            { m_save = spin_lock_blocking(spin_lock_instance(k_coro_spin_lock_num)); }
+    void unlock()          { spin_unlock(spin_lock_instance(k_coro_spin_lock_num), m_save); }
     bool try_lock()        { lock(); return true; }
     void lock_shared()     { lock(); }
     void unlock_shared()   { unlock(); }

@@ -20,16 +20,12 @@ namespace coro {
  *
  * **Dropping:** destroying a `JoinHandle<T>` without `co_await`-ing it marks the task for
  * cancellation. If destroyed inside a coroutine's `poll()` call the enclosing
- * `CoroutineScope` takes ownership of the child's `OwnedTask` and waits for the child to
- * drain before the parent coroutine completes.
+ * `CoroutineScope` records a `weak_ptr<TaskBase>` to the child and waits for it to drain
+ * before the parent coroutine completes. Task lifetime is always anchored by the executor's
+ * owned map — no ownership transfer is needed.
  *
  * **Detaching:** `std::move(handle).detach()` lets the task run to completion without
- * cancellation. The task anchors its own lifetime via `TaskStateBase::self_owned` until
- * it reaches a terminal state.
- *
- * **Ownership:** `m_owned` is the sole persistent strong reference to the task. Wakers
- * stored by futures awaiting this task use `weak_ptr<Waker>` and do not contribute to
- * the reference count. See doc/task_ownership.md for the ownership model.
+ * cancellation. The executor's owned map keeps it alive until it reaches a terminal state.
  *
  * `JoinHandle` is `[[nodiscard]]` — silently discarding it would cancel the task immediately,
  * which is almost always unintentional.
@@ -42,8 +38,8 @@ public:
     using OutputType = T;
 
     explicit JoinHandle(std::shared_ptr<detail::TaskState<T>> state,
-                        detail::OwnedTask owned = {})
-        : m_state(std::move(state)), m_owned(std::move(owned)) {}
+                        std::weak_ptr<detail::TaskBase> task_ref = {})
+        : m_state(std::move(state)), m_task_ref(std::move(task_ref)) {}
 
     JoinHandle(const JoinHandle&)            = delete;
     JoinHandle& operator=(const JoinHandle&) = delete;
@@ -61,14 +57,14 @@ public:
     /// - Running        → RunningAndNotified: task is mid-poll; worker re-enqueues after poll.
     /// - Notified / RunningAndNotified / Done: already queued or finished — no-op.
     ///
-    /// EDGE CASE: if m_owned is empty (handle moved-from or detached) or owning_executor is
+    /// EDGE CASE: if m_task_ref is expired (handle moved-from or detached) or owning_executor is
     /// null (task never scheduled), cancellation is degraded: cancelled=true is set but the
     /// task is not actively woken. It will remain parked until naturally woken by whatever
     /// it awaits, at which point it will observe cancelled=true and self-terminate.
     void cancel() noexcept {
         if (!m_state) return;
         m_state->cancelled.store(true, std::memory_order_relaxed);
-        auto task = m_owned.get();
+        auto task = m_task_ref.lock();
         if (!task || !task->owning_executor) return;
 
         auto expected = detail::SchedulingState::Idle;
@@ -103,37 +99,17 @@ public:
 
     /// @brief Cancels the task (if cancelOnDestroy) and registers with the enclosing scope.
     ///
-    /// If inside a coroutine poll (t_current_coro != null), transfers OwnedTask ownership
-    /// to the scope so the parent waits for the child to drain.
-    ///
-    /// If not inside a coroutine and not cancelling (cancelOnDestroy=false), and the task
-    /// is scheduled (has an executor), set self_owned on the task's state so it anchors
-    /// its own lifetime until completion — equivalent to an implicit detach().
-    /// Unscheduled tasks (owning_executor==null) are freed immediately when m_owned drops.
+    /// If inside a coroutine poll (t_current_coro != null), records a weak_ptr to the child
+    /// in the scope's pending list so the parent waits for the child to drain.
+    /// The executor's owned map keeps the task alive — no ownership transfer is needed.
     ~JoinHandle() {
         if (!m_state) return;  // moved-from or already cleaned up
         if (m_cancelOnDestroy) {
-            cancel();  // wakes the task → executor gets a temp ref before m_owned drops
+            cancel();
         }
-        if (detail::t_current_coro && m_owned) {
-            // Inside a coroutine: transfer ownership to scope for structured concurrency.
-            detail::t_current_coro->add_child(std::move(m_owned));
-        } else if (!m_cancelOnDestroy && m_owned) {
-            // Outside a scope, not cancelling: if the task is scheduled, set self_owned
-            // so it can survive to completion while parked (no waker holds a strong ref).
-            auto task = m_owned.get();
-            if (task && task->owning_executor) {
-                std::shared_ptr<void> self_ref = m_owned.get();
-                {
-                    std::lock_guard lock(m_state->mutex);
-                    if (!m_state->terminated) {
-                        m_state->self_owned = std::move(self_ref);
-                    }
-                }
-            }
-            // m_owned destroyed after lock released (or immediately if not scheduled)
+        if (detail::t_current_coro) {
+            detail::t_current_coro->add_child(m_task_ref);
         }
-        // m_state and m_owned (if not transferred to scope) destroyed here
     }
 
     /// @brief Configures whether dropping this handle cancels the task (default: `true`).
@@ -149,26 +125,11 @@ public:
 
     /// @brief Lets the task run without cancellation; the caller surrenders all synchronization.
     ///
-    /// Moves the `OwnedTask` into `TaskStateBase::self_owned` so the task anchors its own
-    /// lifetime until it reaches a terminal state (mark_done/setResult/setException clears
-    /// self_owned under the state mutex). The task is freed when the executor drops its
-    /// final temporary reference after the terminal method fires.
-    ///
-    /// Sets self_owned under m_state->mutex before releasing m_owned to close any window
-    /// where neither the caller's OwnedTask nor self_owned holds a strong reference.
+    /// The executor's owned map already keeps the task alive until it reaches a terminal state.
+    /// Detaching simply releases the JoinHandle's state reference and task_ref.
     JoinHandle& detach() & {
-        if (m_state && m_owned) {
-            std::shared_ptr<void> self_ref = m_owned.get();
-            {
-                std::lock_guard lock(m_state->mutex);
-                if (!m_state->terminated) {
-                    m_state->self_owned = std::move(self_ref);
-                }
-            }
-            // m_owned destroyed after lock released
-        }
         m_state.reset();
-        m_owned = {};
+        m_task_ref = {};
         return *this;
     }
 
@@ -205,12 +166,11 @@ public:
 private:
     bool m_cancelOnDestroy = true;
     // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same TaskImpl
-    // allocation as m_owned. Provides typed access to the result and waker slot.
-    // Does not independently anchor the task lifetime — m_owned does that.
+    // allocation as m_task_ref. Provides typed access to the result and waker slot.
     std::shared_ptr<detail::TaskState<T>> m_state;
-    // Category 1 (doc/task_ownership.md): sole persistent strong reference to the task.
-    // Move-only to enforce the single-owner invariant. Null after detach() or move-from.
-    detail::OwnedTask m_owned;
+    // Category 4 (doc/task_ownership.md): notification/cancel only — no lifetime ownership.
+    // The executor's owned map is the lifetime anchor (Category 1).
+    std::weak_ptr<detail::TaskBase> m_task_ref;
 };
 
 } // namespace coro

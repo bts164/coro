@@ -10,6 +10,10 @@ void CurrentThreadExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(m_owned_mutex);
+        m_owned_tasks.insert(task);
+    }
     std::lock_guard lock(m_ready_mutex);
     m_ready.push(std::move(task));
 }
@@ -62,6 +66,10 @@ bool CurrentThreadExecutor::poll_ready_tasks() {
         if (done) {
             task->scheduling_state.store(
                 detail::SchedulingState::Done, std::memory_order_relaxed);
+            {
+                std::lock_guard lock(m_owned_mutex);
+                m_owned_tasks.erase(task);
+            }
         } else {
             expected = detail::SchedulingState::Running;
             if (task->scheduling_state.compare_exchange_strong(
@@ -69,7 +77,7 @@ bool CurrentThreadExecutor::poll_ready_tasks() {
                     std::memory_order_acq_rel,
                     std::memory_order_relaxed))
             {
-                task.reset(); // waker holds the only ref; parks until wake() fires
+                task.reset(); // executor's owned map keeps the task alive while parked
             } else {
                 // wake() fired during poll() — RunningAndNotified → Notified, re-enqueue
                 if (expected != detail::SchedulingState::RunningAndNotified) {

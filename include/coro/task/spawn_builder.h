@@ -35,12 +35,11 @@ struct StreamDriver {
                 m_channel->buffer.push(std::move(*m_pending));
                 m_pending.reset();
                 auto to_wake = std::move(m_channel->consumer_waker);
-                m_channel->consumer_waker.reset();
                 lock.unlock();
-                if (to_wake) to_wake->wake();
+                if (auto w = to_wake.lock()) w->wake();
                 // Fall through to poll stream again.
             } else {
-                m_channel->producer_waker = ctx.getWaker()->clone();
+                m_channel->producer_waker = ctx.get_weak_waker();
                 return PollPending;
             }
         }
@@ -56,9 +55,8 @@ struct StreamDriver {
                 m_channel->exception = result.error();
                 m_channel->closed    = true;
                 auto to_wake = std::move(m_channel->consumer_waker);
-                m_channel->consumer_waker.reset();
                 lock.unlock();
-                if (to_wake) to_wake->wake();
+                if (auto w = to_wake.lock()) w->wake();
                 return PollReady;
             }
 
@@ -68,9 +66,8 @@ struct StreamDriver {
                 std::unique_lock lock(m_channel->mutex);
                 m_channel->closed = true;
                 auto to_wake = std::move(m_channel->consumer_waker);
-                m_channel->consumer_waker.reset();
                 lock.unlock();
-                if (to_wake) to_wake->wake();
+                if (auto w = to_wake.lock()) w->wake();
                 return PollReady;
             }
 
@@ -79,13 +76,12 @@ struct StreamDriver {
             if (m_channel->buffer.size() < m_channel->capacity) {
                 m_channel->buffer.push(std::move(*opt));
                 auto to_wake = std::move(m_channel->consumer_waker);
-                m_channel->consumer_waker.reset();
                 lock.unlock();
-                if (to_wake) to_wake->wake();
+                if (auto w = to_wake.lock()) w->wake();
                 // Keep polling stream.
             } else {
                 m_pending                = std::move(opt);
-                m_channel->producer_waker = ctx.getWaker()->clone();
+                m_channel->producer_waker = ctx.get_weak_waker();
                 return PollPending;
             }
         }
@@ -128,28 +124,23 @@ public:
         auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
         impl->name = std::move(m_name);
         std::shared_ptr<detail::TaskState<T>> state = impl;
-        // Aliased shared_ptr to the same TaskImpl allocation — wrapped in OwnedTask
-        // to enforce the single-owner invariant (see doc/task_ownership.md).
-        detail::OwnedTask owned{std::shared_ptr<detail::TaskBase>(impl)};
+        std::weak_ptr<detail::TaskBase> task_ref{impl};
         if (m_executor)
             m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
-        return JoinHandle<T>(std::move(state), std::move(owned));
+        return JoinHandle<T>(std::move(state), std::move(task_ref));
     }
 
     /// @brief Creates a bounded channel, schedules the stream driver, and returns a @ref StreamHandle.
     template<Stream S>
     StreamHandle<typename S::ItemType> spawn(S stream) {
         auto channel = std::make_shared<detail::Channel<typename S::ItemType>>(m_buffer_size);
-        detail::OwnedTask driver;
+        std::weak_ptr<detail::TaskBase> driver;
         if (m_executor) {
             using Driver = detail::StreamDriver<S>;
             auto impl = std::make_shared<detail::TaskImpl<Driver>>(
                 Driver{std::move(stream), channel, std::nullopt});
             impl->name = std::move(m_name);
-            // Keep a persistent strong ref in OwnedTask before moving impl into schedule().
-            // The work-stealing executor stores raw pointers in its run queues and relies on
-            // an external owner to keep the task alive between enqueue and pickup.
-            driver = detail::OwnedTask{std::shared_ptr<detail::TaskBase>(impl)};
+            driver = std::weak_ptr<detail::TaskBase>{impl};
             m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
         }
         return StreamHandle<typename S::ItemType>(std::move(channel), std::move(driver));

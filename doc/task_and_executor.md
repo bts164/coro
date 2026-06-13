@@ -173,7 +173,7 @@ void await_transform(T&&) = delete;
 class SpawnBuilder {
 public:
     SpawnBuilder& name(std::string name);
-    SpawnBuilder& buffer(std::size_t size);  // bounded channel capacity for streams (default: 64)
+    SpawnBuilder& buffer(std::size_t size);  // StreamTaskState queue capacity (default: 64)
 
     template<Future F>
     JoinHandle<typename F::OutputType> spawn(F future);
@@ -211,23 +211,49 @@ Coro<void> example()
 `JoinHandle<T>` satisfies `Future<T>` and is marked `[[nodiscard]]` — discarding it drops
 and cancels the task immediately, which is almost never intentional.
 
-`spawn()` creates a single `TaskImpl<F>` object via `make_shared`. `TaskImpl<F>` inherits
-from both `TaskBase` (the executor-facing interface) and `TaskState<T>` (the result,
+`spawn(future)` creates a single `TaskImpl<F>` object via `make_shared`. `TaskImpl<F>`
+inherits from both `TaskBase` (the executor-facing interface) and `TaskState<T>` (the result,
 cancellation flag, and wakers). Two aliased `shared_ptr`s are produced from this one
 allocation — they share the same reference count and keep the same `TaskImpl<F>` alive, but
 point to different base subobjects:
 
 ```mermaid
 flowchart LR
-    S["spawn()"]
+    S["spawn(future)"]
     I["<b>TaskImpl&lt;F&gt;</b><br/>one make_shared allocation<br/>= TaskBase + TaskState&lt;T&gt; + F m_future"]
-    E["Executor queue<br/>shared_ptr&lt;TaskBase&gt; — temporary only"]
-    J["JoinHandle&lt;T&gt;<br/>OwnedTask m_owned (lifetime anchor)<br/>shared_ptr&lt;TaskState&lt;T&gt;&gt; m_state (result access)"]
+    OL["Executor owned set<br/>shared_ptr&lt;TaskBase&gt; — lifetime anchor<br/>held from spawn until terminal state"]
+    E["Executor queue<br/>shared_ptr&lt;TaskBase&gt; — temporary (Notified/Running)"]
+    J["JoinHandle&lt;T&gt;<br/>shared_ptr&lt;TaskState&lt;T&gt;&gt; — result access only"]
 
     S -->|"creates"| I
+    I -->|"inserted into"| OL
     I -->|"temporary ref while\nNotified or Running"| E
     I -->|"aliased to"| J
 ```
+
+`spawn(stream)` follows the same pattern. `StreamTaskImpl<S>` inherits from both `TaskBase`
+and `StreamTaskState<T>` (a bounded queue of `T` items, a closed flag, and an exception
+slot). `StreamHandle<T>` holds an aliased `shared_ptr<StreamTaskState<T>>` into the same
+allocation — exactly parallel to how `JoinHandle` holds `shared_ptr<TaskState<T>>`:
+
+```mermaid
+flowchart LR
+    S["spawn(stream)"]
+    I["<b>StreamTaskImpl&lt;S&gt;</b><br/>one make_shared allocation<br/>= TaskBase + StreamTaskState&lt;T&gt; + S m_stream"]
+    OL["Executor owned set<br/>shared_ptr&lt;TaskBase&gt; — lifetime anchor<br/>held from spawn until terminal state"]
+    E["Executor queue<br/>shared_ptr&lt;TaskBase&gt; — temporary (Notified/Running)"]
+    SH["StreamHandle&lt;T&gt;<br/>shared_ptr&lt;StreamTaskState&lt;T&gt;&gt; — queue access only"]
+
+    S -->|"creates"| I
+    I -->|"inserted into"| OL
+    I -->|"temporary ref while\nNotified or Running"| E
+    I -->|"aliased to"| SH
+```
+
+The executor polls `StreamTaskImpl<S>` directly via the normal task poll loop. On each poll
+the stream produces the next item into `StreamTaskState`'s queue; when the queue is full the
+task parks until `StreamHandle::poll_next()` consumes an item and wakes it. No separate
+driver coroutine or channel allocation is needed.
 
 `JoinHandle` exposes explicit control over the task's lifetime:
 
@@ -238,8 +264,8 @@ public:
     // Satisfies Future<T> — co_await to get the result
     PollResult<T> poll(Context& ctx);
 
-    // Detaches without cancelling. Moves OwnedTask into TaskBase::self_owned so the
-    // task anchors its own lifetime until it reaches a terminal state.
+    // Detaches without cancelling. Releases the handle's result-access reference;
+    // the task continues running, tracked by the executor's owned set.
     JoinHandle& detach() &;
     JoinHandle&& detach() &&;
 
@@ -247,9 +273,8 @@ public:
     JoinHandle& cancelOnDestroy(bool b = true) &;
     JoinHandle&& cancelOnDestroy(bool b = true) &&;
 
-    // Destructor: cancels the task (if cancelOnDestroy) and transfers OwnedTask to
-    // the enclosing CoroutineScope if inside a poll(), otherwise self-anchors the
-    // task via self_owned when cancelOnDestroy=false.
+    // Destructor: if cancelOnDestroy, sets the cancel flag on the task. The executor's
+    // owned set keeps the task alive until it reaches a terminal state.
     ~JoinHandle();
 };
 ```
@@ -258,15 +283,14 @@ The shared `TaskState<T>` (embedded in `TaskImpl<F>`) handles these scenarios sa
 
 - Task completes before `JoinHandle` is polled — result stored, handle reads it on next poll
 - `JoinHandle` polled before task completes — weak waker registered, task fires it on completion
-- `JoinHandle` dropped inside coroutine — `OwnedTask` transferred to `CoroutineScope`; scope drains before parent completes
-- `JoinHandle` dropped outside coroutine — cancellation flag set; task self-terminates at next natural wakeup
-- `JoinHandle::detach()` called — `OwnedTask` moved into `TaskBase::self_owned`; task continues unaffected until terminal state
+- `JoinHandle` dropped — cancellation flag set; executor's owned set keeps task alive until it drains
+- `JoinHandle::detach()` called — handle's result-access reference released; task continues tracked by executor until terminal state
 - Task throws — exception stored in `TaskState<T>`, re-thrown when `JoinHandle` is `co_await`ed
 
-`StreamHandle<T>` satisfies `Stream<T>` and is also `[[nodiscard]]`. Internally it is the
-consumer end of a bounded channel. The spawned task drives `poll_next()` on the original
-stream and sends values through the channel, suspending when the buffer is full to preserve
-back-pressure.
+`StreamHandle<T>` satisfies `Stream<T>` and is also `[[nodiscard]]`. It holds an aliased
+`shared_ptr<StreamTaskState<T>>` into the same `StreamTaskImpl<S>` allocation. Dropping it
+cancels the background stream task; the executor's owned set keeps the task alive until it
+drains.
 
 ### JoinHandle lifetime options
 
@@ -275,14 +299,13 @@ There are three ways to relinquish a `JoinHandle`, with different effects on the
 | Action | Effect on task |
 |---|---|
 | `co_await handle` | Waits for completion, returns result or rethrows exception |
-| `handle.detach()` | Task runs to completion; `OwnedTask` moved into `self_owned`; result discarded; no cancellation |
-| Drop inside coroutine | `OwnedTask` transferred to enclosing `CoroutineScope`; scope drains before parent frame is freed |
-| Drop outside coroutine | Cancellation flag set; task exits at next natural wakeup; result discarded |
+| `handle.detach()` | Result-access reference released; task runs to completion tracked by executor; no cancellation |
+| Drop (any context) | Cancellation flag set; executor's owned list keeps task alive until it drains to terminal state |
 
 `detach()` is the explicit fire-and-forget path. Detached tasks are not tracked by the
-enclosing `CoroutineScope` — they run to completion independently. Use `cancelOnDestroy(false)`
-when the task should complete (not be cancelled) but still participate in the scope's drain
-guarantee.
+enclosing `CoroutineScope` but remain tracked by the executor's owned list — they run to
+completion and are cleaned up safely on shutdown. Use `cancelOnDestroy(false)` when the
+task should complete (not be cancelled) if the `JoinHandle` is dropped without detaching.
 
 This three-way design mirrors Julia's pattern extended with explicit detach:
 
@@ -293,9 +316,9 @@ This three-way design mirrors Julia's pattern extended with explicit detach:
 ### Internal Task types
 
 `TaskBase` is a non-template abstract base held by the executor queue and waker clones.
-`TaskImpl<F>` is the concrete template that inherits from both `TaskBase` and
-`TaskState<F::OutputType>` and stores the future directly — one `make_shared` allocation
-covers the entire task. Users never interact with either type directly.
+`TaskImpl<F>` and `StreamTaskImpl<S>` are the concrete templates — each combines `TaskBase`
+with its respective state type into a single `make_shared` allocation. Users never interact
+with any of these types directly.
 
 ```cpp
 // Internal — not public API
@@ -305,7 +328,6 @@ public:
     std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
     std::string name;
     int         last_worker_index = -1;
-    std::shared_ptr<void> self_owned; // detached-task self-reference; cleared at terminal state
     virtual bool poll(Context& ctx) = 0;
     virtual bool is_complete() const = 0;                    // checked by CoroutineScope
     virtual void set_waker(std::weak_ptr<Waker> waker) = 0; // called by JoinHandle and CoroutineScope
@@ -314,6 +336,7 @@ public:
     virtual ~TaskBase() = default;
 };
 
+// Future tasks — one result slot
 template<Future F>
 class TaskImpl : public TaskBase, public TaskState<typename F::OutputType> {
     F    m_future;
@@ -325,12 +348,42 @@ class TaskImpl : public TaskBase, public TaskState<typename F::OutputType> {
     void cancel_task() noexcept override { /* sets cancelled flag, calls wake() */ }
 };
 
-// spawn() produces one allocation; OwnedTask is the sole persistent lifetime anchor:
+// Stream tasks — bounded queue of results
+template<Stream S>
+class StreamTaskImpl : public TaskBase, public StreamTaskState<typename S::ItemType> {
+    S    m_stream;
+    bool m_completed        = false;
+    bool m_cancel_requested = false;
+    bool poll(Context& ctx) override { /* drives m_stream; pushes items into StreamTaskState queue */ }
+    bool is_complete() const override;
+    void set_waker(std::weak_ptr<Waker> w) override;
+    void cancel_task() noexcept override;
+};
+
+// StreamTaskState<T> — co-allocated with StreamTaskImpl; holds the bounded result queue.
+// StreamHandle<T> holds an aliased shared_ptr<StreamTaskState<T>> into this allocation.
+template<typename T>
+struct StreamTaskState {
+    std::mutex             mutex;
+    std::queue<T>          buffer;
+    std::size_t            capacity;
+    bool                   closed    = false;
+    std::exception_ptr     exception;
+    std::weak_ptr<Waker>   producer_waker;  // woken when buffer has space
+    std::weak_ptr<Waker>   consumer_waker;  // woken when buffer has items or stream closes
+};
+
+// spawn(future) — one allocation; executor's owned set is the lifetime anchor:
 auto impl = std::make_shared<TaskImpl<F>>(std::move(future));
-std::shared_ptr<TaskState<typename F::OutputType>> join_ptr = impl;
-detail::OwnedTask owned{std::shared_ptr<TaskBase>(impl)};
-executor->schedule(std::shared_ptr<TaskBase>(std::move(impl)));
-return JoinHandle<T>(std::move(join_ptr), std::move(owned));
+std::shared_ptr<TaskState<T>>  join_ptr = impl;
+executor->schedule(std::shared_ptr<TaskBase>(impl));  // inserts into executor's owned set
+return JoinHandle<T>(std::move(join_ptr));             // result-access ref only
+
+// spawn(stream) — same pattern with StreamTaskImpl:
+auto impl = std::make_shared<StreamTaskImpl<S>>(std::move(stream), capacity);
+std::shared_ptr<StreamTaskState<T>> sh_ptr = impl;
+executor->schedule(std::shared_ptr<TaskBase>(impl));  // inserts into executor's owned set
+return StreamHandle<T>(std::move(sh_ptr));             // queue-access ref only
 ```
 
 ### Abstract Executor interface
@@ -527,6 +580,127 @@ public:
 ```
 
 The cancellation design will be its own feature phase.
+
+### The Drain Invariant
+
+**Every future must guarantee that its drain completes in finite time.**
+
+This is the single rule all futures in the library must uphold. It is what makes runtime
+shutdown safe and deadlock-free, and it applies to futures themselves — not to call sites.
+A future that satisfies the invariant is safe to `co_await` anywhere, including during the
+drain of a parent task, because it will itself complete in finite time when cancelled.
+
+#### Trivially drainable futures
+
+A future that does not implement a cancel method has no async teardown path — it satisfies
+the invariant automatically. When cancellation is requested, the coroutine and task
+machinery detects this before the future is polled again and destructs it directly. The
+future's `poll()` is never called during drain; the future is simply destroyed. The effect
+is identical to returning `PollDropped`, but the check happens at the task level rather than
+inside `poll()` itself.
+
+#### Non-trivially drainable futures
+
+A future that does implement a cancel method has async cleanup work to perform. Its
+`poll()` is called during drain and must return `PollDropped` (or `PollReady`) in finite
+time once cancellation has been requested:
+
+```cpp
+struct MyFuture {
+    using OutputType = void;
+    bool m_cancelling = false;
+
+    // cancel() is called by the task machinery when the task is cancelled.
+    // It kicks off async cleanup work and sets a flag so poll() knows to drain.
+    void cancel() {
+        m_cancelling = true;
+        submit_async_cleanup();  // e.g. uv_close, flush buffer, etc.
+    }
+
+    PollResult<void> poll(Context& ctx) {
+        if (m_cancelling) {
+            if (cleanup_complete()) return PollDropped;  // drain done
+            m_waker = ctx.get_weak_waker();
+            return PollPending;  // waiting for cleanup — MUST complete in finite time
+        }
+        if (work_is_done()) return PollReady;
+        m_waker = ctx.get_weak_waker();
+        return PollPending;
+    }
+};
+```
+
+The sufficient condition that is easiest to reason about: **only suspend during drain to
+wait for child task drains.** Since each child obeys the same rule the drain tree always
+terminates, and there is no dependency on any external subsystem remaining operational.
+This is conservative and overly restrictive — a future could satisfy the invariant through
+other means — but any alternative requires careful reasoning, as the case study below shows.
+
+!!! note "NOTE: Executor shutdown ordering"
+    A non-trivially drainable future whose `cancel()` submits work to an external subsystem
+    (such as a libuv `uv_close` request) is only as good as the guarantee that the subsystem
+    remains operational during the drain phase. If the executor stops the event loop before
+    draining such a future, the completion callback never fires, `poll()` returns `PollPending`
+    forever, and the drain deadlocks. The executor's shutdown sequence must therefore keep the
+    event loop live for the entire duration of the drain.
+
+#### Shutdown and detached tasks
+
+The executor tracks all spawned tasks, including detached ones. On shutdown it cancels all
+tracked tasks and drains them before returning from `block_on`. Because detached tasks obey
+the drain invariant, this always terminates.
+
+This differs from Tokio's approach (synchronous drop of all tasks on shutdown), which works
+in Rust because Rust futures are safe to drop at any await point without running destructor
+logic that accesses other futures' data. In C++, RAII objects in coroutine frames can hold
+references into other frames, making ordered destruction via drain the only safe strategy.
+
+#### Owned task list
+
+The executor maintains an intrusive doubly-linked list of all live tasks, with the list
+node embedded directly in `TaskBase` — no separate allocation per entry. This follows the
+same pattern as `IntrusiveList` already used in `JoinSet`.
+
+The list is protected by a single mutex. This is deliberately simple: the owned task list
+is **not on the hot path**. It is only accessed at three points:
+
+- **Spawn** — insert the new task
+- **Completion** — remove the task
+- **Shutdown** — iterate, cancel, and drain
+
+Normal polling never touches this list, so the mutex is almost never contended. This is
+the key difference from the run queue, which required lock-free per-thread queues precisely
+because every wake and every poll goes through it.
+
+Tokio shards its owned task list across N independent `Mutex<LinkedList>`s to further
+reduce contention at high task-spawn rates. *Sharding* means splitting a shared data
+structure into N independently-locked pieces so threads tend to hit different shards rather
+than all contending on one lock — reducing contention by roughly a factor of N. For our
+use case this is not warranted today, but if profiling ever shows spawn/completion becoming
+a bottleneck on the global mutex, sharding is the natural next step.
+
+!!! tip "TODO: Consider sharding the owned task list"
+    If high task-spawn rates under the work-stealing executor show measurable contention on
+    the owned task list mutex, shard it across N lists (one per worker thread is the natural
+    split). Not needed today — revisit if profiling shows it.
+
+#### Planned exception: `CancelGuard` (not yet implemented)
+
+!!! warning "WARNING: CancelGuard does not exist yet"
+    The following describes a possible future addition. No `CancelGuard` type exists in the
+    library today. Do not design code around it.
+
+A future `CancelGuard` type would allow a coroutine to temporarily opt out of the drain
+invariant — explicitly declaring that a particular section must not be interrupted by
+cancellation, even during a drain. This is an opt-in escape hatch for situations where an
+operation truly must complete before the task can safely exit (e.g. flushing a write buffer
+to a file before close).
+
+A `CancelGuard` would be a deliberate exception to the invariant, not a design flaw. The
+user accepts full responsibility for ensuring that the guarded section terminates in finite
+time. A `CancelGuard` that wraps an external wait (IO, condition variable) that never
+completes would deadlock the drain and therefore the runtime shutdown — the same risk the
+drain invariant is designed to prevent.
 
 ### Unhandled exceptions in spawned tasks
 

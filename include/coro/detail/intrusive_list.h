@@ -163,7 +163,11 @@ public:
     }
 
     /// @brief Unlinks @p node from wherever it sits in the list.
+    /// Safe to call on a node that is not currently in this list — no-op.
     void remove(NodePtr node) noexcept {
+        // A non-member node has prev == next == nullptr and is not the head.
+        // The single-element case also has prev == next == nullptr, but IS the head.
+        if (!node->prev && !node->next && m_head != node) return;
         if (node->prev) node->prev->next = node->next;
         else            m_head = node->next;
         if (node->next) node->next->prev = node->prev;

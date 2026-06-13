@@ -129,6 +129,9 @@ public:
      *
      * Thread-safe. Idempotent — calling `set()` on an already-set event is a
      * no-op (the waiter has already been woken).
+     *
+     * NOT ISR-SAFE: calls waker->wake() which touches shared_ptr ref-counts and
+     * the executor queue. Use IsrEvent::signal_from_isr() from ISR context instead.
      */
     void set() {
         std::shared_ptr<detail::Waker> waker;

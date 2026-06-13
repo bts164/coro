@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include "executor_traits.h"
 #include <coro/stream.h>
 #include <coro/coro.h>
 #include <coro/co_invoke.h>
@@ -11,6 +12,8 @@
 #include <vector>
 
 using namespace coro;
+
+namespace {
 
 class MockWaker : public detail::Waker {
 public:
@@ -85,6 +88,8 @@ struct WrongReturnType {
     int poll_next(detail::Context&) { return 0; }
 };
 static_assert(!Stream<WrongReturnType>);
+
+}  // namespace
 
 // --- Runtime tests ---
 
@@ -271,6 +276,8 @@ TEST(NextFutureTest, DroppedAfterSuspendLeavesStreamUsable) {
 // stream is still usable in subsequent rounds.
 // -----------------------------------------------------------------------
 
+namespace {
+
 // Immediately-ready void future used as the "other branch" in select.
 struct SelectVoidBranch {
     using OutputType = void;
@@ -283,51 +290,47 @@ struct SelectNeverBranch {
     PollResult<void> poll(detail::Context&) { return PollPending; }
 };
 
-TEST(NextFutureTest, SelectLosingBranchLeavesStreamUsable) {
-    // select(next(s), ImmediateVoid) — ImmediateVoid wins; next(s) was pending.
-    // After select returns, the stream must still deliver all its items.
-    Runtime rt(1);
+}  // namespace
+
+// -----------------------------------------------------------------------
+// Async select integration — parameterised across all executors
+// -----------------------------------------------------------------------
+
+template<typename Traits>
+class NextFutureAsyncTest : public testing::Test {
+protected:
+    Traits traits;
+};
+TYPED_TEST_SUITE(NextFutureAsyncTest, AllExecutors);
+
+TYPED_TEST(NextFutureAsyncTest, SelectLosingBranchLeavesStreamUsable) {
     std::vector<int> results;
-
-    rt.block_on(co_invoke([&results]() -> Coro<void> {
+    this->traits.rt.block_on([](std::vector<int>& results) -> Coro<void> {
         SuspendingStream<int> s({10, 20, 30});
-
-        // next(s) suspends on first poll; ImmediateVoid wins immediately.
         auto sel = co_await select(next(s), SelectVoidBranch{});
         EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(sel)));
-
-        // Stream still usable — collect remaining items.
         while (auto item = co_await next(s))
             results.push_back(*item);
-    }));
-
+    }(results));
     std::sort(results.begin(), results.end());
     EXPECT_EQ(results, (std::vector<int>{10, 20, 30}));
 }
 
-TEST(NextFutureTest, SelectWinningBranchDeliversItem) {
-    // select(next(s), NeverFuture) — next(s) wins once the item is ready.
-    Runtime rt(1);
+TYPED_TEST(NextFutureAsyncTest, SelectWinningBranchDeliversItem) {
     std::optional<int> got;
-
-    rt.block_on(co_invoke([&got]() -> Coro<void> {
+    this->traits.rt.block_on([](std::optional<int>& got) -> Coro<void> {
         SuspendingStream<int> s({42});
         auto sel = co_await select(next(s), SelectNeverBranch{});
         if (std::holds_alternative<SelectBranch<0, std::optional<int>>>(sel))
             got = std::get<SelectBranch<0, std::optional<int>>>(sel).value;
-    }));
-
+    }(got));
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(*got, 42);
 }
 
-TEST(NextFutureTest, SelectRepeatedRoundsCollectsAllItems) {
-    // Each iteration wraps next(s) in select. Verifies waker is refreshed correctly
-    // each round and all items are delivered in order.
-    Runtime rt(1);
+TYPED_TEST(NextFutureAsyncTest, SelectRepeatedRoundsCollectsAllItems) {
     std::vector<int> results;
-
-    rt.block_on(co_invoke([&results]() -> Coro<void> {
+    this->traits.rt.block_on([](std::vector<int>& results) -> Coro<void> {
         SuspendingStream<int> s({1, 2, 3, 4});
         while (true) {
             auto sel = co_await select(next(s), SelectNeverBranch{});
@@ -337,7 +340,6 @@ TEST(NextFutureTest, SelectRepeatedRoundsCollectsAllItems) {
             if (!item) break;
             results.push_back(*item);
         }
-    }));
-
+    }(results));
     EXPECT_EQ(results, (std::vector<int>{1, 2, 3, 4}));
 }

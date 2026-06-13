@@ -11,6 +11,7 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_set>
 
 // Forward declaration — full type in <libwebsockets.h>, included only by translation
 // units that use lws directly.
@@ -131,6 +132,11 @@ private:
     std::thread::id   m_uv_thread_id;  // set at thread start; used by enqueue()
     std::thread       m_uv_thread;
     std::atomic<bool> m_stopping{false};
+
+    // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
+    // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
+    std::mutex                                                               m_owned_mutex;
+    std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
 };
 
 // ---------------------------------------------------------------------------

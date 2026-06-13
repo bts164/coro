@@ -70,8 +70,9 @@ co_await select(next(int_tasks), next(str_tasks));
 ## Cancel on drop
 
 Dropping a `JoinSet` (without calling `drain()`) cancels all pending child tasks.
-Inside a `co_invoke` lambda, the enclosing `CoroutineScope` ensures the cancelled tasks
-finish draining before the lambda's `Coro<T>` completes — no use-after-free.
+The executor's owned list keeps each cancelled task alive until it drains to a terminal
+state. On shutdown, the executor-level drain ensures all tasks complete before
+`block_on` returns.
 
 ```cpp
 co_await co_invoke([&data]() -> Coro<void> {
@@ -113,7 +114,7 @@ live `JoinSetTask`, and any live `JoinSetDrainFuture` via `shared_ptr`. It holds
 
 | Field | Type | Description |
 |---|---|---|
-| `pending_handles` | `set<shared_ptr<TaskBase>>` | Strong refs to running tasks — lifetime anchors while tasks are Idle between executor polls |
+| `pending_handles` | intrusive list of `JoinSetTask*` | Non-owning; O(1) removal when task completes. Executor's owned list is the lifetime anchor. |
 | `idle_handles` | `list<shared_ptr<TaskState<T>>>` | Completed tasks awaiting consumption; aliased into the same allocation as the corresponding `TaskBase` |
 | `consumer_waker` | `shared_ptr<Waker>` | Wakes the `next()`/`drain()` consumer when a task completes |
 | `mutex` | `std::mutex` | Protects all fields |
@@ -158,15 +159,15 @@ remainder of `poll()`.
 
 When `JoinSet` is dropped, `cancel_pending()`:
 
-1. Collects all entries from `pending_handles` into a local `vector` (keeping tasks
-   alive via temporary strong refs).
-2. Clears `pending_handles` (drops the persistent refs).
-3. Calls `cancel_task()` on each task — sets `cancelled = true` and enqueues the task
-   so the executor sees the flag on the next poll.
+1. Iterates `pending_handles` (intrusive list of raw `JoinSetTask*` pointers) under
+   the mutex and calls `cancel_task()` on each, setting `cancelled = true` and enqueuing
+   the task so the executor sees the flag on its next poll.
+2. Clears `pending_handles`.
 
-Tasks that are currently Running or Notified are already held by the executor's
-temporary strong reference and self-terminate on their next poll. The local `vector`
-ensures Idle tasks are not freed between the ref-drop and the `cancel_task()` enqueue.
+The executor's owned list keeps every task alive through this process — no strong refs
+need to be collected first. No ownership transfer to a `CoroutineScope` is needed: the
+executor-level drain on shutdown ensures all cancelled tasks reach a terminal state
+before `block_on` returns.
 
 ### Stream<T> satisfaction
 

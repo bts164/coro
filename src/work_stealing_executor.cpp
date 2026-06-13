@@ -81,6 +81,10 @@ void WorkStealingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(m_owned_mutex);
+        m_owned_tasks.insert(task);
+    }
     enqueue(std::move(task));
 }
 
@@ -288,7 +292,11 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         if (done) {
             task->scheduling_state.store(
                 detail::SchedulingState::Done, std::memory_order_relaxed);
-            task.reset();
+            {
+                std::lock_guard lock(m_owned_mutex);
+                m_owned_tasks.erase(task);
+            }
+            // task.reset() here — owned map was the lifetime anchor
         } else {
             // Try Running → Idle.
             expected = detail::SchedulingState::Running;
@@ -297,7 +305,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                     std::memory_order_acq_rel,
                     std::memory_order_relaxed))
             {
-                task.reset(); // release temporary executor ref; task lives via OwnedTask
+                task.reset(); // release temporary executor ref; task lives via m_owned_tasks
             } else {
                 // CAS failed: expected now holds the actual state. The only valid
                 // state here is RunningAndNotified — wake() fired during poll().

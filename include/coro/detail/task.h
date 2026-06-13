@@ -93,14 +93,14 @@ public:
     /**
      * @brief Returns true if the task has reached a terminal state.
      * Implemented by TaskImpl<F> by checking TaskState<T>::terminated under lock.
-     * Called through OwnedTask::is_complete() for type-erased scope tracking.
+     * Called by CoroutineScope for type-erased drain tracking via weak_ptr<TaskBase>.
      */
     virtual bool is_complete() const = 0;
 
     /**
      * @brief Installs a weak waker that is fired when this task completes.
-     * Called by CoroutineScope::set_drain_waker() through OwnedTask to notify
-     * the parent when a dropped child finishes. Implemented by TaskImpl<F>.
+     * Called by CoroutineScope::set_drain_waker() to notify the parent when a
+     * dropped child finishes. Implemented by TaskImpl<F>.
      */
     virtual void set_waker(std::weak_ptr<Waker> waker) = 0;
 
@@ -123,6 +123,12 @@ public:
     virtual void cancel_task() noexcept {}
 
     // Waker implementation — defined in task.cpp to break the circular include with executor.h.
+    //
+    // NOT ISR-SAFE: wake() calls shared_from_this() (atomic shared_ptr refcount) and
+    // enqueue() on the owning executor. On RP2040 single-core this is safe in practice,
+    // but the guarantee is platform- and configuration-dependent. Do not call wake()
+    // from an ISR without first reading doc/isr_safety.md. A safe wake_from_isr()
+    // alternative is tracked there.
     void wake() override;
     std::shared_ptr<Waker> clone() override;
 
@@ -233,55 +239,6 @@ private:
     std::optional<F> m_future;
     bool m_completed        = false;
     bool m_cancel_requested = false;
-};
-
-/**
- * @brief Move-only wrapper that is the sole persistent strong reference to a task.
- *
- * `OwnedTask` controls task lifetime: the task allocation is freed when the last
- * `OwnedTask` for it is destroyed. No other entity may hold a persistent
- * `shared_ptr<TaskBase>` — waker clones stored by futures use `weak_ptr<Waker>` and
- * the executor holds only a temporary strong reference while the task is Running or
- * Notified. See doc/task_ownership.md for the full ownership model.
- *
- * The "sole persistent strong reference" contract is enforced by convention: any code
- * that obtains a temporary strong reference (via `get()` or by locking a `weak_ptr`)
- * must not store it persistently beyond the current call stack.
- */
-class OwnedTask {
-public:
-    OwnedTask() = default;
-
-    explicit OwnedTask(std::shared_ptr<TaskBase> task)
-        : m_ptr(std::move(task)) {}
-
-    OwnedTask(OwnedTask&&) noexcept            = default;
-    OwnedTask& operator=(OwnedTask&&) noexcept = default;
-
-    OwnedTask(const OwnedTask&)            = delete;
-    OwnedTask& operator=(const OwnedTask&) = delete;
-
-    explicit operator bool() const noexcept { return m_ptr != nullptr; }
-
-    /// @brief Returns the underlying strong pointer for temporary use only.
-    /// The returned reference is valid only for the current call stack.
-    const std::shared_ptr<TaskBase>& get() const noexcept { return m_ptr; }
-
-    /// @brief Returns a weak pointer for notification-only storage.
-    std::weak_ptr<TaskBase> get_weak() const noexcept { return m_ptr; }
-
-    /// @brief Returns true if the task has reached a terminal state.
-    bool is_complete() const {
-        return m_ptr && m_ptr->is_complete();
-    }
-
-    /// @brief Installs the completion waker on the task. Fired when the task reaches a terminal state.
-    void set_waker(std::weak_ptr<Waker> waker) {
-        if (m_ptr) m_ptr->set_waker(std::move(waker));
-    }
-
-private:
-    std::shared_ptr<TaskBase> m_ptr;
 };
 
 } // namespace coro::detail

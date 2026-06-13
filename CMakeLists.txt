@@ -3,9 +3,18 @@ project(coro VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(ENABLE_ASAN "Build with AddressSanitizer + LeakSanitizer + UBSan" OFF)
 option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
 option(WITH_GPERFTOOLS "Build with gperftools" OFF)
 option(CORO_USE_LOCAL_RUN_QUEUE "Use lock-free local run queue in WorkStealingExecutor (experimental)" ON)
+
+if(ENABLE_ASAN AND ENABLE_TSAN)
+    message(FATAL_ERROR "ENABLE_ASAN and ENABLE_TSAN are mutually exclusive")
+endif()
+if(ENABLE_ASAN)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 if(ENABLE_TSAN)
     add_compile_options(-fsanitize=thread -g)
     add_link_options(-fsanitize=thread)

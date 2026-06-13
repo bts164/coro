@@ -24,7 +24,7 @@ namespace coro::detail {
  * Transitions:
  *   schedule()           : Idle → Notified  (set explicitly before first enqueue)
  *   worker dequeues      : Notified → Running  (CAS; failure = bug)
- *   poll() Pending + no concurrent wake : Running → Idle  (CAS; OwnedTask in parent holds the only ref)
+ *   poll() Pending + no concurrent wake : Running → Idle  (CAS; executor's owned map holds the only persistent ref)
  *   poll() Pending + concurrent wake    : Running → RunningAndNotified (CAS in wake())
  *   post-poll RunningAndNotified detected: RunningAndNotified → Notified (CAS; re-enqueue)
  *   wake() while Idle    : Idle → Notified  (CAS in TaskBase::wake(); calls enqueue())
@@ -32,7 +32,7 @@ namespace coro::detail {
  *   poll() returns Ready : Running → Done  (store; terminal)
  */
 enum class SchedulingState : uint8_t {
-    Idle               = 0,  ///< Suspended; OwnedTask in parent is the sole persistent strong ref
+    Idle               = 0,  ///< Suspended; executor's owned map is the sole persistent strong ref
     Running            = 1,  ///< Inside poll(); owned by the worker
     Notified           = 2,  ///< In a ready queue; waiting to be polled
     RunningAndNotified = 3,  ///< Inside poll() AND wake() fired; worker re-enqueues after poll
@@ -54,16 +54,6 @@ struct TaskStateBase {
     mutable detail::Mutex   mutex;
     detail::CondVar         cv;
     bool                    terminated{false};
-
-    // Self-reference for detached tasks. Set by JoinHandle::detach() before releasing
-    // OwnedTask, cleared by all terminal methods (mark_done, setResult, setException)
-    // under the same critical section that sets terminated=true. This ensures a detached
-    // task anchors its own lifetime until it reaches a terminal state.
-    //
-    // Stored as shared_ptr<void> to avoid a circular type dependency between TaskStateBase
-    // and OwnedTask/TaskBase. The underlying allocation is a TaskImpl<F>; the shared_ptr
-    // carries the correct deleter regardless of the void type.
-    std::shared_ptr<void>   self_owned;
 
     // RACE CONDITION NOTE: this is safe because every code path that sets
     // `terminated = true` also calls `cv.notify_all()` *in the same critical
@@ -96,15 +86,13 @@ struct TaskStateBase {
  *   is waiting for the child to drain.
  *
  * These two cases are mutually exclusive: if the JoinHandle is being awaited it has not
- * been dropped, so the scope never holds the OwnedTask; if the handle was dropped the scope
- * owns the child and the JoinHandle can no longer call poll(). Only one waiter exists at
- * any point in the task's lifetime.
+ * been dropped; if the handle was dropped the scope tracks the child and the JoinHandle
+ * can no longer call poll(). Only one waiter exists at any point in the task's lifetime.
  *
  * Using `weak_ptr<Waker>` (rather than `shared_ptr<Waker>`) breaks the ownership cycles
- * documented in doc/shared_ptr_cycles.md. Task lifetime is anchored by OwnedTask (held
- * by the parent scope or JoinHandle), not by waker clones. Firing a stored waker becomes
- * `lock() + wake()`; if the task has been freed before the waker fires, lock() returns
- * null and the call is a silent no-op.
+ * documented in doc/shared_ptr_cycles.md. Task lifetime is anchored by the executor's
+ * owned map, not by waker clones. Firing a stored waker becomes `lock() + wake()`; if
+ * the task has been freed before the waker fires, lock() returns null and is a no-op.
  *
  * All mutable fields (except `cancelled`) are protected by `mutex`.
  * `cancelled` is an atomic so `Task::poll()` can check it without holding the lock.
@@ -146,7 +134,6 @@ struct TaskState : TaskStateBase {
             terminated = true;
             cv.notify_all();
             wk = std::move(waker);
-            self_owned.reset();  // release detached self-ref under the same lock
         }
         if (auto w = wk.lock()) w->wake();
     }
@@ -160,7 +147,6 @@ struct TaskState : TaskStateBase {
             terminated = true;
             cv.notify_all();
             wk = std::move(waker);
-            self_owned.reset();
         }
         if (auto w = wk.lock()) w->wake();
     }
@@ -175,7 +161,6 @@ struct TaskState : TaskStateBase {
             terminated = true;
             cv.notify_all();
             wk = std::move(waker);
-            self_owned.reset();
         }
         if (auto w = wk.lock()) w->wake();
     }
@@ -189,7 +174,6 @@ struct TaskState : TaskStateBase {
             terminated = true;
             cv.notify_all();
             wk = std::move(waker);
-            self_owned.reset();
         }
         if (auto w = wk.lock()) w->wake();
     }

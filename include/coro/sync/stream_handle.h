@@ -26,8 +26,8 @@ struct Channel {
     std::size_t            capacity;
     bool                   closed   = false;
     std::exception_ptr     exception;
-    std::shared_ptr<Waker> producer_waker;  // wake when buffer has space
-    std::shared_ptr<Waker> consumer_waker;  // wake when buffer has items or stream is closed
+    std::weak_ptr<Waker> producer_waker;  // wake when buffer has space
+    std::weak_ptr<Waker> consumer_waker;  // wake when buffer has items or stream is closed
 
     explicit Channel(std::size_t cap) : capacity(cap) {}
 };
@@ -56,14 +56,14 @@ public:
     StreamHandle() = default;
 
     explicit StreamHandle(std::shared_ptr<detail::Channel<T>> channel,
-                          detail::OwnedTask driver = {})
+                          std::weak_ptr<detail::TaskBase> driver = {})
         : m_channel(std::move(channel)), m_driver(std::move(driver)) {}
 
     // Cancel the driver task if the handle is dropped before the stream is exhausted.
     // Mirrors JoinHandle's cancel-on-destroy so the producer doesn't run indefinitely
-    // after the consumer is gone, and ensures the driver task is never left with no owner.
+    // after the consumer is gone.
     ~StreamHandle() {
-        if (auto task = m_driver.get())
+        if (auto task = m_driver.lock())
             task->cancel_task();
     }
 
@@ -82,9 +82,8 @@ public:
             T item = std::move(m_channel->buffer.front());
             m_channel->buffer.pop();
             auto to_wake = std::move(m_channel->producer_waker);
-            m_channel->producer_waker.reset();
             lock.unlock();
-            if (to_wake) to_wake->wake();
+            if (auto w = to_wake.lock()) w->wake();
             return std::optional<T>(std::move(item));
         }
 
@@ -93,16 +92,14 @@ public:
             return std::optional<T>(std::nullopt);
         }
 
-        m_channel->consumer_waker = ctx.getWaker()->clone();
+        m_channel->consumer_waker = ctx.get_weak_waker();
         return PollPending;
     }
 
 private:
     std::shared_ptr<detail::Channel<T>> m_channel;
-    // Lifetime anchor for the background StreamDriver task (mirrors OwnedTask in JoinHandle).
-    // Without this, the work-stealing executor's raw-pointer queue has no persistent owner,
-    // and the task can be freed before a worker calls shared_from_this() on it.
-    detail::OwnedTask m_driver;
+    // Notification/cancel ref only — lifetime is anchored by the executor's owned map.
+    std::weak_ptr<detail::TaskBase> m_driver;
 };
 
 } // namespace coro

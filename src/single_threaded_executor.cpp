@@ -16,6 +16,10 @@ void SingleThreadedExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(m_owned_mutex);
+        m_owned_tasks.insert(task);
+    }
     enqueue(std::move(task));
 }
 
@@ -73,16 +77,20 @@ bool SingleThreadedExecutor::poll_ready_tasks() {
         if (done) {
             task->scheduling_state.store(
                 detail::SchedulingState::Done, std::memory_order_relaxed);
-            // Task completed — drop it (destructor fires here).
+            {
+                std::lock_guard lock(m_owned_mutex);
+                m_owned_tasks.erase(task);
+            }
+            // Task completed — executor's owned map was the lifetime anchor; now freed.
         } else {
-            // Try Running → Idle: park the task; OwnedTask in parent holds the only persistent ref.
+            // Try Running → Idle: park the task; executor's owned map keeps it alive.
             expected = detail::SchedulingState::Running;
             if (task->scheduling_state.compare_exchange_strong(
                     expected, detail::SchedulingState::Idle,
                     std::memory_order_acq_rel,
                     std::memory_order_relaxed))
             {
-                task.reset(); // release temporary executor ref; task lives via OwnedTask
+                task.reset(); // release temporary executor ref; task lives via m_owned_tasks
             } else {
                 // CAS failed: expected now holds the actual state. The only valid
                 // state here is RunningAndNotified — wake() fired during poll().

@@ -148,6 +148,9 @@ public:
      * receiver has already been dropped, giving the caller ownership of the
      * unsent value back.
      *
+     * NOT ISR-SAFE: calls waker->wake() which touches shared_ptr ref-counts and
+     * the executor queue. Use IsrEvent::signal_from_isr() from ISR context instead.
+     *
      * @param value The value to send.
      * @return `{}` on success; `std::unexpected<U>(std::forward<U>(value))` if the receiver is gone.
      */
@@ -176,6 +179,9 @@ public:
      *
      * Returns `{}` on success; `std::unexpected(ChannelError::Closed)` if the
      * receiver has already been dropped.
+     *
+     * NOT ISR-SAFE: calls waker->wake() which touches shared_ptr ref-counts and
+     * the executor queue. Use IsrEvent::signal_from_isr() from ISR context instead.
      */
     std::expected<void, ChannelError> send() requires std::is_void_v<T> {
         std::shared_ptr<coro::detail::Waker> waker;

@@ -20,10 +20,11 @@ namespace coro::detail {
  * The scope provides the *implicit structured concurrency* guarantee: a coroutine's frame
  * is not freed until all children it spawned and then dropped have themselves finished.
  *
- * The scope owns each pending child via `OwnedTask` — the move-only wrapper that is the
- * sole persistent strong reference to the task. Wakers (used to notify the parent when a
- * child completes) are stored as `weak_ptr<Waker>` on the child's `TaskState`, not here,
- * so no reference cycle is created. See doc/task_ownership.md and doc/shared_ptr_cycles.md.
+ * The scope tracks each pending child via `weak_ptr<TaskBase>`. Lifetime is owned by the
+ * executor's `m_owned_tasks` map from spawn to terminal state — no ownership transfer is
+ * needed when a JoinHandle is dropped. Wakers (used to notify the parent when a child
+ * completes) are stored as `weak_ptr<Waker>` on the child's `TaskState`, not here,
+ * so no reference cycle is created. See doc/task_ownership.md.
  *
  * `CoroutineScope` contains a `std::mutex` and is therefore not copyable. It is movable
  * via a custom move constructor that moves the pending-child list and default-constructs
@@ -33,7 +34,7 @@ namespace coro::detail {
  *
  * ### Registration
  * When a `JoinHandle` destructor fires while `t_current_coro` is non-null, it calls
- * `add_child()` to transfer ownership of the child's `OwnedTask` to the enclosing scope.
+ * `add_child()` to record a `weak_ptr<TaskBase>` in the scope's pending list.
  *
  * ### Drain
  * After the coroutine frame is destroyed, `Coro::poll()` calls `set_drain_waker()`. This
@@ -62,25 +63,27 @@ public:
     CoroutineScope& operator=(const CoroutineScope&) = delete;
 
     /**
-     * @brief Takes ownership of a pending child task. Called from `JoinHandle::~JoinHandle()`
-     * while `t_current_coro` points to this scope.
+     * @brief Records a weak reference to a pending child task. Called from
+     * `JoinHandle::~JoinHandle()` while `t_current_coro` points to this scope.
      *
-     * `OwnedTask` is the sole persistent strong reference to the task; transferring it here
-     * means the scope now controls the task's lifetime until it completes.
+     * The executor's owned map keeps the task alive — no ownership transfer is needed.
      */
-    void add_child(OwnedTask task) {
+    void add_child(std::weak_ptr<TaskBase> task) {
         std::lock_guard lock(m_mutex);
         m_pending.push_back(std::move(task));
     }
 
     /**
-     * @brief Sweeps completed children (destroying their OwnedTask) and returns `true` if any remain.
+     * @brief Sweeps completed or expired children and returns `true` if any remain.
      */
     bool has_pending() {
         std::lock_guard lock(m_mutex);
         m_pending.erase(
             std::remove_if(m_pending.begin(), m_pending.end(),
-                [](const OwnedTask& t) { return t.is_complete(); }),
+                [](const std::weak_ptr<TaskBase>& wp) {
+                    auto t = wp.lock();
+                    return !t || t->is_complete();
+                }),
             m_pending.end());
         return !m_pending.empty();
     }
@@ -89,8 +92,8 @@ public:
      * @brief Installs a weak scope waker on all pending children and returns `true` if any remain.
      *
      * Uses a double-sweep to close the race between child completion and waker installation:
-     * 1. Remove already-done children (dropping their OwnedTask — freeing the task allocation).
-     * 2. Install the weak waker on remaining children via OwnedTask::set_scope_waker().
+     * 1. Remove already-done or expired children.
+     * 2. Install the weak waker on remaining children via TaskBase::set_waker().
      * 3. Sweep again — a child may have completed between steps 1 and 2.
      *
      * The waker is stored as `weak_ptr<Waker>` on the child's TaskState::waker.
@@ -101,23 +104,23 @@ public:
      */
     bool set_drain_waker(std::weak_ptr<Waker> waker) {
         std::lock_guard lock(m_mutex);
-        m_pending.erase(
-            std::remove_if(m_pending.begin(), m_pending.end(),
-                [](const OwnedTask& t) { return t.is_complete(); }),
-            m_pending.end());
+        auto is_done = [](const std::weak_ptr<TaskBase>& wp) {
+            auto t = wp.lock();
+            return !t || t->is_complete();
+        };
+        m_pending.erase(std::remove_if(m_pending.begin(), m_pending.end(), is_done),
+                        m_pending.end());
         if (m_pending.empty()) return false;
-        for (auto& task : m_pending)
-            task.set_waker(waker);
-        m_pending.erase(
-            std::remove_if(m_pending.begin(), m_pending.end(),
-                [](const OwnedTask& t) { return t.is_complete(); }),
-            m_pending.end());
+        for (auto& wp : m_pending)
+            if (auto t = wp.lock()) t->set_waker(waker);
+        m_pending.erase(std::remove_if(m_pending.begin(), m_pending.end(), is_done),
+                        m_pending.end());
         return !m_pending.empty();
     }
 
 private:
-    detail::Mutex          m_mutex;
-    std::vector<OwnedTask> m_pending;
+    detail::Mutex                        m_mutex;
+    std::vector<std::weak_ptr<TaskBase>> m_pending;
 };
 
 /**

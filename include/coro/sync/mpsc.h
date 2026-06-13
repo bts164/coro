@@ -308,6 +308,9 @@ public:
      * Returns an `MpscSendFuture` that resolves immediately if buffer space is
      * available, or suspends until space opens up. If the receiver is dropped
      * while suspended, resolves with `std::unexpected(value)`.
+     *
+     * NOT ISR-SAFE: calls waker->wake() which touches shared_ptr ref-counts and
+     * the executor queue. Use IsrChannel<T>::send_from_isr() from ISR context instead.
      */
     [[nodiscard]] MpscSendFuture<T> send(T value) {
         return MpscSendFuture<T>(m_shared, std::move(value));
@@ -318,6 +321,9 @@ public:
      *
      * Returns `{}` on success. On failure returns `TrySendError<T>` carrying
      * the unsent value and the reason (`Full` or `Disconnected`).
+     *
+     * NOT ISR-SAFE: calls waker->wake() on success. Use IsrChannel<T>::send_from_isr()
+     * from ISR context instead.
      */
     std::expected<void, TrySendError<T>> try_send(T value) {
         std::unique_lock lock(m_shared->mutex);
@@ -343,6 +349,9 @@ public:
      *
      * Intended for use on threads created by `spawn_blocking`. **Do not call from a
      * coroutine or executor thread** — it will block the thread and stall the executor.
+     *
+     * NOT ISR-SAFE: blocks on a condition variable and calls waker->wake(). Use
+     * IsrChannel<T>::send_from_isr() from ISR context instead.
      *
      * @return `{}` on success. `std::unexpected(value)` if the receiver was dropped
      *         while waiting.

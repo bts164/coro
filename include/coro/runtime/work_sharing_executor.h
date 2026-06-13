@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace coro {
@@ -76,6 +77,11 @@ private:
 
     std::vector<std::thread> m_workers;
     Runtime*                 m_runtime;
+
+    // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
+    // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
+    std::mutex                                                               m_owned_mutex;
+    std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
 };
 
 } // namespace coro

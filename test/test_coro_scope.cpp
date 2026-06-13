@@ -20,20 +20,14 @@ struct NeverFuture {
     PollResult<T> poll(Context&) { return PollPending; }
 };
 
-// Helper: make an OwnedTask wrapping a pending TaskImpl<NeverFuture<int>> and return
-// both the OwnedTask (for the scope) and the TaskState (for external completion control).
-static std::pair<OwnedTask, std::shared_ptr<TaskState<int>>> make_pending_int_task() {
+// Helper: make a pending TaskImpl<NeverFuture<int>>. Returns the strong ref (caller
+// acts as the executor's owned map) and the aliased TaskState for completion control.
+static std::pair<std::shared_ptr<TaskBase>, std::shared_ptr<TaskState<int>>>
+make_pending_int_task() {
     auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
-    std::shared_ptr<TaskState<int>> state = impl;  // aliased; same allocation
-    OwnedTask owned{std::shared_ptr<TaskBase>(impl)};
-    return {std::move(owned), std::move(state)};
-}
-
-// Helper: make an already-completed OwnedTask.
-static OwnedTask make_done_int_task(int value) {
-    auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
-    impl->setResult(value);  // mark terminated immediately
-    return OwnedTask(std::shared_ptr<TaskBase>(impl));
+    std::shared_ptr<TaskState<int>> state = impl;
+    std::shared_ptr<TaskBase> base = impl;
+    return {std::move(base), std::move(state)};
 }
 
 // --- CoroutineScope unit tests ---
@@ -45,21 +39,27 @@ TEST(CoroutineScopeTest, EmptyScopeHasNoPending) {
 
 TEST(CoroutineScopeTest, AddCompletedChildShowsNoPending) {
     CoroutineScope scope;
-    scope.add_child(make_done_int_task(42));
-    EXPECT_FALSE(scope.has_pending());  // swept immediately
+    {
+        auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
+        impl->setResult(42);
+        scope.add_child(std::weak_ptr<TaskBase>(impl));
+        // impl drops here → weak_ptr expires; has_pending() sweeps expired entries
+    }
+    EXPECT_FALSE(scope.has_pending());
 }
 
 TEST(CoroutineScopeTest, AddPendingChildShowsPending) {
     CoroutineScope scope;
-    auto [owned, state] = make_pending_int_task();
-    scope.add_child(std::move(owned));
+    auto [base, state] = make_pending_int_task();
+    scope.add_child(std::weak_ptr<TaskBase>(base));
     EXPECT_TRUE(scope.has_pending());
+    // base kept alive until here — mirrors the executor's owned map
 }
 
 TEST(CoroutineScopeTest, PendingChildClearsAfterCompletion) {
     CoroutineScope scope;
-    auto [owned, state] = make_pending_int_task();
-    scope.add_child(std::move(owned));
+    auto [base, state] = make_pending_int_task();
+    scope.add_child(std::weak_ptr<TaskBase>(base));
 
     EXPECT_TRUE(scope.has_pending());
     state->setResult(99);
@@ -72,18 +72,18 @@ TEST(CoroutineScopeTest, JoinHandleDropRegistersWithCurrentScope) {
     CoroutineScope scope;
     auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
     std::shared_ptr<TaskState<int>> state = impl;
-    OwnedTask owned{std::shared_ptr<TaskBase>(impl)};
-    impl.reset();  // scope/JoinHandle now hold the only refs
+    std::shared_ptr<TaskBase> base = impl;
+    impl.reset();
 
     {
         // Simulate being inside a poll() call by setting t_current_coro directly.
         t_current_coro = &scope;
-        JoinHandle<int> handle(std::move(state), std::move(owned));
-        // destructor fires with t_current_coro set → transfers OwnedTask to scope
+        JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        // destructor fires with t_current_coro set → adds weak_ptr to scope
     }
     t_current_coro = nullptr;
 
-    // The task is not yet complete, so it should be in the pending list.
+    // base still alive (acts as executor owned map) → task is pending
     EXPECT_TRUE(scope.has_pending());
 }
 
@@ -91,13 +91,13 @@ TEST(CoroutineScopeTest, DetachedJoinHandleDoesNotRegister) {
     CoroutineScope scope;
     auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
     std::shared_ptr<TaskState<int>> state = impl;
-    OwnedTask owned{std::shared_ptr<TaskBase>(impl)};
+    std::shared_ptr<TaskBase> base = impl;
     impl.reset();
 
     {
         t_current_coro = &scope;
-        JoinHandle<int> handle(std::move(state), std::move(owned));
-        std::move(handle).detach();  // detach sets self_owned on state, clears m_state/m_owned
+        JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        std::move(handle).detach();  // clears m_state/m_task_ref → destructor returns early
     }
     t_current_coro = nullptr;
 
@@ -108,15 +108,14 @@ TEST(CoroutineScopeTest, JoinHandleDropWithNullCurrentCoroDoesNotRegister) {
     CoroutineScope scope;
     auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
     std::shared_ptr<TaskState<int>> state = impl;
-    OwnedTask owned{std::shared_ptr<TaskBase>(impl)};
+    std::shared_ptr<TaskBase> base = impl;
     impl.reset();
 
     {
         // t_current_coro is null — no scope to register with
         ASSERT_EQ(t_current_coro, nullptr);
-        JoinHandle<int> handle(std::move(state), std::move(owned));
-        // destructor: t_current_coro null + cancelOnDestroy=true → cancel() called
-        // (no executor registered, so just sets cancelled=true) → not registered with scope
+        JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        // destructor: t_current_coro null → add_child not called
     }
 
     EXPECT_FALSE(scope.has_pending());

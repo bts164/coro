@@ -8,109 +8,100 @@ waker clone is a strong `shared_ptr<TaskBase>` pointing to the same allocation a
 task itself.
 
 This makes waker clones **dual-purpose**: they serve as both the *notification
-mechanism* (calling `wake()` re-enqueues the task) and the *lifetime anchor* (the
-strong reference keeps a parked task allocation alive). The executor drops its
-`shared_ptr<TaskBase>` when a task parks; waker clones stored by leaf futures then
-become the sole thing keeping the task alive until something wakes it.
-
-The problem is that every future that needs to notify a task must also own a strong
-reference to it. For the `CoroutineScope` this creates a persistent strong cycle
-(Cycle 3 in [shared_ptr_cycles.md](shared_ptr_cycles.md)):
+mechanism* (calling `wake()` re-enqueues the task) and as a *strong reference* to the
+task allocation. The problem is that any future which needs to notify a task also holds
+a strong reference to it. For the `CoroutineScope` this creates a persistent strong
+cycle:
 
 ```mermaid
 graph TD
     Parent["TaskImpl (parent)"] -->|"owns"| Scope["CoroutineScope"]
-    Scope -->|"m_pending\nOwnedTask — strong"| ChildState["TaskImpl (child)"]
-    ChildState -->|"TaskState::waker\nshared_ptr&lt;Waker&gt; — strong"| Parent
+    Scope -->|"m_pending — strong"| Child["TaskImpl (child)"]
+    Child -->|"TaskState::waker\nshared_ptr&lt;Waker&gt; — strong"| Parent
 ```
 
-The child holds a strong reference to the parent through `scope_waker`, and the
-parent holds a strong reference to the child through `m_pending`. Both are required
-for structured concurrency to work — the parent must track children, and children must
-be able to wake the parent. The cycle is the mechanism; it cannot be removed without
-also removing the guarantee.
-
-The fix is to separate the two roles that waker clones currently play.
+Both edges are load-bearing — the parent must track children, and children must be
+able to wake the parent — so the cycle cannot be removed without changing the mechanism.
 
 ---
 
 ## Design
 
-Two complementary changes decouple task lifetime from waker notification:
+Two complementary changes break all cycles and provide a clean ownership hierarchy:
 
-**`OwnedTask`** — a move-only wrapper that is the sole persistent strong reference to
-a task. It controls when the task allocation is freed. No other entity holds a
-persistent strong reference.
+**Executor-owned task list** — the executor holds a `shared_ptr<TaskBase>` for every
+live task, from spawn until the task reaches a terminal state. This is always the
+authoritative lifetime anchor. No other entity needs to hold a persistent strong
+reference to a `TaskBase`/`TaskImpl` allocation while the task is running. `OwnedTask`
+as a concept is eliminated: the executor IS the owner.
 
 **`weak_ptr<Waker>` storage** — all fields that store wakers for later notification
-(`TaskState::waker`, leaf future waker fields) change from `shared_ptr<Waker>`
-to `weak_ptr<Waker>`. `TaskBase` and the `Waker` interface are otherwise unchanged.
-Firing a stored waker becomes `lock()` + `wake()` rather than `->wake()`. If the task
-has been freed before the waker fires, `lock()` returns null and the call is a
-silent no-op.
+change from `shared_ptr<Waker>` to `weak_ptr<Waker>`. `TaskBase` and the `Waker`
+interface are otherwise unchanged. Firing a stored waker becomes `lock()` + `wake()`
+rather than `->wake()`. If the task has been freed before the waker fires, `lock()`
+returns null and the call is a safe no-op.
 
 With these two changes, the reference graph for Cycle 3 becomes:
 
 ```mermaid
 graph TD
-    Parent["TaskImpl (parent)"] -->|"owns"| Scope["CoroutineScope"]
-    Scope -->|"m_pending: OwnedTask — strong"| Child["TaskImpl (child)"]
-    Child -. "TaskState::waker: weak_ptr&lt;Waker&gt; — weak" .-> Parent
+    Executor -->|"owned list: shared_ptr — strong"| Parent
+    Executor -->|"owned list: shared_ptr — strong"| Child
+    Parent -->|"owns"| Scope["CoroutineScope"]
+    Scope -. "m_pending: weak_ptr — weak" .-> Child
+    Child -. "TaskState::waker: weak_ptr — weak" .-> Parent
 ```
 
-The dashed (weak) edge does not contribute to the reference count. The cycle is
-broken. The parent is kept alive by its *own* `OwnedTask` held in the grandparent's
-`JoinHandle` or `CoroutineScope` — not by the child.
+The executor is the root. Both edges in the former cycle are now weak. The parent's
+allocation is kept alive by the executor's owned list, not by any child-held reference.
 
 ---
 
-## `OwnedTask`
+## Executor-owned task list
 
-`OwnedTask` is a move-only type wrapping `shared_ptr<TaskBase>`. The copy constructor
-and copy-assignment are deleted; transfer is always explicit.
+The executor maintains an intrusive doubly-linked list of all live tasks. The list node
+is embedded directly in `TaskBase` — no separate allocation per entry. The list is
+protected by a single mutex and is accessed at three points only:
 
-```cpp
-class OwnedTask {
-public:
-    OwnedTask(OwnedTask&&) noexcept = default;
-    OwnedTask& operator=(OwnedTask&&) noexcept = default;
+- **Spawn** — insert the new task into the list
+- **Completion** — remove the task; if no `shared_ptr<TaskState<T>>` references remain,
+  the allocation is freed immediately
+- **Shutdown** — iterate, cancel all tasks, and drain before returning from `block_on`
 
-    OwnedTask(const OwnedTask&)            = delete;
-    OwnedTask& operator=(const OwnedTask&) = delete;
+Normal polling never touches this list. The mutex is rarely contended.
 
-    // Type-erased lifecycle queries — delegate to TaskBase virtuals.
-    bool is_complete() const;
-    void set_waker(std::weak_ptr<Waker> waker);
+This replaces `OwnedTask` as the mechanism that keeps a parked task alive between the
+executor dropping its queue reference and the task being woken back into the queue. The
+executor's owned list always covers this window.
 
-    // Temporary strong-reference access — for cancel() and executor enqueue only.
-    // The returned shared_ptr must not be stored persistently.
-    const std::shared_ptr<TaskBase>& get() const;
-    std::weak_ptr<TaskBase> get_weak() const;
-};
+---
+
+## `JoinHandle<T>` — result access only
+
+`JoinHandle<T>` holds a single `shared_ptr<TaskState<T>>`. This serves two purposes:
+
+- While the task is running, it provides typed access to the result slot once the task
+  completes (aliased into the same `TaskImpl` allocation as `TaskBase`).
+- After the executor removes the task from its owned list at completion, if the
+  `JoinHandle` is still alive it becomes the sole surviving reference to the allocation,
+  keeping it live until the result is consumed.
+
+`JoinHandle` no longer holds an `OwnedTask` and is no longer the task's lifetime anchor
+while the task is running — the executor's owned list handles that.
+
+```mermaid
+flowchart TD
+    Spawn["spawn(future)"]
+    Exec["Executor owned list\nshared_ptr&lt;TaskBase&gt; — strong"]
+    JH["JoinHandle&lt;T&gt;\nshared_ptr&lt;TaskState&lt;T&gt;&gt; — result access"]
+
+    Spawn -->|"inserts into"| Exec
+    Spawn -->|"produces"| JH
+
+    JH -->|"co_await: task completes"| Await["result extracted\nJoinHandle dropped → allocation freed\n(or earlier if executor removes first)"]
+    JH -->|"dropped without co_await"| Cancel["cancel flag set\ntask drains; executor removes at completion"]
+    JH -->|"detach()"| Detach["JoinHandle dropped; no cancel\ntask tracked by executor until completion"]
 ```
-
-The "sole persistent strong reference" contract is by convention: any code that
-obtains a temporary strong reference (via `get()` or by locking a `weak_ptr`) must
-not store it persistently. This is the same convention as `std::mutex` — you may lock
-it temporarily but you do not copy or store it.
-
-To allow type-erased lifecycle queries through `OwnedTask`, `TaskBase` exposes virtual
-methods:
-
-```cpp
-class TaskBase : ... {
-    virtual bool is_complete() const = 0;
-    virtual void set_waker(std::weak_ptr<Waker> waker) = 0;
-    virtual void on_task_complete() noexcept {}   // default no-op; overridden by JoinSetTask
-    virtual void cancel_task() noexcept {}         // default no-op; overridden by TaskImpl<F>
-};
-```
-
-`TaskImpl<F>` implements `is_complete()` and `set_waker()` by delegating to its inherited
-`TaskState<T>` subobject. `on_task_complete()` is called at every terminal exit from
-`TaskImpl<F>::poll()` (after `setResult`, `setException`, or `mark_done`); the default
-no-op is overridden by `JoinSetTask<F>` to perform JoinSet bookkeeping.
-`CoroutineScope::m_pending` holds `OwnedTask` objects directly.
 
 ---
 
@@ -148,95 +139,125 @@ Running; it is dropped when `poll()` returns. It is not stored anywhere.
 
 ---
 
-## Ownership Flow
+## JoinSet tasks
 
-`JoinHandle<T>` holds two aliased references into the same `TaskImpl<F>` allocation:
+`JoinSet::spawn()` allocates a `JoinSetTask<F>` covering the executor-facing `TaskBase`
+and the result-holding `TaskState<T>`. Unlike a regular spawned task, there is no
+`JoinHandle` — the consumer reads results via the `JoinSetSharedState`.
 
-- **`OwnedTask m_owned`** — the lifetime anchor (move-only).
-- **`shared_ptr<TaskState<T>> m_state`** — aliased pointer for typed result access.
+With executor-level ownership, `JoinSetSharedState::pending_handles` no longer needs
+to anchor each task's lifetime. It uses an intrusive list of raw `JoinSetTask*` pointers
+(safe because the executor's owned list guarantees the tasks remain live) with O(1)
+insertion, removal, and iteration:
 
 ```mermaid
-flowchart TD
-    Spawn["spawn(future)"]
-    JH["JoinHandle&lt;T&gt;\n───────────────────\nOwnedTask m_owned\nshared_ptr&lt;TaskState&lt;T&gt;&gt; m_state"]
+graph TD
+    JS["JoinSet&lt;T&gt;"]
+    State["JoinSetSharedState&lt;T&gt;\n──────────────────────────\npending_handles: intrusive list\nidle_handles: deque&lt;shared_ptr&lt;TaskState&lt;T&gt;&gt;&gt;"]
+    Task["JoinSetTask&lt;F&gt;"]
 
-    Spawn -->|"produces"| JH
-
-    JH -->|"co_await: task completes"| Await["result extracted\nOwnedTask destroyed → TaskImpl freed"]
-    JH -->|"dropped inside coroutine"| Scope["CoroutineScope::m_pending\nholds OwnedTask"]
-    JH -->|"detach()"| Detach["OwnedTask moved into\ntask's self_owned field"]
-
-    Scope -->|"child completes"| ScopeDone["OwnedTask destroyed\nTaskImpl freed"]
-    Detach -->|"task reaches terminal state"| DetachDone["self_owned cleared\nTaskImpl freed"]
+    JS -->|"m_state: shared_ptr — strong"| State
+    State -->|"pending_handles: raw ptr — non-owning"| Task
+    Task -. "m_set_state: weak_ptr — weak" .-> State
 ```
 
-Neither reference creates a cycle: `JoinHandle` is external to the task and nothing
-inside the task points back to it.
+On task completion, `on_task_complete()` unlinks `this` from `pending_handles` in O(1)
+via the embedded intrusive list node. An aliased `shared_ptr<TaskState<T>>` (into the
+same allocation) is moved to `idle_handles` for the consumer to read. At this point the
+executor still holds the task via its owned list; when both the executor's owned-list
+entry and the `idle_handles` entry are dropped, the allocation is freed.
+
+On `JoinSet` destruction, `cancel_pending()` iterates `pending_handles`, calls
+`cancel_task()` on each, and clears the list. No ownership transfer to a `CoroutineScope`
+is needed: the executor's owned list keeps every cancelled task alive, and the
+executor-level drain on shutdown ensures all cancelled tasks reach a terminal state
+before `block_on` returns.
 
 ---
 
-## Detached Tasks
+## Stream tasks
 
-When `JoinHandle::detach()` is called, the caller surrenders ownership. No parent
-holds the `OwnedTask`, so the task must anchor its own lifetime until it reaches a
-terminal state.
+`StreamHandle<T>` holds a `shared_ptr<Channel<T>>` for the consumer end of the channel.
+The background `StreamDriver` task is tracked by the executor's owned list like any
+other spawned task — no `OwnedTask` is needed in `StreamHandle`.
 
-`detach()` moves the `OwnedTask` into a `self_owned` field on `TaskBase` itself.
-Every terminal method (`setResult`, `setDone`, `setException`, `mark_done`) clears
-`self_owned` inside the same critical section that sets `terminated = true` and fires
-the wakers. When the executor's temporary strong reference (from the ready queue) is
-subsequently dropped, the refcount reaches zero and the task frees itself.
+When `StreamHandle` is dropped, the channel's consumer end is closed. `StreamDriver`
+detects this on its next poll (channel write returns a closed-channel error) and returns
+`PollDropped`, after which the executor removes it from the owned list and the allocation
+is freed.
+
+For rapid cancellation without waiting for the driver to reach its next natural poll,
+`StreamHandle` can call `cancel_task()` on the driver via a `weak_ptr<TaskBase>` — this
+wakes the driver immediately so it polls and exits in the next executor cycle. The
+`weak_ptr` does not anchor the driver's lifetime; that is the executor's job.
 
 ```mermaid
-graph LR
-    Task["TaskImpl&lt;F&gt;"] -->|"self_owned: OwnedTask"| Task
+graph TD
+    SH["StreamHandle&lt;T&gt;\nshared_ptr&lt;Channel&lt;T&gt;&gt;\nweak_ptr&lt;TaskBase&gt; (for cancel)"]
+    Driver["TaskImpl&lt;StreamDriver&lt;S&gt;&gt;"]
+    Channel["Channel&lt;T&gt;\nweak_ptr&lt;Waker&gt; producer_waker\nweak_ptr&lt;Waker&gt; consumer_waker"]
+
+    SH -->|"m_channel: shared_ptr — strong"| Channel
+    Driver -->|"m_channel: shared_ptr — strong"| Channel
+    Channel -. "producer_waker: weak_ptr — weak" .-> Driver
+    Channel -. "consumer_waker: weak_ptr — weak" .-> ConsumerTask["consumer TaskImpl"]
 ```
 
-The self-reference is set before the task is first enqueued, so there is no window
-where neither the caller's `OwnedTask` nor `self_owned` exists.
-
-This is an intentional self-cycle with a guaranteed break point at task completion.
-If the executor orphans a detached task and never polls it to a terminal state, the
-self-reference leaks — but this is the same failure mode as the current design, where
-waker clones would leak indefinitely. The self-reference does not introduce a new
-leak class; it moves the responsibility for the leak from implicit waker-clone lifetime
-to an explicit, auditable field.
+!!! warning "WARNING: Channel waker fields must remain weak_ptr"
+    Do not change `Channel::producer_waker` or `Channel::consumer_waker` to `shared_ptr<Waker>`.
+    Both fields form cycles through the task graph that prevent allocations from ever being freed
+    when a task is cancelled. Use `ctx.get_weak_waker()` to set them and `lock()` before firing.
 
 ---
 
-## Reference Categories
+## Detached tasks
+
+When `JoinHandle::detach()` is called, the caller surrenders ownership of the result.
+The task continues running and is tracked by the executor's owned list like any other
+task. No `self_owned` self-reference is needed — the executor guarantees the allocation
+remains live until the task reaches a terminal state.
+
+On `JoinHandle` drop without `detach()` (with `cancelOnDestroy = true`): the cancel
+flag is set and the task will drain. The executor's owned list keeps it alive through
+the drain.
+
+On shutdown, the executor cancels all tracked tasks (including detached ones) and drains
+them before `block_on` returns. Detached tasks are therefore not truly "fire and forget"
+with respect to memory — they are cleaned up safely on shutdown — but they are decoupled
+from any `CoroutineScope` and do not block their spawning coroutine from returning.
+
+---
+
+## Reference categories
 
 Every `shared_ptr` or `weak_ptr` touching a `TaskBase`/`TaskState` allocation falls
-into one of four categories. Knowing which category a reference belongs to makes it
-easy to audit new code for correctness.
+into one of four categories.
 
 ---
 
-### Category 1 — `OwnedTask`: the sole persistent lifetime anchor
+### Category 1 — Executor owned list: the authoritative lifetime anchor
 
-`OwnedTask` is the single entity whose lifetime controls when the `TaskImpl` allocation
-is freed. Exactly one `OwnedTask` exists per live task. It is held by:
+The executor holds one `shared_ptr<TaskBase>` per live task in its owned-list from
+spawn until terminal state. This is the single entity whose lifetime controls when the
+`TaskImpl` allocation MAY be freed (the actual free happens when all Category 2
+references are also released).
 
-- `JoinHandle::m_owned` — for spawned tasks awaited by a parent coroutine
-- `CoroutineScope::m_pending` — after a `JoinHandle` is dropped inside a coroutine
-- `TaskStateBase::self_owned` — for detached tasks (self-reference cleared at completion)
-
-Code review rule: if you are storing a `shared_ptr<TaskBase>` in a data structure
-that outlives the current call stack, you are creating a second persistent lifetime
-anchor — which violates the ownership model. Use `OwnedTask` explicitly or justify
-why a second anchor is correct.
+No other data structure may hold a persistent `shared_ptr<TaskBase>` as a lifetime
+anchor. The executor's owned list is the only correct place.
 
 ---
 
-### Category 2 — Companion aliased `shared_ptr<TaskState<T>>`
+### Category 2 — `shared_ptr<TaskState<T>>`: result access and post-completion lifetime
 
-`JoinHandle` holds `m_state: shared_ptr<TaskState<T>>` alongside `m_owned`. Both are
-aliased `shared_ptr`s into the same `TaskImpl` allocation — they share one reference
-count and contribute no extra heap object. `m_state` exists solely for typed result
-access (`poll()`, reading the value after completion). It does not independently
-anchor the task lifetime; `m_owned` does that.
+`JoinHandle<T>` holds `m_state: shared_ptr<TaskState<T>>`. Both Category 1 and
+Category 2 are aliased `shared_ptr`s into the same `TaskImpl` allocation — they share
+one reference count.
 
-`Runtime::block_on()` uses this same pattern without an explicit `OwnedTask`:
+Category 2 references exist for result reading (`poll()`, reading the value after
+completion). After the executor removes the task at terminal state, any surviving
+Category 2 references extend the allocation's lifetime until they are released.
+
+`block_on` uses this same pattern for its root task:
 
 ```cpp
 auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
@@ -246,9 +267,8 @@ m_executor->wait_for_completion(*state);
 // state keeps TaskImpl alive on the call stack for the duration of block_on()
 ```
 
-`state` is the sole persistent strong reference for the root task. It lives on the
-`block_on` call stack until `wait_for_completion` returns, keeping the task alive even
-after the executor parks it. No `OwnedTask` is needed here.
+`JoinSet::idle_handles` also holds `shared_ptr<TaskState<T>>` aliased into the
+`JoinSetTask` allocation, keeping it alive until the consumer reads the result.
 
 ---
 
@@ -256,17 +276,8 @@ after the executor parks it. No `OwnedTask` is needed here.
 
 Executor queues (`m_ready`, `m_local_queues`, `m_injection_queue`, `m_incoming_wakes`)
 hold `shared_ptr<TaskBase>`. These exist only while the task is in the `Notified` or
-`Running` state:
-
-- **Notified**: the task is in the ready queue waiting to be polled. The executor queue
-  reference keeps it alive because the task has not yet been parked and no leaf-future
-  waker holds a strong reference at this point.
-- **Running**: the worker loop holds the `shared_ptr` in a local variable while polling.
-
-When the task parks (`Running → Idle`), the executor drops its reference and `OwnedTask`
-(Category 1) becomes the sole surviving strong reference. If the executor queue held a
-`weak_ptr` instead, the task could be freed between enqueue and poll — which would be
-a use-after-free.
+`Running` state. They are in addition to, not instead of, the Category 1 owned-list
+entry.
 
 These references **must not** be changed to `weak_ptr`.
 
@@ -276,17 +287,14 @@ These references **must not** be changed to `weak_ptr`.
 
 All wakers stored for later notification are `weak_ptr<Waker>`:
 
-- `TaskState::waker` — a single slot shared between `JoinHandle::poll()` (set while the
-  caller awaits the result) and `CoroutineScope::set_waker()` (set while the scope waits
-  for a dropped child to drain). These two uses are mutually exclusive: a handle is either
-  being co_awaited (not dropped) or it has been dropped into a scope (not awaited).
+- `TaskState::waker` — a single slot shared between `JoinHandle::poll()` (while the
+  caller awaits the result) and `CoroutineScope` (while the scope waits for a dropped
+  child to drain).
 - Leaf futures (uv_future, sleep, channels, etc.) — store the waker from `ctx.get_weak_waker()`
 
 A `weak_ptr<Waker>` does not contribute to the reference count of the task it points
 at. Firing is `if (auto w = stored_waker.lock()) w->wake()`. If the task has already
-been freed (its `OwnedTask` dropped), `lock()` returns null and the call is a safe
-no-op. If the task is alive, `lock()` produces a transient strong `shared_ptr<Waker>`
-that is released immediately after `wake()` returns.
+been freed, `lock()` returns null and the call is a safe no-op.
 
 **This is the correct storage type for any waker that will be held across a suspension
 point.** Using `shared_ptr<Waker>` instead creates an ownership cycle because
@@ -300,54 +308,66 @@ See [shared_ptr_cycles.md](shared_ptr_cycles.md) for the full cycle analysis.
 
 | Usage | Type | Category | Why |
 |---|---|---|---|
-| `CoroutineScope::m_pending` | `vector<OwnedTask>` | 1 — lifetime anchor | sole persistent strong ref for dropped children |
-| `JoinHandle::m_owned` | `OwnedTask` | 1 — lifetime anchor | sole persistent strong ref for spawned task |
-| `JoinSetSharedState::pending_handles` | `set<shared_ptr<TaskBase>>` | 1 — lifetime anchor | strong refs to running JoinSet tasks while Idle between polls |
-| `TaskStateBase::self_owned` | `shared_ptr<void>` | 1 — lifetime anchor | detached task self-reference; cleared at terminal state |
-| `JoinHandle::m_state` | `shared_ptr<TaskState<T>>` | 2 — companion alias | typed result access; same allocation as m_owned |
-| `JoinSetSharedState::idle_handles` | `list<shared_ptr<TaskState<T>>>` | 2 — companion alias | aliased into same JoinSetTask allocation; consumer reads result directly |
-| `Runtime::block_on()` `state` | `shared_ptr<TaskState<T>>` | 2 — companion alias | root task anchor for synchronous call stack |
+| Executor owned list entry | `shared_ptr<TaskBase>` | 1 — lifetime anchor | authoritative owner from spawn to terminal state |
+| `JoinHandle::m_state` | `shared_ptr<TaskState<T>>` | 2 — result access | typed result access; same allocation; extends lifetime after executor removes at completion |
+| `JoinSetSharedState::idle_handles` | `deque<shared_ptr<TaskState<T>>>` | 2 — result access | aliased into `JoinSetTask` allocation; consumer reads result directly |
+| `Runtime::block_on()` local `state` | `shared_ptr<TaskState<T>>` | 2 — result access | root task anchor for synchronous call stack |
 | Executor queue entries | `shared_ptr<TaskBase>` | 3 — temporary (Notified/Running) | task must stay alive between enqueue and poll |
 | `TaskState::waker` | `weak_ptr<Waker>` | 4 — notification only | shared slot for JoinHandle awaiter and CoroutineScope drain; must not create cycle |
 | Leaf future waker fields | `weak_ptr<Waker>` | 4 — notification only | fires task wake from I/O or timer callback |
+| `Channel::producer_waker` | `weak_ptr<Waker>` | 4 — notification only | wakes StreamDriver when buffer has space; must not create cycle |
+| `Channel::consumer_waker` | `weak_ptr<Waker>` | 4 — notification only | wakes consumer task when buffer has items or stream is closed; must not create cycle |
+| `CoroutineScope::m_pending` | `vector<weak_ptr<TaskBase>>` | — non-owning | drain tracking only; executor's owned list provides lifetime |
+| `JoinSetSharedState::pending_handles` | intrusive list of `JoinSetTask*` | — non-owning | O(1) task lookup/removal; executor's owned list provides lifetime |
+| `StreamHandle` driver ref | `weak_ptr<TaskBase>` | — non-owning | cancel-on-drop only; executor's owned list provides lifetime |
 
 ---
 
-## Cycle Analysis
+## Cycle analysis
 
 | Cycle | Status |
 |---|---|
 | 1: `TaskImpl → Coro → CoroutineScope → shared_ptr<Waker> → TaskImpl` | **Eliminated** — `m_drain_waker` removed; waker storage is `weak_ptr` |
-| 2: `JoinSetSharedState → pending_handles → JoinSetTask → JoinSetSharedState` | **Eliminated** — `JoinSetTask::m_set_state` is `weak_ptr<JoinSetSharedState>`; no strong back-reference |
-| 3: `CoroutineScope → TaskState_child → waker → TaskBase_parent → TaskImpl_parent` | **Eliminated** — `TaskState::waker` is `weak_ptr<Waker>`; weak edge does not close the cycle |
+| 2: `JoinSetSharedState → pending_handles → JoinSetTask → JoinSetSharedState` | **Eliminated** — `JoinSetTask::m_set_state` is `weak_ptr<JoinSetSharedState>`; `pending_handles` uses raw pointers, not strong refs |
+| 3: `CoroutineScope → TaskState_child → waker → TaskBase_parent` | **Eliminated** — `CoroutineScope::m_pending` uses `weak_ptr`; `TaskState::waker` is `weak_ptr`; no strong edge in either direction |
 | 4: `TaskImpl → TaskState::self_waker → shared_ptr<Waker> → TaskImpl` | **Eliminated** — `self_waker` removed; no future stores a strong waker pointing back to its own task |
-| Detached self-ref: `TaskImpl → self_owned → TaskImpl` | Intentional; guaranteed to break at task completion |
+| Detached task self-ref: `TaskImpl → self_owned → TaskImpl` | **Eliminated** — `self_owned` removed; executor's owned list is the lifetime anchor for detached tasks |
+| 5: `StreamDriver → m_channel → producer_waker (strong) → StreamDriver` | **Eliminated** — `Channel::producer_waker` is `weak_ptr<Waker>` |
+| 6: `consumer_task → StreamHandle → m_channel → consumer_waker (strong) → consumer_task` | **Eliminated** — `Channel::consumer_waker` is `weak_ptr<Waker>` |
 
 ---
 
 ## Invariants
 
-**1. `OwnedTask` is the sole entity that may hold a persistent strong `shared_ptr<TaskBase>`.**
-Temporary strong references (executor queue, `weak_ptr::lock()` during waker firing)
-are held only for the duration of the current call and are never stored in any data
-structure.
+**1. The executor's owned list is the sole persistent `shared_ptr<TaskBase>`.**
+No other data structure holds a persistent strong reference to a `TaskBase` allocation
+while the task is alive. Temporary strong references (executor queue entries,
+`weak_ptr::lock()` during waker firing, `shared_from_this()` during `on_task_complete()`)
+are held only for the duration of the current call stack and are never stored.
 
-**2. `OwnedTask` outlives all code paths that lock the task's `weak_ptr<Waker>`.**
-Locking during `wake()` obtains only a transient strong reference. If `OwnedTask` has
-already been destroyed, `lock()` returns null and the call is a safe no-op.
+**2. The executor inserts each task exactly once (at spawn) and removes it exactly once
+(at terminal state).**
+Between these two events, the executor's owned list guarantees the allocation is live.
+After removal, any remaining Category 2 references (`JoinHandle::m_state`,
+`JoinSetSharedState::idle_handles`) extend the allocation until they are released.
 
-**3. `OwnedTask` is destroyed only after the task reaches a terminal state or has
-been drained by `CoroutineScope`.**
-`CoroutineScope` drops an `OwnedTask` only after `is_complete()` returns true.
-`JoinHandle` drops `OwnedTask` only after polling confirms the task has terminated.
-These are enforced by the existing draining protocol in `Coro<T>` and `CoroutineScope`.
+**3. `weak_ptr<Waker>` is always used for stored wakers.**
+`Category 4` wakers must use `get_weak_waker()` and `lock()` before firing. Using
+`shared_ptr<Waker>` for any stored waker field creates a reference cycle through the
+task graph.
 
-**4. For detached tasks, `self_owned` is set before the task's first enqueue.**
-`detach()` sets `TaskBase::self_owned` before calling `schedule()` on the executor.
-There is no window where neither the caller's `OwnedTask` nor `self_owned` holds a
-strong reference.
+**4. `cancel_pending()` may iterate raw task pointers safely.**
+Because the executor's owned list keeps every tracked task alive, iterating
+`JoinSetSharedState::pending_handles` (raw pointers) or `CoroutineScope::m_pending`
+(`weak_ptr<TaskBase>`) is safe as long as the iteration happens while the executor is
+running and before the owned list entry is removed (i.e., before terminal state). Under
+the shared mutex, this is always the case.
 
-**5. Terminal methods clear `self_owned` exactly once, under the task state mutex.**
-`mark_done`, `setResult`, `setDone`, and `setException` clear `self_owned` inside the
-same critical section that sets `terminated = true`. This ensures the self-reference
-is released on every terminal path and cannot be cleared twice.
+**5. `cancel_pending()` does not need to transfer tasks to a `CoroutineScope`.**
+The executor-level drain on shutdown ensures all cancelled tasks reach a terminal state
+before `block_on` returns. `add_child()` is no longer required for JoinSet cancellation.
+
+**6. Detached tasks are tracked by the executor.**
+`JoinHandle::detach()` removes the handle's Category 2 reference. The executor's owned
+list keeps the task alive. On shutdown, the executor cancels and drains all tracked
+tasks including detached ones — no self-reference or external anchor is needed.

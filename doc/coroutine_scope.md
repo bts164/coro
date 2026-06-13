@@ -206,7 +206,9 @@ thread-local to identify which scope to register with.
 
 When a `JoinHandle` is destroyed and `t_current_coro` is non-null, the destructor:
 1. Sets `cancelled = true` on the child `TaskState` (via `cancel()`).
-2. Calls `t_current_coro->add_child(std::move(m_owned))` to transfer ownership of the child's `OwnedTask` to the scope.
+2. Records a `weak_ptr<TaskBase>` to the child in the scope's pending list so the
+   scope can track drain completion. The executor's owned list keeps the child alive
+   — no ownership transfer is needed.
 
 The `JoinHandle` destructor fires during the coroutine body's LIFO unwind (guaranteed by
 the frame lifetime invariant above), so `t_current_coro` is always valid at that point.

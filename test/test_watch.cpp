@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "executor_traits.h"
 #include <coro/coro.h>
 #include <coro/co_invoke.h>
 #include <coro/sync/watch.h>
@@ -7,56 +8,62 @@
 
 using namespace coro;
 
-// --- Concept checks ---
 static_assert(Future<WatchChangedFuture<int>>);
 
-// --- Construction ---
+template<typename Traits>
+class WatchTest : public testing::Test {
+protected:
+    Traits traits;
+};
+TYPED_TEST_SUITE(WatchTest, AllExecutors);
 
-TEST(WatchTest, ChannelReturnsLinkedPair) {
+// --- Construction / synchronous API ---
+
+TYPED_TEST(WatchTest, ChannelReturnsLinkedPair) {
     auto [tx, rx] = watch_channel<int>(0);
     (void)tx; (void)rx;
 }
 
-TEST(WatchTest, SenderIsMovable) {
+TYPED_TEST(WatchTest, SenderIsMovable) {
     auto [tx, rx] = watch_channel<int>(0);
     auto tx2 = std::move(tx);
     (void)tx2; (void)rx;
 }
 
-TEST(WatchTest, ReceiverIsMovable) {
+TYPED_TEST(WatchTest, ReceiverIsMovable) {
     auto [tx, rx] = watch_channel<int>(0);
     auto rx2 = std::move(rx);
     (void)tx; (void)rx2;
 }
 
-TEST(WatchTest, ReceiverIsCloneable) {
+TYPED_TEST(WatchTest, ReceiverIsCloneable) {
     auto [tx, rx] = watch_channel<int>(0);
     auto rx2 = rx.clone();
     (void)tx; (void)rx2;
 }
 
-TEST(WatchTest, SenderIsCloneable) {
+TYPED_TEST(WatchTest, SenderIsCloneable) {
     auto [tx, rx] = watch_channel<int>(0);
     auto tx2 = tx.clone();
     (void)tx2; (void)rx;
 }
 
-TEST(WatchTest, ClonedSenderCanSend) {
+TYPED_TEST(WatchTest, ClonedSenderCanSend) {
     auto [tx, rx] = watch_channel<int>(0);
     auto tx2 = tx.clone();
     EXPECT_TRUE(tx2.send(99).has_value());
     EXPECT_EQ(*rx.borrow(), 99);
 }
 
-TEST(WatchTest, ChannelRemainsOpenWhenOneSenderDropped) {
+TYPED_TEST(WatchTest, ChannelRemainsOpenWhenOneSenderDropped) {
     auto [tx, rx] = watch_channel<int>(0);
     auto tx2 = tx.clone();
-    { auto dropped = std::move(tx); }  // first sender dropped — channel still open
+    { auto dropped = std::move(tx); }
     EXPECT_TRUE(tx2.send(42).has_value());
     EXPECT_EQ(*rx.borrow(), 42);
 }
 
-TEST(WatchTest, ChannelClosedWhenAllSendersDropped) {
+TYPED_TEST(WatchTest, ChannelClosedWhenAllSendersDropped) {
     auto [tx, rx] = watch_channel<int>(0);
     auto tx2 = tx.clone();
     { auto d1 = std::move(tx); }
@@ -64,35 +71,29 @@ TEST(WatchTest, ChannelClosedWhenAllSendersDropped) {
     EXPECT_TRUE(rx.sender_dropped());
 }
 
-TEST(WatchTest, ChangedErrorOnlyAfterAllSendersDropped) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, ChangedErrorOnlyAfterAllSendersDropped) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
         auto tx2 = tx.clone();
-        { auto dropped = std::move(tx); }  // one sender dropped — channel still open
-
-        // tx2 still alive — send advances version, changed() must resolve with success
+        { auto dropped = std::move(tx); }
         tx2.send(1);
         auto r1 = co_await rx.changed();
-        EXPECT_TRUE(r1.has_value());  // not SenderDropped
-
-        { auto dropped = std::move(tx2); }  // last sender dropped
+        EXPECT_TRUE(r1.has_value());
+        { auto dropped = std::move(tx2); }
         auto r2 = co_await rx.changed();
         EXPECT_FALSE(r2.has_value());
         EXPECT_EQ(r2.error(), ChannelError::SenderDropped);
     }());
 }
 
-// --- Synchronous send / borrow ---
-
-TEST(WatchTest, SendSucceedsWithLiveReceiver) {
+TYPED_TEST(WatchTest, SendSucceedsWithLiveReceiver) {
     auto [tx, rx] = watch_channel<int>(0);
     auto r = tx.send(42);
     EXPECT_TRUE(r.has_value());
     (void)rx;
 }
 
-TEST(WatchTest, SendReturnsValueWhenAllReceiversDropped) {
+TYPED_TEST(WatchTest, SendReturnsValueWhenAllReceiversDropped) {
     auto [tx, rx] = watch_channel<int>(0);
     { auto dropped = std::move(rx); }
     auto r = tx.send(42);
@@ -100,21 +101,19 @@ TEST(WatchTest, SendReturnsValueWhenAllReceiversDropped) {
     EXPECT_EQ(r.error(), 42);
 }
 
-TEST(WatchTest, BorrowReadsInitialValue) {
+TYPED_TEST(WatchTest, BorrowReadsInitialValue) {
     auto [tx, rx] = watch_channel<int>(7);
-    auto guard = rx.borrow();
-    EXPECT_EQ(*guard, 7);
+    EXPECT_EQ(*rx.borrow(), 7);
     (void)tx;
 }
 
-TEST(WatchTest, BorrowReflectsLatestSend) {
+TYPED_TEST(WatchTest, BorrowReflectsLatestSend) {
     auto [tx, rx] = watch_channel<int>(0);
     tx.send(99);
-    auto guard = rx.borrow();
-    EXPECT_EQ(*guard, 99);
+    EXPECT_EQ(*rx.borrow(), 99);
 }
 
-TEST(WatchTest, BorrowArrowOperator) {
+TYPED_TEST(WatchTest, BorrowArrowOperator) {
     struct Point { int x, y; };
     auto [tx, rx] = watch_channel<Point>({1, 2});
     auto guard = rx.borrow();
@@ -123,7 +122,7 @@ TEST(WatchTest, BorrowArrowOperator) {
     (void)tx;
 }
 
-TEST(WatchTest, ClonesAreIndependent) {
+TYPED_TEST(WatchTest, ClonesAreIndependent) {
     auto [tx, rx] = watch_channel<int>(0);
     auto rx2 = rx.clone();
     tx.send(10);
@@ -131,7 +130,7 @@ TEST(WatchTest, ClonesAreIndependent) {
     EXPECT_EQ(*rx2.borrow(), 10);
 }
 
-TEST(WatchTest, MultipleReceiversSeeLatestValue) {
+TYPED_TEST(WatchTest, MultipleReceiversSeeLatestValue) {
     auto [tx, rx] = watch_channel<int>(0);
     auto rx2 = rx.clone();
     auto rx3 = rx.clone();
@@ -141,11 +140,10 @@ TEST(WatchTest, MultipleReceiversSeeLatestValue) {
     EXPECT_EQ(*rx3.borrow(), 55);
 }
 
-// --- Async integration (require Phase 3 implementation) ---
+// --- Async ---
 
-TEST(WatchTest, ChangedResolvesWhenValueSent) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, ChangedResolvesWhenValueSent) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
         co_await coro::spawn(coro::co_invoke([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send(42);
@@ -157,19 +155,17 @@ TEST(WatchTest, ChangedResolvesWhenValueSent) {
     }());
 }
 
-TEST(WatchTest, ChangedResolvesImmediatelyIfAlreadyChanged) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, ChangedResolvesImmediatelyIfAlreadyChanged) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
-        tx.send(1); // version now 1; last_seen is 0
-        auto r = co_await rx.changed(); // should resolve immediately
+        tx.send(1);
+        auto r = co_await rx.changed();
         EXPECT_TRUE(r.has_value());
     }());
 }
 
-TEST(WatchTest, ChangedErrorWhenSenderDropped) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, ChangedErrorWhenSenderDropped) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
         { auto dropped = std::move(tx); }
         auto r = co_await rx.changed();
@@ -178,10 +174,9 @@ TEST(WatchTest, ChangedErrorWhenSenderDropped) {
     }());
 }
 
-TEST(WatchTest, MultipleReceiversWokenOnSend) {
-    Runtime rt;
+TYPED_TEST(WatchTest, MultipleReceiversWokenOnSend) {
     int count = 0;
-    rt.block_on([&]() -> Coro<void> {
+    this->traits.rt.block_on([](int& count) -> Coro<void> {
         auto [tx, rx1] = watch_channel<int>(0);
         auto rx2 = rx1.clone();
         auto rx3 = rx1.clone();
@@ -189,48 +184,38 @@ TEST(WatchTest, MultipleReceiversWokenOnSend) {
         if ((co_await rx1.changed()).has_value()) ++count;
         if ((co_await rx2.changed()).has_value()) ++count;
         if ((co_await rx3.changed()).has_value()) ++count;
-    }());
+    }(count));
     EXPECT_EQ(count, 3);
 }
 
 // --- borrow_and_update ---
 
-TEST(WatchTest, BorrowAndUpdateReadsCurrentValue) {
+TYPED_TEST(WatchTest, BorrowAndUpdateReadsCurrentValue) {
     auto [tx, rx] = watch_channel<int>(7);
     tx.send(42);
-    auto guard = rx.borrow_and_update();
-    EXPECT_EQ(*guard, 42);
+    EXPECT_EQ(*rx.borrow_and_update(), 42);
 }
 
-TEST(WatchTest, BorrowAndUpdateMarksVersionSeen) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, BorrowAndUpdateMarksVersionSeen) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
         tx.send(1);
-        // borrow_and_update marks version as seen — changed() must NOT resolve until
-        // a new send happens after this call.
         { auto guard = rx.borrow_and_update(); (void)guard; }
-        bool resolved = false;
-        auto handle = spawn(co_invoke([&tx = tx]() mutable -> Coro<void> {
+        spawn(co_invoke([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send(2);
             co_return;
-        }));
+        })).detach();
         auto r = co_await rx.changed();
-        resolved = r.has_value();
-        co_await std::move(handle);
-        EXPECT_TRUE(resolved);
+        EXPECT_TRUE(r.has_value());
         EXPECT_EQ(*rx.borrow(), 2);
     }());
 }
 
-TEST(WatchTest, BorrowWithoutUpdateStillSeesExistingChange) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, BorrowWithoutUpdateStillSeesExistingChange) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
         tx.send(1);
-        // plain borrow() does NOT mark version seen
         { auto guard = rx.borrow(); (void)guard; }
-        // changed() should resolve immediately because version > last_seen
         auto r = co_await rx.changed();
         EXPECT_TRUE(r.has_value());
     }());
@@ -238,29 +223,25 @@ TEST(WatchTest, BorrowWithoutUpdateStillSeesExistingChange) {
 
 // --- send_if_modified ---
 
-TEST(WatchTest, SendIfModifiedReturnsTrueWhenModified) {
+TYPED_TEST(WatchTest, SendIfModifiedReturnsTrueWhenModified) {
     auto [tx, rx] = watch_channel<int>(0);
     bool result = tx.send_if_modified([](int& v) { v = 42; return true; });
     EXPECT_TRUE(result);
     EXPECT_EQ(*rx.borrow(), 42);
 }
 
-TEST(WatchTest, SendIfModifiedReturnsFalseWhenNotModified) {
+TYPED_TEST(WatchTest, SendIfModifiedReturnsFalseWhenNotModified) {
     auto [tx, rx] = watch_channel<int>(0);
     bool result = tx.send_if_modified([](int&) { return false; });
     EXPECT_FALSE(result);
     EXPECT_EQ(*rx.borrow(), 0);
 }
 
-TEST(WatchTest, SendIfModifiedDoesNotWakeReceiversWhenNotModified) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, SendIfModifiedDoesNotWakeReceiversWhenNotModified) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
-        // No-op send_if_modified must not increment version.
         tx.send_if_modified([](int&) { return false; });
-        // changed() should not resolve immediately (version unchanged).
-        // Send a real update to unblock.
-        spawn(co_invoke([&tx = tx]() mutable -> Coro<void> {
+        spawn(co_invoke([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send(99);
             co_return;
         })).detach();
@@ -270,11 +251,10 @@ TEST(WatchTest, SendIfModifiedDoesNotWakeReceiversWhenNotModified) {
     }());
 }
 
-TEST(WatchTest, SendIfModifiedWakesReceiversWhenModified) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, SendIfModifiedWakesReceiversWhenModified) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
-        spawn(co_invoke([&tx = tx]() mutable -> Coro<void> {
+        spawn(co_invoke([tx = std::move(tx)]() mutable -> Coro<void> {
             tx.send_if_modified([](int& v) { v = 7; return true; });
             co_return;
         })).detach();
@@ -286,44 +266,34 @@ TEST(WatchTest, SendIfModifiedWakesReceiversWhenModified) {
 
 // --- borrow_mut ---
 
-TEST(WatchTest, BorrowMutProvidesWriteAccess) {
+TYPED_TEST(WatchTest, BorrowMutProvidesWriteAccess) {
     auto [tx, rx] = watch_channel<int>(0);
-    {
-        auto guard = tx.borrow_mut();
-        *guard = 99;
-    } // version incremented, receivers notified
+    { auto guard = tx.borrow_mut(); *guard = 99; }
     EXPECT_EQ(*rx.borrow(), 99);
 }
 
-TEST(WatchTest, BorrowMutArrowOperator) {
+TYPED_TEST(WatchTest, BorrowMutArrowOperator) {
     struct Point { int x, y; };
     auto [tx, rx] = watch_channel<Point>({0, 0});
-    {
-        auto guard = tx.borrow_mut();
-        guard->x = 3;
-        guard->y = 7;
-    }
+    { auto guard = tx.borrow_mut(); guard->x = 3; guard->y = 7; }
     auto g = rx.borrow();
     EXPECT_EQ(g->x, 3);
     EXPECT_EQ(g->y, 7);
 }
 
-TEST(WatchTest, BorrowMutIncrementsVersion) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, BorrowMutIncrementsVersion) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
         { auto guard = tx.borrow_mut(); *guard = 5; }
-        // version was incremented on guard drop — changed() resolves immediately
         auto r = co_await rx.changed();
         EXPECT_TRUE(r.has_value());
         EXPECT_EQ(*rx.borrow(), 5);
     }());
 }
 
-TEST(WatchTest, BorrowMutNotifiesMultipleReceivers) {
-    Runtime rt;
+TYPED_TEST(WatchTest, BorrowMutNotifiesMultipleReceivers) {
     int count = 0;
-    rt.block_on([&]() -> Coro<void> {
+    this->traits.rt.block_on([](int& count) -> Coro<void> {
         auto [tx, rx1] = watch_channel<int>(0);
         auto rx2 = rx1.clone();
         auto rx3 = rx1.clone();
@@ -331,18 +301,17 @@ TEST(WatchTest, BorrowMutNotifiesMultipleReceivers) {
         if ((co_await rx1.changed()).has_value()) ++count;
         if ((co_await rx2.changed()).has_value()) ++count;
         if ((co_await rx3.changed()).has_value()) ++count;
-    }());
+    }(count));
     EXPECT_EQ(count, 3);
 }
 
-TEST(WatchTest, BorrowMutWakesWaitingReceivers) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, BorrowMutWakesWaitingReceivers) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
-        spawn(co_invoke([&tx = tx]() mutable -> Coro<void> {
+        spawn(co_invoke([tx = std::move(tx)]() mutable -> Coro<void> {
             auto guard = tx.borrow_mut();
             *guard = 77;
-            co_return; // guard dropped here, wakes rx
+            co_return;
         })).detach();
         auto r = co_await rx.changed();
         EXPECT_TRUE(r.has_value());
@@ -350,13 +319,10 @@ TEST(WatchTest, BorrowMutWakesWaitingReceivers) {
     }());
 }
 
-TEST(WatchTest, LastWriteWins) {
-    Runtime rt;
-    rt.block_on([&]() -> Coro<void> {
+TYPED_TEST(WatchTest, LastWriteWins) {
+    this->traits.rt.block_on([]() -> Coro<void> {
         auto [tx, rx] = watch_channel<int>(0);
-        tx.send(1);
-        tx.send(2);
-        tx.send(3);
+        tx.send(1); tx.send(2); tx.send(3);
         co_await rx.changed();
         EXPECT_EQ(*rx.borrow(), 3);
     }());

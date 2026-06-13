@@ -9,6 +9,7 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_set>
 
 namespace coro {
 
@@ -75,6 +76,11 @@ private:
     // Identity of the thread currently running wait_for_completion().
     // Used by enqueue() to distinguish local vs. remote wakeups.
     std::thread::id m_poll_thread_id;
+
+    // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
+    // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
+    std::mutex                                                               m_owned_mutex;
+    std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
 };
 
 } // namespace coro

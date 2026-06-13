@@ -1,6 +1,7 @@
 #pragma once
 
 #include <coro/detail/context.h>
+#include <coro/detail/coro_scope.h>
 #include <coro/detail/intrusive_list.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/task.h>
@@ -9,11 +10,9 @@
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
 #include <exception>
-#include <list>
 #include <memory>
 #include <optional>
 #include <coro/detail/mutex.h>
-#include <set>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -29,29 +28,35 @@ namespace detail {
 /**
  * @brief Shared state for a JoinSet<T>.
  *
- * - `pending_handles` — strong references to tasks still running. Serves as
- *   the sole persistent lifetime anchor for each task while it is Idle (parked
- *   between executor polls). When a task completes, it removes itself from
- *   pending and moves to idle inside on_task_complete().
+ * - `pending_handles` — intrusive list of Nodes embedded in each running
+ *   JoinSetTask. Each Node holds a non-owning raw TaskBase* pointer.
+ *   Lifetime is anchored by the executor's owned map. When a task completes
+ *   normally, on_task_complete() removes its node in O(1). When the JoinSet
+ *   is destroyed, cancel_pending() sets each node's task pointer to nullptr
+ *   (the sentinel that tells on_task_complete() to skip) and calls cancel_task().
  *
  * - `idle_handles` — aliased shared_ptr<TaskState<T>> for tasks that have
  *   reached a terminal state. The consumer reads results directly from
  *   TaskState<T>, avoiding any extra result copy.
  *
- * JoinSetTask holds a weak_ptr<JoinSetSharedState> to break the cycle:
- *   JoinSetSharedState::pending_handles → TaskBase
- *                                       → (weak) → JoinSetSharedState
+ * JoinSetTask holds a weak_ptr<JoinSetSharedState> — no strong back-reference.
  */
 template<typename T>
 struct JoinSetSharedState {
     struct Node {
-        std::shared_ptr<TaskBase> task;
-        Node *next = nullptr;
-        Node *prev = nullptr;
+        // Raw pointer, not weak_ptr: weak_ptr::lock() is an atomic operation, and
+        // it would always succeed here anyway — a task stays alive in the executor's
+        // m_owned_tasks set for the entire time its Node is in pending_handles.
+        // on_task_complete() fires from inside poll() before the executor erases the
+        // task, so there is no window where this pointer can dangle.
+        // nullptr is the sentinel meaning cancel_pending() already processed this node.
+        TaskBase* task = nullptr;
+        Node* next = nullptr;
+        Node* prev = nullptr;
     };
     detail::Mutex                             mutex;
     std::shared_ptr<Waker>                    consumer_waker;
-    IntrusiveList<Node*>                      pending_handles; ///< Running tasks (lifetime anchors).
+    detail::IntrusiveList<Node*>              pending_handles; ///< Running tasks (lifetime anchors).
     std::deque<std::shared_ptr<TaskState<T>>> idle_handles;    ///< Completed tasks awaiting consumption.
 };
 
@@ -61,19 +66,16 @@ struct JoinSetSharedState {
 
 /**
  * @brief Concrete task for JoinSet::spawn(). A single allocation covers the
- * executor-facing TaskBase, the result-holding TaskState<T>, and the JoinSet
- * tracking data — no separate JoinHandle or handle wrapper is needed.
+ * executor-facing TaskBase, the result-holding TaskState<T>, and the Node
+ * that links this task into JoinSetSharedState::pending_handles.
  *
- * Inherits TaskImpl<F> for all inner-future polling, the full cancellation
- * protocol, and result/exception/mark_done delivery. Overrides
- * on_task_complete() to move itself from pending to idle in the owning
- * JoinSet's shared state and wake the consumer.
+ * Lifetime is anchored by the executor's owned map. The Node holds a non-owning
+ * raw TaskBase* pointer so the intrusive list gets O(1) removal.
  *
- * Uses weak_ptr<JoinSetSharedState> to avoid a reference cycle between the
- * shared state (which owns pending_handles → this task) and the task itself.
- * When JoinSet is destroyed, lock() returns null and on_task_complete() is a
- * silent no-op; the executor's temporary strong reference keeps the task alive
- * through the remainder of poll().
+ * cancel_pending() sets m_node.task to nullptr under the mutex.
+ * on_task_complete() checks !m_node.task under the same mutex: if null, the
+ * JoinSet is being destroyed so the result is discarded rather than pushed to
+ * idle_handles.
  */
 template<Future F>
 class JoinSetTask : public TaskImpl<F> {
@@ -85,27 +87,28 @@ public:
 
     void on_task_complete() noexcept override {
         auto state = m_set_state.lock();
-        if (!state) return;  // JoinSet was destroyed — nothing to notify
+        if (!state) {
+            // JoinSet was destroyed. cancel_pending() already cleared m_node.task.
+            // The executor's temporary reference keeps the task alive through this poll.
+            return;
+        }
 
-        // Build an aliased shared_ptr<TaskState<T>> from shared_from_this().
-        // Both share the same control block (same allocation), but the stored
-        // pointer is the TaskState<T> subobject. The consumer uses this to
-        // read the result directly, the same way JoinHandle::poll() would.
         auto self_base = this->shared_from_this();  // shared_ptr<TaskBase>
         std::shared_ptr<TaskState<T>> self_state(self_base, static_cast<TaskState<T>*>(this));
 
         std::shared_ptr<Waker> waker;
         {
             std::lock_guard lock(state->mutex);
+            if (!m_node.task) return;  // JoinSet is being destroyed — discard result
             state->pending_handles.remove(&m_node);
-            m_node.task.reset();
+            m_node.task = nullptr;
             state->idle_handles.push_back(std::move(self_state));
             waker = std::exchange(state->consumer_waker, nullptr);
         }
         if (waker) waker->wake();
     }
 
-    JoinSetSharedState<T>::Node m_node;
+    typename JoinSetSharedState<T>::Node m_node;
 private:
     std::weak_ptr<JoinSetSharedState<T>> m_set_state;
 };
@@ -218,13 +221,13 @@ public:
             std::move(m_future),
             std::weak_ptr<detail::JoinSetSharedState<T>>(m_state));
         task->name = std::move(m_name);
-        std::shared_ptr<detail::TaskBase> task_base(task);
-        task->m_node.task = task_base;
+        // Non-owning raw pointer — lifetime is anchored by the executor's owned map.
+        task->m_node.task = task.get();
         {
             std::lock_guard lock(m_state->mutex);
             m_state->pending_handles.push_back(&task->m_node);
         }
-        coro::schedule_task(std::move(task_base));
+        coro::schedule_task(std::shared_ptr<detail::TaskBase>(std::move(task)));
     }
 
 private:
@@ -246,16 +249,14 @@ private:
  * `JoinSet<T>` satisfies `Stream<T>`.
  *
  * **Allocation model:** each `spawn()` creates a single `JoinSetTask<F>` allocation
- * that covers the executor-facing `TaskBase`, the result-holding `TaskState<T>`, and
- * the JoinSet tracking data. When the task completes it moves itself from the pending
- * to idle queue; the consumer reads the result directly from `TaskState<T>` without
- * an extra copy or intermediate handle.
+ * covering the executor-facing `TaskBase` and the result-holding `TaskState<T>`.
+ * Task lifetime is anchored by the executor's owned map. When a task completes it
+ * moves itself from the pending list to the idle queue; the consumer reads the result
+ * directly from `TaskState<T>` without an extra copy.
  *
- * **Cancel on drop:** destroying a `JoinSet` cancels all pending tasks and drops the
- * persistent strong references. Tasks that are currently Idle are woken via
- * `cancel_task()` so the executor picks them up, observes `cancelled = true`, and
- * drains them; tasks that are Running or Notified are already held by the executor's
- * temporary reference and will self-terminate on their next poll.
+ * **Cancel on drop:** destroying a `JoinSet` cancels all pending tasks. Each cancelled
+ * task is registered as a weak_ptr in the enclosing coroutine scope (if inside one),
+ * so the parent waits for all children to drain before completing.
  *
  * @tparam T The value type produced by spawned tasks. Use `JoinSet<void>` for tasks
  *           that produce no value.
@@ -361,28 +362,28 @@ public:
     }
 
 private:
-    // Marks all pending tasks cancelled and drops the persistent strong references.
-    // Tasks that are Idle are woken by cancel_task() so the executor observes
-    // cancelled=true and drains them. Running/Notified tasks are already held by the
-    // executor's temporary reference and self-terminate on the next poll.
+    // Cancels all pending tasks and, if inside a coroutine scope, registers each
+    // as a weak_ptr so the parent waits for them to drain.
+    //
+    // Sets each node's task pointer to nullptr under the mutex — the sentinel that
+    // tells on_task_complete() the JoinSet is gone and to discard the result.
+    // The executor's owned map keeps every task alive through completion.
     void cancel_pending() {
         if (!m_state) return;
-        std::vector<std::shared_ptr<detail::TaskBase>> to_cancel;
+        std::vector<detail::TaskBase*> to_cancel;
         {
             std::lock_guard lock(m_state->mutex);
             to_cancel.reserve(m_state->pending_handles.size());
             while (auto h = m_state->pending_handles.pop_front()) {
-                if (auto ptr = h->task) {
-                    to_cancel.push_back(ptr);
-                }
+                to_cancel.push_back(h->task);
+                h->task = nullptr;  // sentinel: on_task_complete() discards result
             }
-            m_state->pending_handles.clear();  // drop persistent refs
         }
-        // Call cancel_task() while to_cancel still holds strong refs — prevents
-        // premature deallocation of Idle tasks between the ref drop and the wake.
-        for (auto& task : to_cancel)
-            task->cancel_task();
-        // to_cancel destructs here; tasks are now Notified (executor holds temp ref).
+        for (auto* task : to_cancel)
+            if (task) task->cancel_task();
+        if (detail::t_current_coro)
+            for (auto* task : to_cancel)
+                if (task) detail::t_current_coro->add_child(task->weak_from_this());
     }
 
     std::shared_ptr<detail::JoinSetSharedState<T>> m_state;
