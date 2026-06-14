@@ -125,6 +125,15 @@ void CurrentThreadExecutor::add_isr_poll(const volatile bool*           flag,
     m_isr_polls.push_back({flag, std::move(waker)});
 }
 
+void CurrentThreadExecutor::remove_isr_poll(const volatile bool* flag) {
+    auto it = std::find_if(m_isr_polls.begin(), m_isr_polls.end(),
+                           [flag](const IsrPollEntry& e) { return e.flag == flag; });
+    if (it != m_isr_polls.end()) {
+        *it = std::move(m_isr_polls.back());
+        m_isr_polls.pop_back();
+    }
+}
+
 void CurrentThreadExecutor::check_isr_events() {
     // Volatile dereference on each iteration forces a real LDRB from memory —
     // the compiler cannot cache the flag value in a register across loop
