@@ -20,6 +20,13 @@ struct NeverFuture {
     PollResult<T> poll(Context&) { return PollPending; }
 };
 
+// A stream that never yields an item — used to create a StreamTaskImpl that looks
+// pending from the scope's perspective.
+struct NeverStream {
+    using ItemType = int;
+    PollResult<std::optional<int>> poll_next(Context&) { return PollPending; }
+};
+
 // Helper: make a pending TaskImpl<NeverFuture<int>>. Returns the strong ref (caller
 // acts as the executor's owned map) and the aliased TaskState for completion control.
 static std::pair<std::shared_ptr<TaskBase>, std::shared_ptr<TaskState<int>>>
@@ -77,8 +84,11 @@ TEST(CoroutineScopeTest, JoinHandleDropRegistersWithCurrentScope) {
 
     {
         // Simulate being inside a poll() call by setting t_current_coro directly.
+        // cancelOnDestroy(false) because this task has no owning_executor — the test
+        // is checking scope registration only, not cancellation behaviour.
         t_current_coro = &scope;
         JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        handle.cancelOnDestroy(false);
         // destructor fires with t_current_coro set → adds weak_ptr to scope
     }
     t_current_coro = nullptr;
@@ -104,6 +114,7 @@ TEST(CoroutineScopeTest, DetachedJoinHandleDoesNotRegister) {
     EXPECT_FALSE(scope.has_pending());
 }
 
+
 TEST(CoroutineScopeTest, JoinHandleDropWithNullCurrentCoroDoesNotRegister) {
     CoroutineScope scope;
     auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
@@ -112,9 +123,11 @@ TEST(CoroutineScopeTest, JoinHandleDropWithNullCurrentCoroDoesNotRegister) {
     impl.reset();
 
     {
-        // t_current_coro is null — no scope to register with
+        // t_current_coro is null — no scope to register with.
+        // cancelOnDestroy(false) because this task has no owning_executor.
         ASSERT_EQ(t_current_coro, nullptr);
         JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        handle.cancelOnDestroy(false);
         // destructor: t_current_coro null → add_child not called
     }
 
@@ -142,6 +155,28 @@ TEST(TaskStateTest, MarkDoneFiresScopeWaker) {
     state->mark_done();
     EXPECT_TRUE(waker->woken);
     EXPECT_TRUE(state->is_complete());
+}
+
+// Parallel to TaskStateTest::MarkDoneFiresScopeWaker, but for StreamTaskState.
+TEST(StreamTaskStateTest, MarkDoneFiresScopeWaker) {
+    class TestWaker : public Waker {
+    public:
+        bool woken = false;
+        void wake() override { woken = true; }
+        std::shared_ptr<Waker> clone() override {
+            return std::make_shared<TestWaker>();
+        }
+    };
+
+    auto state = std::make_shared<StreamTaskState<int>>(4);
+    auto waker = std::make_shared<TestWaker>();
+    {
+        std::lock_guard lock(state->mutex);
+        state->scope_waker = waker;
+    }
+    state->mark_done();
+    EXPECT_TRUE(waker->woken);
+    EXPECT_TRUE(state->terminated);
 }
 
 TEST(TaskStateTest, SetResultMarksDoneAndFiresScopeWaker) {

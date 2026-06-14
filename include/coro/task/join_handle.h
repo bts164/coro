@@ -9,6 +9,7 @@
 #include <coro/detail/coro_scope.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 namespace coro {
@@ -65,7 +66,9 @@ public:
         if (!m_state) return;
         m_state->cancelled.store(true, std::memory_order_relaxed);
         auto task = m_task_ref.lock();
-        if (!task || !task->owning_executor) return;
+        if (!task) return;
+        // owning_executor must always be set — see TaskImpl::cancel_task() for rationale.
+        assert(task->owning_executor != nullptr);
 
         auto expected = detail::SchedulingState::Idle;
         while (true) {
@@ -186,6 +189,93 @@ private:
     std::shared_ptr<detail::TaskState<T>> m_state;
     // Category 4 (doc/task_ownership.md): notification/cancel only — no lifetime ownership.
     // The executor's owned map is the lifetime anchor (Category 1).
+    std::weak_ptr<detail::TaskBase> m_task_ref;
+};
+
+/**
+ * @brief Consumer end of a bounded queue backed by a background StreamTaskImpl task.
+ *
+ * Returned by `Runtime::spawn(stream)` and `SpawnBuilder::spawn(stream)`. Satisfies `Stream<T>`.
+ *
+ * Holds an aliased `shared_ptr<StreamTaskState<T>>` into the same `StreamTaskImpl<S>`
+ * allocation as the executor's task reference — no separate channel allocation. The
+ * background task polls the original stream and pushes items into the queue; `poll_next()`
+ * dequeues them, waking the producer when space becomes available.
+ *
+ * Dropping the handle cancels the background task. The executor's owned set keeps it alive
+ * until it drains.
+ *
+ * `[[nodiscard]]` — discarding drops the consumer end; produced items are lost.
+ *
+ * @tparam T The item type yielded by the stream.
+ */
+template<typename T>
+class [[nodiscard]] StreamHandle {
+public:
+    using ItemType = T;
+
+    StreamHandle() = default;
+
+    explicit StreamHandle(std::shared_ptr<detail::StreamTaskState<T>> state,
+                          std::weak_ptr<detail::TaskBase> task_ref = {})
+        : m_state(std::move(state)), m_task_ref(std::move(task_ref)) {}
+
+    /// @brief Cancels the background task, keeping the handle alive to drain buffered items.
+    ///
+    /// Items already in the queue remain readable via poll_next(); after they are consumed,
+    /// poll_next() returns nullopt (clean end, no exception). Unlike dropping the handle,
+    /// cancel() does not register with the enclosing CoroutineScope.
+    void cancel() noexcept {
+        if (auto task = m_task_ref.lock())
+            task->cancel_task();
+    }
+
+    /// @brief Cancels the background task and registers with the enclosing CoroutineScope.
+    ///
+    /// If destroyed inside a coroutine's poll() call, records a weak_ptr to the background
+    /// task in the scope's pending list so the parent coroutine waits for it to drain.
+    /// Items remaining in the buffer are discarded — the consumer end is gone.
+    ~StreamHandle() {
+        if (!m_state) return;  // moved-from
+        if (auto task = m_task_ref.lock())
+            task->cancel_task();
+        if (detail::t_current_coro)
+            detail::t_current_coro->add_child(m_task_ref);
+    }
+
+    StreamHandle(const StreamHandle&)            = delete;
+    StreamHandle& operator=(const StreamHandle&) = delete;
+
+    StreamHandle(StreamHandle&&) noexcept            = default;
+    StreamHandle& operator=(StreamHandle&&) noexcept = default;
+
+    PollResult<std::optional<T>> poll_next(detail::Context& ctx) {
+        if (!m_state) return std::optional<T>(std::nullopt);
+
+        std::unique_lock lock(m_state->mutex);
+
+        if (!m_state->buffer.empty()) {
+            T item = std::move(m_state->buffer.front());
+            m_state->buffer.pop();
+            auto to_wake = std::move(m_state->producer_waker);
+            lock.unlock();
+            if (auto w = to_wake.lock()) w->wake();
+            return std::optional<T>(std::move(item));
+        }
+
+        if (m_state->closed) {
+            if (m_state->exception) return PollError(m_state->exception);
+            return std::optional<T>(std::nullopt);
+        }
+
+        m_state->consumer_waker = ctx.get_weak_waker();
+        return PollPending;
+    }
+
+private:
+    /// Aliased shared_ptr into the StreamTaskImpl allocation — queue access only.
+    std::shared_ptr<detail::StreamTaskState<T>> m_state;
+    /// Notification/cancel reference only — lifetime anchored by the executor's owned set.
     std::weak_ptr<detail::TaskBase> m_task_ref;
 };
 

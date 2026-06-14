@@ -1,13 +1,16 @@
 #pragma once
 
 // Internal — not part of the public API.
-// Shared ref-counted state between an executor-held Task and its JoinHandle.
+// Shared ref-counted state between executor-held tasks and their handles.
+//   TaskState<T>       — shared between TaskImpl<F>      and JoinHandle<T>
+//   StreamTaskState<T> — shared between StreamTaskImpl<S> and StreamHandle<T>
 
 #include <atomic>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <coro/detail/mutex.h>
 
 #include <coro/detail/waker.h>
@@ -174,6 +177,45 @@ struct TaskState : TaskStateBase {
             terminated = true;
             cv.notify_all();
             wk = std::move(waker);
+        }
+        if (auto w = wk.lock()) w->wake();
+    }
+};
+
+/**
+ * @brief Shared state between StreamTaskImpl (producer) and StreamHandle (consumer).
+ *
+ * Co-allocated with StreamTaskImpl via make_shared. StreamHandle holds an aliased
+ * shared_ptr<StreamTaskState<T>> into the same allocation — exactly parallel to how
+ * JoinHandle holds shared_ptr<TaskState<T>>.
+ *
+ * Fields:
+ *   buffer/capacity/closed/exception — bounded queue machinery for StreamHandle::poll_next()
+ *   producer_waker — woken when buffer has space (backpressure recovery)
+ *   consumer_waker — woken when buffer has items or stream closes
+ *   terminated/scope_waker — task completion tracking for CoroutineScope drain
+ */
+template<typename T>
+struct StreamTaskState {
+    mutable detail::Mutex  mutex;
+    std::queue<T>          buffer;
+    std::size_t            capacity;
+    bool                   closed      = false;  ///< stream exhausted, errored, or cancelled
+    bool                   terminated  = false;  ///< task reached terminal state (poll() returned true)
+    std::exception_ptr     exception;
+    std::weak_ptr<Waker>   producer_waker;  ///< woken when buffer has space
+    std::weak_ptr<Waker>   consumer_waker;  ///< woken when buffer has items or stream closes
+    std::weak_ptr<Waker>   scope_waker;     ///< woken when task terminates (CoroutineScope drain)
+
+    explicit StreamTaskState(std::size_t cap) : capacity(cap) {}
+
+    /// @brief Signals task completion. Fires scope_waker so CoroutineScope drain proceeds.
+    void mark_done() {
+        std::weak_ptr<Waker> wk;
+        {
+            std::lock_guard lock(mutex);
+            terminated = true;
+            wk = std::move(scope_waker);
         }
         if (auto w = wk.lock()) w->wake();
     }

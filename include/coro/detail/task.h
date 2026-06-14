@@ -4,11 +4,15 @@
 // Type-erased, heap-allocated unit of work held by the executor.
 // Users never construct a TaskBase or TaskImpl directly — spawn() creates them internally.
 
+#include <assert.h>
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
 #include <coro/future.h>
+#include <coro/stream.h>
 #include <coro/detail/task_state.h>
+#include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -184,6 +188,11 @@ public:
     }
 
     void cancel_task() noexcept override {
+        // owning_executor must always be set. A null executor means the task was never
+        // scheduled, so cancel_task() would set cancelled=true but the task would never
+        // be polled, mark_done() would never fire, and any CoroutineScope drain would
+        // deadlock. Every task must go through spawn() before its handle can be dropped.
+        assert(owning_executor != nullptr);
         this->cancelled.store(true, std::memory_order_relaxed);
         wake();
     }
@@ -239,6 +248,149 @@ private:
     std::optional<F> m_future;
     bool m_completed        = false;
     bool m_cancel_requested = false;
+};
+
+/**
+ * @brief Concrete stream task. One make_shared allocation combines the executor interface
+ * (TaskBase), the bounded item queue (StreamTaskState<T>), and the stream itself.
+ *
+ * Mirrors the structure of TaskImpl<F>: inherits TaskBase (executor queue / waker) and
+ * StreamTaskState<T> (StreamHandle queue access). spawn(stream) creates one instance and
+ * produces two aliased shared_ptrs from it:
+ *   - shared_ptr<TaskBase>               for the executor (lifetime anchor)
+ *   - shared_ptr<StreamTaskState<T>>     for the StreamHandle (queue access)
+ *
+ * On each poll() the stream produces the next item into StreamTaskState's queue. When the
+ * queue is full the task parks (stores producer_waker) until StreamHandle consumes an item
+ * and wakes it. No separate driver coroutine or channel allocation needed.
+ *
+ * @tparam S Any type satisfying @ref Stream.
+ */
+template<Stream S>
+class StreamTaskImpl : public TaskBase, public StreamTaskState<typename S::ItemType> {
+public:
+    using ItemType = typename S::ItemType;
+
+    explicit StreamTaskImpl(S stream, std::size_t capacity)
+        : StreamTaskState<ItemType>(capacity), m_stream(std::move(stream)) {}
+
+    bool is_complete() const override {
+        std::lock_guard lock(this->mutex);
+        return this->terminated;
+    }
+
+    void set_waker(std::weak_ptr<Waker> waker) override {
+        std::lock_guard lock(this->mutex);
+        this->scope_waker = std::move(waker);
+    }
+
+    void cancel_task() noexcept override {
+        // See TaskImpl::cancel_task() — owning_executor must always be set.
+        assert(owning_executor != nullptr);
+        m_cancelled.store(true, std::memory_order_relaxed);
+        wake();
+    }
+
+    bool poll(Context& ctx) override {
+        if (m_completed) return true;
+
+        if (m_cancelled.load(std::memory_order_relaxed)) {
+            // Consumer dropped the StreamHandle — close the queue and terminate.
+            std::weak_ptr<Waker> consumer_wk;
+            {
+                std::lock_guard lock(this->mutex);
+                this->closed = true;
+                consumer_wk = std::move(this->consumer_waker);
+            }
+            if (auto w = consumer_wk.lock()) w->wake();
+            m_stream.reset();
+            m_pending.reset();
+            m_completed = true;
+            this->mark_done();
+            on_task_complete();
+            return true;
+        }
+
+        // Flush a pending item that was buffered during backpressure.
+        if (m_pending.has_value()) {
+            std::weak_ptr<Waker> consumer_wk;
+            {
+                std::unique_lock lock(this->mutex);
+                if (this->buffer.size() < this->capacity) {
+                    this->buffer.push(std::move(*m_pending));
+                    m_pending.reset();
+                    consumer_wk = std::move(this->consumer_waker);
+                } else {
+                    this->producer_waker = ctx.get_weak_waker();
+                    return false;
+                }
+            }
+            if (auto w = consumer_wk.lock()) w->wake();
+            // Fall through to poll the stream again.
+        }
+
+        // Drain the stream into the queue.
+        while (true) {
+            auto result = m_stream->poll_next(ctx);
+
+            if (result.isPending()) return false;
+
+            if (result.isError()) {
+                std::weak_ptr<Waker> consumer_wk;
+                {
+                    std::lock_guard lock(this->mutex);
+                    this->exception = result.error();
+                    this->closed    = true;
+                    consumer_wk = std::move(this->consumer_waker);
+                }
+                if (auto w = consumer_wk.lock()) w->wake();
+                m_stream.reset();
+                m_completed = true;
+                this->mark_done();
+                on_task_complete();
+                return true;
+            }
+
+            auto opt = std::move(result).value();
+            if (!opt.has_value()) {
+                // Stream exhausted.
+                std::weak_ptr<Waker> consumer_wk;
+                {
+                    std::lock_guard lock(this->mutex);
+                    this->closed = true;
+                    consumer_wk = std::move(this->consumer_waker);
+                }
+                if (auto w = consumer_wk.lock()) w->wake();
+                m_stream.reset();
+                m_completed = true;
+                this->mark_done();
+                on_task_complete();
+                return true;
+            }
+
+            // Push item into the queue, or park under backpressure.
+            std::weak_ptr<Waker> consumer_wk;
+            {
+                std::unique_lock lock(this->mutex);
+                if (this->buffer.size() < this->capacity) {
+                    this->buffer.push(std::move(*opt));
+                    consumer_wk = std::move(this->consumer_waker);
+                } else {
+                    m_pending            = std::move(opt);
+                    this->producer_waker = ctx.get_weak_waker();
+                    return false;
+                }
+            }
+            if (auto w = consumer_wk.lock()) w->wake();
+            // Keep polling the stream.
+        }
+    }
+
+private:
+    std::optional<S>        m_stream;
+    std::optional<ItemType> m_pending;
+    bool                    m_completed = false;
+    std::atomic<bool>       m_cancelled{false};
 };
 
 } // namespace coro::detail

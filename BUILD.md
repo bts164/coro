@@ -42,6 +42,60 @@ ctest --preset conan-release --exclude-regex "PcieDecoder"
 ctest --preset conan-release -R PcieDecoder
 ```
 
+## Sanitizer Builds
+
+`ENABLE_ASAN` and `ENABLE_TSAN` are mutually exclusive.
+
+```bash
+# AddressSanitizer + LeakSanitizer + UBSan
+conan install . --build=missing -s:h build_type=Debug
+cmake --preset conan-debug -DENABLE_ASAN=ON
+cmake --build --preset conan-debug
+ctest --preset conan-debug
+
+# ThreadSanitizer
+cmake --preset conan-debug -DENABLE_TSAN=ON
+cmake --build --preset conan-debug
+ctest --preset conan-debug
+```
+
+### Recommended environment variables when running sanitizer builds
+
+Set these before running `ctest` or a single test binary. Without
+`halt_on_error=1`, a low-level error common to every test repeats across the
+entire suite and makes the output unreadably long.
+
+**AddressSanitizer + LeakSanitizer + UBSan (`ENABLE_ASAN=ON`)**
+
+```bash
+export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
+export UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1
+ctest --preset conan-debug --stop-on-failure   # -x for short
+```
+
+| Variable / Option | Effect |
+|---|---|
+| `ASAN_OPTIONS=halt_on_error=1` | Stop on the first ASAN error instead of continuing through all tests |
+| `abort_on_error=1` | Call `abort()` instead of `_exit()` — generates a core dump; lets gdb/lldb stop at the exact failure point |
+| `detect_leaks=1` | Enable LeakSanitizer (on by default on Linux, off on macOS) |
+| `check_initialization_order=1` | Detect bugs caused by global initializer ordering |
+| `strict_string_checks=1` | Stricter boundary checking on `strlen`, `strcpy`, etc. |
+| `detect_stack_use_after_return=1` | Catch stack variable references that outlive their stack frame |
+| `UBSAN_OPTIONS=print_stacktrace=1` | Print a full stack trace on every UBSan violation |
+
+**ThreadSanitizer (`ENABLE_TSAN=ON`)**
+
+```bash
+export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1
+ctest --preset conan-debug --stop-on-failure
+```
+
+| Variable / Option | Effect |
+|---|---|
+| `halt_on_error=1` | Stop on the first race or deadlock report |
+| `abort_on_error=1` | Call `abort()` for core dump / debugger catch |
+| `second_deadlock_stack=1` | Print both lock acquisition stacks on deadlock reports |
+
 ## Dependencies
 
 All dependencies are in `conanfile.txt`:

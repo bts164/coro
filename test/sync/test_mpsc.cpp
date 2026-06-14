@@ -150,7 +150,10 @@ TYPED_TEST(MpscTest, AllSendersDropped) {
 TYPED_TEST(MpscTest, SingleSenderSingleReceiver) {
     std::vector<int> received;
     this->traits.rt.block_on([](std::vector<int>& received) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        // GCC bug: structured bindings in coroutines leak when spanning a suspension.
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(1);
         co_await tx.send(2);
         co_await tx.send(3);
@@ -164,7 +167,9 @@ TYPED_TEST(MpscTest, SingleSenderSingleReceiver) {
 TYPED_TEST(MpscTest, MultipleSenders) {
     std::vector<int> received;
     this->traits.rt.block_on([](std::vector<int>& received) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(8);
+        auto _ch = mpsc_channel<int>(8);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto tx2 = tx.clone();
         co_await tx.send(1);
         co_await tx2.send(2);
@@ -177,7 +182,9 @@ TYPED_TEST(MpscTest, MultipleSenders) {
 
 TYPED_TEST(MpscTest, ReceiverExhaustedAfterAllSendersDropped) {
     this->traits.rt.block_on([]() -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         { auto dropped = std::move(tx); }
         auto v = co_await next(rx);
         EXPECT_FALSE(v.has_value());
@@ -186,7 +193,9 @@ TYPED_TEST(MpscTest, ReceiverExhaustedAfterAllSendersDropped) {
 
 TYPED_TEST(MpscTest, ReceiverDroppedReturnsSendError) {
     this->traits.rt.block_on([]() -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(1);
+        auto _ch = mpsc_channel<int>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(1);
         { auto dropped = std::move(rx); }
         auto r = co_await tx.send(2);
@@ -197,7 +206,9 @@ TYPED_TEST(MpscTest, ReceiverDroppedReturnsSendError) {
 
 TYPED_TEST(MpscTest, ErrorChannelPattern) {
     this->traits.rt.block_on([]() -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<std::expected<int, std::string>>(4);
+        auto _ch = mpsc_channel<std::expected<int, std::string>>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(42);
         co_await tx.send(std::unexpected(std::string("oops")));
         { auto dropped = std::move(tx); }
@@ -212,7 +223,9 @@ TYPED_TEST(MpscTest, ErrorChannelPattern) {
 
 TYPED_TEST(MpscTest, RecvReceivesValue) {
     this->traits.rt.block_on([]() -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(42);
         { auto dropped = std::move(tx); }
         auto v = co_await rx.recv();
@@ -225,7 +238,9 @@ TYPED_TEST(MpscTest, RecvReceivesValue) {
 
 TYPED_TEST(MpscTest, RecvCanBeReusedAfterCancelledSelect) {
     this->traits.rt.block_on([]() -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         struct ImmediateInt {
             using OutputType = int;
             PollResult<int> poll(detail::Context&) { return 99; }
@@ -242,7 +257,9 @@ TYPED_TEST(MpscTest, RecvCanBeReusedAfterCancelledSelect) {
 TYPED_TEST(MpscTest, ZeroCopyNoDoubleSendInt) {
     std::vector<int> received;
     this->traits.rt.block_on([](std::vector<int>& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(1);
+        auto _ch = mpsc_channel<int>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
             for (int i = 0; i < 5; ++i) co_await tx.send(i);
         }(std::move(tx)));
@@ -255,7 +272,9 @@ TYPED_TEST(MpscTest, ZeroCopyNoDoubleSendInt) {
 TYPED_TEST(MpscTest, ZeroCopyNoDoubleSendString) {
     std::vector<std::string> received;
     this->traits.rt.block_on([](std::vector<std::string>& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<std::string>(1);
+        auto _ch = mpsc_channel<std::string>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto producer = coro::spawn([](MpscSender<std::string> tx) -> Coro<void> {
             for (int i = 0; i < 5; ++i) co_await tx.send("value_" + std::to_string(i));
         }(std::move(tx)));
@@ -268,7 +287,9 @@ TYPED_TEST(MpscTest, ZeroCopyNoDoubleSendString) {
 TYPED_TEST(MpscTest, ZeroCopyExactItemCount) {
     int count = 0;
     this->traits.rt.block_on([](int& cnt) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(1);
+        auto _ch = mpsc_channel<int>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
             for (int i = 0; i < 10; ++i) co_await tx.send(i);
         }(std::move(tx)));
@@ -281,7 +302,9 @@ TYPED_TEST(MpscTest, ZeroCopyExactItemCount) {
 TYPED_TEST(MpscTest, CapacityZeroDirectZeroCopyPath) {
     std::vector<int> received;
     this->traits.rt.block_on([](std::vector<int>& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(0);
+        auto _ch = mpsc_channel<int>(0);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
             for (int i = 0; i < 5; ++i) co_await tx.send(i);
         }(std::move(tx)));
@@ -294,7 +317,9 @@ TYPED_TEST(MpscTest, CapacityZeroDirectZeroCopyPath) {
 TYPED_TEST(MpscTest, MultipleSendersCapacity1NoDuplicates) {
     int sum = 0, count = 0;
     this->traits.rt.block_on([](int& s, int& c) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(1);
+        auto _ch = mpsc_channel<int>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto tx2 = tx.clone();
         auto tx3 = tx.clone();
         auto s1 = coro::spawn([](MpscSender<int> t) -> Coro<void> {
@@ -323,7 +348,9 @@ TEST(MpscSingleThreadedTest, SenderSuspendsWhenFull) {
     Runtime rt(1);
     rt.block_on([]() -> Coro<void> {
         int x[3] = {0, 0, 0};
-        auto [tx, rx] = mpsc_channel<int*>(2);
+        auto _ch = mpsc_channel<int*>(2);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(&x[0]);
         co_await tx.send(&x[1]);
         auto h = coro::spawn(coro::co_invoke([rx = std::move(rx)]() mutable -> Coro<void> {
@@ -346,7 +373,9 @@ TEST(MpscSingleThreadedTest, RecvFutureDirectZeroCopyNoDuplicates) {
     Runtime rt(1);
     std::vector<int> received;
     rt.block_on([](std::vector<int>& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(0);
+        auto _ch = mpsc_channel<int>(0);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
             for (int i = 0; i < 3; ++i) co_await tx.send(i);
         }(std::move(tx)));
@@ -362,7 +391,9 @@ TEST(MpscSingleThreadedTest, ReceiverSuspendsBeforeSenderSends) {
     Runtime rt(1);
     int received = -1;
     rt.block_on([](int& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto sender = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
             co_await tx.send(42);
         }(std::move(tx)));
@@ -378,7 +409,9 @@ TEST(MpscSingleThreadedTest, TrySendWakesAsyncReceiver) {
     Runtime rt(1);
     int received = -1;
     rt.block_on([](int& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto sender = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
             tx.try_send(77);
             co_return;
@@ -394,7 +427,9 @@ TEST(MpscSingleThreadedTest, ReceiverDroppedWhileSenderInWaiters) {
     Runtime rt(1);
     bool got_error = false;
     rt.block_on([](bool& err) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(1);
+        auto _ch = mpsc_channel<int>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(1);
         auto h = coro::spawn([](MpscSender<int> tx, bool& err) -> Coro<void> {
             auto r = co_await tx.send(2);
@@ -416,7 +451,9 @@ TEST(MpscBlockingTest, BlockingRecvGetsPreloadedValue) {
     Runtime rt(1);
     int result = -1;
     rt.block_on([](int& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(42);
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> int {
@@ -431,7 +468,9 @@ TEST(MpscBlockingTest, BlockingRecvBlocksUntilSent) {
     Runtime rt(1);
     int result = -1;
     rt.block_on([](int& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto handle = coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> int {
                 auto v = rx.blocking_recv();
@@ -447,7 +486,9 @@ TEST(MpscBlockingTest, BlockingRecvReturnsNulloptWhenAllSendersDropped) {
     Runtime rt(1);
     bool got_nullopt = false;
     rt.block_on([](bool& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         { auto dropped = std::move(tx); }
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> bool {
@@ -461,7 +502,9 @@ TEST(MpscBlockingTest, BlockingSendDeliversToAsyncReceiver) {
     Runtime rt(1);
     int result = -1;
     rt.block_on([](int& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(4);
+        auto _ch = mpsc_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto handle = coro::spawn_blocking(
             [tx = std::move(tx)]() mutable { tx.blocking_send(77); });
         auto v = co_await next(rx);
@@ -475,7 +518,9 @@ TEST(MpscBlockingTest, BlockingSendBlocksUntilSpace) {
     Runtime rt(1);
     std::vector<int> received;
     rt.block_on([](std::vector<int>& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(2);
+        auto _ch = mpsc_channel<int>(2);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(1);
         co_await tx.send(2);
         auto handle = coro::spawn_blocking(
@@ -492,7 +537,9 @@ TEST(MpscBlockingTest, BlockingSendReturnsUnsentValueWhenReceiverDropped) {
     Runtime rt(1);
     std::optional<int> unsent;
     rt.block_on([](std::optional<int>& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(1);
+        auto _ch = mpsc_channel<int>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         co_await tx.send(1);
         { auto dropped = std::move(rx); }
         out = co_await coro::spawn_blocking(
@@ -509,8 +556,12 @@ TEST(MpscBlockingTest, BlockingWorkerPipeline) {
     Runtime rt(1);
     std::vector<int> results;
     rt.block_on([](std::vector<int>& out) -> Coro<void> {
-        auto [in_tx,  in_rx]  = mpsc_channel<int>(4);
-        auto [out_tx, out_rx] = mpsc_channel<int>(4);
+        auto _ch_in  = mpsc_channel<int>(4);
+        auto in_tx   = std::move(_ch_in.first);
+        auto in_rx   = std::move(_ch_in.second);
+        auto _ch_out = mpsc_channel<int>(4);
+        auto out_tx  = std::move(_ch_out.first);
+        auto out_rx  = std::move(_ch_out.second);
         auto worker = coro::spawn_blocking(
             [in_rx  = std::move(in_rx),
              out_tx = std::move(out_tx)]() mutable {
@@ -531,7 +582,9 @@ TEST(MpscBlockingTest, BlockingRecvZeroCopyNoDuplicates) {
     Runtime rt(1);
     std::vector<int> received;
     rt.block_on([](std::vector<int>& out) -> Coro<void> {
-        auto [tx, rx] = mpsc_channel<int>(1);
+        auto _ch = mpsc_channel<int>(1);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
         auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
             for (int i = 0; i < 4; ++i) co_await tx.send(i);
         }(std::move(tx)));

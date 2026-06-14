@@ -273,7 +273,12 @@ TYPED_TEST(JoinSetTest, NextInSelectLosingBranchLeavesJoinSetUsable) {
         js.spawn(OneShotFuture<int>{10});
         js.spawn(OneShotFuture<int>{20});
         auto sel = co_await select(next(js), ReadyVoidFuture{});
-        EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(sel)));
+        // On multi-threaded executors the spawned tasks may complete before the
+        // select evaluates, so either branch can win. Capture the result if
+        // next(js) won so no item is silently dropped.
+        if (auto* b = std::get_if<SelectBranch<0, std::optional<int>>>(&sel))
+            if (b->value) results.push_back(*b->value);
+        // JoinSet must be fully drainable regardless of which branch won.
         while (auto item = co_await next(js))
             results.push_back(*item);
     }(results));

@@ -49,13 +49,17 @@ TEST(FileTest, BasicOpenWriteReadClose) {
     rt.block_on([](std::string path) -> Coro<void> {
         // Write
         auto file = co_await File::open(path, FileMode::Write | FileMode::Create | FileMode::Truncate);
-        auto [written, data] = co_await file.write(std::string("Hello, File I/O!"));
+        // GCC bug: structured bindings in coroutines leak when spanning a suspension.
+        // 'data' must survive the co_await File::open() below, so it must be a named frame variable.
+        auto wr      = co_await file.write(std::string("Hello, File I/O!"));
+        auto written = wr.first;
+        auto data    = std::move(wr.second);
         EXPECT_EQ(written, data.size());
         // Drop file to close, then re-open read-only
         file = co_await File::open(path, FileMode::Read);  // assignment closes previous fd
-        auto [n, buf] = co_await file.read(std::array<std::byte, 128>{});
-        EXPECT_EQ(n, data.size());
-        std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
+        auto rr = co_await file.read(std::array<std::byte, 128>{});
+        EXPECT_EQ(rr.first, data.size());
+        std::string read_back(reinterpret_cast<const char*>(rr.second.data()), rr.first);
         EXPECT_EQ(read_back, data);
     }(temp.path_string()));
 }
@@ -72,8 +76,8 @@ TEST(FileTest, ReadEOF) {
     Runtime rt;
     rt.block_on([](std::string path) -> Coro<void> {
         auto file = co_await File::open(path, FileMode::Read);
-        auto [n, _] = co_await file.read(std::array<std::byte, 16>{});
-        EXPECT_EQ(n, 0);  // EOF
+        auto rr = co_await file.read(std::array<std::byte, 16>{});
+        EXPECT_EQ(rr.first, 0);  // EOF
     }(temp.path_string()));
 }
 
@@ -111,9 +115,9 @@ TEST(FileTest, PositionalIO) {
         co_await file.write_at(std::string("AAAA"), 0);
         co_await file.write_at(std::string("BBBB"), 100);
 
-        auto [n, buf] = co_await file.read_at(std::array<std::byte, 4>{}, 100);
-        EXPECT_EQ(n, 4);
-        std::string read_back(reinterpret_cast<const char*>(buf.data()), n);
+        auto rr = co_await file.read_at(std::array<std::byte, 4>{}, 100);
+        EXPECT_EQ(rr.first, 4);
+        std::string read_back(reinterpret_cast<const char*>(rr.second.data()), rr.first);
         EXPECT_EQ(read_back, "BBBB");
     }(temp.path_string()));
 }
@@ -135,9 +139,9 @@ TEST(FileTest, MultipleSequentialReads) {
         file = co_await File::open(path, FileMode::Read);  // closes write fd, opens read
         std::size_t total = 0;
         while (true) {
-            auto [n, _] = co_await file.read(std::array<std::byte, 64>{});
-            if (n == 0) break;
-            total += n;
+            auto rr = co_await file.read(std::array<std::byte, 64>{});
+            if (rr.first == 0) break;
+            total += rr.first;
         }
         EXPECT_EQ(total, 128u);
     }(temp.path_string()));
@@ -164,8 +168,8 @@ TEST(FileTest, MultipleConcurrentFiles) {
         // Read phase
         for (int i = 0; i < n; ++i) {
             auto file = co_await File::open(paths[i], FileMode::Read);
-            auto [bytes, buf] = co_await file.read(std::array<std::byte, 32>{});
-            std::string got(reinterpret_cast<const char*>(buf.data()), bytes);
+            auto rr = co_await file.read(std::array<std::byte, 32>{});
+            std::string got(reinterpret_cast<const char*>(rr.second.data()), rr.first);
             EXPECT_EQ(got, "File" + std::to_string(i));
         }
     }(N, [&] {

@@ -2,94 +2,12 @@
 
 #include <coro/runtime/executor.h>
 #include <coro/task/join_handle.h>
-#include <coro/stream.h>
-#include <coro/task/stream_handle.h>
 #include <coro/detail/task.h>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 
 namespace coro {
-
-namespace detail {
-
-// StreamDriver<S> — internal Future<void> that drives a stream and pushes items
-// through a bounded Channel. Runs as a background Task scheduled by the executor.
-// Backpressure: when the channel buffer is full, the driver parks itself and waits
-// for the consumer (StreamHandle) to make space.
-template<Stream S>
-struct StreamDriver {
-    using OutputType = void;
-    using ItemType   = typename S::ItemType;
-
-    S                                        m_stream;
-    std::shared_ptr<Channel<ItemType>>       m_channel;
-    std::optional<ItemType>                  m_pending;  // item buffered while channel was full
-
-    PollResult<void> poll(Context& ctx) {
-        // Flush pending item (backpressure recovery).
-        if (m_pending.has_value()) {
-            std::unique_lock lock(m_channel->mutex);
-            if (m_channel->buffer.size() < m_channel->capacity) {
-                m_channel->buffer.push(std::move(*m_pending));
-                m_pending.reset();
-                auto to_wake = std::move(m_channel->consumer_waker);
-                lock.unlock();
-                if (auto w = to_wake.lock()) w->wake();
-                // Fall through to poll stream again.
-            } else {
-                m_channel->producer_waker = ctx.get_weak_waker();
-                return PollPending;
-            }
-        }
-
-        // Drain the stream into the channel.
-        while (true) {
-            auto result = m_stream.poll_next(ctx);
-
-            if (result.isPending()) return PollPending;
-
-            if (result.isError()) {
-                std::unique_lock lock(m_channel->mutex);
-                m_channel->exception = result.error();
-                m_channel->closed    = true;
-                auto to_wake = std::move(m_channel->consumer_waker);
-                lock.unlock();
-                if (auto w = to_wake.lock()) w->wake();
-                return PollReady;
-            }
-
-            auto opt = std::move(result).value();
-            if (!opt.has_value()) {
-                // Stream exhausted.
-                std::unique_lock lock(m_channel->mutex);
-                m_channel->closed = true;
-                auto to_wake = std::move(m_channel->consumer_waker);
-                lock.unlock();
-                if (auto w = to_wake.lock()) w->wake();
-                return PollReady;
-            }
-
-            // Got an item — push to buffer or park under backpressure.
-            std::unique_lock lock(m_channel->mutex);
-            if (m_channel->buffer.size() < m_channel->capacity) {
-                m_channel->buffer.push(std::move(*opt));
-                auto to_wake = std::move(m_channel->consumer_waker);
-                lock.unlock();
-                if (auto w = to_wake.lock()) w->wake();
-                // Keep polling stream.
-            } else {
-                m_pending                = std::move(opt);
-                m_channel->producer_waker = ctx.get_weak_waker();
-                return PollPending;
-            }
-        }
-    }
-};
-
-} // namespace detail
-
 
 /**
  * @brief Builder for configuring a background task before spawning it.
@@ -111,7 +29,7 @@ public:
         return *this;
     }
 
-    /// @brief Sets the bounded channel capacity for stream tasks (default: 64 items).
+    /// @brief Sets the bounded queue capacity for stream tasks (default: 64 items).
     SpawnBuilder& buffer(std::size_t size) {
         m_buffer_size = size;
         return *this;
@@ -130,20 +48,20 @@ public:
         return JoinHandle<T>(std::move(state), std::move(task_ref));
     }
 
-    /// @brief Creates a bounded channel, schedules the stream driver, and returns a @ref StreamHandle.
+    /// @brief Creates a StreamTaskImpl, schedules it, and returns a @ref StreamHandle.
+    ///
+    /// One make_shared allocation combines TaskBase, StreamTaskState<T>, and the stream.
+    /// StreamHandle receives an aliased shared_ptr<StreamTaskState<T>> into that allocation.
     template<Stream S>
     StreamHandle<typename S::ItemType> spawn(S stream) {
-        auto channel = std::make_shared<detail::Channel<typename S::ItemType>>(m_buffer_size);
-        std::weak_ptr<detail::TaskBase> driver;
-        if (m_executor) {
-            using Driver = detail::StreamDriver<S>;
-            auto impl = std::make_shared<detail::TaskImpl<Driver>>(
-                Driver{std::move(stream), channel, std::nullopt});
-            impl->name = std::move(m_name);
-            driver = std::weak_ptr<detail::TaskBase>{impl};
+        using T = typename S::ItemType;
+        auto impl = std::make_shared<detail::StreamTaskImpl<S>>(std::move(stream), m_buffer_size);
+        impl->name = std::move(m_name);
+        std::shared_ptr<detail::StreamTaskState<T>> state = impl;
+        std::weak_ptr<detail::TaskBase> task_ref{impl};
+        if (m_executor)
             m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
-        }
-        return StreamHandle<typename S::ItemType>(std::move(channel), std::move(driver));
+        return StreamHandle<T>(std::move(state), std::move(task_ref));
     }
 
 private:
