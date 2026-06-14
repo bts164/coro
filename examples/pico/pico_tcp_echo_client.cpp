@@ -3,11 +3,8 @@
 // Pico W TCP echo client. Connects to a running echo server, sends 5 messages,
 // and prints the replies.
 //
-// Build with the Pico SDK. Pass WiFi credentials and server address at
-// configure time:
-//
-//   cmake -DWIFI_SSID="myssid" -DWIFI_PASSWORD="mypassword" \
-//         -DECHO_HOST="192.168.1.100" ...
+// Build with the Pico SDK. Copy wifi_credentials.h.example to wifi_credentials.h
+// and fill in your network details before configuring with cmake.
 
 #include <pico/stdlib.h>
 #include <pico/stdio_usb.h>
@@ -16,17 +13,11 @@
 #include <coro/io/tcp_stream.h>
 #include <coro/coro.h>
 #include <coro/task/join_set.h>
+#include "wifi_credentials.h"
 #include <cstdio>
 #include <string>
 
 using namespace coro;
-
-#ifndef WIFI_SSID
-#define WIFI_SSID     "your_wifi_ssid"
-#endif
-#ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "your_wifi_password"
-#endif
 #ifndef ECHO_HOST
 #define ECHO_HOST     "192.168.1.100"
 #endif

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "irq.h"
 
 // Stub for Pico SDK <hardware/dma.h> used in Linux unit-test builds.
 // Only the symbols used by AsyncDmaTransfer are stubbed. Real RP2040 hardware
@@ -10,7 +11,6 @@ using uint = unsigned int;
 
 static constexpr uint NUM_DMA_CHANNELS = 12;
 static constexpr uint DMA_IRQ_0 = 11;  // matches Pico SDK value
-static constexpr uint8_t PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY = 0x80;
 
 // Transfer data sizes (match pico SDK enum values)
 enum dma_channel_transfer_size {
@@ -22,8 +22,6 @@ enum dma_channel_transfer_size {
 struct dma_channel_config {
     uint32_t ctrl = 0;
 };
-
-using irq_handler_t = void(*)();
 
 // ---------------------------------------------------------------------------
 // Channel config helpers — all no-ops in the stub
@@ -50,16 +48,16 @@ void dma_channel_start(uint ch);
 void dma_channel_abort(uint ch);
 
 // ---------------------------------------------------------------------------
+// Per-channel IRQ enable / status
+// ---------------------------------------------------------------------------
+inline void dma_channel_set_irq0_enabled(uint, bool) {}
+inline bool dma_channel_is_busy(uint) { return false; }
+
+// ---------------------------------------------------------------------------
 // IRQ status — controlled by test helpers below
 // ---------------------------------------------------------------------------
 bool dma_irqn_get_channel_status(uint irq_index, uint ch);
 void dma_irqn_acknowledge_channel(uint irq_index, uint ch);
-
-// ---------------------------------------------------------------------------
-// IRQ registration — stubs record the handler; tests invoke it via helpers
-// ---------------------------------------------------------------------------
-void irq_add_shared_handler(uint irq_num, irq_handler_t handler, uint8_t order_priority);
-void irq_set_enabled(uint irq_num, bool enabled);
 
 // ---------------------------------------------------------------------------
 // Test helpers

@@ -28,7 +28,7 @@ portable C++20/23 with no platform dependencies and compiles as-is.
 
 | Flag | Effect |
 |---|---|
-| `CORO_PICO` | Selects `CurrentThreadExecutor`, bare-metal mutex stubs, `SleepFuture` timer queue, no libuv |
+| `CORO_PICO` | Selects `CurrentThreadExecutor`, no-op mutex stubs, `SleepFuture` timer queue, no libuv |
 | `CORO_TCP_BACKEND_LWIP` | Selects lwIP TCP backend for `TcpStream` / `TcpListener` |
 
 Both flags are set automatically by `cmake/platforms/pico.cmake`.
@@ -40,7 +40,7 @@ Both flags are set automatically by `cmake/platforms/pico.cmake`.
 | `uv_run(UV_RUN_ONCE)` | `cyw43_arch_poll()` |
 | `uv_tcp_t` | lwIP `tcp_pcb*` |
 | `uv_timer_t` | `CurrentThreadExecutor` timer queue (min-heap + `time_us_64()`) |
-| `uv_async_send()` doorbell | Not needed — single-threaded; ISR/core-1 path uses spin lock + IRQ disable |
+| `uv_async_send()` doorbell | Not needed — single-threaded cooperative scheduling; ISR path uses `IsrEvent` volatile flags |
 | `UvCallbackResult` | `LwipCallbackResult` (no mutex; see below) |
 | `SingleThreadedUvExecutor` (dedicated I/O thread) | `CurrentThreadExecutor` (runs on calling thread) |
 
@@ -67,46 +67,68 @@ have passed since the last iteration.
 
 ## Synchronisation and ISR safety
 
-### `detail::Mutex` — spin lock + IRQ disable critical sections
+### `detail::Mutex` — no-op on Pico
 
 On all non-Pico targets `detail::Mutex` / `detail::SharedMutex` are thin aliases for
-`std::mutex` / `std::shared_mutex`. On Pico they are implemented using the Pico SDK's
-`spin_lock_blocking()` / `spin_unlock()`, which **both disable IRQs and acquire a
-hardware spin lock** in a single operation:
+`std::mutex` / `std::shared_mutex`. On Pico they are **no-ops** — all methods are empty:
 
 ```cpp
 class Mutex {
 public:
-    void lock()     { m_save = spin_lock_blocking(spin_lock_instance(k_coro_spin_lock_num)); }
-    void unlock()   { spin_unlock(spin_lock_instance(k_coro_spin_lock_num), m_save); }
-    bool try_lock() { lock(); return true; }
-private:
-    uint32_t m_save = 0;  // saved PRIMASK, restored by spin_unlock
+    void lock()     {}
+    void unlock()   {}
+    bool try_lock() { return true; }
 };
 ```
 
-`spin_lock_blocking` calls `save_and_disable_interrupts()` internally before spinning
-on the lock register; `spin_unlock` calls `restore_interrupts()` after releasing it.
-The `m_save` field carries the saved IRQ state between the two calls.
+This is correct because `CurrentThreadExecutor` is **cooperative and single-threaded**.
+`co_await` is the only yield point: no two coroutines ever run concurrently, so no
+mutual exclusion is needed to protect channel state, wakers, or the ready queue. IRQ
+handlers communicate with coroutines exclusively via `IsrEvent` and `IsrChannel<T>`
+(described below), not by calling coro sync primitives directly.
 
-This is used uniformly for every mutex instance in the library — including channel
-state, oneshot, watch, and the executor's ready queue.
+#### History: why spin locks were used and then removed
 
-!!! note "Why both IRQ disable and spin lock?"
-    Two sources of concurrency exist on RP2040:
+The initial Pico port implemented `detail::Mutex` using `spin_lock_blocking()` /
+`spin_unlock()` from the Pico SDK, sharing a single hardware spin lock (number 16)
+across every mutex instance. This approach disabled IRQs for the entire duration of each
+lock-guarded critical section.
 
-    1. **ISR preemption** — an IRQ handler on the same core can call `OneshotSender::send()`
-       or `waker->wake()` while the executor is mid-operation. IRQ disable prevents this.
-    2. **Core 1 access** — a sensor driver or peripheral handler running on core 1 can call
-       the same APIs concurrently. IRQ disable alone does nothing to core 1; the spin lock
-       provides the necessary mutual exclusion between cores.
+The intent was to allow ISR handlers and core-1 code to safely call coro APIs (channel
+send, waker wake, etc.) directly. In practice, this caused a class of hard-to-diagnose
+deadlocks: coro mutexes protect channel state that is accessed deep inside application
+logic (e.g. inside a `WatchSender::borrow_mut()` scope). Application code running under
+these locks may legitimately perform slow I/O — I2C writes, `printf` via USB-CDC — that
+depend on IRQ handlers to make progress. With IRQs disabled for the duration of the lock,
+those handlers could never run, deadlocking the whole system.
 
-!!! note "Only one hardware spin lock is consumed"
-    Regardless of how many channels, wakers, or tasks exist, all `detail::Mutex` instances
-    share spin lock 16. This is correct because without preemptive scheduling each core can
-    hold at most one coro mutex at a time — IRQs are masked while the lock is held
-    (preventing ISR preemption on the same core), and there are no OS threads. One spin lock
-    therefore suffices to arbitrate between core 0, core 1, and any ISR on either core.
+A concrete example from the `pico_ws2812_tcp` example:
+
+1. `display_loop` called `rx.borrow_and_update()` (acquires `detail::Mutex` → IRQs disabled)
+2. Inside the lock, `lcd.write()` issued an I2C transaction (~640 µs per character)
+3. The I2C peripheral fired a TX-empty IRQ to advance the transfer — but IRQs were disabled
+4. `i2c_write_blocking` spun forever waiting for the IRQ flag
+5. USB-CDC `printf` later in the loop also requires IRQ service; filling the TX buffer blocked
+6. Entire system deadlocked
+
+The root cause is that the spin-lock approach coupled IRQ liveness to coro internal lock
+scopes, making any I/O inside a lock-guarded section unsafe. The correct fix is to
+recognise that these locks are unnecessary in the first place.
+
+!!! warning "WARNING: Core-1 task dispatch would require revisiting this decision"
+    No-op mutexes are correct *only* as long as all coro operations (spawning tasks,
+    sending on channels, waking futures) happen on the same core as the executor. If a
+    future feature adds the ability to dispatch tasks or send on channels from core 1,
+    every `detail::Mutex` guard site would need to become a real critical section again.
+    Any core-1 integration must audit this before landing.
+
+#### Cortex-M0+ atomics
+
+`std::atomic` operations in coro internals (e.g. `SchedulingState` CAS in `TaskBase`)
+use IRQ-disable (`CPSID I / CPSIE I`) on Cortex-M0+ because M0+ lacks the `LDREX` /
+`STREX` load-linked / store-conditional instructions. The libatomic fallback disables IRQs
+for approximately 4–6 instructions per operation. This is safe and correct; the brief
+IRQ-disable window is far too short to cause the deadlock class described above.
 
 ### ISR → coroutine communication: `IsrEvent` and `IsrChannel<T>`
 
@@ -232,84 +254,6 @@ handler is registered once (via `irq_add_shared_handler`) when the first
     `AsyncDmaTransfer` could be extended to support `DMA_IRQ_1` as an alternative.
     This is deferred until a concrete need arises.
 
-#### Usage: PIO TX FIFO DMA (WS2812B)
-
-```cpp
-// In PioStrip (PicoLED fork):
-AsyncDmaTransfer m_dma;   // one per strip; claims channel at construction
-
-coro::Coro<void> PioStrip::show() {
-    dma_channel_config cfg = dma_channel_get_default_config(m_dma.channel());
-    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);
-    channel_config_set_read_increment(&cfg, true);
-    channel_config_set_write_increment(&cfg, false);
-    channel_config_set_dreq(&cfg, pio_get_dreq(m_pioBlock, m_stateMachine, true));
-
-    co_await m_dma.transfer(cfg,
-        m_data,                                   // source: LED pixel buffer
-        &m_pioBlock->txf[m_stateMachine],         // dest:   PIO TX FIFO
-        m_numLeds);                               // 32-bit words
-}
-```
-
-The PIO state machine's autopull DREQ gates the DMA — data is clocked into the
-FIFO only as fast as the PIO program consumes it, so the CPU does no work while
-150–200 LEDs are being shifted out (≈6 ms at 800 kHz).
-
----
-
-## PicoLED integration: async `show()`
-
-The [PicoLED library](https://github.com/ForsakenNGS/PicoLED) drives WS2812B strips
-via a PIO state machine. Its `PioStrip::show()` calls `pio_sm_put_blocking()` in a
-loop, blocking the executor for ≈6 ms per 200 LEDs — unacceptable for a coroutine
-application running concurrent TCP sessions.
-
-The coro repo maintains a fork of PicoLED at `examples/pico/PicoLED/` with two changes:
-
-1. **`show()` becomes `coro::Coro<void>`** throughout the class hierarchy
-   (`PicoLedTarget`, `PioStrip`, `VirtualStrip`, `PicoLedController`). The blocking
-   `pio_sm_put_blocking` loop is replaced by a single `AsyncDmaTransfer`.
-2. **`AsyncDmaTransfer m_dma`** is added as a member of `PioStrip`. It claims its DMA
-   channel at construction and holds it for the lifetime of the strip object.
-
-The fork's `CMakeLists.txt` adds `coro_pico_hal` as a dependency.
-
-### Class hierarchy change
-
-```mermaid
-classDiagram
-    class PicoLedTarget {
-        +show() Coro~void~ *
-    }
-    class PioStrip {
-        -AsyncDmaTransfer m_dma
-        +show() Coro~void~
-    }
-    class VirtualStrip {
-        +show() Coro~void~
-    }
-    class WS2812B
-    PicoLedTarget <|-- PioStrip
-    PicoLedTarget <|-- VirtualStrip
-    PioStrip <|-- WS2812B
-```
-
-### Cancellation behaviour
-
-If `show()` is cancelled mid-transfer (e.g. a new animation command arrives while a
-frame is being clocked out):
-
-- The RAII destructor of `AsyncDmaTransfer::transfer()` calls `dma_channel_abort()`,
-  which immediately stops the DMA engine without waiting for the current beat.
-- The PIO TX FIFO may contain stale data; the state machine continues clocking it
-  until the FIFO drains. The resulting partial frame will appear as garbage on a
-  fraction of the strip for one frame period (≈300 µs reset gap follows).
-- For the WS2812B TCP server example the policy is **let the frame finish before
-  applying a new command** — `show()` is not cancelled mid-transfer. Cancellation
-  is supported by the primitive for applications that require it.
-
----
 
 ### `LwipCallbackResult` — no mutex needed for lwIP callbacks
 
@@ -333,9 +277,8 @@ cmake/platforms/
   pico_hal.cmake                Optional HAL layer: defines coro_pico_hal (DMA, SPI, ...)
 
 include/coro/
-  detail/mutex.h                Platform-portable mutex: spin lock + IRQ disable on Pico
-                                (hardware spin lock 16, shared across all instances),
-                                std::mutex elsewhere
+  detail/mutex.h                Platform-portable mutex: no-op stubs on Pico (cooperative
+                                scheduling makes locking unnecessary), std::mutex elsewhere
   sync/
     isr_event.h                 IsrEvent / IsrChannel<T> — ISR-to-coroutine primitives
     sleep.h                     SleepFuture — timer-queue based on Pico, libuv on desktop
@@ -364,11 +307,12 @@ src/
 examples/pico/
   CMakeLists.txt                Standalone Pico SDK build
   lwipopts.h                    lwIP configuration (DHCP, TCP, NO_SYS=1)
+  wifi_credentials.h.example    Template — copy to wifi_credentials.h (gitignored)
   pico_tcp_echo_server.cpp      TCP echo server example
   pico_tcp_echo_client.cpp      TCP echo client example
-  pico_ws2812_tcp.cpp           WS2812B LED strip controller via TCP (uses coro_pico_hal)
-  ws2812.pio                    800 kHz NRZ PIO program for WS2812B
-  PicoLED/                      Fork of ForsakenNGS/PicoLED with async show()
+  pico_ws2812_tcp.cpp           WS2812B LED controller with TCP command interface
+  ws2812_gui.py                 PyQt6 desktop GUI for the LED controller
+  requirements.txt              Python dependencies (pip install -r requirements.txt)
   README.md                     Build instructions
 ```
 
@@ -382,8 +326,9 @@ Identical CAS state machine as `SingleThreadedExecutor`
 (`Notified → Running → Idle / RunningAndNotified`). Key differences:
 
 - **Single-threaded.** No remote injection queue. `enqueue()` pushes directly to
-  `m_ready`, protected by `m_ready_mutex` (a `detail::Mutex` — spin lock + IRQ disable)
-  so that wakers called from ISR handlers or from core 1 are safe.
+  `m_ready`, nominally protected by `m_ready_mutex` (a `detail::Mutex` — a no-op on
+  Pico; see [Synchronisation](#synchronisation-and-isr-safety)). Wakers from ISR
+  handlers must go through `IsrEvent` / `IsrChannel<T>`, not direct `enqueue()` calls.
 - **No `std::condition_variable` in the run loop.** `wait_for_completion()` polls
   `state.terminated` in a loop rather than blocking on a condvar.
 - **Timer queue.** A min-heap of `(deadline_us, waker)` pairs. `schedule_timer()`
@@ -560,6 +505,7 @@ pico_add_extra_outputs(my_firmware)   # generates .uf2 / .bin / .hex
 #include <coro/coro.h>
 #include <coro/task/join_set.h>
 #include <coro/sync/timeout.h>
+#include "wifi_credentials.h"   // gitignored — copy wifi_credentials.h.example
 #include <string>
 
 using namespace coro;
@@ -592,7 +538,7 @@ int main() {
     stdio_init_all();
     cyw43_arch_init();
     cyw43_arch_enable_sta_mode();
-    cyw43_arch_wifi_connect_timeout_ms("SSID", "password",
+    cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD,
                                        CYW43_AUTH_WPA2_AES_PSK, 15000);
     std::printf("IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
 

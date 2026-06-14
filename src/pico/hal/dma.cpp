@@ -2,6 +2,7 @@
 
 #include <coro/pico/hal/dma.h>
 #include <hardware/dma.h>
+#include <hardware/irq.h>
 #include <stdexcept>
 #include <mutex>
 
@@ -56,12 +57,18 @@ AsyncDmaTransfer::AsyncDmaTransfer() {
                                PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
         irq_set_enabled(DMA_IRQ_0, true);
     });
+
+    // Allow this channel's completion to assert DMA_IRQ_0.
+    // Without this the global irq_set_enabled(DMA_IRQ_0) has no effect for
+    // this channel: the NVIC line is armed but the channel never drives it.
+    dma_channel_set_irq0_enabled(static_cast<uint>(m_channel), true);
 }
 
 AsyncDmaTransfer::~AsyncDmaTransfer() {
     // Clear dispatch table entry before aborting so a late-firing IRQ does not
     // write into a destroyed IsrEvent.
     s_dispatch[m_channel] = nullptr;
+    dma_channel_set_irq0_enabled(static_cast<uint>(m_channel), false);
     dma_channel_abort(static_cast<uint>(m_channel));
     dma_channel_unclaim(static_cast<uint>(m_channel));
 }

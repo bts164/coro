@@ -4,9 +4,8 @@
 // received from any connected client. Handles multiple concurrent connections
 // via JoinSet.
 //
-// Build with the Pico SDK. Pass WiFi credentials at configure time:
-//
-//   cmake -DWIFI_SSID="myssid" -DWIFI_PASSWORD="mypassword" ...
+// Build with the Pico SDK. Copy wifi_credentials.h.example to wifi_credentials.h
+// and fill in your network details before configuring with cmake.
 //
 // Connect from a desktop machine:
 //   echo "hello" | nc <pico-ip> 8080
@@ -21,17 +20,11 @@
 #include <coro/coro.h>
 #include <coro/task/join_set.h>
 #include <coro/sync/timeout.h>
+#include "wifi_credentials.h"
 #include <cstdio>
 #include <string>
 
 using namespace coro;
-
-#ifndef WIFI_SSID
-#define WIFI_SSID     "your_wifi_ssid"
-#endif
-#ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "your_wifi_password"
-#endif
 static constexpr const char* BIND_HOST = "0.0.0.0";
 static constexpr uint16_t    BIND_PORT = 8080;
 

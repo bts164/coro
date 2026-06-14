@@ -97,6 +97,22 @@ public:
         }
     }
 
+    /// @brief Cancels the task and returns the handle for the caller to co_await.
+    ///
+    /// Calls cancel() then moves the handle out so the caller can co_await it
+    /// directly — no intermediate coroutine frame, no extra allocation.
+    ///
+    ///   co_await std::move(*g_handle).cancel_and_join();
+    ///   g_handle = spawn(new_task());
+    ///
+    /// The caller suspends until the task has fully drained (frame and all scope
+    /// children destroyed), then resumes. For JoinHandle<void>, the co_await
+    /// completes silently whether the task finished normally or was cancelled.
+    [[nodiscard]] JoinHandle cancel_and_join() && {
+        cancel();
+        return std::move(*this);
+    }
+
     /// @brief Cancels the task (if cancelOnDestroy) and registers with the enclosing scope.
     ///
     /// If inside a coroutine poll (t_current_coro != null), records a weak_ptr to the child

@@ -1,7 +1,10 @@
 # coro
 
-A C++20 coroutines library for multi-threaded asynchronous task synchronization and I/O,
-heavily inspired by Rust's async model and the Tokio runtime.
+A C++20 coroutines library for asynchronous task synchronization and I/O, heavily
+inspired by Rust's async model and the Tokio runtime. It scales from cooperative
+multitasking on a single thread all the way to a fully multi-threaded work-stealing
+executor, and the runtime is lightweight enough to run on bare-metal microcontrollers
+with no RTOS required — a working Raspberry Pi Pico port ships with the library.
 
 ## What are coroutines
 
@@ -54,6 +57,10 @@ difference from OS threads is what happens while a task waits:
 | Scheduling | Preemptive — OS can interrupt at any time | Cooperative — suspends only at `co_await` points |
 | Practical scale | Thousands | Hundreds of thousands |
 
+On the Pico port, `CurrentThreadExecutor` drives tasks on the calling thread,
+interleaving task polling with `cyw43_arch_poll()` in a simple main loop, enabling
+cooperative multitasking with no RTOS and no user-written event loop required.
+
 ## Key features
 
 - **`Coro<T>` / `CoroStream<T>`** — async function and async generator return types; compose with `co_await` and `co_yield`.
@@ -66,6 +73,7 @@ difference from OS threads is what happens while a task waits:
 - **`spawn_blocking()`** — run blocking code on a dedicated thread pool without starving the executor.
 - **Async I/O** — `File`, `TcpStream`, `TcpListener`, `WsStream`, and `WsListener` for async file, TCP, and WebSocket I/O (backed by libuv).
 - **Multi-threaded executor** — tasks are distributed across worker threads automatically.
+- **MCU support** — `CurrentThreadExecutor` runs the full task graph on the calling thread; ships with a working Raspberry Pi Pico port.
 
 ## Quick example
 

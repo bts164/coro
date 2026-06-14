@@ -33,13 +33,13 @@ set(_CORO_INCLUDE ${CORO_ROOT}/include)
 #   target_link_libraries(my_firmware PRIVATE coro_pico pico_stdlib pico_cyw43_arch_lwip_poll)
 # ---------------------------------------------------------------------------
 add_library(coro_pico STATIC
-    ${_CORO_SRC}/waker.cpp
-    ${_CORO_SRC}/task.cpp
-    ${_CORO_SRC}/cancellation_token.cpp
-    ${_CORO_SRC}/context.cpp
-    ${_CORO_SRC}/executor.cpp
-    ${_CORO_SRC}/runtime.cpp
-    ${_CORO_SRC}/current_thread_executor.cpp
+    ${_CORO_SRC}/task/waker.cpp
+    ${_CORO_SRC}/task/task.cpp
+    ${_CORO_SRC}/task/context.cpp
+    ${_CORO_SRC}/sync/cancellation_token.cpp
+    ${_CORO_SRC}/runtime/executor.cpp
+    ${_CORO_SRC}/runtime/runtime.cpp
+    ${_CORO_SRC}/runtime/current_thread_executor.cpp
     ${_CORO_SRC}/io/lwip/tcp_stream_lwip.cpp
     ${_CORO_SRC}/io/lwip/tcp_listener_lwip.cpp
 )

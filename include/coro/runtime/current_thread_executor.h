@@ -119,6 +119,7 @@ public:
     /// IsrEvent without busy-polling. Safe to call from the executor thread only
     /// (not from an ISR — registration happens inside the coroutine, not the ISR).
     void add_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker);
+    void remove_isr_poll(const volatile bool* flag);
 
     /// @brief Scans registered ISR event flags; fires wakers for any that are set.
     /// Called from wait_for_completion() on every loop iteration, after m_poll().

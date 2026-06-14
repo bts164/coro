@@ -1,9 +1,10 @@
-# Pico TCP Echo Examples
+# Pico W Examples
 
-Two examples showing `coro` running on a Raspberry Pi Pico W:
+Three examples showing `coro` running on a Raspberry Pi Pico W:
 
 - **`pico_tcp_echo_server`** — binds to `0.0.0.0:8080`, accepts connections, and echoes back everything it receives. Handles multiple concurrent clients via `JoinSet`.
 - **`pico_tcp_echo_client`** — connects to a running echo server, sends 5 messages, and prints the replies.
+- **`pico_ws2812_tcp`** — WS2812B LED controller. Accepts TCP connections on port 2812 and drives LEDs with fill/set/clear commands and animated effects. Comes with a PyQt6 desktop GUI (`ws2812_gui.py`).
 
 ---
 
@@ -53,18 +54,32 @@ Then reload your shell or run `source ~/.bashrc`.
 
 ---
 
-## Step 2 — Build the examples
+## Step 2 — Set your WiFi credentials
 
-From the `examples/pico` directory:
+Copy the credentials template and fill in your network name and password:
+
+```bash
+cd examples/pico
+cp wifi_credentials.h.example wifi_credentials.h
+$EDITOR wifi_credentials.h   # set WIFI_SSID and WIFI_PASSWORD
+```
+
+`wifi_credentials.h` is listed in `.gitignore` so it will never be accidentally committed.
+
+!!! warning "Never pass credentials on the cmake command line"
+    Putting `-DWIFI_SSID=...` on the cmake command line bakes the values into
+    `CMakeCache.txt` and `compile_commands.json`, where they can leak in build logs
+    or editor tooling. The `wifi_credentials.h` approach keeps them out of the build
+    system entirely.
+
+---
+
+## Step 3 — Build the examples
 
 ```bash
 cd examples/pico
 mkdir -p build && cd build
-
-cmake .. \
-    -DWIFI_SSID="your_network_name" \
-    -DWIFI_PASSWORD="your_network_password"
-
+cmake ..
 make -j$(nproc) pico_tcp_echo_server
 ```
 
@@ -72,7 +87,7 @@ A successful build produces `pico_tcp_echo_server.uf2` in the build directory.
 
 ---
 
-## Step 3 — Flash the firmware
+## Step 4 — Flash the firmware
 
 1. Hold the **BOOTSEL** button on the Pico W while plugging it into USB.
 2. Release BOOTSEL once it appears as a USB mass storage device (named `RPI-RP2`).
@@ -86,7 +101,7 @@ The Pico reboots automatically and starts running the firmware.
 
 ---
 
-## Step 4 — Monitor serial output
+## Step 5 — Monitor serial output
 
 The firmware prints its IP address and status over USB serial. Open a terminal:
 
@@ -117,7 +132,7 @@ Note the IP address assigned by your router — you need it for the next step. I
 
 ---
 
-## Step 5 — Test with the host client
+## Step 6 — Test with the host client
 
 Build and run `tcp_echo_client` from the main coro build (it uses the libuv-based executor on Linux — no lwIP needed on the host side):
 
@@ -139,6 +154,63 @@ echo "hello" | nc 192.168.1.42 8080
 
 ---
 
+## WS2812B LED controller (`pico_ws2812_tcp`)
+
+### Build and flash
+
+```bash
+cd examples/pico/build
+make -j$(nproc) pico_ws2812_tcp
+cp pico_ws2812_tcp.uf2 /media/$USER/RPI-RP2/
+```
+
+### Desktop GUI
+
+Install Python dependencies (once):
+
+```bash
+cd examples/pico
+pip install -r requirements.txt
+```
+
+Launch the GUI (replace the IP with your Pico's address):
+
+```bash
+python ws2812_gui.py --host 192.168.1.42 --port 2812
+```
+
+The GUI has two tabs:
+
+- **Effects** — pick an effect (Fade, Marquee, Comet, Stars, Bounce, Particles), choose a colour, tune the parameters with the spin-boxes, and click **Apply Effect**. Click **Stop** to return to manual mode.
+- **Manual** — set brightness, fill all LEDs with a colour, set individual pixels, or push the current buffer with Show.
+
+### TCP command reference
+
+Commands are newline-terminated text. Each returns `ok` or `err: <reason>`.
+
+```
+fill <r> <g> <b>
+set  <i> <r> <g> <b>
+clear
+show
+stop
+brightness <0-255>
+effect fade      <r> <g> <b> <rate>
+effect marquee   <speed> <r> <g> <b>
+effect comet     <r> <g> <b> <speed> <length> <faderate>
+effect stars     <r> <g> <b> <spawnrate> <faderate>
+effect bounce    <r> <g> <b> <size> <gravity> <faderate>
+effect particles <r> <g> <b> <spread> <cool>
+```
+
+Quick test with netcat:
+
+```bash
+echo "effect fade 255 0 64 1.5" | nc 192.168.1.42 2812
+```
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -147,5 +219,5 @@ echo "hello" | nc 192.168.1.42 8080
 | `fatal error: pico/cyw43_arch.h` | Building for wrong board | Run `export PICO_BOARD=pico_w` and wipe the build dir |
 | `arm-none-eabi-gcc: not found` | Toolchain not installed | `sudo apt install gcc-arm-none-eabi` |
 | Pico does not appear as mass storage | BOOTSEL not held during plug-in | Unplug, hold BOOTSEL, replug |
-| Serial shows `WiFi connect failed` | Wrong SSID / password or 5 GHz network | Pico W supports 2.4 GHz only; rerun cmake with correct credentials |
+| Serial shows `WiFi connect failed` | Wrong SSID / password or 5 GHz network | Pico W supports 2.4 GHz only; fix `wifi_credentials.h` and rebuild |
 | Client connects but gets no echo | Firewall on Pico's subnet | Not applicable — the Pico has no firewall; check the server serial log for accepted connections |

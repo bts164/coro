@@ -42,6 +42,14 @@
 #define TCP_SND_BUF                 (8 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
 
+// mDNS / DNS-SD — advertises the device as <hostname>.local on the LAN
+#define LWIP_MDNS_RESPONDER         1
+#define MDNS_MAX_SERVICES           1
+#define LWIP_NUM_NETIF_CLIENT_DATA  1   // slot for mdns_netif_client_id
+#define LWIP_IGMP                   1   // required by MDNS responder for multicast group join
+// mDNS + IGMP each register timers; bump the pool to avoid MEMP_SYS_TIMEOUT exhaustion
+#define MEMP_NUM_SYS_TIMEOUT        16
+
 // Misc
 #define LWIP_NETIF_STATUS_CALLBACK  1
 #define LWIP_NETIF_LINK_CALLBACK    1

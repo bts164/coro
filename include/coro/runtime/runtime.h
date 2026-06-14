@@ -66,6 +66,13 @@ public:
     /// executor thread (i.e. from inside a coroutine), never from an ISR.
     void register_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker);
 
+    /// @brief Removes an ISR poll registration before it fires.
+    ///
+    /// Called by IsrWaitFuture's destructor when the awaiting coroutine is
+    /// cancelled while the flag is still pending. Prevents the executor from
+    /// dereferencing a flag pointer whose backing IsrEvent may have been destroyed.
+    void remove_isr_poll(const volatile bool* flag);
+
     /// @brief Drains the coroutine ready queue once. Returns true if any task was polled.
     ///
     /// Call this from the firmware main loop alongside `cyw43_arch_poll()`:

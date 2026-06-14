@@ -55,12 +55,6 @@ void dma_irqn_acknowledge_channel(uint irq_index, uint ch) {
 }
 
 // ---------------------------------------------------------------------------
-// IRQ registration — stubs just record the handler (not invoked automatically)
-// ---------------------------------------------------------------------------
-
-void irq_add_shared_handler(uint, irq_handler_t, uint8_t) {}
-void irq_set_enabled(uint, bool) {}
-
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
