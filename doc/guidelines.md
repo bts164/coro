@@ -8,6 +8,8 @@ each rule has a short title, a rationale, and concrete examples.
 
 ## Table of Contents
 
+- [GCC Compiler Bug: Structured Bindings in Coroutines](#gcc-compiler-bug-structured-bindings-in-coroutines) ⚠️
+    - GCC.1 — Never use structured bindings inside a coroutine body for variables that may be live across a `co_await`
 - [Coroutine Scope](#coroutine-scope)
     - CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
     - CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
@@ -31,6 +33,86 @@ each rule has a short title, a rationale, and concrete examples.
     - IS.1 — Only call `signal_from_isr()` or `send_from_isr()` from an interrupt handler
     - IS.2 — Keep interrupt handlers minimal: write a flag or value and return immediately
     - IS.3 — Declare `IsrEvent` and `IsrChannel<T>` at static or class scope; never as coroutine locals
+
+---
+
+## GCC Compiler Bug: Structured Bindings in Coroutines
+
+!!! danger "WARNING: Silent memory leak — no compiler diagnostic, code is syntactically correct"
+    This section documents a **GCC compiler defect**, not a language rule. Structured bindings
+    (`auto [a, b] = expr`) are valid C++ and work correctly everywhere except inside a coroutine
+    body when the bound variables span a real `co_await` suspension. GCC simply fails to generate
+    the destructor call for the hidden storage object in that specific case. The code compiles
+    without warnings, runs without crashes, and only leaks — making it one of the hardest classes
+    of bug to notice in code review. Always run LSan (`ENABLE_ASAN=ON` with `detect_leaks=1`)
+    to catch it. See `doc/gcc_structured_binding_coro_bug.md` for the full technical analysis.
+
+### GCC.1 — Never use structured bindings inside a coroutine body for variables that may be live across a `co_await`
+
+**Reason:** This is a GCC implementation defect (related to GCC PR 100611). The C++ standard
+requires all automatic-duration locals — including the anonymous storage object `__e` created by
+`auto [a, b] = expr` — to have their destructors called before `final_suspend` fires. GCC does not
+do this for structured bindings whose hidden `__e` variable is placed in the coroutine frame (i.e.,
+when a variable bound from `__e` is still in scope at a real `co_await` point). The result is a
+silent memory leak of anything `__e` holds on the heap: strings, channel handles, `unique_ptr`s,
+and so on.
+
+To be clear: **the syntax is correct, the semantics are standard-conforming, and this is purely a
+GCC bug.** We work around it by avoiding structured bindings in coroutine bodies whenever the bound
+variables could cross a suspension.
+
+This applies to **any** type that supports structured bindings — `std::pair`, `std::tuple`,
+aggregates, third-party tuple-like types — whenever unpacked inside a coroutine body. The library's
+own channel types (`oneshot_channel`, `mpsc_channel`, `watch_channel`) prevent this at compile time
+by returning non-aggregate named structs that do not support structured bindings (see CH.6). For all
+other types the only protection is this rule.
+
+**Trigger condition — `__e` spans a real suspension:**
+
+```cpp
+// The hidden variable __e (of type pair<size_t, string>) is placed in the coroutine
+// frame because 'data' (__e.second) is read AFTER the co_await on the next line.
+auto [written, data] = co_await file.write(std::string("hello, world"));
+file = co_await File::open(path, FileMode::Read);  // <-- real suspension; __e spans it
+EXPECT_EQ(data, "hello, world");  // data is __e.second — but __e's dtor was never called
+```
+
+**Safe pattern — unpack into a named variable:**
+
+```cpp
+// wr is a named frame variable; GCC correctly destroys it on coroutine completion.
+auto wr   = co_await file.write(std::string("hello, world"));
+auto data = std::move(wr.second);
+file = co_await File::open(path, FileMode::Read);  // suspension — data is safe
+EXPECT_EQ(data, "hello, world");
+```
+
+**Safe pattern — channel types enforce this at compile time:**
+
+```cpp
+// Compile error — the library's channel factory returns a non-aggregate struct:
+auto [tx, rx] = oneshot_channel<int>();   // error: structured binding not supported
+
+// Correct — access named members directly or move them out:
+auto ch = oneshot_channel<int>();
+ch.tx.send(42);
+auto val = co_await ch.rx.recv();
+```
+
+**Safe when `__e` does NOT span a suspension** (no leak, but avoid for consistency):
+
+```cpp
+Coro<void> ok() {
+    auto [a, b] = some_pair();
+    use(a, b);
+    co_return;  // no co_await after the binding — __e stays on the stack, no leak
+}
+```
+
+Note that whether `__e` "spans a suspension" is a runtime property — if a `co_await` always
+resolves immediately without suspending, no leak occurs. But this is fragile: adding a slow path
+later silently re-introduces the leak. Treat the rule as static: if a `co_await` textually follows
+the binding in the same scope, avoid the structured binding.
 
 ---
 

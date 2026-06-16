@@ -83,58 +83,68 @@ public:
     [[nodiscard]] static OpenFuture open(std::string path, FileMode mode);
 
     /**
-     * @brief Reads up to `buf.size()` bytes from the current file position.
-     *
-     * Takes ownership of `buf`; returns `{bytes_read, buf}`.
-     *
-     * When `exact` is `false` (default), issues a single read and returns however
-     * many bytes the OS delivered — may be less than `buf.size()`.
-     *
-     * When `exact` is `true`, loops until `buf.size()` bytes have been read or
-     * EOF is reached. Use this when you know exactly how many bytes are coming.
-     *
+     * @brief Single read from the current file position. Returns `{bytes_read, buf}`;
+     * may return fewer bytes than `buf.size()`.
      * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
     template <ByteBuffer Buf>
-    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read(Buf buf, bool exact = false);
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read(Buf buf);
 
     /**
-     * @brief Reads up to `buf.size()` bytes starting at `offset` (pread-style).
-     *
-     * Does not modify the file's current position. Takes ownership of `buf`;
-     * returns `{bytes_read, buf}`. See `read()` for the meaning of `exact`.
-     *
+     * @brief Loops until `buf.size()` bytes have been read or EOF is reached.
+     * Returns `{bytes_read, buf}`; `bytes_read < buf.size()` indicates EOF.
      * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
     template <ByteBuffer Buf>
-    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read_at(Buf buf, int64_t offset, bool exact = false);
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read_exact(Buf buf);
 
     /**
-     * @brief Writes bytes from `buf` to the current file position.
-     *
-     * Takes ownership of `buf`; returns `{bytes_written, buf}`.
-     *
-     * When `exact` is `false` (default), issues a single write and returns however
-     * many bytes the OS accepted — may be less than `buf.size()`.
-     *
-     * When `exact` is `true`, loops until all `buf.size()` bytes have been written.
-     * Use this when you need guaranteed full delivery.
-     *
+     * @brief Single read at `offset` (pread-style). Does not modify the file position.
+     * Returns `{bytes_read, buf}`; may return fewer bytes than `buf.size()`.
      * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
     template <ByteBuffer Buf>
-    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write(Buf buf, bool exact = false);
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read_at(Buf buf, int64_t offset);
 
     /**
-     * @brief Writes bytes from `buf` starting at `offset` (pwrite-style).
-     *
-     * Does not modify the file's current position. Takes ownership of `buf`;
-     * returns `{bytes_written, buf}`. See `write()` for the meaning of `exact`.
-     *
+     * @brief Loops at `offset` until `buf.size()` bytes have been read or EOF.
+     * Does not modify the file position. Returns `{bytes_read, buf}`.
      * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
     template <ByteBuffer Buf>
-    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write_at(Buf buf, int64_t offset, bool exact = false);
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read_at_exact(Buf buf, int64_t offset);
+
+    /**
+     * @brief Single write to the current file position. Returns `{bytes_written, buf}`;
+     * may write fewer bytes than `buf.size()`.
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
+     */
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write(Buf buf);
+
+    /**
+     * @brief Loops until all `buf.size()` bytes have been written.
+     * Returns `{bytes_written, buf}`.
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
+     */
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write_exact(Buf buf);
+
+    /**
+     * @brief Single write at `offset` (pwrite-style). Does not modify the file position.
+     * Returns `{bytes_written, buf}`; may write fewer bytes than `buf.size()`.
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
+     */
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write_at(Buf buf, int64_t offset);
+
+    /**
+     * @brief Loops at `offset` until all `buf.size()` bytes have been written.
+     * Does not modify the file position. Returns `{bytes_written, buf}`.
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
+     */
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> write_at_exact(Buf buf, int64_t offset);
 
 private:
     explicit File(uv_file fd, SingleThreadedUvExecutor* exec);

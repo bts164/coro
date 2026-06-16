@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+// Protocol for the WS2812B TCP LED controller.
+// Transport: each message on the wire is prefixed by a 4-byte little-endian length.
+// Direction: Command (host → Pico), Response (Pico → host).
+
+// Signal-only payload — used for commands and responses that carry no data.
+message Empty {}
+
+message Color {
+    uint32 r = 1;
+    uint32 g = 2;
+    uint32 b = 3;
+}
+
+message SetPixel {
+    uint32 index = 1;
+    Color  color = 2;
+}
+
+message SetPixels {
+    repeated SetPixel pixels = 1;
+}
+
+// --- Effect parameter messages ---
+
+message FadeEffect {
+    Color color = 1;
+    float rate  = 2;
+}
+
+message MarqueeEffect {
+    float speed = 1;
+    Color color = 2;
+}
+
+message CometEffect {
+    Color tail_color = 1;  // trail fade colour
+    float speed      = 2;
+    float length     = 3;
+    float faderate   = 4;
+    bool  wrap       = 5;  // true = wrap around strip; false = bounce at ends
+    Color head_color = 6;  // head colour; defaults to tail_color if left as black
+}
+
+message StarsEffect {
+    Color color     = 1;
+    float spawnrate = 2;
+    float faderate  = 3;
+}
+
+message BounceEffect {
+    Color tail_color = 1;  // trail fade colour
+    float size       = 2;
+    float gravity    = 3;
+    float faderate   = 4;
+    Color head_color = 5;  // ball colour; defaults to tail_color if left as black
+}
+
+message ParticlesEffect {
+    Color color  = 1;
+    float spread = 2;
+    float cool   = 3;
+}
+
+message WavesEffect {
+    Color color1     = 1;
+    Color color2     = 2;
+    float wavelength = 3;
+    float gravity    = 4;
+}
+
+message SpringEffect {
+    Color color1      = 1;
+    Color color2      = 2;
+    float wavelength  = 3;  // initial wavelength (pixels); determines number of visible cycles
+    float k           = 4;  // spring constant — higher = faster oscillation
+    float damping     = 5;  // damping coefficient (0 = no damping, oscillates forever)
+    float equilibrium = 6;  // natural length as fraction of strip (default ~0.667)
+}
+
+message PlasmaEffect {
+    float speed            = 1;  // base animation speed multiplier (1.0 = default)
+    float brownian_theta   = 2;  // mean-reversion rate — how quickly speed returns to base (OU θ)
+    float brownian_sigma   = 3;  // volatility — amplitude of random speed fluctuations (OU σ)
+}
+
+// --- Top-level command (host → Pico) ---
+
+message Command {
+    oneof cmd {
+        // Pixel control
+        Color     fill       =  1;  // fill all LEDs with this color and show
+        SetPixel  set        =  2;  // set one LED and show
+        SetPixels set_pixels = 17; // set multiple LEDs and show
+        Empty    clear      =  3;  // clear all LEDs and show
+        Empty    show       =  4;  // push current buffer
+        Empty    stop       =  5;  // stop any running effect
+        uint32   brightness =  6;  // set global brightness (0–255)
+        Empty    get_leds   =  7;  // query active LED count
+        uint32   set_leds   =  8;  // set active LED count (1–300)
+        // Effects
+        FadeEffect      fade      =  9;
+        MarqueeEffect   marquee   = 10;
+        CometEffect     comet     = 11;
+        StarsEffect     stars     = 12;
+        BounceEffect    bounce    = 13;
+        ParticlesEffect particles = 14;
+        WavesEffect     waves     = 15;
+        SpringEffect    spring    = 16;
+        PlasmaEffect    plasma    = 18;
+    }
+}
+
+// --- Response (Pico → host) ---
+
+message Response {
+    oneof result {
+        Empty  ok        = 1;  // command succeeded
+        string error     = 2;  // command failed; human-readable reason
+        uint32 led_count = 3;  // reply to get_leds
+    }
+}

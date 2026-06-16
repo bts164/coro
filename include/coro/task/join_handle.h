@@ -28,6 +28,10 @@ namespace coro {
  * **Detaching:** `std::move(handle).detach()` lets the task run to completion without
  * cancellation. The executor's owned map keeps it alive until it reaches a terminal state.
  *
+ * **Empty state:** `JoinHandle()` default-constructs to an empty handle (`valid()` returns false).
+ * Assigning a new handle from `spawn()` replaces the old one, cancelling any running task.
+ * Assigning `{}` is equivalent to calling `stop()` — it cancels and drops the current task.
+ *
  * `JoinHandle` is `[[nodiscard]]` — silently discarding it would cancel the task immediately,
  * which is almost always unintentional.
  *
@@ -38,6 +42,10 @@ class [[nodiscard]] JoinHandle {
 public:
     using OutputType = T;
 
+    /// @brief Constructs an empty (no-task) handle. valid() returns false.
+    /// Useful as a member that starts unset and is later assigned from spawn().
+    JoinHandle() noexcept = default;
+
     explicit JoinHandle(std::shared_ptr<detail::TaskState<T>> state,
                         std::weak_ptr<detail::TaskBase> task_ref = {})
         : m_state(std::move(state)), m_task_ref(std::move(task_ref)) {}
@@ -47,6 +55,11 @@ public:
 
     JoinHandle(JoinHandle&&) noexcept            = default;
     JoinHandle& operator=(JoinHandle&&) noexcept = default;
+
+    /// @brief Returns true if this handle refers to a live task.
+    /// False for a default-constructed handle or after detach().
+    bool valid() const noexcept { return m_state != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
 
     /// @brief Marks the task for cancellation and wakes it so it sees cancelled on its next poll.
     /// Satisfies the Cancellable concept — the enclosing Coro<T> cancel protocol calls this,
@@ -205,6 +218,9 @@ private:
  * Dropping the handle cancels the background task. The executor's owned set keeps it alive
  * until it drains.
  *
+ * **Empty state:** `StreamHandle()` default-constructs to an empty handle (`valid()` returns
+ * false). `poll_next()` on an empty handle immediately returns `nullopt`.
+ *
  * `[[nodiscard]]` — discarding drops the consumer end; produced items are lost.
  *
  * @tparam T The item type yielded by the stream.
@@ -214,11 +230,15 @@ class [[nodiscard]] StreamHandle {
 public:
     using ItemType = T;
 
-    StreamHandle() = default;
+    /// @brief Constructs an empty (no-task) handle. valid() returns false.
+    StreamHandle() noexcept = default;
 
     explicit StreamHandle(std::shared_ptr<detail::StreamTaskState<T>> state,
                           std::weak_ptr<detail::TaskBase> task_ref = {})
         : m_state(std::move(state)), m_task_ref(std::move(task_ref)) {}
+
+    bool valid() const noexcept { return m_state != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
 
     /// @brief Cancels the background task, keeping the handle alive to drain buffered items.
     ///

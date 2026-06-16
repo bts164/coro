@@ -59,7 +59,7 @@ coro::Coro<int> async_main(int argc, char *argv[])
 
         // Start the write (buffer moved in); sleep while it's in flight.
         std::size_t expected_n = buffer.size();
-        auto wh = file.write(std::move(buffer), true);
+        auto wh = file.write_exact(std::move(buffer));
 
         if (49 == (i%50)) {
             auto t = system_clock::now();

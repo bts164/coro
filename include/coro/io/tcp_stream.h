@@ -66,6 +66,24 @@ public:
     }
 
     /**
+     * @brief Reads exactly buf.size() bytes. Returns {bytes_read, buf}.
+     * bytes_read < buf.size() indicates EOF before the buffer was filled.
+     * @tparam Buf Any type satisfying ByteBuffer.
+     */
+    template<ByteBuffer Buf>
+    [[nodiscard]] Coro<std::pair<std::size_t, Buf>> read_exact(Buf buf) {
+        auto* data = reinterpret_cast<std::byte*>(std::ranges::data(buf));
+        const std::size_t size = std::ranges::size(buf);
+        std::size_t total = 0;
+        while (total < size) {
+            std::size_t n = co_await read_impl(data + total, size - total);
+            if (n == 0) break;
+            total += n;
+        }
+        co_return std::pair<std::size_t, Buf>{total, std::move(buf)};
+    }
+
+    /**
      * @brief Writes all bytes in buf to the stream. Returns buf after completion.
      * @tparam Buf Any type satisfying ByteBuffer.
      * @throws std::runtime_error on connection error.
@@ -154,6 +172,16 @@ public:
      */
     template <ByteBuffer Buf>
     [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read(Buf buf);
+
+    /**
+     * @brief Reads exactly `buf.size()` bytes by looping until the buffer is full.
+     * Returns `{bytes_read, buf}`; `bytes_read < buf.size()` indicates EOF before
+     * the buffer was filled.
+     *
+     * @tparam Buf Any type satisfying @ref ByteBuffer (e.g. `std::string`, `std::vector<std::byte>`).
+     */
+    template <ByteBuffer Buf>
+    [[nodiscard]] JoinHandle<std::pair<std::size_t, Buf>> read_exact(Buf buf);
 
     /**
      * @brief Writes all bytes in `buf` to the stream and returns `buf`.

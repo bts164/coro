@@ -1,0 +1,6 @@
+# nanopb static allocation bounds for ws2812.proto.
+# All variable-length fields must have an upper bound so nanopb can allocate
+# them on the stack or in the coroutine frame instead of using malloc.
+
+Response.error       max_size:64
+SetPixels.pixels     max_count:300

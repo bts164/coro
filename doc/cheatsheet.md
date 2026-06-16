@@ -308,6 +308,10 @@ co_await out.write(std::move(buf));
 
 auto& [n2, buf2] =
     co_await f.read_at(std::vector<std::byte>(4096), /*offset=*/512);
-auto& [n3, buf3] =
-    co_await f.read(std::vector<std::byte>(4096), /*exact=*/true);
+
+// _exact variants loop until the buffer is full (or EOF):
+auto& [n3, buf3] = co_await f.read_exact(std::vector<std::byte>(4096));
+auto& [n4, buf4] = co_await f.read_at_exact(std::vector<std::byte>(4096), /*offset=*/512);
+co_await out.write_exact(std::move(buf));
+co_await out.write_at_exact(std::move(buf2), /*offset=*/512);
 ```
