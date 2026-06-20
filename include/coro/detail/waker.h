@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <coro/detail/rc.h>
 
 namespace coro::detail {
 
@@ -11,8 +12,8 @@ namespace coro::detail {
  * timers) that need to notify the executor when they become ready. Calling `wake()` moves
  * the associated task from the Suspended state back into the executor's ready queue.
  *
- * **Ownership:** `Waker` is reference-counted via `shared_ptr`. A leaf future typically
- * stores a clone (`clone()`) so the executor retains the original.
+ * **Ownership:** `Waker` is reference-counted via `Rc` (`shared_ptr` off Pico). A leaf future
+ * typically stores a clone (`clone()`) so the executor retains the original.
  *
  * **Thread safety:** `wake()` must be safe to call from any thread, including libuv
  * callback threads.
@@ -28,7 +29,7 @@ public:
 
     /// @brief Returns a new `Waker` that wakes the same task.
     /// Used when a future needs to hand off the waker to multiple waiters.
-    virtual std::shared_ptr<Waker> clone() = 0;
+    virtual Rc<Waker> clone() = 0;
 };
 
 } // namespace coro::detail

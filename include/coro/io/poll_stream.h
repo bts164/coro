@@ -181,8 +181,8 @@ private:
         State* owner;
         explicit LibuvWaker(State* s) : owner(s) {}
         void wake() override;
-        std::shared_ptr<detail::Waker> clone() override {
-            return std::make_shared<LibuvWaker>(owner);
+        detail::Rc<detail::Waker> clone() override {
+            return detail::make_rc<LibuvWaker>(owner);
         }
     };
 

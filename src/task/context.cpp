@@ -2,16 +2,16 @@
 
 namespace coro::detail {
 
-Context::Context(std::shared_ptr<Waker> waker)
+Context::Context(Rc<Waker> waker)
     : m_waker(std::move(waker)) {}
 
 Context::~Context() = default;
 
-std::shared_ptr<Waker> Context::getWaker() const {
+Rc<Waker> Context::getWaker() const {
     return m_waker;
 }
 
-std::weak_ptr<Waker> Context::get_weak_waker() const {
+Weak<Waker> Context::get_weak_waker() const {
     return m_waker;
 }
 

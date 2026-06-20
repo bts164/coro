@@ -14,19 +14,34 @@ class CoroRecipe(ConanFile):
         "shared": [True, False],
         "fPIC": [True, False],
         "with_gperftools": [True, False],
-        "with_local_run_queue": [True, False]
+        "with_local_run_queue": [True, False],
+        "with_sanitize": ["none", "asan", "tsan"]
     }
     default_options = {
         "shared": True,
         "fPIC": True,
         "with_gperftools": True,
-        "with_local_run_queue": True
+        "with_local_run_queue": True,
+        "with_sanitize": "none"
     }
-    exports_sources = "include/*.h","include/*.hpp", "src/*.cpp", "CMakeLists.txt"
+    exports_sources = "include/*.h","include/*.hpp", "src/*.cpp", "CMakeLists.txt", "cmake/*.cmake"
 
     def config_options(self):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
+
+        # Lets CORO_SANITIZE in the environment (e.g. via .envrc) set the
+        # default for with_sanitize without passing -o on the conan CLI.
+        # config_options() runs before run_configure_method() merges the
+        # profile/CLI -o values onto self.options (methods.py), so an
+        # explicit -o with_sanitize=... still overrides this. configure()
+        # runs too late for this purpose — it executes after that merge, so
+        # setting the option there would clobber an explicit -o instead of
+        # yielding to it.
+        sanitize = os.environ.get("CORO_SANITIZE", "none").strip().lower()
+        if sanitize not in ("none", "asan", "tsan"):
+            sanitize = "none"
+        self.options.with_sanitize = sanitize
 
     def configure(self):
         if self.options.shared:
@@ -59,6 +74,7 @@ class CoroRecipe(ConanFile):
         tc = CMakeToolchain(self)
         tc.cache_variables["WITH_GPERFTOOLS"] = self.options.with_gperftools
         tc.cache_variables["CORO_USE_LOCAL_RUN_QUEUE"] = self.options.with_local_run_queue
+        tc.cache_variables["WITH_SANITIZE"] = str(self.options.with_sanitize)
         tc.generate()
 
     def build(self):

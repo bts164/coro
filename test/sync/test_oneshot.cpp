@@ -192,6 +192,41 @@ TYPED_TEST(OneshotTest, SenderDroppedReturnsTrueAfterValueConsumed) {
     EXPECT_TRUE(dropped_after_recv);
 }
 
+// Move-assigning into a live OneshotSender/OneshotReceiver must close the OLD
+// channel (run the destructor's alive-flag-clear-and-wake protocol on it),
+// not just silently drop the old Rc. Regression test for a defaulted
+// move-assignment bug found in MpscSender and fixed analogously here.
+TYPED_TEST(OneshotTest, ReassigningLiveSenderClosesOldChannel) {
+    bool old_channel_closed = false;
+    this->traits.rt.block_on([](bool& out) -> Coro<void> {
+        auto chan_a = oneshot_channel<int>();
+        auto tx_a   = std::move(chan_a.first);
+        auto rx_a   = std::move(chan_a.second);
+        auto chan_b = oneshot_channel<int>();
+        auto tx_b   = std::move(chan_b.first);
+
+        tx_a = std::move(tx_b); // displaces the sender for channel A
+
+        auto result = co_await rx_a.recv();
+        out = !result.has_value() && result.error() == ChannelError::Closed;
+    }(old_channel_closed));
+    EXPECT_TRUE(old_channel_closed);
+}
+
+TYPED_TEST(OneshotTest, ReassigningLiveReceiverDropsOldChannelReceiver) {
+    auto chan_a = oneshot_channel<int>();
+    auto tx_a   = std::move(chan_a.first);
+    auto rx_a   = std::move(chan_a.second);
+    auto chan_b = oneshot_channel<int>();
+    auto rx_b   = std::move(chan_b.second);
+
+    rx_a = std::move(rx_b); // displaces the receiver for channel A
+
+    auto result = tx_a.send(42);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), 42);
+}
+
 // ---------------------------------------------------------------------------
 // OneshotVoidTest — all executors
 // ---------------------------------------------------------------------------

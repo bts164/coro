@@ -11,6 +11,7 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <coro/detail/rc.h>
 #include <coro/detail/mutex.h>
 #include <utility>
 #include <vector>
@@ -29,7 +30,7 @@ namespace detail {
 template<typename T>
 struct MpscSenderNode : coro::detail::IntrusiveListNode {
     std::optional<T>                     value;
-    std::shared_ptr<coro::detail::Waker> waker;
+    detail::Rc<coro::detail::Waker> waker;
 };
 
 /**
@@ -41,7 +42,7 @@ struct MpscSenderNode : coro::detail::IntrusiveListNode {
  * empty) and wakes the receiver.
  */
 struct MpscReceiverNode {
-    std::shared_ptr<coro::detail::Waker> waker;
+    detail::Rc<coro::detail::Waker> waker;
 };
 
 /**
@@ -89,7 +90,7 @@ class MpscSendFuture {
 public:
     using OutputType = std::expected<void, T>;
 
-    MpscSendFuture(std::shared_ptr<detail::MpscShared<T>> shared, T value)
+    MpscSendFuture(detail::Rc<detail::MpscShared<T>> shared, T value)
         : m_shared(std::move(shared))
     {
         m_node.value.emplace(std::move(value));
@@ -169,7 +170,7 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::MpscShared<T>> m_shared;
+    detail::Rc<detail::MpscShared<T>> m_shared;
     detail::MpscSenderNode<T>              m_node;
 };
 
@@ -199,7 +200,7 @@ class MpscRecvFuture {
 public:
     using OutputType = std::optional<T>;
 
-    explicit MpscRecvFuture(std::shared_ptr<detail::MpscShared<T>> shared)
+    explicit MpscRecvFuture(detail::Rc<detail::MpscShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
     MpscRecvFuture(const MpscRecvFuture&)            = delete;
@@ -252,9 +253,9 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::MpscShared<T>> m_shared;
+    detail::Rc<detail::MpscShared<T>> m_shared;
 
-    std::shared_ptr<coro::detail::Waker> _tryPromoteSender() {
+    detail::Rc<coro::detail::Waker> _tryPromoteSender() {
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             m_shared->buffer.push_back(std::move(*node->value));
@@ -276,7 +277,7 @@ private:
 template<typename T>
 class MpscSender {
 public:
-    explicit MpscSender(std::shared_ptr<detail::MpscShared<T>> shared)
+    explicit MpscSender(detail::Rc<detail::MpscShared<T>> shared)
         : m_shared(std::move(shared))
     {
         std::lock_guard lock(m_shared->mutex);
@@ -286,21 +287,26 @@ public:
     MpscSender(const MpscSender&)            = delete;
     MpscSender& operator=(const MpscSender&) = delete;
     MpscSender(MpscSender&&)                 = default;
-    MpscSender& operator=(MpscSender&&)      = default;
 
-    ~MpscSender() {
-        if (!m_shared) return;
-        std::shared_ptr<coro::detail::Waker> waker;
-        {
-            std::lock_guard lock(m_shared->mutex);
-            if (--m_shared->sender_count == 0) {
-                if (m_shared->receiver_waiter.has_value())
-                    waker = std::move(m_shared->receiver_waiter->waker);
-                m_shared->cv.notify_all();
-            }
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_shared, dropping the old Rc without running the
+    // sender_count-decrement-and-wake protocol below (that protocol only
+    // lives in the destructor). std::swap is NOT sufficient here — if the
+    // right-hand side is a named object moved via std::move (not a genuine
+    // temporary), swapping just stashes the old state inside that named
+    // object, deferring the close until IT happens to go out of scope,
+    // which may be arbitrarily late. Instead, explicitly close the old
+    // channel right now via the same helper the destructor uses, then take
+    // over the new state.
+    MpscSender& operator=(MpscSender&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_shared = std::move(other.m_shared);
         }
-        if (waker) waker->wake();
+        return *this;
     }
+
+    ~MpscSender() { close(); }
 
     /**
      * @brief Sends @p value asynchronously.
@@ -402,7 +408,25 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::MpscShared<T>> m_shared;
+    // Decrements sender_count and wakes the receiver if this was the last
+    // sender. Shared between the destructor and move-assignment so both
+    // close the channel through the same protocol.
+    void close() {
+        if (!m_shared) return;
+        detail::Rc<coro::detail::Waker> waker;
+        {
+            std::lock_guard lock(m_shared->mutex);
+            if (--m_shared->sender_count == 0) {
+                if (m_shared->receiver_waiter.has_value())
+                    waker = std::move(m_shared->receiver_waiter->waker);
+                m_shared->cv.notify_all();
+            }
+        }
+        if (waker) waker->wake();
+        m_shared = nullptr;
+    }
+
+    detail::Rc<detail::MpscShared<T>> m_shared;
 };
 
 /**
@@ -420,28 +444,31 @@ class MpscReceiver {
 public:
     using ItemType = T;
 
-    explicit MpscReceiver(std::shared_ptr<detail::MpscShared<T>> shared)
+    explicit MpscReceiver(detail::Rc<detail::MpscShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
     MpscReceiver(const MpscReceiver&)            = delete;
     MpscReceiver& operator=(const MpscReceiver&) = delete;
     MpscReceiver(MpscReceiver&&)                 = default;
-    MpscReceiver& operator=(MpscReceiver&&)      = default;
 
-    ~MpscReceiver() {
-        if (!m_shared) return;
-        std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
-        {
-            std::lock_guard lock(m_shared->mutex);
-            m_shared->receiver_alive = false;
-            while (auto* raw = m_shared->sender_waiters.pop_front()) {
-                auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
-                if (node->waker) wakers.push_back(std::move(node->waker));
-            }
-            m_shared->cv.notify_all();
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_shared, dropping the old Rc without running the
+    // receiver_alive-clear-and-wake protocol below. std::swap is NOT
+    // sufficient — if the right-hand side is a named object moved via
+    // std::move rather than a genuine temporary, swapping just stashes the
+    // old state inside that named object, deferring the close until it
+    // happens to go out of scope. Explicitly close the old channel via the
+    // same helper the destructor uses, then take over the new state.
+    MpscReceiver& operator=(MpscReceiver&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_shared    = std::move(other.m_shared);
+            m_recv_node = std::move(other.m_recv_node);
         }
-        for (auto& w : wakers) w->wake();
+        return *this;
     }
+
+    ~MpscReceiver() { close(); }
 
     /**
      * @brief Returns `true` if all senders have been dropped and the buffer is empty.
@@ -561,7 +588,7 @@ public:
     }
 
 private:
-    std::shared_ptr<coro::detail::Waker> _tryPromoteSender() {
+    detail::Rc<coro::detail::Waker> _tryPromoteSender() {
         if (auto* raw = m_shared->sender_waiters.pop_front()) {
             auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
             m_shared->buffer.push_back(std::move(*node->value));
@@ -571,7 +598,26 @@ private:
         return nullptr;
     }
 
-    std::shared_ptr<detail::MpscShared<T>> m_shared;
+    // Clears receiver_alive and wakes any blocked senders. Shared between the
+    // destructor and move-assignment so both close the channel through the
+    // same protocol.
+    void close() {
+        if (!m_shared) return;
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
+        {
+            std::lock_guard lock(m_shared->mutex);
+            m_shared->receiver_alive = false;
+            while (auto* raw = m_shared->sender_waiters.pop_front()) {
+                auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
+                if (node->waker) wakers.push_back(std::move(node->waker));
+            }
+            m_shared->cv.notify_all();
+        }
+        for (auto& w : wakers) w->wake();
+        m_shared = nullptr;
+    }
+
+    detail::Rc<detail::MpscShared<T>> m_shared;
     detail::MpscReceiverNode               m_recv_node;
 };
 
@@ -584,7 +630,7 @@ private:
  */
 template<typename T>
 [[nodiscard]] std::pair<MpscSender<T>, MpscReceiver<T>> mpsc_channel(size_t capacity) {
-    auto shared = std::make_shared<detail::MpscShared<T>>(capacity);
+    auto shared = detail::make_rc<detail::MpscShared<T>>(capacity);
     return { MpscSender<T>(shared), MpscReceiver<T>(shared) };
 }
 

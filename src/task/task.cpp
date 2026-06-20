@@ -49,7 +49,7 @@ void TaskBase::wake() {
     }
 }
 
-std::shared_ptr<Waker> TaskBase::clone() {
+Rc<Waker> TaskBase::clone() {
     // shared_from_this() increments the existing refcount — no allocation.
     return shared_from_this();
 }

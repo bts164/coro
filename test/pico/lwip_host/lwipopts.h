@@ -28,6 +28,10 @@
 #define DNS_TABLE_SIZE          4
 #define DNS_MAX_NAME_LENGTH     256
 
+/* MQTT — needed for MqttClient (src/pico/mqtt.cpp). Uses the raw TCP API
+ * directly (LWIP_ALTCP left unset), same as the rest of this test config. */
+#define LWIP_MQTT                1
+
 /* Loopback netif */
 #define LWIP_HAVE_LOOPIF        1
 #define LWIP_NETIF_LOOPBACK     1

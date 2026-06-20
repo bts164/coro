@@ -5,18 +5,8 @@
 #include <coro/coro.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/context.h>
+#include <coro/detail/isr_flag.h>
 #include <coro/runtime/runtime.h>
-// Data memory barrier + compiler barrier. Written as inline asm rather than
-// relying on CMSIS __DMB() to avoid two-phase lookup failures in template
-// methods and to keep this header self-contained.
-// On ARM: full dmb instruction drains the write buffer.
-// On x86 (host unit tests): store-store ordering is guaranteed by TSO hardware;
-// compiler barrier alone is sufficient for correctness.
-#if defined(__ARM_ARCH)
-#define CORO_DMB() __asm__ volatile("dmb" ::: "memory")
-#else
-#define CORO_DMB() __asm__ volatile("" ::: "memory")
-#endif
 #include <type_traits>
 #ifdef CORO_DMA_DEBUG
 #include <cstdio>
@@ -26,7 +16,10 @@
 //
 // These are the ONLY coro types safe to call from an interrupt service routine.
 // All other coro APIs (event::set, oneshot::send, mpsc::send, wake(), etc.) are
-// undefined behavior from ISR context. See doc/isr_safety.md for a full audit.
+// undefined behavior from ISR context. See doc/design/isr_safety.md for a full
+// audit, including why every flag/payload access below goes through a
+// dedicated hardware spin lock instead of a bare `volatile` or `std::atomic`
+// ("Cross-core ISR delivery").
 //
 // Only available under CORO_PICO — on desktop platforms there are no hardware
 // ISRs; use the normal channels and events instead.
@@ -34,15 +27,16 @@
 namespace coro {
 
 // Internal — used by IsrEvent and IsrChannel.
-// Registers (flag, waker) with the executor on first poll() and returns
-// PollPending. The executor checks the flag once per event loop iteration;
-// when it observes the flag set it fires the waker. The future returns
-// PollReady on the next poll().
+// Registers (ref, waker) with the executor on first poll() and returns
+// PollPending. The executor checks the flag once per event loop iteration —
+// through the paired spin lock, exactly like the ISR write — and when it
+// observes the flag set it fires the waker. The future returns PollReady on
+// the next poll().
 class IsrWaitFuture {
 public:
     using OutputType = void;
 
-    explicit IsrWaitFuture(const volatile bool* flag) : m_flag(flag) {}
+    explicit IsrWaitFuture(IsrFlagRef ref) : m_ref(ref) {}
 
     ~IsrWaitFuture() {
         // If the awaiting coroutine is cancelled while we are registered with the
@@ -50,18 +44,18 @@ public:
         // would dereference a flag pointer into a potentially-destroyed IsrEvent,
         // and the waker would hold an unnecessary strong reference to the task.
         if (m_registered)
-            current_runtime().remove_isr_poll(m_flag);
+            current_runtime().remove_isr_poll(m_ref);
     }
 
     // Move transfers ownership of the registration; source must not deregister.
     IsrWaitFuture(IsrWaitFuture&& other) noexcept
-        : m_flag(other.m_flag), m_registered(other.m_registered) {
+        : m_ref(other.m_ref), m_registered(other.m_registered) {
         other.m_registered = false;
     }
     IsrWaitFuture& operator=(IsrWaitFuture&& other) noexcept {
         if (this != &other) {
-            if (m_registered) current_runtime().remove_isr_poll(m_flag);
-            m_flag       = other.m_flag;
+            if (m_registered) current_runtime().remove_isr_poll(m_ref);
+            m_ref        = other.m_ref;
             m_registered = other.m_registered;
             other.m_registered = false;
         }
@@ -71,25 +65,28 @@ public:
     IsrWaitFuture& operator=(const IsrWaitFuture&) = delete;
 
     PollResult<void> poll(detail::Context& ctx) {
-        if (*m_flag) {
+        uint32_t save = spin_lock_blocking(m_ref.lock);
+        bool set = *m_ref.flag;
+        spin_unlock(m_ref.lock, save);
+        if (set) {
 #ifdef CORO_DMA_DEBUG
-            std::printf("[IsrEvent] flag %p is SET — returning PollReady\n", (void*)m_flag);
+            std::printf("[IsrEvent] flag %p is SET — returning PollReady\n", (void*)m_ref.flag);
 #endif
             return PollReady;
         }
         if (!m_registered) {
-            current_runtime().register_isr_poll(m_flag, ctx.getWaker());
+            current_runtime().register_isr_poll(m_ref, ctx.getWaker());
             m_registered = true;
 #ifdef CORO_DMA_DEBUG
-            std::printf("[IsrEvent] flag %p registered with executor\n", (void*)m_flag);
+            std::printf("[IsrEvent] flag %p registered with executor\n", (void*)m_ref.flag);
 #endif
         }
         return PollPending;
     }
 
 private:
-    const volatile bool* m_flag;
-    bool                 m_registered = false;
+    IsrFlagRef m_ref;
+    bool       m_registered = false;
 };
 
 static_assert(Future<IsrWaitFuture>);
@@ -107,14 +104,36 @@ static_assert(Future<IsrWaitFuture>);
  * Limitations:
  * - Only one coroutine should call wait() at a time.
  * - A second signal_from_isr() before wait() returns is silently lost.
- * - Do not call signal_from_isr() before wait() is entered — wait() clears
- *   any stale signal on entry.
+ * - signal_from_isr() called before wait() is entered is NOT lost — the
+ *   next wait() observes it immediately via IsrWaitFuture::poll(). If that
+ *   signal is actually stale (e.g. a level-triggered ISR firing on
+ *   unrelated noise before the caller starts caring about it), call
+ *   clear() first to discard it.
  */
 class IsrEvent {
 public:
-    // ISR-safe. Single volatile write → one STRB → naturally atomic on ARM.
-    // No memory barrier needed: there is no payload to order.
-    void signal_from_isr() noexcept { m_flag = true; }
+    IsrEvent() : m_lock(spin_lock_instance(next_striped_spin_lock_num())) {}
+
+    // ISR-safe. Takes the dedicated hardware spin lock — disables IRQs on
+    // this core and spins on the SIO register for cross-core exclusion (see
+    // doc/design/isr_safety.md, "Cross-core ISR delivery") — sets the flag,
+    // releases. No payload to order, but the lock itself is what makes this
+    // safe against an ISR firing on the *other* core, which a bare volatile
+    // write is not.
+    void signal_from_isr() noexcept {
+        uint32_t save = spin_lock_blocking(m_lock);
+        m_flag = true;
+        spin_unlock(m_lock, save);
+    }
+
+    // Not ISR-safe — call only from the executor thread. Discards a pending
+    // signal without waiting for it, so a later wait() observes only a
+    // fresh signal rather than one left over from an unrelated earlier edge.
+    void clear() noexcept {
+        uint32_t save = spin_lock_blocking(m_lock);
+        m_flag = false;
+        spin_unlock(m_lock, save);
+    }
 
     [[nodiscard]] Coro<void> wait() {
         // Do NOT clear m_flag here. If the IRQ fires between the caller setting
@@ -122,11 +141,14 @@ public:
         // true and IsrWaitFuture::poll() will return PollReady immediately.
         // Clearing on entry would swallow that signal and park forever.
         // The clear at the end handles stale signals from previous transfers.
-        co_await IsrWaitFuture{&m_flag};
+        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}};
+        uint32_t save = spin_lock_blocking(m_lock);
         m_flag = false;
+        spin_unlock(m_lock, save);
     }
 
 private:
+    spin_lock_t*  m_lock;
     volatile bool m_flag = false;
 };
 
@@ -144,33 +166,32 @@ template<typename T>
     requires std::is_trivially_copyable_v<T>
 class IsrChannel {
 public:
-    // ISR-safe.
-    //
-    // __DMB() provides release semantics for m_value: the "memory" clobber
-    // acts as a compiler barrier preventing the compiler from reordering the
-    // m_value store past the m_flag store, and the dmb instruction drains the
-    // write buffer so m_value is globally visible before m_flag is written.
-    // This pairs with the CORO_DMB() acquire in receive().
+    IsrChannel() : m_lock(spin_lock_instance(next_striped_spin_lock_num())) {}
+
+    // ISR-safe. m_value and m_flag are written inside the same spin-lock
+    // critical section, so the lock's own acquire/release ordering — the same
+    // ordering pico-sdk's queue_t relies on — guarantees the receiver never
+    // observes a partially-written value. The lock also provides the
+    // cross-core exclusion a manual barrier never did (see
+    // doc/design/isr_safety.md, "Cross-core ISR delivery").
     void send_from_isr(T value) noexcept {
+        uint32_t save = spin_lock_blocking(m_lock);
         m_value = value;
-        CORO_DMB();
-        m_flag = true;
+        m_flag  = true;
+        spin_unlock(m_lock, save);
     }
 
-    // CORO_DMB() provides acquire semantics for m_value: the "memory" clobber
-    // prevents the compiler from hoisting the m_value load above the point
-    // where m_flag was observed true, and the dmb instruction ensures any
-    // hardware write-buffer effects from the sender are visible before the
-    // load executes. This pairs with the CORO_DMB() release in send_from_isr().
     [[nodiscard]] Coro<T> receive() {
-        co_await IsrWaitFuture{&m_flag};
-        CORO_DMB();
+        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}};
+        uint32_t save = spin_lock_blocking(m_lock);
         T value = m_value;
-        m_flag = false;
+        m_flag  = false;
+        spin_unlock(m_lock, save);
         co_return value;
     }
 
 private:
+    spin_lock_t*  m_lock;
     volatile bool m_flag = false;
     T             m_value{};
 };

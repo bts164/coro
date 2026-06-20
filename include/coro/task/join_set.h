@@ -7,6 +7,7 @@
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/waker.h>
+#include <coro/detail/rc.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
 #include <exception>
@@ -54,10 +55,10 @@ struct JoinSetSharedState {
         Node* next = nullptr;
         Node* prev = nullptr;
     };
-    detail::Mutex                             mutex;
-    std::shared_ptr<Waker>                    consumer_waker;
-    detail::IntrusiveList<Node*>              pending_handles; ///< Running tasks (lifetime anchors).
-    std::deque<std::shared_ptr<TaskState<T>>> idle_handles;    ///< Completed tasks awaiting consumption.
+    detail::Mutex                       mutex;
+    Rc<Waker>                           consumer_waker;
+    detail::IntrusiveList<Node*>        pending_handles; ///< Running tasks (lifetime anchors).
+    std::deque<Rc<TaskState<T>>>        idle_handles;    ///< Completed tasks awaiting consumption.
 };
 
 // -----------------------------------------------------------------------
@@ -81,7 +82,7 @@ template<Future F>
 class JoinSetTask : public TaskImpl<F> {
     using T = typename F::OutputType;
 public:
-    JoinSetTask(F future, std::weak_ptr<JoinSetSharedState<T>> set_state)
+    JoinSetTask(F future, Weak<JoinSetSharedState<T>> set_state)
         : TaskImpl<F>(std::move(future))
         , m_set_state(std::move(set_state)) {}
 
@@ -93,10 +94,10 @@ public:
             return;
         }
 
-        auto self_base = this->shared_from_this();  // shared_ptr<TaskBase>
-        std::shared_ptr<TaskState<T>> self_state(self_base, static_cast<TaskState<T>*>(this));
+        auto self_base = this->shared_from_this();  // Rc<TaskBase>
+        Rc<TaskState<T>> self_state(self_base, static_cast<TaskState<T>*>(this));
 
-        std::shared_ptr<Waker> waker;
+        Rc<Waker> waker;
         {
             std::lock_guard lock(state->mutex);
             if (!m_node.task) return;  // JoinSet is being destroyed — discard result
@@ -110,7 +111,7 @@ public:
 
     typename JoinSetSharedState<T>::Node m_node;
 private:
-    std::weak_ptr<JoinSetSharedState<T>> m_set_state;
+    Weak<JoinSetSharedState<T>> m_set_state;
 };
 
 // -----------------------------------------------------------------------
@@ -130,13 +131,13 @@ class JoinSetDrainFuture {
 public:
     using OutputType = void;
 
-    explicit JoinSetDrainFuture(std::shared_ptr<JoinSetSharedState<T>> state)
+    explicit JoinSetDrainFuture(Rc<JoinSetSharedState<T>> state)
         : m_state(std::move(state)) {}
 
     JoinSetDrainFuture(JoinSetDrainFuture&&) noexcept = default;
 
     PollResult<void> poll(detail::Context& ctx) {
-        std::deque<std::shared_ptr<TaskState<T>>> to_process;
+        std::deque<Rc<TaskState<T>>> to_process;
         bool any_pending;
         {
             std::lock_guard lock(m_state->mutex);
@@ -172,8 +173,8 @@ public:
     }
 
 private:
-    std::shared_ptr<JoinSetSharedState<T>> m_state;
-    std::exception_ptr                     m_first_exception;
+    Rc<JoinSetSharedState<T>> m_state;
+    std::exception_ptr        m_first_exception;
 };
 
 } // namespace detail
@@ -195,7 +196,7 @@ template<typename T, Future F>
     requires std::same_as<typename F::OutputType, T>
 class [[nodiscard]] JoinSetSpawnBuilder {
 public:
-    JoinSetSpawnBuilder(F future, std::shared_ptr<detail::JoinSetSharedState<T>> state)
+    JoinSetSpawnBuilder(F future, detail::Rc<detail::JoinSetSharedState<T>> state)
         : m_future(std::move(future)), m_state(std::move(state)) {}
 
     JoinSetSpawnBuilder(JoinSetSpawnBuilder&&) noexcept            = default;
@@ -217,23 +218,27 @@ public:
     /// @brief Schedules the future as a child task in the owning `JoinSet`.
     /// Must be called exactly once. Consumes the builder.
     void spawn() && {
-        auto task = std::make_shared<detail::JoinSetTask<F>>(
+        auto task = detail::make_rc<detail::JoinSetTask<F>>(
             std::move(m_future),
-            std::weak_ptr<detail::JoinSetSharedState<T>>(m_state));
+            detail::Weak<detail::JoinSetSharedState<T>>(m_state));
         task->name = std::move(m_name);
         // Non-owning raw pointer — lifetime is anchored by the executor's owned map.
         task->m_node.task = task.get();
+        detail::Weak<detail::TaskBase> task_ref{task};
+#ifdef CORO_PICO
+        task->set_self(task_ref);
+#endif
         {
             std::lock_guard lock(m_state->mutex);
             m_state->pending_handles.push_back(&task->m_node);
         }
-        coro::schedule_task(std::shared_ptr<detail::TaskBase>(std::move(task)));
+        coro::schedule_task(detail::Rc<detail::TaskBase>(std::move(task)));
     }
 
 private:
-    F                                               m_future;
-    std::shared_ptr<detail::JoinSetSharedState<T>>  m_state;
-    std::string                                     m_name;
+    F                                              m_future;
+    detail::Rc<detail::JoinSetSharedState<T>>      m_state;
+    std::string                                    m_name;
 };
 
 
@@ -267,7 +272,7 @@ public:
     using ItemType     = T;
     using OptionalType = std::conditional_t<std::is_void_v<T>, bool, std::optional<T>>;
 
-    JoinSet() : m_state(std::make_shared<detail::JoinSetSharedState<T>>()) {}
+    JoinSet() : m_state(detail::make_rc<detail::JoinSetSharedState<T>>()) {}
 
     JoinSet(const JoinSet&)            = delete;
     JoinSet& operator=(const JoinSet&) = delete;
@@ -386,7 +391,7 @@ private:
                 if (task) detail::t_current_coro->add_child(task->weak_from_this());
     }
 
-    std::shared_ptr<detail::JoinSetSharedState<T>> m_state;
+    detail::Rc<detail::JoinSetSharedState<T>> m_state;
 };
 
 } // namespace coro

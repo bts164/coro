@@ -8,11 +8,12 @@
 #include <string>
 
 using namespace coro;
+using namespace coro::detail;
 
 class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
+    MOCK_METHOD(Rc<detail::Waker>, clone, (), (override));
 };
 
 // --- Helper coroutines ---
@@ -99,7 +100,7 @@ TEST(CoroTest, VoidCoroIsMovable) {
 // --- co_return value ---
 
 TEST(CoroTest, IntPollReturnsReady) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto c = returns_int();
     auto result = c.poll(ctx);
@@ -108,7 +109,7 @@ TEST(CoroTest, IntPollReturnsReady) {
 }
 
 TEST(CoroTest, VoidPollReturnsReady) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto c = returns_void();
     EXPECT_TRUE(c.poll(ctx).isReady());
@@ -117,7 +118,7 @@ TEST(CoroTest, VoidPollReturnsReady) {
 // --- co_await an inner Future ---
 
 TEST(CoroTest, AwaitsImmediateFuture) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto c = awaits_immediate(99);
     auto result = c.poll(ctx);
@@ -126,14 +127,14 @@ TEST(CoroTest, AwaitsImmediateFuture) {
 }
 
 TEST(CoroTest, AwaitsImmediateVoidFuture) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto c = awaits_immediate_void();
     EXPECT_TRUE(c.poll(ctx).isReady());
 }
 
 TEST(CoroTest, ChainsStringFutures) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto c = chain_two();
     auto result = c.poll(ctx);
@@ -144,7 +145,7 @@ TEST(CoroTest, ChainsStringFutures) {
 // --- Exception propagation ---
 
 TEST(CoroTest, ThrowInBodyStoredAsError) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto c = throws_immediately();
     auto result = c.poll(ctx);
@@ -153,7 +154,7 @@ TEST(CoroTest, ThrowInBodyStoredAsError) {
 }
 
 TEST(CoroTest, InnerFutureErrorRethrown) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto c = awaits_throwing();
     auto result = c.poll(ctx);
@@ -178,12 +179,12 @@ public:
         return m_value;
     }
 
-    std::shared_ptr<detail::Waker> storedWaker() const { return m_waker; }
+    Rc<detail::Waker> storedWaker() const { return m_waker; }
 
 private:
     int                    m_value;
     bool                   m_polled_once = false;
-    std::shared_ptr<detail::Waker> m_waker;
+    Rc<detail::Waker> m_waker;
 };
 
 Coro<int> awaits_two_poll(TwoPollFuture f) {
@@ -191,7 +192,7 @@ Coro<int> awaits_two_poll(TwoPollFuture f) {
 }
 
 TEST(CoroTest, SuspendsOnPendingInnerFuture) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(0);  // waker not called by the test
     detail::Context ctx(waker);
 
@@ -204,7 +205,7 @@ TEST(CoroTest, SuspendsOnPendingInnerFuture) {
 }
 
 TEST(CoroTest, ResumesAfterInnerFutureBecomesReady) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(::testing::AnyNumber());
     detail::Context ctx(waker);
 
@@ -242,7 +243,7 @@ public:
 private:
     int                    m_value;
     int                    m_remaining;
-    std::shared_ptr<detail::Waker> m_waker;
+    Rc<detail::Waker> m_waker;
 };
 
 Coro<int> awaits_spurious(SpuriousWakeFuture f) {
@@ -252,7 +253,7 @@ Coro<int> awaits_spurious(SpuriousWakeFuture f) {
 // The outer Coro must absorb spurious wakes without resuming the coroutine
 // until the inner future is genuinely ready.
 TEST(CoroTest, SpuriousWakeDoesNotResumeCoroutine) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(::testing::AnyNumber());
     detail::Context ctx(waker);
 

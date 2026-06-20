@@ -11,6 +11,10 @@
 #include <optional>
 #include <utility>
 
+#if defined(CORO_PICO) && defined(CORO_PICO_FRAME_POOL)
+#include <coro/detail/frame_pool.h>
+#endif
+
 namespace coro {
 
 namespace detail {
@@ -47,6 +51,51 @@ struct CoroPromiseBase : public PollablePromise {
     std::exception_ptr    m_exception;
     CoroPromiseBase*      m_prev = nullptr;
     CoroPromiseBase*      m_next = nullptr;
+
+#if defined(CORO_PICO) && defined(CORO_PICO_FRAME_POOL)
+    // Experimental, opt-in (define CORO_PICO_FRAME_POOL to enable — off by
+    // default). Pools small/medium coroutine frames instead of going through
+    // the general-purpose allocator on every suspend/resume. Slot sizes and
+    // counts below are placeholders for initial measurement, not tuned — see
+    // doc/design/pico_port.md's "Coroutine frame pooling" section. Falls back
+    // to ::operator new/delete for anything that doesn't fit or exhausts a
+    // pool, so correctness never depends on these sizes being right.
+    static void* operator new(std::size_t size) {
+        // Each call to small_pool()/medium_pool() pays a guard-checked function
+        // call (Meyers singleton init check) — cache the reference once per
+        // operator new/delete call instead of re-invoking the accessor for
+        // every use, and read slot_size off the type (no instance needed).
+        if (size <= SmallPool::slot_size) {
+            auto& small = small_pool();
+            if (void* p = small.allocate())  return p;
+            auto& medium = medium_pool();
+            if (void* p = medium.allocate()) return p; // small pool exhausted, try up a tier
+        } else if (size <= MediumPool::slot_size) {
+            if (void* p = medium_pool().allocate()) return p;
+        }
+        return ::operator new(size);
+    }
+
+    static void operator delete(void* ptr, std::size_t) noexcept {
+        auto& small = small_pool();
+        if (small.owns(ptr)) { small.deallocate(ptr); return; }
+        auto& medium = medium_pool();
+        if (medium.owns(ptr)) { medium.deallocate(ptr); return; }
+        ::operator delete(ptr);
+    }
+
+private:
+    using SmallPool  = FramePool<64, 4>;
+    using MediumPool = FramePool<256, 2>;
+
+    // Meyers singletons: one shared pool per size class, constructed on first
+    // use. Safe without locking — CurrentThreadExecutor never has two
+    // coroutines mid-allocation at once (see mutex.h's no-op rationale).
+    static SmallPool&  small_pool()  { static SmallPool  p; return p; }
+    static MediumPool& medium_pool() { static MediumPool p; return p; }
+
+public:
+#endif
 };
 
 template<typename T>

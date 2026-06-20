@@ -26,7 +26,7 @@ struct OneshotShared {
     std::optional<OneshotSlotType<T>>    slot;           ///< Filled by send().
     bool                                 sender_alive   = true;
     bool                                 receiver_alive = true;
-    std::shared_ptr<coro::detail::Waker> receiver_waker; ///< Set when receiver suspends.
+    detail::Rc<coro::detail::Waker> receiver_waker; ///< Set when receiver suspends.
 };
 
 } // namespace detail
@@ -47,7 +47,7 @@ class OneshotRecvFuture {
 public:
     using OutputType = std::expected<T, ChannelError>;
 
-    explicit OneshotRecvFuture(std::shared_ptr<detail::OneshotShared<T>> shared)
+    explicit OneshotRecvFuture(detail::Rc<detail::OneshotShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
     OneshotRecvFuture(const OneshotRecvFuture&)            = delete;
@@ -92,7 +92,7 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::OneshotShared<T>> m_shared;
+    detail::Rc<detail::OneshotShared<T>> m_shared;
 };
 
 /**
@@ -108,26 +108,30 @@ private:
 template<typename T>
 class OneshotSender {
 public:
-    explicit OneshotSender(std::shared_ptr<detail::OneshotShared<T>> shared)
+    explicit OneshotSender(detail::Rc<detail::OneshotShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
     OneshotSender(const OneshotSender&)            = delete;
     OneshotSender& operator=(const OneshotSender&) = delete;
     OneshotSender(OneshotSender&&)                 = default;
-    OneshotSender& operator=(OneshotSender&&)      = default;
 
-    ~OneshotSender() {
-        if (!m_shared) return;
-        // Dropping without send() closes the channel; wake any waiting receiver.
-        std::shared_ptr<coro::detail::Waker> waker;
-        {
-            std::lock_guard lock(m_shared->mutex);
-            m_shared->sender_alive = false;
-            m_shared->cv.notify_all();
-            waker = std::move(m_shared->receiver_waker);
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_shared, dropping the old Rc without running the
+    // sender_alive-clear-and-wake protocol below. std::swap is NOT
+    // sufficient — if the right-hand side is a named object moved via
+    // std::move rather than a genuine temporary, swapping just stashes the
+    // old state inside that named object, deferring the close until it
+    // happens to go out of scope. Explicitly close the old channel via the
+    // same helper the destructor uses, then take over the new state.
+    OneshotSender& operator=(OneshotSender&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_shared = std::move(other.m_shared);
         }
-        if (waker) waker->wake();
+        return *this;
     }
+
+    ~OneshotSender() { close(); }
 
     /**
      * @brief Returns `true` if the receiver has been dropped.
@@ -158,7 +162,7 @@ public:
         !std::is_void_v<T> && std::convertible_to<U, T>
     )
     std::expected<void, std::decay_t<U>> send(U &&value) {
-        std::shared_ptr<coro::detail::Waker> waker;
+        detail::Rc<coro::detail::Waker> waker;
         {
             std::lock_guard lock(m_shared->mutex);
             if (!m_shared->receiver_alive) {
@@ -184,7 +188,7 @@ public:
      * the executor queue. Use IsrEvent::signal_from_isr() from ISR context instead.
      */
     std::expected<void, ChannelError> send() requires std::is_void_v<T> {
-        std::shared_ptr<coro::detail::Waker> waker;
+        detail::Rc<coro::detail::Waker> waker;
         {
             std::lock_guard lock(m_shared->mutex);
             if (!m_shared->receiver_alive)
@@ -200,7 +204,23 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::OneshotShared<T>> m_shared;
+    // Clears sender_alive and wakes any waiting receiver. Shared between the
+    // destructor and move-assignment so both close the channel through the
+    // same protocol.
+    void close() {
+        if (!m_shared) return;
+        detail::Rc<coro::detail::Waker> waker;
+        {
+            std::lock_guard lock(m_shared->mutex);
+            m_shared->sender_alive = false;
+            m_shared->cv.notify_all();
+            waker = std::move(m_shared->receiver_waker);
+        }
+        if (waker) waker->wake();
+        m_shared = nullptr;
+    }
+
+    detail::Rc<detail::OneshotShared<T>> m_shared;
 };
 
 /**
@@ -218,20 +238,30 @@ private:
 template<typename T>
 class OneshotReceiver {
 public:
-    explicit OneshotReceiver(std::shared_ptr<detail::OneshotShared<T>> shared)
+    explicit OneshotReceiver(detail::Rc<detail::OneshotShared<T>> shared)
         : m_shared(std::move(shared)) {}
 
     OneshotReceiver(const OneshotReceiver&)            = delete;
     OneshotReceiver& operator=(const OneshotReceiver&) = delete;
     OneshotReceiver(OneshotReceiver&&)                 = default;
-    OneshotReceiver& operator=(OneshotReceiver&&)      = default;
 
-    ~OneshotReceiver() {
-        if (!m_shared) return;
-        std::lock_guard lock(m_shared->mutex);
-        m_shared->receiver_alive = false;
-        m_shared->receiver_waker = nullptr;
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_shared, dropping the old Rc without running the
+    // receiver_alive-clear protocol below. std::swap is NOT sufficient — if
+    // the right-hand side is a named object moved via std::move rather than
+    // a genuine temporary, swapping just stashes the old state inside that
+    // named object, deferring the close until it happens to go out of scope.
+    // Explicitly close the old channel via the same helper the destructor
+    // uses, then take over the new state.
+    OneshotReceiver& operator=(OneshotReceiver&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_shared = std::move(other.m_shared);
+        }
+        return *this;
     }
+
+    ~OneshotReceiver() { close(); }
 
     /**
      * @brief Returns `true` if the sender has been dropped without sending a value.
@@ -284,7 +314,24 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::OneshotShared<T>> m_shared;
+    // Clears receiver_alive and the stored waker. Shared between the
+    // destructor and move-assignment so both close the channel through the
+    // same protocol.
+    void close() {
+        if (!m_shared) return;
+        // Lock scoped to a nested block: resetting m_shared below may drop the
+        // last reference to OneshotShared, destroying its mutex. That must
+        // happen after the lock_guard has already unlocked and gone out of
+        // scope — unlocking inline would otherwise touch freed memory.
+        {
+            std::lock_guard lock(m_shared->mutex);
+            m_shared->receiver_alive = false;
+            m_shared->receiver_waker = nullptr;
+        }
+        m_shared = nullptr;
+    }
+
+    detail::Rc<detail::OneshotShared<T>> m_shared;
 };
 
 /**
@@ -295,7 +342,7 @@ private:
  */
 template<typename T>
 [[nodiscard]] std::pair<OneshotSender<T>, OneshotReceiver<T>> oneshot_channel() {
-    auto shared = std::make_shared<detail::OneshotShared<T>>();
+    auto shared = detail::make_rc<detail::OneshotShared<T>>();
     return { OneshotSender<T>(shared), OneshotReceiver<T>(shared) };
 }
 

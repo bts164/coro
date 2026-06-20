@@ -7,6 +7,7 @@
 #include <coro/detail/task.h>
 #include <coro/runtime/executor.h>
 #include <coro/detail/coro_scope.h>
+#include <coro/detail/rc.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -46,15 +47,35 @@ public:
     /// Useful as a member that starts unset and is later assigned from spawn().
     JoinHandle() noexcept = default;
 
-    explicit JoinHandle(std::shared_ptr<detail::TaskState<T>> state,
-                        std::weak_ptr<detail::TaskBase> task_ref = {})
+    explicit JoinHandle(detail::Rc<detail::TaskState<T>> state,
+                        detail::Weak<detail::TaskBase> task_ref = {})
         : m_state(std::move(state)), m_task_ref(std::move(task_ref)) {}
 
     JoinHandle(const JoinHandle&)            = delete;
     JoinHandle& operator=(const JoinHandle&) = delete;
 
-    JoinHandle(JoinHandle&&) noexcept            = default;
-    JoinHandle& operator=(JoinHandle&&) noexcept = default;
+    JoinHandle(JoinHandle&&) noexcept = default;
+
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_state/m_task_ref, dropping the old task reference
+    // without running the destructor's cancel()-and-register-with-scope
+    // protocol below. std::swap is NOT sufficient — if the right-hand side
+    // is a named object moved via std::move rather than a genuine temporary,
+    // swapping just stashes the old state inside that named object,
+    // deferring the cancel until it happens to go out of scope. Explicitly
+    // close the old handle via the same helper the destructor uses, then
+    // take over the new state (e.g. `handle = spawn(...)` must cancel
+    // handle's previous task right now, not silently let it keep running
+    // until some unrelated variable's scope ends).
+    JoinHandle& operator=(JoinHandle&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_cancelOnDestroy = other.m_cancelOnDestroy;
+            m_state           = std::move(other.m_state);
+            m_task_ref        = std::move(other.m_task_ref);
+        }
+        return *this;
+    }
 
     /// @brief Returns true if this handle refers to a live task.
     /// False for a default-constructed handle or after detach().
@@ -134,15 +155,7 @@ public:
     /// If inside a coroutine poll (t_current_coro != null), records a weak_ptr to the child
     /// in the scope's pending list so the parent waits for the child to drain.
     /// The executor's owned map keeps the task alive — no ownership transfer is needed.
-    ~JoinHandle() {
-        if (!m_state) return;  // moved-from or already cleaned up
-        if (m_cancelOnDestroy) {
-            cancel();
-        }
-        if (detail::t_current_coro) {
-            detail::t_current_coro->add_child(m_task_ref);
-        }
-    }
+    ~JoinHandle() { close(); }
 
     /// @brief Configures whether dropping this handle cancels the task (default: `true`).
     JoinHandle& cancelOnDestroy(bool b = true) & {
@@ -196,13 +209,30 @@ public:
     }
 
 private:
+    // Cancels the task (if cancelOnDestroy) and registers it with the
+    // enclosing scope. Shared between the destructor and move-assignment so
+    // both close out a held task through the same protocol — resets m_state
+    // so a subsequent call (e.g. from the destructor, after move-assignment
+    // already ran it) is a no-op.
+    void close() {
+        if (!m_state) return;  // moved-from or already cleaned up
+        if (m_cancelOnDestroy) {
+            cancel();
+        }
+        if (detail::t_current_coro) {
+            detail::t_current_coro->add_child(m_task_ref);
+        }
+        m_state.reset();
+        m_task_ref = {};
+    }
+
     bool m_cancelOnDestroy = true;
     // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same TaskImpl
     // allocation as m_task_ref. Provides typed access to the result and waker slot.
-    std::shared_ptr<detail::TaskState<T>> m_state;
+    detail::Rc<detail::TaskState<T>> m_state;
     // Category 4 (doc/task_ownership.md): notification/cancel only — no lifetime ownership.
     // The executor's owned map is the lifetime anchor (Category 1).
-    std::weak_ptr<detail::TaskBase> m_task_ref;
+    detail::Weak<detail::TaskBase> m_task_ref;
 };
 
 /**
@@ -233,8 +263,8 @@ public:
     /// @brief Constructs an empty (no-task) handle. valid() returns false.
     StreamHandle() noexcept = default;
 
-    explicit StreamHandle(std::shared_ptr<detail::StreamTaskState<T>> state,
-                          std::weak_ptr<detail::TaskBase> task_ref = {})
+    explicit StreamHandle(detail::Rc<detail::StreamTaskState<T>> state,
+                          detail::Weak<detail::TaskBase> task_ref = {})
         : m_state(std::move(state)), m_task_ref(std::move(task_ref)) {}
 
     bool valid() const noexcept { return m_state != nullptr; }
@@ -255,19 +285,30 @@ public:
     /// If destroyed inside a coroutine's poll() call, records a weak_ptr to the background
     /// task in the scope's pending list so the parent coroutine waits for it to drain.
     /// Items remaining in the buffer are discarded — the consumer end is gone.
-    ~StreamHandle() {
-        if (!m_state) return;  // moved-from
-        if (auto task = m_task_ref.lock())
-            task->cancel_task();
-        if (detail::t_current_coro)
-            detail::t_current_coro->add_child(m_task_ref);
-    }
+    ~StreamHandle() { close(); }
 
     StreamHandle(const StreamHandle&)            = delete;
     StreamHandle& operator=(const StreamHandle&) = delete;
 
-    StreamHandle(StreamHandle&&) noexcept            = default;
-    StreamHandle& operator=(StreamHandle&&) noexcept = default;
+    StreamHandle(StreamHandle&&) noexcept = default;
+
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_state/m_task_ref, dropping the old background task
+    // reference without running the destructor's cancel_task()-and-register-
+    // with-scope protocol below. std::swap is NOT sufficient — if the
+    // right-hand side is a named object moved via std::move rather than a
+    // genuine temporary, swapping just stashes the old state inside that
+    // named object, deferring the cancel until it happens to go out of
+    // scope, which may be arbitrarily late. Explicitly close the old handle
+    // via the same helper the destructor uses, then take over the new state.
+    StreamHandle& operator=(StreamHandle&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_state    = std::move(other.m_state);
+            m_task_ref = std::move(other.m_task_ref);
+        }
+        return *this;
+    }
 
     PollResult<std::optional<T>> poll_next(detail::Context& ctx) {
         if (!m_state) return std::optional<T>(std::nullopt);
@@ -293,10 +334,25 @@ public:
     }
 
 private:
+    // Cancels the background task and registers it with the enclosing scope.
+    // Shared between the destructor and move-assignment so both close out a
+    // held task through the same protocol — resets m_state so a subsequent
+    // call (e.g. from the destructor, after move-assignment already ran it)
+    // is a no-op.
+    void close() {
+        if (!m_state) return;  // moved-from or already cleaned up
+        if (auto task = m_task_ref.lock())
+            task->cancel_task();
+        if (detail::t_current_coro)
+            detail::t_current_coro->add_child(m_task_ref);
+        m_state.reset();
+        m_task_ref = {};
+    }
+
     /// Aliased shared_ptr into the StreamTaskImpl allocation — queue access only.
-    std::shared_ptr<detail::StreamTaskState<T>> m_state;
+    detail::Rc<detail::StreamTaskState<T>> m_state;
     /// Notification/cancel reference only — lifetime anchored by the executor's owned set.
-    std::weak_ptr<detail::TaskBase> m_task_ref;
+    detail::Weak<detail::TaskBase> m_task_ref;
 };
 
 } // namespace coro

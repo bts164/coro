@@ -2,6 +2,7 @@
 
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
+#include <coro/detail/rc.h>
 #include <memory>
 
 namespace coro {
@@ -21,7 +22,7 @@ public:
     virtual ~Executor();
 
     /// @brief Submit a task for scheduling. Sets `scheduling_state` to `Notified`.
-    virtual void schedule(std::shared_ptr<detail::TaskBase> task) = 0;
+    virtual void schedule(detail::Rc<detail::TaskBase> task) = 0;
 
     /// @brief Route a task to the appropriate ready queue.
     ///
@@ -29,7 +30,7 @@ public:
     /// Implementations check the calling thread's identity:
     /// - Same thread as the owning worker → local queue, no lock.
     /// - Any other thread → mutex-protected injection queue + condvar signal.
-    virtual void enqueue(std::shared_ptr<detail::TaskBase> task) = 0;
+    virtual void enqueue(detail::Rc<detail::TaskBase> task) = 0;
 
     /// @brief Block the calling thread until `state.terminated` is true.
     ///

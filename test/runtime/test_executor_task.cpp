@@ -15,7 +15,7 @@ using namespace std::chrono_literals;
 class MockWaker : public Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
+    MOCK_METHOD(Rc<Waker>, clone, (), (override));
 };
 
 struct ImmediateFuture {
@@ -52,21 +52,21 @@ TEST(TaskTest, WrapsAnyFuture) {
 }
 
 TEST(TaskTest, CompletedTaskPollReturnsTrue) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     Context ctx(waker);
     TaskImpl<ImmediateFuture> t(ImmediateFuture{1});
     EXPECT_TRUE(t.poll(ctx));
 }
 
 TEST(TaskTest, PendingTaskPollReturnsFalse) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     Context ctx(waker);
     TaskImpl<NeverFuture> t(NeverFuture{});
     EXPECT_FALSE(t.poll(ctx));
 }
 
 TEST(TaskTest, PollWritesResultToState) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     Context ctx(waker);
     auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{99});
     std::shared_ptr<TaskState<int>> state = impl;
@@ -77,7 +77,7 @@ TEST(TaskTest, PollWritesResultToState) {
 }
 
 TEST(TaskTest, PollWritesExceptionToState) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     Context ctx(waker);
     struct ThrowingFuture {
         using OutputType = int;
@@ -93,7 +93,7 @@ TEST(TaskTest, PollWritesExceptionToState) {
 }
 
 TEST(TaskTest, CancelledTaskIsSkipped) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     Context ctx(waker);
     auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{5});
     std::shared_ptr<TaskState<int>> state = impl;
@@ -154,7 +154,7 @@ TEST(SingleThreadedExecutorTest, SelfWakingTaskCompletesInTwoPasses) {
 }
 
 TEST(SingleThreadedExecutorTest, SetResultCallsJoinWaker) {
-    auto join_waker = std::make_shared<MockWaker>();
+    auto join_waker = make_rc<MockWaker>();
     EXPECT_CALL(*join_waker, wake()).Times(1);
 
     SingleThreadedExecutor ex;
@@ -166,7 +166,7 @@ TEST(SingleThreadedExecutorTest, SetResultCallsJoinWaker) {
 }
 
 TEST(SingleThreadedExecutorTest, WaitForComplete) {
-    auto join_waker = std::make_shared<MockWaker>();
+    auto join_waker = make_rc<MockWaker>();
     EXPECT_CALL(*join_waker, wake()).Times(1);
 
     SingleThreadedExecutor ex;
@@ -185,7 +185,7 @@ TEST(SingleThreadedExecutorTest, WaitForComplete) {
 struct PromiseWakeFuture {
     using OutputType = int;
     int                                         m_value;
-    std::promise<std::shared_ptr<detail::Waker>>* m_promise;
+    std::promise<Rc<detail::Waker>>* m_promise;
     bool                                         m_first = true;
 
     PollResult<int> poll(Context& ctx) {
@@ -202,7 +202,7 @@ TEST(SingleThreadedExecutorTest, ExternalThreadWakeup) {
     // Verifies that a task suspended waiting for an external wake is correctly
     // resumed when wake() is called from another thread, and that
     // wait_for_completion() does not return prematurely.
-    std::promise<std::shared_ptr<detail::Waker>> waker_promise;
+    std::promise<Rc<detail::Waker>> waker_promise;
     auto waker_future = waker_promise.get_future();
 
     SingleThreadedExecutor ex;
@@ -230,7 +230,7 @@ TEST(SingleThreadedExecutorTest, WaitForCompletionDoesNotReturnEarlyWithPendingT
     // exited wait_for_completion() when the ready queue was empty, before the
     // task had a chance to be woken externally. With the injection queue +
     // condvar fix it must block until the task completes.
-    std::promise<std::shared_ptr<detail::Waker>> waker_promise;
+    std::promise<Rc<detail::Waker>> waker_promise;
     auto waker_future = waker_promise.get_future();
 
     SingleThreadedExecutor ex;

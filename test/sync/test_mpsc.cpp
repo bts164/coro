@@ -145,6 +145,22 @@ TYPED_TEST(MpscTest, AllSendersDropped) {
     EXPECT_TRUE(rx.all_senders_dropped());
 }
 
+// Move-assigning into a live MpscSender must drop the OLD channel's sender
+// count (running the destructor's protocol on it), not just silently drop
+// the old Rc. Regression test for the bug that caused a displaced
+// MqttClient::subscribe() stream to hang instead of ending.
+TYPED_TEST(MpscTest, ReassigningLiveSenderDropsOldChannelSender) {
+    auto chan_a = mpsc_channel<int>(4);
+    auto tx_a   = std::move(chan_a.first);
+    auto rx_a   = std::move(chan_a.second);
+    auto chan_b = mpsc_channel<int>(4);
+    auto tx_b   = std::move(chan_b.first);
+
+    tx_a = std::move(tx_b); // displaces the sender for channel A
+
+    EXPECT_TRUE(rx_a.all_senders_dropped());
+}
+
 // --- Async executor-agnostic tests ---
 
 TYPED_TEST(MpscTest, SingleSenderSingleReceiver) {

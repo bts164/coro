@@ -6,6 +6,7 @@
 
 #include <coro/detail/task.h>
 #include <coro/detail/waker.h>
+#include <coro/detail/rc.h>
 #include <algorithm>
 #include <memory>
 #include <vector>
@@ -68,7 +69,7 @@ public:
      *
      * The executor's owned map keeps the task alive — no ownership transfer is needed.
      */
-    void add_child(std::weak_ptr<TaskBase> task) {
+    void add_child(Weak<TaskBase> task) {
         std::lock_guard lock(m_mutex);
         m_pending.push_back(std::move(task));
     }
@@ -80,7 +81,7 @@ public:
         std::lock_guard lock(m_mutex);
         m_pending.erase(
             std::remove_if(m_pending.begin(), m_pending.end(),
-                [](const std::weak_ptr<TaskBase>& wp) {
+                [](const Weak<TaskBase>& wp) {
                     auto t = wp.lock();
                     return !t || t->is_complete();
                 }),
@@ -102,9 +103,9 @@ public:
      *
      * @return `true` if at least one child is still pending after the double-sweep.
      */
-    bool set_drain_waker(std::weak_ptr<Waker> waker) {
+    bool set_drain_waker(Weak<Waker> waker) {
         std::lock_guard lock(m_mutex);
-        auto is_done = [](const std::weak_ptr<TaskBase>& wp) {
+        auto is_done = [](const Weak<TaskBase>& wp) {
             auto t = wp.lock();
             return !t || t->is_complete();
         };
@@ -119,8 +120,8 @@ public:
     }
 
 private:
-    detail::Mutex                        m_mutex;
-    std::vector<std::weak_ptr<TaskBase>> m_pending;
+    detail::Mutex            m_mutex;
+    std::vector<Weak<TaskBase>> m_pending;
 };
 
 /**

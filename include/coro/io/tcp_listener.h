@@ -8,6 +8,7 @@
 
 #include <coro/coro.h>
 #include <coro/io/tcp_stream.h>
+#include <coro/detail/rc.h>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -49,9 +50,9 @@ public:
     [[nodiscard]] Coro<TcpStream> accept();
 
 private:
-    explicit TcpListener(std::shared_ptr<detail::LwipListenCtx> impl);
+    explicit TcpListener(detail::Rc<detail::LwipListenCtx> impl);
 
-    std::shared_ptr<detail::LwipListenCtx> m_impl;
+    detail::Rc<detail::LwipListenCtx> m_impl;
 };
 
 } // namespace coro

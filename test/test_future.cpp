@@ -5,11 +5,12 @@
 #include <string>
 
 using namespace coro;
+using namespace coro::detail;
 
 class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
+    MOCK_METHOD(Rc<Waker>, clone, (), (override));
 };
 
 // Stub: always returns Pending and stores the waker for inspection.
@@ -21,9 +22,9 @@ public:
         m_waker = ctx.getWaker();
         return PollPending;
     }
-    std::shared_ptr<detail::Waker> storedWaker() const { return m_waker; }
+    Rc<detail::Waker> storedWaker() const { return m_waker; }
 private:
-    std::shared_ptr<detail::Waker> m_waker;
+    Rc<detail::Waker> m_waker;
 };
 
 // Stub: should return Ready(value) — body left as PollPending until Phase 3.
@@ -59,14 +60,14 @@ static_assert(!Future<WrongReturnType>);
 // --- Runtime tests ---
 
 TEST(NeverFutureTest, PollReturnsPending) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     NeverFuture<int> f;
     EXPECT_TRUE(f.poll(ctx).isPending());
 }
 
 TEST(NeverFutureTest, StoresWakerAfterPoll) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     NeverFuture<int> f;
     f.poll(ctx);
@@ -75,7 +76,7 @@ TEST(NeverFutureTest, StoresWakerAfterPoll) {
 
 // Disabled until Phase 3 implements ImmediateFuture::poll.
 TEST(ImmediateFutureTest, PollReturnsReady) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     ImmediateFuture<int> f(42);
     auto result = f.poll(ctx);

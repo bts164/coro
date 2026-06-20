@@ -2,6 +2,7 @@
 
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
+#include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
 #include <memory>
 #include <coro/detail/mutex.h>
@@ -134,7 +135,7 @@ public:
      * the executor queue. Use IsrEvent::signal_from_isr() from ISR context instead.
      */
     void set() {
-        std::shared_ptr<detail::Waker> waker;
+        detail::Rc<detail::Waker> waker;
         {
             std::lock_guard lock(m_mutex);
             m_set = true;
@@ -173,7 +174,7 @@ private:
     mutable detail::Mutex          m_mutex;
     bool                           m_set   = false;
     WaitFuture*                    m_wait_future = nullptr;
-    std::shared_ptr<detail::Waker> m_waker;
+    detail::Rc<detail::Waker> m_waker;
 };
 
 } // namespace coro

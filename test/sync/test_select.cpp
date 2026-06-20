@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "executor_traits.h"
+#include <coro/detail/rc.h>
 #include <coro/sync/select.h>
 #include <coro/coro.h>
 #include <coro/runtime/runtime.h>
@@ -57,7 +58,7 @@ public:
 private:
     int m_remaining;
     int m_value;
-    std::shared_ptr<detail::Waker> m_waker;
+    detail::Rc<detail::Waker> m_waker;
 };
 
 }  // namespace
@@ -123,12 +124,12 @@ namespace {
 
 struct WritingFuture {
     using OutputType = void;
-    std::shared_ptr<int> dest;
+    detail::Rc<int> dest;
     int value;
     PollResult<void> poll(detail::Context&) { *dest = value; return PollReady; }
 };
 
-Coro<void> coro_that_spawns_and_blocks(std::shared_ptr<int> out) {
+Coro<void> coro_that_spawns_and_blocks(detail::Rc<int> out) {
     spawn(WritingFuture{out, 99}).cancelOnDestroy(false);
     struct NeverCoro {
         using OutputType = void;
@@ -141,8 +142,8 @@ Coro<void> coro_that_spawns_and_blocks(std::shared_ptr<int> out) {
 }  // namespace
 
 TYPED_TEST(SelectTest, CancelledCoroBranchDrainsChildrenBeforeSelectCompletes) {
-    auto shared = std::make_shared<int>(0);
-    this->traits.rt.block_on([](std::shared_ptr<int> out) -> Coro<void> {
+    auto shared = detail::make_rc<int>(0);
+    this->traits.rt.block_on([](detail::Rc<int> out) -> Coro<void> {
         auto result = co_await select(
             coro_that_spawns_and_blocks(out),
             ImmediateVoid{});

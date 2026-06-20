@@ -6,11 +6,12 @@
 #include <vector>
 
 using namespace coro;
+using namespace coro::detail;
 
 class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
+    MOCK_METHOD(Rc<detail::Waker>, clone, (), (override));
 };
 
 // Helper: drain a CoroStream synchronously into a vector, asserting no errors.
@@ -100,7 +101,7 @@ TEST(CoroStreamTest, IsMovable) {
 // --- Empty stream ---
 
 TEST(CoroStreamTest, EmptyStreamReturnsNullopt) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = empty_stream();
     auto r = s.poll_next(ctx);
@@ -109,7 +110,7 @@ TEST(CoroStreamTest, EmptyStreamReturnsNullopt) {
 }
 
 TEST(CoroStreamTest, ExhaustedStreamKeepsReturningNullopt) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = empty_stream();
     s.poll_next(ctx);  // exhaust
@@ -121,7 +122,7 @@ TEST(CoroStreamTest, ExhaustedStreamKeepsReturningNullopt) {
 // --- co_yield items ---
 
 TEST(CoroStreamTest, RangeYieldsExpectedValues) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = range(0, 4);
     auto items = drain(s, ctx);
@@ -129,7 +130,7 @@ TEST(CoroStreamTest, RangeYieldsExpectedValues) {
 }
 
 TEST(CoroStreamTest, ExhaustionAfterLastItem) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = range(0, 2);
     drain(s, ctx);
@@ -141,7 +142,7 @@ TEST(CoroStreamTest, ExhaustionAfterLastItem) {
 // --- co_return value (HasFinalValue = true) ---
 
 TEST(CoroStreamTest, FinalValueEmittedAsLastItem) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = range_with_sum(1, 4);  // yields 1, 2, 3 then co_return 6
     auto items = drain(s, ctx);
@@ -150,7 +151,7 @@ TEST(CoroStreamTest, FinalValueEmittedAsLastItem) {
 }
 
 TEST(CoroStreamTest, FinalValueFollowedByNullopt) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = range_with_sum(0, 1);  // co_yield 0, then co_return 0 (sum)
     s.poll_next(ctx);               // item: 0
@@ -163,7 +164,7 @@ TEST(CoroStreamTest, FinalValueFollowedByNullopt) {
 // --- Exception propagation ---
 
 TEST(CoroStreamTest, ExceptionBeforeYieldStoredAsError) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = throws_on_first_yield();
     auto r = s.poll_next(ctx);
@@ -172,7 +173,7 @@ TEST(CoroStreamTest, ExceptionBeforeYieldStoredAsError) {
 }
 
 TEST(CoroStreamTest, ExceptionAfterYieldStoredAsError) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = throws_after_one_yield();
 
@@ -188,7 +189,7 @@ TEST(CoroStreamTest, ExceptionAfterYieldStoredAsError) {
 // --- co_await inside generator ---
 
 TEST(CoroStreamTest, AwaitingStreamYieldsCorrectValues) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto s = awaiting_stream();
     auto items = drain(s, ctx);

@@ -5,11 +5,12 @@
 #include <stdexcept>
 
 using namespace coro;
+using namespace coro::detail;
 
 class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
+    MOCK_METHOD(Rc<detail::Waker>, clone, (), (override));
 };
 
 static std::shared_ptr<detail::TaskState<int>> make_int_state() {
@@ -64,6 +65,21 @@ TEST(JoinHandleTest, VoidDestructorSetsCancelledFlag) {
     EXPECT_TRUE(state->cancelled.load());
 }
 
+// Move-assigning into a live JoinHandle must cancel the OLD task (running the
+// destructor's cancel()-and-register-with-scope protocol on it), not just
+// silently drop the old state and let it run unbounded. Regression test for
+// the same defaulted-move-assignment bug found in MpscSender/OneshotSender/
+// WatchSender/WatchReceiver/MpscReceiver.
+TEST(JoinHandleTest, MoveAssignmentCancelsDisplacedTask) {
+    auto state_a = make_int_state();
+    auto state_b = make_int_state();
+    JoinHandle<int> ha(state_a);
+    JoinHandle<int> hb(state_b);
+    ha = std::move(hb);
+    EXPECT_TRUE(state_a->cancelled.load());
+    EXPECT_FALSE(state_b->cancelled.load());
+}
+
 TEST(JoinHandleTest, DetachDoesNotCancel) {
     auto state = make_int_state();
     JoinHandle<int> h(state);
@@ -81,14 +97,14 @@ TEST(JoinHandleTest, VoidDetachDoesNotCancel) {
 // --- poll: Pending when no result yet, waker stored ---
 
 TEST(JoinHandleTest, PollReturnsPendingWhenNoResult) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     JoinHandle<int> h(make_int_state());
     EXPECT_TRUE(h.poll(ctx).isPending());
 }
 
 TEST(JoinHandleTest, PollStoresWakerInState) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto state = make_int_state();
     JoinHandle<int> h(state);
@@ -97,7 +113,7 @@ TEST(JoinHandleTest, PollStoresWakerInState) {
 }
 
 TEST(JoinHandleTest, VoidPollReturnsPendingWhenNoResult) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     JoinHandle<void> h(make_void_state());
     EXPECT_TRUE(h.poll(ctx).isPending());
@@ -106,7 +122,7 @@ TEST(JoinHandleTest, VoidPollReturnsPendingWhenNoResult) {
 // --- poll: Ready when result has been set ---
 
 TEST(JoinHandleTest, PollReturnsReadyAfterSetResult) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto state = make_int_state();
     state->setResult(42);
@@ -117,7 +133,7 @@ TEST(JoinHandleTest, PollReturnsReadyAfterSetResult) {
 }
 
 TEST(JoinHandleTest, VoidPollReturnsReadyAfterSetDone) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto state = make_void_state();
     state->setResult();
@@ -128,7 +144,7 @@ TEST(JoinHandleTest, VoidPollReturnsReadyAfterSetDone) {
 // --- poll: Error when exception has been set ---
 
 TEST(JoinHandleTest, PollReturnsErrorAfterSetException) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto state = make_int_state();
     state->setException(std::make_exception_ptr(std::runtime_error("oops")));
@@ -139,7 +155,7 @@ TEST(JoinHandleTest, PollReturnsErrorAfterSetException) {
 }
 
 TEST(JoinHandleTest, VoidPollReturnsErrorAfterSetException) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto state = make_void_state();
     state->setException(std::make_exception_ptr(std::runtime_error("oops")));
@@ -152,7 +168,7 @@ TEST(JoinHandleTest, VoidPollReturnsErrorAfterSetException) {
 // --- setResult wakes the stored waker ---
 
 TEST(JoinHandleTest, SetResultCallsWaker) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(1);
     detail::Context ctx(waker);
     auto state = make_int_state();
@@ -162,7 +178,7 @@ TEST(JoinHandleTest, SetResultCallsWaker) {
 }
 
 TEST(JoinHandleTest, SetExceptionCallsWaker) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(1);
     detail::Context ctx(waker);
     auto state = make_int_state();

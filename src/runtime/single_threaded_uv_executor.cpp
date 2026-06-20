@@ -28,6 +28,12 @@ SingleThreadedUvExecutor::SingleThreadedUvExecutor(Runtime * /*runtime*/) {
     m_uv_thread = std::thread([this]() noexcept {
         this->io_thread_loop();
     });
+    // get_id() is available as soon as the std::thread object exists (the OS
+    // assigns the id at pthread_create) — no need to wait for io_thread_loop
+    // to actually start running. Setting it here, on the constructing thread,
+    // avoids a data race with enqueue() being called (from another thread)
+    // before io_thread_loop got a chance to set it itself.
+    m_uv_thread_id = m_uv_thread.get_id();
 }
 
 SingleThreadedUvExecutor::~SingleThreadedUvExecutor() {
@@ -195,7 +201,6 @@ void SingleThreadedUvExecutor::io_async_cb(uv_async_t* handle) {
 }
 
 void SingleThreadedUvExecutor::io_thread_loop() {
-    m_uv_thread_id = std::this_thread::get_id();
     set_current_uv_executor(this);
 
     lws_set_log_level(0, nullptr);

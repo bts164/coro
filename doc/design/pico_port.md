@@ -130,6 +130,75 @@ use IRQ-disable (`CPSID I / CPSIE I`) on Cortex-M0+ because M0+ lacks the `LDREX
 for approximately 4–6 instructions per operation. This is safe and correct; the brief
 IRQ-disable window is far too short to cause the deadlock class described above.
 
+### Non-atomic refcounting and scheduling state (`Rc<T>` / `Weak<T>` / `RelaxedState<T>`)
+
+The same single-threaded, no-ISR-touches-this argument that justifies the no-op `Mutex`
+above (and the IRQ-disable fallback for `std::atomic` noted just above) also applies to
+task ownership and scheduling-state fields, which on desktop/server still go through
+fully atomic `std::shared_ptr`/`std::weak_ptr` and `std::atomic<T>`.
+
+`coro::detail::Rc<T>` / `Weak<T>` ([`detail/rc.h`](../../include/coro/detail/rc.h)) are
+conditional aliases:
+
+```cpp
+#ifdef CORO_PICO
+template<typename T> using Rc   = /* non-atomic intrusive-refcount pointer */;
+template<typename T> using Weak = /* corresponding weak reference */;
+#else
+template<typename T> using Rc   = std::shared_ptr<T>;
+template<typename T> using Weak = std::weak_ptr<T>;
+#endif
+```
+
+On Pico, `Rc<T>`/`Weak<T>` are a plain non-atomic intrusive-refcount pointer covering only
+the subset of `shared_ptr`/`weak_ptr`'s API the library actually uses: `make_rc<T>(...)`,
+copy/move, `reset()`, an aliasing constructor (for `JoinHandle<T>`/`StreamHandle<T>`
+holding a view into the same allocation as the owning task — see
+[task_ownership.md](task_ownership.md)), and `Weak<T>::lock()`. There is no generic
+`enable_rc_from_this<T>` — `TaskBase` grows a private `Weak<TaskBase> m_self` member plus
+`set_self()`/`shared_from_this()`/`weak_from_this()` under `CORO_PICO`, set once at each
+task-creation call site right after the controlling `Rc<TaskImpl<F>>` is constructed.
+Call-site syntax is identical on both platforms; only construction differs.
+
+`RelaxedState<T>` ([`detail/relaxed_state.h`](../../include/coro/detail/relaxed_state.h))
+does the same for scheduling fields (`TaskBase::scheduling_state`,
+`TaskState<T>::cancelled`, `StreamTaskImpl::m_cancelled`): it exposes the same
+`load`/`store`/`compare_exchange_strong` surface these call sites already use, backed by
+a plain `T` instead of `std::atomic<T>` on Pico (an alias for `std::atomic<T>` elsewhere),
+so no call-site changes beyond the field's declared type are needed.
+
+!!! warning "WARNING: `Rc<T>`/`Weak<T>`/`RelaxedState<T>` must never leave the executor thread"
+    The entire justification for dropping atomicity is that nothing outside the
+    `CurrentThreadExecutor`'s own thread ever touches one of these. If a future change
+    introduces multi-core task dispatch on Pico (see the core-1 warning above for `Mutex`),
+    this assumption breaks for all of `Mutex`, `Rc`/`Weak`, and `RelaxedState` at the same
+    time, and all three need revisiting together.
+
+### Coroutine frame pooling (`FramePool`) — experimental, off by default
+
+!!! note "NOTE: disabled unless CORO_PICO_FRAME_POOL is defined"
+    This feature is experimental. It is gated behind its own opt-in flag,
+    `CORO_PICO_FRAME_POOL`, separate from `CORO_PICO` — `cmake/platforms/pico.cmake` does
+    **not** define it, so real Pico builds get the plain heap allocator unless an
+    application explicitly adds
+    `target_compile_definitions(coro_pico PUBLIC CORO_PICO_FRAME_POOL)`.
+
+When enabled, `CoroPromiseBase` ([`include/coro/coro.h`](../../include/coro/coro.h))
+overrides `operator new`/`operator delete` to route small/medium coroutine frame
+allocations through `FramePool<SlotSize, SlotCount>`
+([`detail/frame_pool.h`](../../include/coro/detail/frame_pool.h)) instead of the general
+heap allocator. `FramePool` is a fixed-size-class intrusive-freelist allocator — the same
+technique tcmalloc/jemalloc use for small allocations, narrowed to a single-threaded
+target with a closed, known set of coroutine frame sizes (no locking needed, for the same
+reason `Mutex` is a no-op here). Both `operator new` and `operator delete` fall back to
+`::operator new`/`::operator delete` whenever a pool doesn't fit the request or is
+exhausted, so correctness never depends on the configured slot sizes/counts being
+right — only the performance win does. `FramePool` itself is platform-agnostic and
+unit-tested on desktop ([`test/detail/test_frame_pool.cpp`](../../test/detail/test_frame_pool.cpp));
+only its use as a promise-type allocator is gated behind `CORO_PICO_FRAME_POOL`. The host
+test suite (`test_pico_suite`) enables the flag so the pooling/`Coro<T>` integration stays
+exercised even though it's off by default for real firmware builds.
+
 ### ISR → coroutine communication: `IsrEvent` and `IsrChannel<T>`
 
 The **only supported** way to signal a coroutine from an ISR is via `IsrEvent` or
@@ -269,12 +338,115 @@ executor thread. There is no separate I/O thread and no concurrent access.
 
 ---
 
+## Optional MQTT module: `coro_pico_mqtt`
+
+`coro_pico_mqtt` is an **optional** cmake target, separate from both `coro_pico` and
+`coro_pico_hal`, that wraps lwIP's `apps/mqtt` client (`lwip/apps/mqtt.h`) as coroutine
+APIs. Applications that don't need MQTT do not link it, and lwIP's MQTT app itself stays
+compiled out unless `LWIP_MQTT` is enabled in `lwipopts.h`.
+
+It depends only on `coro_pico` (for `LwipCallbackResult` and the lwIP backend already
+used by `TcpStream`) — not on `coro_pico_hal`, since MQTT has nothing to do with DMA/SPI/I2C.
+
+```cmake
+# Link the MQTT module in addition to the core:
+target_link_libraries(my_firmware PRIVATE coro_pico coro_pico_mqtt)
+```
+
+```c
+// lwipopts.h
+#define LWIP_MQTT 1
+```
+
+### Wrapping pattern
+
+Same shape as `TcpStream`'s lwIP wrapping (no mutex needed — every lwIP MQTT callback
+fires synchronously inside `cyw43_arch_poll()`, on the executor thread):
+
+- **Connect** (`mqtt_client_connect()` + `mqtt_connection_cb_t`) is one-shot — wrapped
+  with `LwipCallbackResult<mqtt_connection_status_t>`, exactly like `TcpStream::connect()`.
+- **Publish acknowledgement** (`mqtt_publish()`'s per-call request callback, used for
+  QoS 1/2) is also one-shot per call — same `LwipCallbackResult` pattern.
+- **Incoming messages** are different: `mqtt_set_inpub_callback()` registers a single
+  pair of callbacks (`mqtt_incoming_publish_cb_t` / `mqtt_incoming_data_cb_t`) for the
+  *whole client*, firing repeatedly for the life of the connection. These get pushed onto
+  an `mpsc::Sender<MqttMessage>` held by `MqttClient`; the application reads them via the
+  paired `mpsc::Receiver<MqttMessage>` returned from `subscribe()`. This is the same
+  single-consumer model `TcpStream` already documents as a known limitation — one reader
+  per client, not per topic.
+
+```cpp
+// include/coro/pico/mqtt.h
+struct MqttMessage {
+    std::string topic;
+    std::vector<std::byte> payload;
+};
+
+class MqttClient {
+public:
+    // Resolves host, opens the TCP connection, and performs the MQTT CONNECT handshake.
+    [[nodiscard]] static coro::Coro<MqttClient> connect(
+        std::string_view host, uint16_t port, std::string_view client_id);
+
+    // Publishes a message. Suspends until the broker PUBACK for QoS 1/2; returns
+    // immediately after the write completes for QoS 0.
+    [[nodiscard]] coro::Coro<void> publish(
+        std::string_view topic, std::span<const std::byte> payload,
+        uint8_t qos = 0, bool retain = false);
+
+    // Sends SUBSCRIBE and returns a stream of every message that arrives on `topic`
+    // for the lifetime of this client. Only one subscribe() call may be outstanding
+    // at a time — see the single-consumer note above.
+    [[nodiscard]] coro::CoroStream<MqttMessage> subscribe(
+        std::string_view topic, uint8_t qos = 0);
+
+private:
+    mqtt_client_t*           m_client;
+    mpsc::Sender<MqttMessage> m_tx;
+};
+```
+
+```mermaid
+sequenceDiagram
+    participant C as coroutine
+    participant M as lwIP mqtt
+    participant E as CurrentThreadExecutor
+
+    C->>M: mqtt_client_connect(conn_cb)
+    C->>E: co_await lwip_wait(connect_result)
+    M-->>C: conn_cb fires: connect_result.complete(status)
+
+    C->>M: mqtt_subscribe(topic, sub_request_cb)
+    C->>E: co_await lwip_wait(sub_result)
+    M-->>C: sub_request_cb fires: sub_result.complete(err)
+
+    loop every broker PUBLISH on topic
+        M-->>C: incoming_publish_cb / incoming_data_cb
+        Note over C: MqttMessage pushed onto mpsc channel
+        C->>C: co_await stream.next() resumes with the message
+    end
+```
+
+!!! note "NOTE: QoS 2 and persistent sessions are out of scope for the first cut"
+    lwIP's `apps/mqtt` itself only implements QoS 0/1 publish acknowledgement and does
+    not support persistent sessions (`CONNECT` always sends `clean_session = 1`). The
+    coro wrapper doesn't add anything beyond what lwIP already provides.
+
+!!! warning "WARNING: CYW43_ARCH_THREADSAFE_BACKGROUND incompatibility"
+    Same caveat as `LwipCallbackResult` above — the no-mutex design assumes
+    `CYW43_ARCH_POLL`. Under `CYW43_ARCH_THREADSAFE_BACKGROUND`, the incoming-message
+    callbacks could fire from a different thread than the one draining the `mpsc`
+    channel, which would need a real `detail::Mutex` guard to be safe.
+
+---
+
 ## File structure
 
 ```
 cmake/platforms/
   pico.cmake                    Platform include: defines coro_pico STATIC library
   pico_hal.cmake                Optional HAL layer: defines coro_pico_hal (DMA, SPI, ...)
+  pico_mqtt.cmake                Optional MQTT module: defines coro_pico_mqtt (lwIP apps/mqtt)
 
 include/coro/
   detail/mutex.h                Platform-portable mutex: no-op stubs on Pico (cooperative
@@ -288,6 +460,7 @@ include/coro/
                                 older pico_tcp_stream.h. New code uses LwipCallbackResult.
     hal/
       dma.h                     AsyncDmaTransfer — RAII async DMA channel (coro_pico_hal)
+    mqtt.h                       MqttClient — coroutine wrapper over lwIP apps/mqtt (coro_pico_mqtt)
   io/
     tcp_stream.h                TcpStream — dispatches to lwIP or libuv backend
     tcp_listener.h              TcpListener — dispatches to lwIP or libuv backend
@@ -299,6 +472,8 @@ src/
   runtime.cpp                   Runtime::schedule_timer() (Pico gate)
   pico/hal/
     dma.cpp                     AsyncDmaTransfer + DMA_IRQ_0 dispatch table
+  pico/
+    mqtt.cpp                     MqttClient implementation (coro_pico_mqtt)
   io/lwip/
     lwip_tcp_ctx.h              LwipTcpCtx internal struct (shared between stream + listener)
     tcp_stream_lwip.cpp         TcpStream lwIP implementation
@@ -645,6 +820,7 @@ already returns an `ip_addr_t` that holds either address family.
 | I2C / SPI async | `coro_pico_hal` | DMA-backed transfers via `AsyncDmaTransfer` |
 | ADC burst | `coro_pico_hal` | DMA from ADC FIFO via `AsyncDmaTransfer` |
 | TLS | `coro_pico` | mbedTLS layered over `TcpStream` |
+| MQTT | `coro_pico_mqtt` | `MqttClient` over lwIP `apps/mqtt` — see [Optional MQTT module](#optional-mqtt-module-coro_pico_mqtt) above |
 
 The `IsrEvent` / `IsrChannel<T>` pattern is the required integration point for all
 hardware peripherals that need ISR → coroutine signalling. For peripherals that do not

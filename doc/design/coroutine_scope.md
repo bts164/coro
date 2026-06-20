@@ -237,6 +237,57 @@ The waker is passed to each pending child's `set_scope_waker` callback and lives
 `TaskState::scope_waker`, which is cleared when the child completes. No member storage of
 the waker in `CoroutineScope` is needed.
 
+### Proposed optimization: inline-capacity pending list
+
+!!! note "TODO: not yet implemented — needs a prototype and on-device cycle measurement before committing"
+    This is a design sketch, not a decision. Validate with a SysTick-based cycle-count
+    measurement of a suspend/resume round trip on real Pico hardware before merging —
+    see [pico_port.md](pico_port.md)'s frame-pooling and refcounting sections for the
+    kind of allocator-driven costs this technique has caught before.
+
+`m_pending` is a `std::vector<Weak<TaskBase>>`. For a coroutine that never spawns children
+(the common case for leaf coroutines) it stays a default-constructed empty vector and never
+allocates — `add_child()`'s first `push_back()` is what triggers the first heap allocation.
+Most coroutines that do spawn children spawn only a handful, so that allocation is wasted
+work most of the time: a few `Weak<TaskBase>` could just as easily live inline in the
+`CoroutineScope` object itself.
+
+The motivating idea: replace `std::vector<Weak<TaskBase>>` with a small inline-capacity
+container — N slots stored directly in `CoroutineScope` plus a single `overflow` pointer used
+only if a coroutine ever spawns more than N children:
+
+```mermaid
+classDiagram
+    class PendingList {
+        -count: size_t
+        -inline_slots: Weak~TaskBase~[N]
+        -overflow: Weak~TaskBase~*
+        +push_back(Weak~TaskBase~)
+        +size() size_t
+    }
+```
+
+This avoids the heap allocation entirely for the common few-children case, and as a side
+benefit keeps those children's `Weak<TaskBase>` pointers physically adjacent to
+`CoroutineScope`'s other members — more likely to share a cache line with whatever else the
+draining code touches, instead of being a separate allocation elsewhere in the heap.
+
+**Why the move concern resolves itself.** The obvious worry with inline storage is that moving
+the container becomes more expensive — copying N inline slots instead of three pointers. But
+`CoroutineScope`'s existing documented invariant (above: "Moves of `Coro<T>` only occur before
+the first `poll()` call... `m_pending` is always empty" at that point) already guarantees this
+never matters: `add_child()` can only run while `t_current_coro` is set, which only happens
+during `poll()`, so by the time any child could exist, the scope has already had its one and
+only `poll()` and will never move again. A move therefore only ever needs to handle the
+`count == 0` case — copy `count` (0) and the `overflow` pointer (always null at that point),
+and skip the inline slots entirely. No deferred-initialization trick or "pinned" flag is
+needed; the existing invariant already provides it.
+
+**Status**: not implemented. Worth prototyping (a small `detail::SmallVec`-style container,
+desktop-tested) but the actual payoff — heap allocation avoided per spawn, plus any cache
+locality benefit — needs to be measured with the same SysTick harness used for `FramePool`
+before deciding it's worth the added complexity over `std::vector`.
+
 ## `PollDropped` — a dedicated cancellation state
 
 `PollResult<T>` carries four states:

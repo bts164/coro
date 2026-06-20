@@ -11,9 +11,12 @@ using namespace std::chrono_literals;
 // IsrEvent tests
 //
 // std::thread simulates the ISR — it calls signal_from_isr() while block_on()
-// is driving the executor. On x86 the volatile write is visible across threads
-// via cache coherence; this is sufficient for behavioral testing even though
-// volatile does not imply std::atomic ordering on the C++ memory model.
+// is driving the executor. Unlike a real single-core interrupt, a std::thread
+// is genuinely concurrent under the C++ memory model, so this only gives
+// well-defined behavior because IsrEvent/IsrChannel serialize every access
+// through a real lock (a std::mutex-backed stub of the hardware spin lock on
+// the host build; see test/pico/stub/hardware/sync.h and
+// doc/design/isr_safety.md, "Cross-core ISR delivery").
 // ---------------------------------------------------------------------------
 
 template<typename Traits>

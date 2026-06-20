@@ -12,6 +12,7 @@
 
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
+#include <coro/detail/rc.h>
 #include <coro/future.h>
 #include <memory>
 #include <optional>
@@ -37,7 +38,7 @@ namespace coro {
  */
 template<typename... Args>
 struct LwipCallbackResult {
-    std::shared_ptr<detail::Waker>     waker;
+    detail::Rc<detail::Waker>          waker;
     std::optional<std::tuple<Args...>> value;
 
     void complete(Args... args) {

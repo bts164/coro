@@ -19,6 +19,8 @@
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/waker.h>
+#include <coro/detail/rc.h>
+#include <coro/detail/isr_flag.h>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -84,13 +86,13 @@ public:
     uint64_t now_us() const { return m_clock(); }
 
     /// Takes ownership of `task` and enqueues it for its first poll.
-    void schedule(std::shared_ptr<detail::TaskBase> task) override;
+    void schedule(detail::Rc<detail::TaskBase> task) override;
 
     /// Re-enqueues a woken task. May be called from a context other than the
     /// executor thread — an IRQ handler on Pico (e.g. DMA completion ISR) or
     /// an external thread on multi-threaded platforms. m_ready_mutex serialises
     /// access appropriately for the current platform (see detail/mutex.h).
-    void enqueue(std::shared_ptr<detail::TaskBase> task) override;
+    void enqueue(detail::Rc<detail::TaskBase> task) override;
 
     /// @brief Runs the event loop until `state.terminated`.
     ///
@@ -106,24 +108,28 @@ public:
 
     /// @brief Registers a one-shot timer that wakes `waker` at `deadline_us`
     /// (microseconds since boot, as returned by time_us_64()).
-    void schedule_timer(uint64_t deadline_us, std::shared_ptr<detail::Waker> waker);
+    void schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> waker);
 
     /// @brief Fires wakers for any timers whose deadline has passed.
     /// Called from wait_for_completion() on every loop iteration.
     void check_expired_timers();
 
-    /// @brief Registers a volatile ISR flag to be polled once per event loop iteration.
+#ifdef CORO_PICO
+    /// @brief Registers an ISR flag to be polled once per event loop iteration.
     ///
-    /// When the flag becomes true, the waker is fired and the entry is removed.
-    /// Called by IsrWaitFuture on its first poll() to park a coroutine awaiting an
-    /// IsrEvent without busy-polling. Safe to call from the executor thread only
-    /// (not from an ISR — registration happens inside the coroutine, not the ISR).
-    void add_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker);
-    void remove_isr_poll(const volatile bool* flag);
+    /// When the flag becomes true (checked through its paired hardware spin lock —
+    /// see doc/design/isr_safety.md, "Cross-core ISR delivery"), the waker is fired
+    /// and the entry is removed. Called by IsrWaitFuture on its first poll() to park
+    /// a coroutine awaiting an IsrEvent without busy-polling. Safe to call from the
+    /// executor thread only (not from an ISR — registration happens inside the
+    /// coroutine, not the ISR).
+    void add_isr_poll(IsrFlagRef ref, detail::Rc<detail::Waker> waker);
+    void remove_isr_poll(IsrFlagRef ref);
 
     /// @brief Scans registered ISR event flags; fires wakers for any that are set.
     /// Called from wait_for_completion() on every loop iteration, after m_poll().
     void check_isr_events();
+#endif // CORO_PICO
 
 private:
     ClockFn m_clock;
@@ -132,11 +138,11 @@ private:
     // m_ready_mutex serialises m_ready access against ISR preemption (Pico) or
     // concurrent thread wakers (multi-threaded platforms). See detail/mutex.h.
     detail::Mutex m_ready_mutex;
-    std::queue<std::shared_ptr<detail::TaskBase>> m_ready;
+    std::queue<detail::Rc<detail::TaskBase>> m_ready;
 
     struct TimerEntry {
         uint64_t deadline_us;
-        std::shared_ptr<detail::Waker> waker;
+        detail::Rc<detail::Waker> waker;
     };
     struct TimerCmp {
         // min-heap: smallest deadline (next to expire) at the top
@@ -148,16 +154,18 @@ private:
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
-    detail::Mutex                                                               m_owned_mutex;
-    std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
+    detail::Mutex                                       m_owned_mutex;
+    std::unordered_set<detail::Rc<detail::TaskBase>>     m_owned_tasks;
 
+#ifdef CORO_PICO
     struct IsrPollEntry {
-        const volatile bool*           flag;  // volatile: each check reads actual memory
-        std::shared_ptr<detail::Waker> waker;
+        IsrFlagRef                 ref;   // flag + paired hardware spin lock
+        detail::Rc<detail::Waker>  waker;
     };
     // Written from coroutine context (executor thread) only; read and cleared
     // from check_isr_events() on the same thread. No synchronisation needed.
     std::vector<IsrPollEntry> m_isr_polls;
+#endif // CORO_PICO
 };
 
 } // namespace coro

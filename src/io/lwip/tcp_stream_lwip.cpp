@@ -99,7 +99,7 @@ void LwipTcpCtx::on_err(void* arg, err_t err) {
 
 namespace coro {
 
-TcpStream::TcpStream(std::shared_ptr<detail::LwipTcpCtx> impl)
+TcpStream::TcpStream(detail::Rc<detail::LwipTcpCtx> impl)
     : m_impl(std::move(impl)) {}
 TcpStream::TcpStream(TcpStream&&) noexcept = default;
 TcpStream& TcpStream::operator=(TcpStream&&) noexcept = default;
@@ -185,7 +185,7 @@ Coro<TcpStream> TcpStream::connect(std::string host, uint16_t port) {
         throw std::runtime_error("TcpStream::connect: " + lwip_err_string(status));
 
     // ---- Step 3: wire up the stream context ----
-    auto ctx = std::make_shared<detail::LwipTcpCtx>();
+    auto ctx = detail::make_rc<detail::LwipTcpCtx>();
     ctx->pcb = pcb;
     // Disable Nagle: send all data immediately without waiting for ACKs to
     // batch small segments. Required for correctness when the stream is
@@ -212,7 +212,7 @@ Coro<std::size_t> TcpStream::read_impl(std::byte* buf, std::size_t size) {
 
     struct DataReady {
         using OutputType = void;
-        std::shared_ptr<detail::LwipTcpCtx> ctx;
+        detail::Rc<detail::LwipTcpCtx> ctx;
 
         PollResult<void> poll(detail::Context& cx) {
             if (!ctx->rx_buf.empty() || ctx->rx_eof || ctx->errored)
@@ -255,7 +255,7 @@ Coro<void> TcpStream::write_impl(const std::byte* buf, std::size_t size) {
 
     struct SpaceAvailable {
         using OutputType = void;
-        std::shared_ptr<detail::LwipTcpCtx> ctx;
+        detail::Rc<detail::LwipTcpCtx> ctx;
 
         PollResult<void> poll(detail::Context& cx) {
             if (ctx->errored || !ctx->pcb) return PollReady;

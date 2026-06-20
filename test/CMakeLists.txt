@@ -1,19 +1,6 @@
 cmake_minimum_required(VERSION 3.31)
 
-option(ENABLE_ASAN "Build with AddressSanitizer + LeakSanitizer + UBSan" OFF)
-option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
-
-if(ENABLE_ASAN AND ENABLE_TSAN)
-    message(FATAL_ERROR "ENABLE_ASAN and ENABLE_TSAN are mutually exclusive")
-endif()
-if(ENABLE_ASAN)
-    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
-    add_link_options(-fsanitize=address,undefined)
-endif()
-if(ENABLE_TSAN)
-    add_compile_options(-fsanitize=thread -g)
-    add_link_options(-fsanitize=thread)
-endif()
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Sanitize.cmake)
 
 find_package(coro CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
@@ -32,6 +19,8 @@ set(TEST_NAMES
     test_poll_result
     test_waker_context
     test_intrusive_list
+    test_rc
+    test_frame_pool
     # flat (foundational types — coro.h, future.h, stream.h, co_invoke.h)
     test_future
     test_future_ref
@@ -78,6 +67,8 @@ set(TEST_SRCS
     detail/test_poll_result.cpp
     detail/test_waker_context.cpp
     detail/test_intrusive_list.cpp
+    detail/test_rc.cpp
+    detail/test_frame_pool.cpp
     # flat
     test_future.cpp
     test_future_ref.cpp
@@ -158,7 +149,12 @@ target_include_directories(coro_pico_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     pico/stub
 )
-target_compile_definitions(coro_pico_core PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP)
+# CORO_PICO_FRAME_POOL is the experimental, off-by-default coroutine frame
+# pooling opt-in (see doc/design/pico_port.md's "Coroutine frame pooling"
+# section). Enabled here so FramePool.CoroFrameRoundTripsThroughPool in
+# test_frame_pool.cpp keeps exercising the integration even though real Pico
+# builds (cmake/platforms/pico.cmake) don't enable it by default.
+target_compile_definitions(coro_pico_core PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP CORO_PICO_FRAME_POOL)
 target_compile_features(coro_pico_core PUBLIC cxx_std_20)
 
 # test_pico_suite — the converted async test files compiled against coro_pico_core.
@@ -166,6 +162,8 @@ target_compile_features(coro_pico_core PUBLIC cxx_std_20)
 # is exercised. Desktop-only code (spawn_blocking, timeout, etc.) is guarded with
 # #ifndef CORO_PICO in each test file.
 add_executable(test_pico_suite
+    detail/test_rc.cpp
+    detail/test_frame_pool.cpp
     sync/test_watch.cpp
     sync/test_event.cpp
     sync/test_select.cpp
@@ -212,24 +210,6 @@ target_link_libraries(test_async_dma PRIVATE
 add_test(NAME test_async_dma COMMAND test_async_dma)
 
 # ---------------------------------------------------------------------------
-# TCP stream tests — lwIP backend, stub networking.
-#
-# Links against coro_pico_core + stub implementations of TcpStream/TcpListener
-# (no real lwIP required). Tests verify compile-time API properties and
-# executor integration. Actual loopback networking tests are commented out in
-# test_tcp_stream.cpp pending host lwIP NO_SYS infrastructure setup.
-# ---------------------------------------------------------------------------
-add_library(coro_lwip_tcp_stubs STATIC
-    pico/stub/lwip_tcp_stubs.cpp
-)
-target_link_libraries(coro_lwip_tcp_stubs PUBLIC coro_pico_core)
-
-add_executable(test_tcp_stream pico/test_tcp_stream.cpp)
-target_link_libraries(test_tcp_stream PRIVATE
-    coro_lwip_tcp_stubs GTest::gtest GTest::gtest_main GTest::gmock)
-add_test(NAME test_tcp_stream COMMAND test_tcp_stream)
-
-# ---------------------------------------------------------------------------
 # Real lwIP TCP tests — host NO_SYS loopback.
 #
 # Downloads lwIP from source and builds it with lwipopts.h configured for
@@ -270,6 +250,7 @@ add_library(lwip_host STATIC
     ${LWIP_DIR}/src/core/ipv4/ip4_addr.c
     ${LWIP_DIR}/src/core/ipv4/ip4_frag.c
     ${LWIP_DIR}/src/core/ipv4/icmp.c
+    ${LWIP_DIR}/src/apps/mqtt/mqtt.c
     pico/lwip_host/sys_now.c
 )
 # Note: loopif.c was removed in lwIP 2.2.0 — loopback netif support is now
@@ -293,4 +274,26 @@ add_executable(test_tcp_stream_real pico/test_tcp_stream_real.cpp)
 target_link_libraries(test_tcp_stream_real PRIVATE
     coro_lwip_tcp GTest::gtest GTest::gtest_main GTest::gmock)
 add_test(NAME test_tcp_stream_real COMMAND test_tcp_stream_real)
+
+# ---------------------------------------------------------------------------
+# MQTT client tests — host NO_SYS loopback, real lwIP apps/mqtt.
+#
+# coro_lwip_mqtt links src/pico/mqtt.cpp against the same lwip_host used above
+# (now also built with apps/mqtt/mqtt.c) plus coro_lwip_tcp, since the test
+# fixture's fake broker is itself a coro::TcpListener-based server that parses
+# the MQTT wire format by hand (lwIP has no broker implementation to test
+# against, only the client wrapped here).
+# ---------------------------------------------------------------------------
+add_library(coro_lwip_mqtt STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/pico/mqtt.cpp
+)
+target_include_directories(coro_lwip_mqtt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip
+)
+target_link_libraries(coro_lwip_mqtt PUBLIC coro_lwip_tcp)
+
+add_executable(test_mqtt_client pico/test_mqtt_client.cpp)
+target_link_libraries(test_mqtt_client PRIVATE
+    coro_lwip_mqtt GTest::gtest GTest::gtest_main GTest::gmock)
+add_test(NAME test_mqtt_client COMMAND test_mqtt_client)
 

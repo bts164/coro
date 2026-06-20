@@ -26,9 +26,9 @@ struct LwipListenCtx {
 
     // Each accepted connection is fully wired up in on_accept so that data
     // arriving before accept() runs is buffered rather than dropped by lwIP.
-    std::deque<std::shared_ptr<LwipTcpCtx>> pending;
-    std::shared_ptr<Waker>                  accept_waker;
-    bool                                    closed = false;
+    std::deque<Rc<LwipTcpCtx>> pending;
+    Rc<Waker>                  accept_waker;
+    bool                       closed = false;
 
     static err_t on_accept(void* arg, tcp_pcb* newpcb, err_t err);
 };
@@ -43,7 +43,7 @@ err_t LwipListenCtx::on_accept(void* arg, tcp_pcb* newpcb, err_t err) {
 
     // Wire up callbacks immediately so any data that arrives before accept()
     // runs gets buffered in LwipTcpCtx::rx_buf rather than dropped by lwIP.
-    auto stream_ctx = std::make_shared<LwipTcpCtx>();
+    auto stream_ctx = make_rc<LwipTcpCtx>();
     stream_ctx->pcb = newpcb;
     tcp_nagle_disable(newpcb);
     tcp_arg (newpcb, stream_ctx.get());
@@ -64,7 +64,7 @@ err_t LwipListenCtx::on_accept(void* arg, tcp_pcb* newpcb, err_t err) {
 
 namespace coro {
 
-TcpListener::TcpListener(std::shared_ptr<detail::LwipListenCtx> impl)
+TcpListener::TcpListener(detail::Rc<detail::LwipListenCtx> impl)
     : m_impl(std::move(impl)) {}
 TcpListener::TcpListener(TcpListener&&) noexcept = default;
 TcpListener& TcpListener::operator=(TcpListener&&) noexcept = default;
@@ -126,7 +126,7 @@ Coro<TcpListener> TcpListener::bind(std::string host, uint16_t port) {
         throw std::runtime_error("TcpListener::bind: tcp_listen failed (out of memory)");
     }
 
-    auto ctx = std::make_shared<detail::LwipListenCtx>();
+    auto ctx = detail::make_rc<detail::LwipListenCtx>();
     ctx->listen_pcb = listen_pcb;
     tcp_arg   (listen_pcb, ctx.get());
     tcp_accept(listen_pcb, detail::LwipListenCtx::on_accept);
@@ -144,7 +144,7 @@ Coro<TcpStream> TcpListener::accept() {
 
     struct ConnectionReady {
         using OutputType = void;
-        std::shared_ptr<detail::LwipListenCtx> ctx;
+        detail::Rc<detail::LwipListenCtx> ctx;
 
         PollResult<void> poll(detail::Context& cx) {
             if (!ctx->pending.empty() || ctx->closed) return PollReady;

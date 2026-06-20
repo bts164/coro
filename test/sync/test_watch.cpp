@@ -104,6 +104,36 @@ TYPED_TEST(WatchTest, SendReturnsValueWhenAllReceiversDropped) {
     EXPECT_EQ(r.error(), 42);
 }
 
+// Move-assigning into a live WatchSender/WatchReceiver must decrement the
+// OLD channel's sender_count/receiver_count (running the destructor's
+// protocol on it), not just silently drop the old Rc. Regression test for a
+// defaulted move-assignment bug found in MpscSender and fixed analogously here.
+TYPED_TEST(WatchTest, ReassigningLiveSenderDropsOldChannelSender) {
+    auto chan_a = watch_channel<int>(0);
+    auto tx_a   = std::move(chan_a.first);
+    auto rx_a   = std::move(chan_a.second);
+    auto chan_b = watch_channel<int>(0);
+    auto tx_b   = std::move(chan_b.first);
+
+    tx_a = std::move(tx_b); // displaces the sender for channel A
+
+    EXPECT_TRUE(rx_a.sender_dropped());
+}
+
+TYPED_TEST(WatchTest, ReassigningLiveReceiverDropsOldChannelReceiver) {
+    auto chan_a = watch_channel<int>(0);
+    auto tx_a   = std::move(chan_a.first);
+    auto rx_a   = std::move(chan_a.second);
+    auto chan_b = watch_channel<int>(0);
+    auto rx_b   = std::move(chan_b.second);
+
+    rx_a = std::move(rx_b); // displaces the receiver for channel A
+
+    EXPECT_TRUE(tx_a.all_receivers_dropped());
+    auto r = tx_a.send(42);
+    EXPECT_FALSE(r.has_value());
+}
+
 TYPED_TEST(WatchTest, BorrowReadsInitialValue) {
     auto [tx, rx] = watch_channel<int>(7);
     EXPECT_EQ(*rx.borrow(), 7);

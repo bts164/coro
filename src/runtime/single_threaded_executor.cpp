@@ -29,10 +29,18 @@ void SingleThreadedExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
         m_ready.push(std::move(task));
     } else {
         // Remote path: external thread — hand off via injection queue.
-        {
-            std::lock_guard lock(m_remote_mutex);
-            m_incoming_wakes.push_back(std::move(task));
-        }
+        //
+        // notify_one() is called while still holding m_remote_mutex (rather
+        // than after unlocking, which would normally be preferred to avoid
+        // waking a thread that immediately blocks on a lock we still hold).
+        // wait_for_completion()'s m_remote_cv.wait(lock, pred) cannot
+        // reacquire the lock and return until this lock is released, so
+        // calling notify_one() here guarantees it has fully returned before
+        // the waiting thread can proceed — and, e.g., destroy this executor
+        // (and m_remote_cv with it) out from under a still-in-flight
+        // notify_one() call from this thread.
+        std::lock_guard lock(m_remote_mutex);
+        m_incoming_wakes.push_back(std::move(task));
         m_remote_cv.notify_one();
     }
 }

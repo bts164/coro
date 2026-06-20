@@ -3,15 +3,16 @@
 #include <coro/detail/context.h>
 
 using namespace coro;
+using namespace coro::detail;
 
 class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<Waker>, clone, (), (override));
+    MOCK_METHOD(Rc<Waker>, clone, (), (override));
 };
 
 TEST(ContextTest, GetWakerReturnsSamePointer) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     EXPECT_EQ(ctx.getWaker(), waker);
 }
@@ -22,15 +23,15 @@ TEST(ContextTest, AcceptsNullWaker) {
 }
 
 TEST(ContextTest, WakerWakeIsCalled) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     EXPECT_CALL(*waker, wake()).Times(1);
     detail::Context ctx(waker);
     ctx.getWaker()->wake();
 }
 
 TEST(ContextTest, WakerCloneIsCalled) {
-    auto waker  = std::make_shared<MockWaker>();
-    auto clone  = std::make_shared<MockWaker>();
+    auto waker  = make_rc<MockWaker>();
+    auto clone  = make_rc<MockWaker>();
     EXPECT_CALL(*waker, clone()).WillOnce(::testing::Return(clone));
     detail::Context ctx(waker);
     auto result = ctx.getWaker()->clone();
@@ -39,12 +40,12 @@ TEST(ContextTest, WakerCloneIsCalled) {
 
 TEST(ContextTest, SubclassCanAddFields) {
     struct DerivedContext : detail::Context {
-        explicit DerivedContext(std::shared_ptr<detail::Waker> w, int extra)
+        explicit DerivedContext(Rc<detail::Waker> w, int extra)
             : Context(std::move(w)), extra(extra) {}
         int extra;
     };
 
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     DerivedContext derived(waker, 42);
     detail::Context& base = derived;
     EXPECT_EQ(base.getWaker(), waker);

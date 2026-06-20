@@ -44,20 +44,39 @@ ctest --preset conan-release -R PcieDecoder
 
 ## Sanitizer Builds
 
-`ENABLE_ASAN` and `ENABLE_TSAN` are mutually exclusive.
+A single `with_sanitize` Conan option (`none` | `asan` | `tsan`) controls the
+sanitizer for both the `coro` package and the `test/` package — it's plumbed
+through to a shared `WITH_SANITIZE` CMake cache variable (`cmake/Sanitize.cmake`)
+so the two builds can't end up with mismatched flags (ASan/TSan must cover the
+whole linked binary, not just one side).
+
+Set it explicitly with `-o`:
 
 ```bash
 # AddressSanitizer + LeakSanitizer + UBSan
-conan install . --build=missing -s:h build_type=Debug
-cmake --preset conan-debug -DENABLE_ASAN=ON
+conan install . --build=missing -s:h build_type=Debug -o with_sanitize=asan
+cmake --preset conan-debug
 cmake --build --preset conan-debug
 ctest --preset conan-debug
 
 # ThreadSanitizer
-cmake --preset conan-debug -DENABLE_TSAN=ON
+conan install . --build=missing -s:h build_type=Debug -o with_sanitize=tsan
+cmake --preset conan-debug
 cmake --build --preset conan-debug
 ctest --preset conan-debug
 ```
+
+The same `-o with_sanitize=...` must also be passed to `conan install` inside
+`test/` (or rely on the env var below, which covers both automatically).
+
+### Setting it via .envrc instead of -o
+
+Copy `.envrc.sample` to `.envrc`, uncomment a `CORO_SANITIZE` line, and run
+`direnv allow`. Both conanfiles read `CORO_SANITIZE` from the environment in
+their `init()` hook and use it as the default for `with_sanitize` — so a
+plain `conan install .` (in both the root and `test/` directories) picks it
+up automatically, no `-o` needed. An explicit `-o with_sanitize=...` still
+overrides the environment if you pass one.
 
 ### Recommended environment variables when running sanitizer builds
 
@@ -65,7 +84,7 @@ Set these before running `ctest` or a single test binary. Without
 `halt_on_error=1`, a low-level error common to every test repeats across the
 entire suite and makes the output unreadably long.
 
-**AddressSanitizer + LeakSanitizer + UBSan (`ENABLE_ASAN=ON`)**
+**AddressSanitizer + LeakSanitizer + UBSan (`with_sanitize=asan`)**
 
 ```bash
 export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
@@ -83,7 +102,7 @@ ctest --preset conan-debug --stop-on-failure   # -x for short
 | `detect_stack_use_after_return=1` | Catch stack variable references that outlive their stack frame |
 | `UBSAN_OPTIONS=print_stacktrace=1` | Print a full stack trace on every UBSan violation |
 
-**ThreadSanitizer (`ENABLE_TSAN=ON`)**
+**ThreadSanitizer (`with_sanitize=tsan`)**
 
 ```bash
 export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1

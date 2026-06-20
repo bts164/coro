@@ -12,13 +12,14 @@
 #include <vector>
 
 using namespace coro;
+using namespace coro::detail;
 
 namespace {
 
 class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
-    MOCK_METHOD(std::shared_ptr<detail::Waker>, clone, (), (override));
+    MOCK_METHOD(Rc<detail::Waker>, clone, (), (override));
 };
 
 // Stub: backed by a vector; should yield items then nullopt — body stubbed until Phase 3.
@@ -94,7 +95,7 @@ static_assert(!Stream<WrongReturnType>);
 // --- Runtime tests ---
 
 TEST(FiniteStreamTest, PollReturnsPendingStub) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     FiniteStream<int> s({1, 2, 3});
     auto r1 = s.poll_next(ctx);
@@ -125,7 +126,7 @@ TEST(NextFutureTest, SatisfiesFutureConcept) {
 }
 
 TEST(NextFutureTest, DelegatesPollNext) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     FiniteStream<int> s({});
     auto n = next(s);
@@ -137,7 +138,7 @@ TEST(NextFutureTest, DelegatesPollNext) {
 
 // Disabled until Phase 3 implements FiniteStream::poll_next.
 TEST(FiniteStreamTest, YieldsAllItems) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     FiniteStream<int> s({1, 2, 3});
     std::vector<int> results;
@@ -151,7 +152,7 @@ TEST(FiniteStreamTest, YieldsAllItems) {
 }
 
 TEST(VoidStreamTest, YieldsCountThenFalse) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     VoidStream s(3);
 
@@ -172,7 +173,7 @@ TEST(VoidStreamTest, NextFutureOutputTypeIsBool) {
 }
 
 TEST(VoidStreamTest, EmptyYieldsFalseImmediately) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     VoidStream s(0);
     auto r = next(s).poll(ctx);
@@ -181,7 +182,7 @@ TEST(VoidStreamTest, EmptyYieldsFalseImmediately) {
 }
 
 TEST(ErrorStreamTest, PropagatesError) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     auto eptr = std::make_exception_ptr(std::runtime_error("stream error"));
     ErrorStream<int> s(42, eptr);
@@ -222,7 +223,7 @@ private:
     std::vector<T>                  m_items;
     std::size_t                     m_index     = 0;
     bool                            m_suspended = false;
-    std::shared_ptr<detail::Waker>  m_waker;
+    Rc<detail::Waker>               m_waker;
 };
 
 static_assert(Stream<SuspendingStream<int>>);
@@ -241,8 +242,8 @@ TEST(NextFutureTest, DroppedAfterSuspendLeavesStreamUsable) {
     public:
         int count = 0;
         void wake() override { ++count; }
-        std::shared_ptr<Waker> clone() override {
-            return std::make_shared<CountingWaker>();
+        Rc<Waker> clone() override {
+            return make_rc<CountingWaker>();
         }
     };
 
@@ -250,7 +251,7 @@ TEST(NextFutureTest, DroppedAfterSuspendLeavesStreamUsable) {
 
     // First NextFuture: poll once → PollPending (waker stored in stream).
     {
-        auto waker = std::make_shared<CountingWaker>();
+        auto waker = make_rc<CountingWaker>();
         detail::Context ctx(waker);
         auto n = next(s);
         auto r = n.poll(ctx);
@@ -260,7 +261,7 @@ TEST(NextFutureTest, DroppedAfterSuspendLeavesStreamUsable) {
 
     // Second NextFuture: stream should deliver the item on the second poll
     // (SuspendingStream advances past the suspend on re-poll).
-    auto waker2 = std::make_shared<CountingWaker>();
+    auto waker2 = make_rc<CountingWaker>();
     detail::Context ctx2(waker2);
     auto n2 = next(s);
     auto r = n2.poll(ctx2);

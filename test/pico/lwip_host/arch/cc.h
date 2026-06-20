@@ -40,4 +40,6 @@ typedef uintptr_t mem_ptr_t;
 #define LWIP_PLATFORM_ASSERT(x) do { assert(x); } while (0)
 
 /* Byte order — Linux x86/x86_64 is little-endian */
+#ifndef BYTE_ORDER
 #define BYTE_ORDER LITTLE_ENDIAN
+#endif

@@ -141,13 +141,13 @@ TEST(TaskStateTest, MarkDoneFiresScopeWaker) {
     public:
         bool woken = false;
         void wake() override { woken = true; }
-        std::shared_ptr<Waker> clone() override {
-            return std::make_shared<TestWaker>();
+        Rc<Waker> clone() override {
+            return make_rc<TestWaker>();
         }
     };
 
     auto state = std::make_shared<TaskState<int>>();
-    auto waker = std::make_shared<TestWaker>();
+    auto waker = make_rc<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
         state->waker = waker;
@@ -163,13 +163,13 @@ TEST(StreamTaskStateTest, MarkDoneFiresScopeWaker) {
     public:
         bool woken = false;
         void wake() override { woken = true; }
-        std::shared_ptr<Waker> clone() override {
-            return std::make_shared<TestWaker>();
+        Rc<Waker> clone() override {
+            return make_rc<TestWaker>();
         }
     };
 
     auto state = std::make_shared<StreamTaskState<int>>(4);
-    auto waker = std::make_shared<TestWaker>();
+    auto waker = make_rc<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
         state->scope_waker = waker;
@@ -184,13 +184,13 @@ TEST(TaskStateTest, SetResultMarksDoneAndFiresScopeWaker) {
     public:
         bool woken = false;
         void wake() override { woken = true; }
-        std::shared_ptr<Waker> clone() override {
-            return std::make_shared<TestWaker>();
+        Rc<Waker> clone() override {
+            return make_rc<TestWaker>();
         }
     };
 
     auto state = std::make_shared<TaskState<int>>();
-    auto waker = std::make_shared<TestWaker>();
+    auto waker = make_rc<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
         state->waker = waker;
@@ -206,10 +206,10 @@ TEST(CoroScopeTest, CancelledCoroReturnsPollDropped) {
     class MockWaker : public Waker {
     public:
         void wake() override {}
-        std::shared_ptr<Waker> clone() override { return std::make_shared<MockWaker>(); }
+        Rc<Waker> clone() override { return make_rc<MockWaker>(); }
     };
 
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     Context ctx(waker);
 
     Coro<void> c = []() -> Coro<void> { co_return; }();
@@ -262,7 +262,7 @@ class EventFuture
     struct SharedState {
         std::mutex m_mutex;
         bool m_set = false;
-        std::shared_ptr<coro::detail::Waker> m_waker;
+        Rc<coro::detail::Waker> m_waker;
     };
     std::shared_ptr<SharedState> m_state;
 public:

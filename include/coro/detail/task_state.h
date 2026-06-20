@@ -12,6 +12,8 @@
 #include <optional>
 #include <queue>
 #include <coro/detail/mutex.h>
+#include <coro/detail/rc.h>
+#include <coro/detail/relaxed_state.h>
 
 #include <coro/detail/waker.h>
 
@@ -112,13 +114,13 @@ struct TaskState : TaskStateBase {
             return std::nullopt;
         }
     }
-    std::atomic<bool>    cancelled{false};        ///< Set by `JoinHandle` destructor; checked by `Task::poll()`.
+    RelaxedState<bool>   cancelled{false};        ///< Set by `JoinHandle` destructor; checked by `Task::poll()`.
     // Category 4 (doc/task_ownership.md): notification-only, no lifetime ownership.
     // weak_ptr so that storing a waker derived from ctx.getWaker() (which IS the task)
     // does not create a shared_ptr cycle back to the owning TaskImpl.
     // At most one waiter exists: either a JoinHandle awaiter or a CoroutineScope drain loop.
     // Fire via: if (auto w = waker.lock()) w->wake();
-    std::weak_ptr<Waker> waker;                   ///< Wakes the sole waiter (JoinHandle or CoroutineScope) on completion.
+    Weak<Waker>          waker;                   ///< Wakes the sole waiter (JoinHandle or CoroutineScope) on completion.
     ResultType           result = init_result();  ///< Set by `setResult()` on successful completion.
     std::exception_ptr   exception;               ///< Set by `setException()` on fault.
 
@@ -131,7 +133,7 @@ struct TaskState : TaskStateBase {
     /// @brief Signals terminal state without a result. Used by `Task` on cancellation.
     /// Fires both `join_waker` and `scope_waker`.
     void mark_done() {
-        std::weak_ptr<Waker> wk;
+        Weak<Waker> wk;
         {
             std::lock_guard lock(mutex);
             terminated = true;
@@ -143,7 +145,7 @@ struct TaskState : TaskStateBase {
 
     /// @brief Stores the successful result and signals completion. Fires the completion waker.
     void setResult() requires std::is_void_v<T> {
-        std::weak_ptr<Waker> wk;
+        Weak<Waker> wk;
         {
             std::lock_guard lock(mutex);
             result = true;
@@ -157,7 +159,7 @@ struct TaskState : TaskStateBase {
     /// @brief Stores the successful result and signals completion. Fires the completion waker.
     template<std::convertible_to<T> U> requires (!std::is_void_v<T>)
     void setResult(U &&value) {
-        std::weak_ptr<Waker> wk;
+        Weak<Waker> wk;
         {
             std::lock_guard lock(mutex);
             result = std::forward<U>(value);
@@ -170,7 +172,7 @@ struct TaskState : TaskStateBase {
 
     /// @brief Stores an unhandled exception and signals completion. Fires the completion waker.
     void setException(std::exception_ptr e) {
-        std::weak_ptr<Waker> wk;
+        Weak<Waker> wk;
         {
             std::lock_guard lock(mutex);
             exception = std::move(e);
@@ -203,15 +205,15 @@ struct StreamTaskState {
     bool                   closed      = false;  ///< stream exhausted, errored, or cancelled
     bool                   terminated  = false;  ///< task reached terminal state (poll() returned true)
     std::exception_ptr     exception;
-    std::weak_ptr<Waker>   producer_waker;  ///< woken when buffer has space
-    std::weak_ptr<Waker>   consumer_waker;  ///< woken when buffer has items or stream closes
-    std::weak_ptr<Waker>   scope_waker;     ///< woken when task terminates (CoroutineScope drain)
+    Weak<Waker>            producer_waker;  ///< woken when buffer has space
+    Weak<Waker>            consumer_waker;  ///< woken when buffer has items or stream closes
+    Weak<Waker>            scope_waker;     ///< woken when task terminates (CoroutineScope drain)
 
     explicit StreamTaskState(std::size_t cap) : capacity(cap) {}
 
     /// @brief Signals task completion. Fires scope_waker so CoroutineScope drain proceeds.
     void mark_done() {
-        std::weak_ptr<Waker> wk;
+        Weak<Waker> wk;
         {
             std::lock_guard lock(mutex);
             terminated = true;

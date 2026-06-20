@@ -10,13 +10,14 @@
 #include <variant>
 
 using namespace coro;
+using namespace coro::detail;
 
 namespace {
 
 class MockWaker : public detail::Waker {
 public:
     void wake() override {}
-    std::shared_ptr<Waker> clone() override { return std::make_shared<MockWaker>(); }
+    Rc<Waker> clone() override { return make_rc<MockWaker>(); }
 };
 
 template<typename T>
@@ -66,7 +67,7 @@ protected:
 TYPED_TEST_SUITE(FutureRefTest, AllExecutors);
 
 TYPED_TEST(FutureRefTest, PollDelegatesToUnderlying) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     ReadyFuture<int> f{42};
     auto r = ref(f).poll(ctx);
@@ -75,7 +76,7 @@ TYPED_TEST(FutureRefTest, PollDelegatesToUnderlying) {
 }
 
 TYPED_TEST(FutureRefTest, PendingDelegatesToUnderlying) {
-    auto waker = std::make_shared<MockWaker>();
+    auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
     NeverFuture<int> f;
     EXPECT_TRUE(ref(f).poll(ctx).isPending());
@@ -91,7 +92,7 @@ TYPED_TEST(FutureRefTest, LosingBranchLeavesUnderlyingFutureUsable) {
         NeverFuture<int> f;
         auto sel = co_await select(coro::ref(f), ImmediateVoid{});
         EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(sel)));
-        auto waker = std::make_shared<MockWaker>();
+        auto waker = make_rc<MockWaker>();
         detail::Context ctx(waker);
         EXPECT_TRUE(ref(f).poll(ctx).isPending());
         got = 0;

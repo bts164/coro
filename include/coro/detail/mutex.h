@@ -10,8 +10,9 @@
 //   CORO_PICO (RP2040 bare-metal):
 //     CurrentThreadExecutor is cooperative and single-threaded. co_await is the
 //     only yield point, so no two coroutines ever interleave. ISR concurrency is
-//     handled explicitly by IsrEvent / IsrChannel via volatile flags and
-//     CORO_DMB() — not by these mutexes. All three types are therefore no-ops.
+//     handled explicitly by IsrEvent / IsrChannel via a dedicated hardware
+//     spin lock per flag (see doc/design/isr_safety.md) — not by these
+//     mutexes. All three types are therefore no-ops.
 //
 // Usage:
 //   #include <coro/detail/mutex.h>
@@ -29,9 +30,11 @@ namespace coro::detail {
 
 // CurrentThreadExecutor is cooperative and single-threaded: co_await is the
 // only yield point, so no two coroutines ever interleave. The only true
-// concurrency source on RP2040 is ISR preemption, and that is handled
-// explicitly by IsrEvent / IsrChannel via volatile flags and CORO_DMB() —
-// not by these mutexes.
+// concurrency source on RP2040 is ISR preemption (same-core) and, on the
+// second core, genuinely concurrent execution — both are handled explicitly
+// by IsrEvent / IsrChannel via a dedicated hardware spin lock per flag (see
+// doc/design/isr_safety.md, "Cross-core ISR delivery") — not by these
+// mutexes.
 //
 // No-op mutexes mean:
 //   • No hardware spin lock is consumed.

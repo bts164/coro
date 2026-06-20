@@ -5,6 +5,7 @@
 // any header under include/coro/.
 
 #include <coro/detail/waker.h>
+#include <coro/detail/rc.h>
 #include <lwip/tcp.h>
 #include <lwip/pbuf.h>
 #include <memory>
@@ -16,12 +17,12 @@ struct LwipTcpCtx {
     tcp_pcb* pcb = nullptr;
 
     // Receive
-    std::vector<uint8_t>           rx_buf;
-    std::shared_ptr<Waker> rx_waker;
-    bool                           rx_eof  = false;
+    std::vector<uint8_t> rx_buf;
+    Rc<Waker>             rx_waker;
+    bool                  rx_eof  = false;
 
     // Transmit
-    std::shared_ptr<Waker> tx_waker;
+    Rc<Waker>             tx_waker;
 
     // Fatal error (pcb is null after on_err fires — lwIP frees it first)
     bool  errored = false;

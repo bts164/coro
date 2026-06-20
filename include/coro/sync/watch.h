@@ -3,6 +3,7 @@
 #include <coro/detail/context.h>
 #include <coro/detail/intrusive_list.h>
 #include <coro/detail/poll_result.h>
+#include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
 #include <coro/sync/channel_error.h>
 
@@ -23,8 +24,8 @@ namespace detail {
  * Removed by the future's destructor if still linked at cancellation time.
  */
 struct WatchReceiverNode : coro::detail::IntrusiveListNode {
-    std::shared_ptr<coro::detail::Waker> waker;
-    uint64_t                             last_seen = 0; ///< Version when the future suspended.
+    detail::Rc<coro::detail::Waker> waker;
+    uint64_t                last_seen = 0; ///< Version when the future suspended.
 };
 
 /**
@@ -77,7 +78,7 @@ template<typename T> class WatchReceiver;
 template<typename T>
 class WatchBorrowGuard {
 public:
-    WatchBorrowGuard(std::shared_ptr<detail::WatchShared<T>> shared,
+    WatchBorrowGuard(detail::Rc<detail::WatchShared<T>> shared,
                      std::shared_lock<detail::SharedMutex> lock)
         : m_shared(std::move(shared)), m_lock(std::move(lock)) {}
 
@@ -90,7 +91,7 @@ public:
     const T* operator->() const noexcept { return &m_shared->value; }
 
 private:
-    std::shared_ptr<detail::WatchShared<T>> m_shared;
+    detail::Rc<detail::WatchShared<T>> m_shared;
     std::shared_lock<detail::SharedMutex>     m_lock;
 };
 
@@ -114,7 +115,7 @@ private:
 template<typename T>
 class WatchBorrowMutGuard {
 public:
-    WatchBorrowMutGuard(std::shared_ptr<detail::WatchShared<T>> shared,
+    WatchBorrowMutGuard(detail::Rc<detail::WatchShared<T>> shared,
                         std::unique_lock<detail::SharedMutex> lock)
         : m_shared(std::move(shared)), m_lock(std::move(lock)) {}
 
@@ -128,7 +129,7 @@ public:
         m_shared->version++;
         m_lock.unlock(); // release value_mutex before waker_mutex (lock ordering)
 
-        std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
         {
             std::lock_guard wl(m_shared->waker_mutex);
             while (auto* raw = m_shared->receiver_waiters.pop_front()) {
@@ -143,7 +144,7 @@ public:
     T* operator->() noexcept { return &m_shared->value; }
 
 private:
-    std::shared_ptr<detail::WatchShared<T>> m_shared;
+    detail::Rc<detail::WatchShared<T>> m_shared;
     std::unique_lock<detail::SharedMutex>     m_lock;
 };
 
@@ -170,7 +171,7 @@ public:
 
     /// @brief Called by `WatchReceiver::changed()`.
     WatchChangedFuture(WatchReceiver<T>& rx,
-                       std::shared_ptr<detail::WatchShared<T>> shared,
+                       detail::Rc<detail::WatchShared<T>> shared,
                        uint64_t last_seen)
         : m_rx(rx), m_shared(std::move(shared)), m_last_seen(last_seen) {}
 
@@ -209,7 +210,7 @@ public:
 
 private:
     WatchReceiver<T>&                       m_rx;
-    std::shared_ptr<detail::WatchShared<T>> m_shared;
+    detail::Rc<detail::WatchShared<T>> m_shared;
     uint64_t                                m_last_seen;
     detail::WatchReceiverNode               m_node;
 };
@@ -228,7 +229,7 @@ private:
 template<typename T>
 class WatchSender {
 public:
-    explicit WatchSender(std::shared_ptr<detail::WatchShared<T>> shared)
+    explicit WatchSender(detail::Rc<detail::WatchShared<T>> shared)
         : m_shared(std::move(shared))
     {
         std::lock_guard lock(m_shared->waker_mutex);
@@ -238,22 +239,24 @@ public:
     WatchSender(const WatchSender&)            = delete;
     WatchSender& operator=(const WatchSender&) = delete;
     WatchSender(WatchSender&&)                 = default;
-    WatchSender& operator=(WatchSender&&)      = default;
 
-    ~WatchSender() {
-        if (!m_shared) return;
-        // Decrement sender count; only wake receivers when the last sender drops.
-        std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
-        {
-            std::lock_guard wl(m_shared->waker_mutex);
-            if (--m_shared->sender_count != 0) return;
-            while (auto* raw = m_shared->receiver_waiters.pop_front()) {
-                auto* node = static_cast<detail::WatchReceiverNode*>(raw);
-                if (node->waker) wakers.push_back(std::move(node->waker));
-            }
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_shared, dropping the old Rc without running the
+    // sender_count-decrement-and-wake protocol below. std::swap is NOT
+    // sufficient — if the right-hand side is a named object moved via
+    // std::move rather than a genuine temporary, swapping just stashes the
+    // old state inside that named object, deferring the close until it
+    // happens to go out of scope. Explicitly close the old channel via the
+    // same helper the destructor uses, then take over the new state.
+    WatchSender& operator=(WatchSender&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_shared = std::move(other.m_shared);
         }
-        for (auto& w : wakers) w->wake();
+        return *this;
     }
+
+    ~WatchSender() { close(); }
 
     /**
      * @brief Overwrites the watched value synchronously.
@@ -268,7 +271,7 @@ public:
      * @return `{}` on success; `std::unexpected(std::move(value))` if no receivers remain.
      */
     std::expected<void, T> send(T value) {
-        std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
         {
             // Exclusive lock on value, then brief lock on wakers.
             std::unique_lock vl(m_shared->value_mutex);
@@ -341,7 +344,7 @@ public:
      */
     template<typename F>
     bool send_if_modified(F&& modify) {
-        std::vector<std::shared_ptr<coro::detail::Waker>> wakers;
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
         {
             std::unique_lock vl(m_shared->value_mutex);
             if (!modify(m_shared->value)) return false;
@@ -359,7 +362,26 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::WatchShared<T>> m_shared;
+    // Decrements sender_count and wakes receivers if this was the last
+    // sender. Shared between the destructor and move-assignment so both
+    // close the channel through the same protocol.
+    void close() {
+        if (!m_shared) return;
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
+        {
+            std::lock_guard wl(m_shared->waker_mutex);
+            if (--m_shared->sender_count == 0) {
+                while (auto* raw = m_shared->receiver_waiters.pop_front()) {
+                    auto* node = static_cast<detail::WatchReceiverNode*>(raw);
+                    if (node->waker) wakers.push_back(std::move(node->waker));
+                }
+            }
+        }
+        for (auto& w : wakers) w->wake();
+        m_shared = nullptr;
+    }
+
+    detail::Rc<detail::WatchShared<T>> m_shared;
 };
 
 /**
@@ -376,7 +398,7 @@ private:
 template<typename T>
 class WatchReceiver {
 public:
-    explicit WatchReceiver(std::shared_ptr<detail::WatchShared<T>> shared)
+    explicit WatchReceiver(detail::Rc<detail::WatchShared<T>> shared)
         : m_shared(std::move(shared)), m_last_seen(0)
     {
         std::lock_guard lock(m_shared->waker_mutex);
@@ -386,13 +408,25 @@ public:
     WatchReceiver(const WatchReceiver&)            = delete;
     WatchReceiver& operator=(const WatchReceiver&) = delete;
     WatchReceiver(WatchReceiver&&)                 = default;
-    WatchReceiver& operator=(WatchReceiver&&)      = default;
 
-    ~WatchReceiver() {
-        if (!m_shared) return;
-        std::lock_guard lock(m_shared->waker_mutex);
-        --m_shared->receiver_count;
+    // Hand-written rather than defaulted: a defaulted move-assignment would
+    // just overwrite m_shared, dropping the old Rc without running the
+    // receiver_count-decrement protocol below. std::swap is NOT sufficient —
+    // if the right-hand side is a named object moved via std::move rather
+    // than a genuine temporary, swapping just stashes the old state inside
+    // that named object, deferring the decrement until it happens to go out
+    // of scope. Explicitly close the old channel via the same helper the
+    // destructor uses, then take over the new state.
+    WatchReceiver& operator=(WatchReceiver&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_shared    = std::move(other.m_shared);
+            m_last_seen = other.m_last_seen;
+        }
+        return *this;
     }
+
+    ~WatchReceiver() { close(); }
 
     /**
      * @brief Returns `true` if the sender has been dropped.
@@ -467,7 +501,22 @@ public:
     uint64_t last_seen() const noexcept { return m_last_seen; }
 
 private:
-    std::shared_ptr<detail::WatchShared<T>> m_shared;
+    // Decrements receiver_count. Shared between the destructor and
+    // move-assignment so both close the channel through the same protocol.
+    void close() {
+        if (!m_shared) return;
+        // Lock scoped to a nested block: resetting m_shared below may drop the
+        // last reference to WatchShared, destroying its mutex. That must
+        // happen after the lock_guard has already unlocked and gone out of
+        // scope — unlocking inline would otherwise touch freed memory.
+        {
+            std::lock_guard lock(m_shared->waker_mutex);
+            --m_shared->receiver_count;
+        }
+        m_shared = nullptr;
+    }
+
+    detail::Rc<detail::WatchShared<T>> m_shared;
     uint64_t                                m_last_seen;
 
     friend class WatchChangedFuture<T>;
@@ -521,7 +570,7 @@ WatchChangedFuture<T>::poll(coro::detail::Context& ctx) {
  */
 template<typename T>
 [[nodiscard]] std::pair<WatchSender<T>, WatchReceiver<T>> watch_channel(T initial) {
-    auto shared = std::make_shared<detail::WatchShared<T>>(std::move(initial));
+    auto shared = detail::make_rc<detail::WatchShared<T>>(std::move(initial));
     return { WatchSender<T>(shared), WatchReceiver<T>(shared) };
 }
 

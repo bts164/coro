@@ -3,6 +3,7 @@
 #include <coro/runtime/executor.h>
 #include <coro/task/join_handle.h>
 #include <coro/detail/task.h>
+#include <coro/detail/rc.h>
 #include <memory>
 #include <string>
 #include <utility>
@@ -39,12 +40,15 @@ public:
     template<Future F>
     JoinHandle<typename F::OutputType> spawn(F future) {
         using T = typename F::OutputType;
-        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
+        auto impl = detail::make_rc<detail::TaskImpl<F>>(std::move(future));
         impl->name = std::move(m_name);
-        std::shared_ptr<detail::TaskState<T>> state = impl;
-        std::weak_ptr<detail::TaskBase> task_ref{impl};
+        detail::Rc<detail::TaskState<T>> state = impl;
+        detail::Weak<detail::TaskBase> task_ref{impl};
+#ifdef CORO_PICO
+        impl->set_self(task_ref);
+#endif
         if (m_executor)
-            m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
+            m_executor->schedule(detail::Rc<detail::TaskBase>(std::move(impl)));
         return JoinHandle<T>(std::move(state), std::move(task_ref));
     }
 
@@ -55,12 +59,15 @@ public:
     template<Stream S>
     StreamHandle<typename S::ItemType> spawn(S stream) {
         using T = typename S::ItemType;
-        auto impl = std::make_shared<detail::StreamTaskImpl<S>>(std::move(stream), m_buffer_size);
+        auto impl = detail::make_rc<detail::StreamTaskImpl<S>>(std::move(stream), m_buffer_size);
         impl->name = std::move(m_name);
-        std::shared_ptr<detail::StreamTaskState<T>> state = impl;
-        std::weak_ptr<detail::TaskBase> task_ref{impl};
+        detail::Rc<detail::StreamTaskState<T>> state = impl;
+        detail::Weak<detail::TaskBase> task_ref{impl};
+#ifdef CORO_PICO
+        impl->set_self(task_ref);
+#endif
         if (m_executor)
-            m_executor->schedule(std::shared_ptr<detail::TaskBase>(std::move(impl)));
+            m_executor->schedule(detail::Rc<detail::TaskBase>(std::move(impl)));
         return StreamHandle<T>(std::move(state), std::move(task_ref));
     }
 

@@ -10,6 +10,8 @@
 #include <coro/future.h>
 #include <coro/stream.h>
 #include <coro/detail/task_state.h>
+#include <coro/detail/rc.h>
+#include <coro/detail/relaxed_state.h>
 #include <atomic>
 #include <memory>
 #include <optional>
@@ -44,7 +46,11 @@ namespace coro::detail {
  * **Not movable:** `TaskBase` objects are always heap-allocated via `make_shared` and
  * accessed through `shared_ptr`. Moving the object itself is never required.
  */
+#ifdef CORO_PICO
+class TaskBase : public Waker {
+#else
 class TaskBase : public Waker, public std::enable_shared_from_this<TaskBase> {
+#endif
 public:
     TaskBase()                             = default;
     TaskBase(const TaskBase&)              = delete;
@@ -53,14 +59,32 @@ public:
     TaskBase& operator=(TaskBase&&)        = delete;
     ~TaskBase() override                   = default;
 
+#ifdef CORO_PICO
     /**
-     * @brief Atomic scheduling state. Managed exclusively by the executor and wake().
+     * @brief Manual replacement for std::enable_shared_from_this<TaskBase>.
+     *
+     * Rc<T>/Weak<T> on Pico are plain non-atomic intrusive-refcount pointers
+     * (see detail/rc.h) with no enable_shared_from_this equivalent, so each
+     * task-creation call site must call set_self() exactly once right after
+     * constructing the owning Rc<TaskBase>, mirroring what make_shared does
+     * automatically on desktop.
+     */
+    void set_self(Weak<TaskBase> self) { m_self = std::move(self); }
+    Rc<TaskBase>   shared_from_this() { return m_self.lock(); }
+    Weak<TaskBase> weak_from_this()   { return m_self; }
+private:
+    Weak<TaskBase> m_self;
+public:
+#endif
+
+    /**
+     * @brief Scheduling state. Managed exclusively by the executor and wake().
      *
      * Starts at `Idle`. `schedule()` sets it to `Notified` before the first enqueue.
      * All subsequent transitions are CAS operations — see `SchedulingState` for the
      * full transition table.
      */
-    alignas(64) std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
+    alignas(64) RelaxedState<SchedulingState> scheduling_state{SchedulingState::Idle};
 
     /// @brief Optional human-readable name set via SpawnBuilder::name(). Empty if unset.
     std::string name;
@@ -106,7 +130,7 @@ public:
      * Called by CoroutineScope::set_drain_waker() to notify the parent when a
      * dropped child finishes. Implemented by TaskImpl<F>.
      */
-    virtual void set_waker(std::weak_ptr<Waker> waker) = 0;
+    virtual void set_waker(Weak<Waker> waker) = 0;
 
     /**
      * @brief Called by TaskImpl<F>::poll() immediately after the terminal
@@ -134,7 +158,7 @@ public:
     // from an ISR without first reading doc/isr_safety.md. A safe wake_from_isr()
     // alternative is tracked there.
     void wake() override;
-    std::shared_ptr<Waker> clone() override;
+    Rc<Waker> clone() override;
 
     /// @brief The task currently being polled on this thread, or nullptr if outside a poll.
     /// Set by the executor before each poll() call and cleared afterward.
@@ -182,7 +206,7 @@ public:
         return this->terminated;
     }
 
-    void set_waker(std::weak_ptr<Waker> waker) override {
+    void set_waker(Weak<Waker> waker) override {
         std::lock_guard lock(this->mutex);
         this->waker = std::move(waker);
     }
@@ -279,7 +303,7 @@ public:
         return this->terminated;
     }
 
-    void set_waker(std::weak_ptr<Waker> waker) override {
+    void set_waker(Weak<Waker> waker) override {
         std::lock_guard lock(this->mutex);
         this->scope_waker = std::move(waker);
     }
@@ -296,7 +320,7 @@ public:
 
         if (m_cancelled.load(std::memory_order_relaxed)) {
             // Consumer dropped the StreamHandle — close the queue and terminate.
-            std::weak_ptr<Waker> consumer_wk;
+            Weak<Waker> consumer_wk;
             {
                 std::lock_guard lock(this->mutex);
                 this->closed = true;
@@ -313,7 +337,7 @@ public:
 
         // Flush a pending item that was buffered during backpressure.
         if (m_pending.has_value()) {
-            std::weak_ptr<Waker> consumer_wk;
+            Weak<Waker> consumer_wk;
             {
                 std::unique_lock lock(this->mutex);
                 if (this->buffer.size() < this->capacity) {
@@ -336,7 +360,7 @@ public:
             if (result.isPending()) return false;
 
             if (result.isError()) {
-                std::weak_ptr<Waker> consumer_wk;
+                Weak<Waker> consumer_wk;
                 {
                     std::lock_guard lock(this->mutex);
                     this->exception = result.error();
@@ -354,7 +378,7 @@ public:
             auto opt = std::move(result).value();
             if (!opt.has_value()) {
                 // Stream exhausted.
-                std::weak_ptr<Waker> consumer_wk;
+                Weak<Waker> consumer_wk;
                 {
                     std::lock_guard lock(this->mutex);
                     this->closed = true;
@@ -369,7 +393,7 @@ public:
             }
 
             // Push item into the queue, or park under backpressure.
-            std::weak_ptr<Waker> consumer_wk;
+            Weak<Waker> consumer_wk;
             {
                 std::unique_lock lock(this->mutex);
                 if (this->buffer.size() < this->capacity) {
@@ -390,7 +414,7 @@ private:
     std::optional<S>        m_stream;
     std::optional<ItemType> m_pending;
     bool                    m_completed = false;
-    std::atomic<bool>       m_cancelled{false};
+    RelaxedState<bool>      m_cancelled{false};
 };
 
 } // namespace coro::detail

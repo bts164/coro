@@ -15,6 +15,10 @@
 #include <coro/stream.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
+#include <coro/detail/rc.h>
+#ifdef CORO_PICO
+#include <coro/detail/isr_flag.h>
+#endif
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -57,21 +61,23 @@ public:
 
     /// @brief Registers a one-shot timer that fires `waker` at `deadline_us`
     /// microseconds since the clock epoch. Used by sleep_for().
-    void schedule_timer(uint64_t deadline_us, std::shared_ptr<detail::Waker> waker);
+    void schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> waker);
 
-    /// @brief Registers a volatile ISR flag to be polled once per event loop iteration.
+    /// @brief Registers an ISR flag to be polled once per event loop iteration.
     ///
-    /// When *flag becomes true the waker is fired and the registration is removed.
-    /// Called by IsrWaitFuture — do not call directly. Must be called from the
-    /// executor thread (i.e. from inside a coroutine), never from an ISR.
-    void register_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker);
+    /// When the flag becomes true (checked through its paired hardware spin lock —
+    /// see doc/design/isr_safety.md, "Cross-core ISR delivery") the waker is fired
+    /// and the registration is removed. Called by IsrWaitFuture — do not call
+    /// directly. Must be called from the executor thread (i.e. from inside a
+    /// coroutine), never from an ISR.
+    void register_isr_poll(IsrFlagRef ref, detail::Rc<detail::Waker> waker);
 
     /// @brief Removes an ISR poll registration before it fires.
     ///
     /// Called by IsrWaitFuture's destructor when the awaiting coroutine is
     /// cancelled while the flag is still pending. Prevents the executor from
     /// dereferencing a flag pointer whose backing IsrEvent may have been destroyed.
-    void remove_isr_poll(const volatile bool* flag);
+    void remove_isr_poll(IsrFlagRef ref);
 
     /// @brief Drains the coroutine ready queue once. Returns true if any task was polled.
     ///
@@ -132,14 +138,17 @@ public:
 #ifndef CORO_PICO
         set_current_uv_executor(&m_uv_executor);
 #endif
-        auto impl = std::make_shared<detail::TaskImpl<F>>(std::move(future));
+        auto impl = detail::make_rc<detail::TaskImpl<F>>(std::move(future));
         // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same
         // TaskImpl allocation. Provides typed access to the result and waker slot.
         // The executor's owned map (Category 1) anchors the task's lifetime until
         // it reaches a terminal state. Lives on this call stack until
         // wait_for_completion() returns.
-        std::shared_ptr<detail::TaskState<typename F::OutputType>> state = impl;
-        m_executor->schedule(std::shared_ptr<detail::TaskBase>(impl));
+        detail::Rc<detail::TaskState<typename F::OutputType>> state = impl;
+#ifdef CORO_PICO
+        impl->set_self(detail::Weak<detail::TaskBase>(impl));
+#endif
+        m_executor->schedule(detail::Rc<detail::TaskBase>(impl));
 
         m_executor->wait_for_completion(*state);
 
@@ -154,7 +163,7 @@ public:
     }
 
     /// @brief Submits a pre-constructed task directly. Used internally by @ref JoinSet.
-    void schedule_task(std::shared_ptr<detail::TaskBase> task) {
+    void schedule_task(detail::Rc<detail::TaskBase> task) {
         m_executor->schedule(std::move(task));
     }
 
@@ -204,7 +213,7 @@ void set_current_runtime(Runtime* rt);
 
 /// @brief Schedules a pre-constructed task on the current runtime.
 /// Used internally by `JoinSet::spawn()`.
-inline void schedule_task(std::shared_ptr<detail::TaskBase> task) {
+inline void schedule_task(detail::Rc<detail::TaskBase> task) {
     current_runtime().schedule_task(std::move(task));
 }
 

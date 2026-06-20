@@ -68,6 +68,93 @@ called from an ISR.
 
 ---
 
+## Cross-core ISR delivery
+
+The reasoning above assumes the only concurrency between an ISR and the executor is
+*preemption on the same core* — the ISR interrupts the executor thread, runs to
+completion, and returns. A plain `volatile bool` flag is sufficient for that case: the
+ISR's write and the executor's later read can never physically overlap, so there's no
+tear, and ordering between the flag and any payload is enforced with a `dmb` (see
+`IsrChannel<T>` below, prior revisions).
+
+That assumption breaks on RP2040's second core. Nothing prevents an ISR from firing on
+core 1 while the `CurrentThreadExecutor` is running on core 0 — that is genuine
+concurrent execution, not preemption, and a `volatile bool` gives no atomicity or
+ordering guarantee for genuinely concurrent access under the C++ memory model. Today
+this is low-risk in practice: the executor busy-polls, so the worst case is the
+executor's check lands one poll-loop iteration before the flag write completes — never
+observed, caught next iteration. **That stops being true once `wfi`-based idle parking
+lands** (planned, see `pico_port.md`): if the executor parks with `wfi` between poll
+iterations, a flag write that lands in the parking window has no guaranteed mechanism
+to wake the core, and the race becomes a real, user-visible missed signal rather than a
+one-iteration delay.
+
+!!! danger "WARNING: do not fix this with std::atomic"
+    The obvious-looking fix — making the flag `std::atomic<bool>` — was considered and
+    rejected. Two reasons:
+
+    1. Cortex-M0+ has no `LDREX`/`STREX` (see Platform background above), so even a
+       plain `std::atomic<bool>::load()`/`store()` is not guaranteed to compile to a
+       bare `ldrb`/`strb`. Whether the toolchain inlines it that way or routes it
+       through `pico_atomic`'s software spin-lock fallback depends on the ABI and
+       toolchain version — it is not something `isr_event.h`'s source can audit the
+       way it can audit a literal `__asm__` block.
+    2. If it *did* fall through to `pico_atomic`'s shared spin-lock (`PICO_SPINLOCK_ID_ATOMIC`),
+       that lock is taken by *all* atomic operations system-wide. An ISR spinning on a
+       lock that ordinary code elsewhere holds is a genuine deadlock — the lock owner
+       can never make progress if the ISR fires on its core and spins forever waiting
+       for the IRQ-disabled owner to release it. (`pico_atomic`'s own implementation
+       briefly re-enables IRQs while spinning specifically to avoid this on the *local*
+       core, but that doesn't help if the lock owner is the same core's ISR busy-spinning.)
+
+    The fix below uses the same underlying hardware primitive `pico_atomic` uses
+    (an SIO spin-lock register) but applies it explicitly and only to the one flag (and
+    payload) that needs it — fully auditable as documented hardware-register
+    read/write semantics, never routed through a generic atomics codegen path.
+
+### The fix: a dedicated hardware spin lock per flag
+
+`pico-sdk`'s own `queue_t` (`pico/util/queue.h`) solves exactly this problem — a value
+shared between an ISR and arbitrary other code, safe across both cores — using two
+primitives from `hardware/sync.h`, not `std::atomic`:
+
+```c
+// pico-sdk's pattern (queue_add_internal, abbreviated):
+uint32_t save = spin_lock_blocking(lock);   // disables IRQs on this core, then
+                                             // spins on a real SIO hardware register
+                                             // (genuine mutual exclusion vs. the other core)
+... touch shared state ...
+spin_unlock(lock, save);                    // releases the register, restores IRQs
+```
+
+`spin_lock_blocking()` does two things, both fully documented hardware/architecture
+behavior rather than toolchain-dependent codegen:
+
+- `save_and_disable_interrupts()` — `cpsid i`. Masks IRQs on *this* core only, so the
+  local ISR cannot preempt the critical section (same guarantee `volatile` relied on
+  before, now explicit).
+- Spins on one of RP2040's 32 SIO spin-lock registers. A *read* of the register
+  atomically claims the lock and returns nonzero if it was free; a *write of zero*
+  releases it. This is real silicon, not LDREX/STREX and not a software CAS loop — the
+  other core spinning on the same register physically cannot proceed until this core
+  writes zero. This is the cross-core exclusion `volatile` never had.
+
+`IsrEvent` and `IsrChannel<T>` each own one dedicated spin-lock instance (drawn from the
+SDK's "striped" pool via `next_striped_spin_lock_num()`, the same allocation strategy
+`queue_init()` uses) and take it around every access to their flag/payload — on both the
+ISR side and the executor side. See the updated primitives below.
+
+On the host test build there is no real SIO register or IRQ to disable;
+`test/pico/stub/hardware/sync.h` backs `spin_lock_blocking()`/`spin_unlock()` with a
+`std::mutex` instead, so that `test_isr_event.cpp`'s `std::thread`-simulated ISR — which
+*is* genuinely concurrent on x86, unlike a real single-core interrupt — gets the same
+mutual-exclusion guarantee under TSan that the SIO register gives real hardware. A
+`std::mutex` would never be safe to take from a *real* ISR (it can block); the host stub
+is only valid because the host's simulated "ISR" is an ordinary thread that's allowed to
+block, not a real interrupt handler.
+
+---
+
 ## Design philosophy
 
 The root cause of ISR unsafety in coro is that nearly every operation eventually
@@ -116,26 +203,36 @@ by never entering that code from ISR context.
 // coro/sync/isr_event.h
 class IsrEvent {
 public:
-    // ISR-safe: single volatile write, nothing else.
-    // A volatile bool is a single STRB instruction on ARM — naturally atomic.
-    // No memory barrier needed: there is no payload to order.
-    void signal_from_isr() noexcept { m_flag = true; }
+    IsrEvent() : m_lock(spin_lock_instance(next_striped_spin_lock_num())) {}
+
+    // ISR-safe. Takes the dedicated hardware spin lock (disables IRQs on this
+    // core, spins on the SIO register for cross-core exclusion — see
+    // "Cross-core ISR delivery" above), sets the flag, releases.
+    void signal_from_isr() noexcept {
+        uint32_t save = spin_lock_blocking(m_lock);
+        m_flag = true;
+        spin_unlock(m_lock, save);
+    }
 
     [[nodiscard]] coro::Coro<void> wait() {
-        m_flag = false;  // discard any stale signal on entry
-        co_await IsrWaitFuture{&m_flag};
+        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}};
+        uint32_t save = spin_lock_blocking(m_lock);
         m_flag = false;  // consume the signal
+        spin_unlock(m_lock, save);
     }
 
 private:
+    spin_lock_t*  m_lock;
     volatile bool m_flag = false;
 };
 ```
 
-On first `co_await`, `IsrWaitFuture` registers `(flag, waker)` with the executor
-and suspends. The executor checks all registered flags once per event loop
-iteration; when it observes the flag set it fires the waker and the coroutine
-resumes. The ISR never touches the scheduler — it writes one flag and returns.
+On first `co_await`, `IsrWaitFuture` registers `(IsrFlagRef, waker)` with the
+executor and suspends. The executor checks all registered flags once per event
+loop iteration — each check takes the paired spin lock, exactly like the ISR
+write does — and when it observes the flag set it fires the waker and the
+coroutine resumes. The ISR never touches the scheduler — it takes its own
+dedicated lock, writes one flag, and returns.
 
 ### `IsrChannel<T>` — signal with a value
 
@@ -145,40 +242,42 @@ template<typename T>
     requires std::is_trivially_copyable_v<T>
 class IsrChannel {
 public:
-    // ISR-safe.
-    // __DMB() provides release semantics: the "memory" clobber is a compiler
-    // barrier that prevents the compiler from reordering the value store past
-    // the flag store, and the dmb instruction drains the write buffer so
-    // m_value is globally visible before m_flag is written.
+    IsrChannel() : m_lock(spin_lock_instance(next_striped_spin_lock_num())) {}
+
+    // ISR-safe. m_value and m_flag are written inside the same critical
+    // section, so the spin lock's own acquire/release ordering (the same
+    // ordering pico-sdk's queue_t relies on) is what guarantees the receiver
+    // never observes a partially-written value — no separate barrier needed.
     void send_from_isr(T value) noexcept {
+        uint32_t save = spin_lock_blocking(m_lock);
         m_value = value;
-        __DMB();
-        m_flag = true;
+        m_flag  = true;
+        spin_unlock(m_lock, save);
     }
 
-    // __DMB() provides acquire semantics: the "memory" clobber prevents the
-    // compiler from hoisting the m_value load above the point where m_flag
-    // was observed true, pairing with the release __DMB() in send_from_isr().
     [[nodiscard]] coro::Coro<T> receive() {
-        co_await IsrWaitFuture{&m_flag};
-        __DMB();
+        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}};
+        uint32_t save = spin_lock_blocking(m_lock);
         T value = m_value;
         m_flag  = false;
+        spin_unlock(m_lock, save);
         co_return value;
     }
 
 private:
+    spin_lock_t*  m_lock;
     volatile bool m_flag = false;
     T             m_value{};
 };
 ```
 
 `m_flag` and `m_value` are the only memory shared between the ISR and the
-coroutine. `m_flag` is a single volatile byte — a naturally atomic STRB/LDRB on
-ARM. `m_value` is plain `T`; the `__DMB()` pair provides the release/acquire
-ordering that guarantees the receiver never observes a partially-written value.
-The `requires trivially_copyable` constraint ensures the assignment in the ISR
-involves no allocation, no constructor, and no exception.
+coroutine, and every access to either — from the ISR, from `IsrWaitFuture::poll()`,
+and from `receive()` — goes through the same dedicated spin lock instance. The
+`requires trivially_copyable` constraint ensures the assignment in the ISR
+involves no allocation, no constructor, and no exception (a spin-lock critical
+section must stay as short as the SDK's own convention demands — see Platform
+background above).
 
 ### Usage example
 

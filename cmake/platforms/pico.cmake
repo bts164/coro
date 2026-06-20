@@ -47,6 +47,10 @@ target_include_directories(coro_pico PUBLIC  ${_CORO_INCLUDE})
 target_include_directories(coro_pico PRIVATE ${_CORO_SRC}/io/lwip)
 target_compile_features(coro_pico PUBLIC cxx_std_23)
 target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP)
+# Coroutine frame pooling (CoroPromiseBase's pooled operator new/delete in
+# coro.h) is experimental and off by default. To opt in:
+#   target_compile_definitions(coro_pico PUBLIC CORO_PICO_FRAME_POOL)
+# See doc/design/pico_port.md's "Coroutine frame pooling" section.
 # pico_stdlib and pico_cyw43_arch_lwip_poll are PRIVATE — they supply include
 # paths for compiling our sources but must NOT be bundled into the archive.
 # Applications must link them directly (see examples/pico/CMakeLists.txt).

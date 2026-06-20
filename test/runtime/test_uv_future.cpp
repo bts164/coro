@@ -73,11 +73,11 @@ TEST(UvFutureTest, PollReadyWhenResultAlreadySet) {
 
     struct NoopWaker : detail::Waker {
         void wake() override {}
-        std::shared_ptr<detail::Waker> clone() override {
-            return std::make_shared<NoopWaker>();
+        detail::Rc<detail::Waker> clone() override {
+            return detail::make_rc<NoopWaker>();
         }
     };
-    auto waker = std::make_shared<NoopWaker>();
+    auto waker = detail::make_rc<NoopWaker>();
     detail::Context ctx(waker);
 
     auto result = fut.poll(ctx);
@@ -96,11 +96,11 @@ TEST(UvFutureTest, PollPendingWhenResultNotSet) {
         bool& woken;
         explicit RecordWaker(bool& w) : woken(w) {}
         void wake() override { woken = true; }
-        std::shared_ptr<detail::Waker> clone() override {
-            return std::make_shared<RecordWaker>(woken);
+        detail::Rc<detail::Waker> clone() override {
+            return detail::make_rc<RecordWaker>(woken);
         }
     };
-    auto waker = std::make_shared<RecordWaker>(woken);
+    auto waker = detail::make_rc<RecordWaker>(woken);
     detail::Context ctx(waker);
 
     auto result = fut.poll(ctx);

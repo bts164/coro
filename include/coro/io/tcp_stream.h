@@ -17,6 +17,7 @@
 
 #include <coro/coro.h>
 #include <coro/io/byte_buffer.h>
+#include <coro/detail/rc.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -99,14 +100,14 @@ public:
 private:
     friend class TcpListener;
 
-    explicit TcpStream(std::shared_ptr<detail::LwipTcpCtx> impl);
+    explicit TcpStream(detail::Rc<detail::LwipTcpCtx> impl);
 
     // Defined in tcp_stream_lwip.cpp (or a stub). Never inline — keeps lwIP
     // headers out of this file.
     [[nodiscard]] Coro<std::size_t> read_impl(std::byte* buf, std::size_t size);
     [[nodiscard]] Coro<void>        write_impl(const std::byte* buf, std::size_t size);
 
-    std::shared_ptr<detail::LwipTcpCtx> m_impl;
+    detail::Rc<detail::LwipTcpCtx> m_impl;
 };
 
 } // namespace coro

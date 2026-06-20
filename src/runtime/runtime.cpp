@@ -37,16 +37,16 @@ uint64_t Runtime::now_us() const {
     return m_current_thread_executor->now_us();
 }
 
-void Runtime::schedule_timer(uint64_t deadline_us, std::shared_ptr<detail::Waker> waker) {
+void Runtime::schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> waker) {
     m_current_thread_executor->schedule_timer(deadline_us, std::move(waker));
 }
 
-void Runtime::register_isr_poll(const volatile bool* flag, std::shared_ptr<detail::Waker> waker) {
-    m_current_thread_executor->add_isr_poll(flag, std::move(waker));
+void Runtime::register_isr_poll(IsrFlagRef ref, detail::Rc<detail::Waker> waker) {
+    m_current_thread_executor->add_isr_poll(ref, std::move(waker));
 }
 
-void Runtime::remove_isr_poll(const volatile bool* flag) {
-    m_current_thread_executor->remove_isr_poll(flag);
+void Runtime::remove_isr_poll(IsrFlagRef ref) {
+    m_current_thread_executor->remove_isr_poll(ref);
 }
 #else
 Runtime::Runtime(std::size_t num_threads)

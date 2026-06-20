@@ -22,7 +22,7 @@ template<typename T>
 void PollStream<T>::LibuvWaker::wake() {
     State& state = *owner;
 
-    detail::Context ctx(std::make_shared<LibuvWaker>(owner));
+    detail::Context ctx(detail::make_rc<LibuvWaker>(owner));
 
     bool should_notify = false;
 
