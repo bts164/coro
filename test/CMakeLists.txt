@@ -50,6 +50,7 @@ set(TEST_NAMES
     test_oneshot
     test_mpsc
     test_watch
+    test_broadcast
     # io/
     test_file
     # test_pipe  # disabled — see io/test_pipe.cpp
@@ -98,6 +99,7 @@ set(TEST_SRCS
     sync/test_oneshot.cpp
     sync/test_mpsc.cpp
     sync/test_watch.cpp
+    sync/test_broadcast.cpp
     # io/
     io/test_file.cpp
     # io/test_pipe.cpp  # disabled
@@ -169,6 +171,7 @@ add_executable(test_pico_suite
     sync/test_select.cpp
     sync/test_mpsc.cpp
     sync/test_oneshot.cpp
+    sync/test_broadcast.cpp
     sync/test_isr_event.cpp
     task/test_join_set.cpp
     task/test_stream_handle.cpp

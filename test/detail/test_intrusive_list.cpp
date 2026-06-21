@@ -58,7 +58,32 @@ TEST(IntrusiveList, NodeUnlinkedAfterPop) {
     IntrusiveList<IntrusiveListNode*> list;
     list.push_back(&a);
     list.pop_front();
-    EXPECT_FALSE(a.is_linked());
+    // prev/next reset to null and a second remove() is a safe no-op.
+    list.remove(&a);
+    EXPECT_TRUE(list.empty());
+}
+
+// Regression test: a node that is the sole element of a list has prev ==
+// next == nullptr, identical to a never-linked node. remove() must not rely
+// on prev/next alone to tell the two apart — it uses m_head to disambiguate.
+TEST(IntrusiveList, RemoveSoleElement) {
+    Node a(1), b(2);
+    IntrusiveList<IntrusiveListNode*> list;
+    list.push_back(&a);
+    list.remove(&a);
+    EXPECT_TRUE(list.empty());
+    // List remains usable afterward.
+    list.push_back(&b);
+    EXPECT_EQ(list.size(), 1u);
+    EXPECT_EQ(static_cast<Node*>(list.pop_front())->value, 2);
+}
+
+// remove() on a node that was never linked must be a safe no-op.
+TEST(IntrusiveList, RemoveNeverLinkedNodeIsNoOp) {
+    Node a(1);
+    IntrusiveList<IntrusiveListNode*> list;
+    list.remove(&a);
+    EXPECT_TRUE(list.empty());
 }
 
 // ── push_back_block ───────────────────────────────────────────────────────────

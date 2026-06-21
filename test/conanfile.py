@@ -25,18 +25,38 @@ class CoroRecipe(ConanFile):
         "with_sanitize": "none"
     }
 
+    # Mirrors conanfile.py's _env_bool/config_options: lets CORO_<OPTION> in
+    # the environment set a boolean option's default without -o on the CLI.
+    # with_gperftools/with_local_run_queue/with_sanitize are mirrored from
+    # the same env vars as the coro package's own conanfile.py so the test
+    # binaries stay consistent with whatever coro package they link against
+    # (required for with_sanitize — see below; the others are just
+    # convenience so one .envrc drives both recipes identically).
+    @staticmethod
+    def _env_bool(name, current):
+        val = os.environ.get(name)
+        if val is None:
+            return current
+        return val.strip().lower() in ("1", "true", "yes", "on")
+
     def config_options(self):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
 
-        # Mirrors conanfile.py: lets CORO_SANITIZE in the environment set the
-        # default so the test binaries are built with the same sanitizer as
-        # the coro package they link against (required — ASan/TSan must be
-        # applied to the whole binary, not just one side of the link).
-        # config_options() runs before run_configure_method() merges the
-        # profile/CLI -o values onto self.options, so an explicit
-        # -o with_sanitize=... still overrides this; configure() runs too
-        # late for this purpose (after that merge).
+        self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
+        self.options.with_gperftools = self._env_bool(
+            "CORO_WITH_GPERFTOOLS", self.options.with_gperftools)
+        self.options.with_local_run_queue = self._env_bool(
+            "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
+
+        # CORO_SANITIZE in the environment sets the default so the test
+        # binaries are built with the same sanitizer as the coro package
+        # they link against (required — ASan/TSan must be applied to the
+        # whole binary, not just one side of the link). config_options()
+        # runs before run_configure_method() merges the profile/CLI -o
+        # values onto self.options, so an explicit -o with_sanitize=... still
+        # overrides this; configure() runs too late for this purpose (after
+        # that merge).
         sanitize = os.environ.get("CORO_SANITIZE", "none").strip().lower()
         if sanitize not in ("none", "asan", "tsan"):
             sanitize = "none"

@@ -205,9 +205,10 @@ CoroStream<MqttMessage> MqttClient::subscribe(std::string topic, uint8_t qos) {
         throw std::runtime_error("MqttClient::subscribe: mqtt_subscribe failed");
 
     // Displaces any previously active subscription — see the single-consumer
-    // note in mqtt.h. Avoid `auto [tx, rx] = mpsc_channel(...)` here — GCC fails
-    // to destroy the structured-binding storage across a coroutine suspension
-    // point (see doc/gcc_structured_binding_coro_bug.md); unpack manually instead.
+    // note in mqtt.h. Unpacked manually rather than `auto [tx, rx] = mpsc_channel(...)`
+    // out of caution for a potential GCC issue with structured bindings spanning a
+    // coroutine suspension (see doc/guidelines.md GCC.1) — unconfirmed on desktop
+    // GCC and not yet retested against this embedded (arm-none-eabi-gcc) toolchain.
     //
     // Registered before awaiting the SUBACK below: on_incoming_data() can fire
     // as soon as the broker acks the subscription, so sub_tx/sub_topic must

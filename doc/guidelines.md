@@ -8,8 +8,8 @@ each rule has a short title, a rationale, and concrete examples.
 
 ## Table of Contents
 
-- [GCC Compiler Bug: Structured Bindings in Coroutines](#gcc-compiler-bug-structured-bindings-in-coroutines) ⚠️
-    - GCC.1 — Never use structured bindings inside a coroutine body for variables that may be live across a `co_await`
+- [Potential GCC Issue: Structured Bindings in Coroutines (Unconfirmed, Low Severity)](#potential-gcc-issue-structured-bindings-in-coroutines-unconfirmed-low-severity)
+    - GCC.1 — Structured bindings in coroutines are fine to use; a past leak report tied to this pattern did not reproduce on retest
 - [Coroutine Scope](#coroutine-scope)
     - CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
     - CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
@@ -36,83 +36,65 @@ each rule has a short title, a rationale, and concrete examples.
 
 ---
 
-## GCC Compiler Bug: Structured Bindings in Coroutines
+## Potential GCC Issue: Structured Bindings in Coroutines (Unconfirmed, Low Severity)
 
-!!! danger "WARNING: Silent memory leak — no compiler diagnostic, code is syntactically correct"
-    This section documents a **GCC compiler defect**, not a language rule. Structured bindings
-    (`auto [a, b] = expr`) are valid C++ and work correctly everywhere except inside a coroutine
-    body when the bound variables span a real `co_await` suspension. GCC simply fails to generate
-    the destructor call for the hidden storage object in that specific case. The code compiles
-    without warnings, runs without crashes, and only leaks — making it one of the hardest classes
-    of bug to notice in code review. Always run LSan (`ENABLE_ASAN=ON` with `detect_leaks=1`)
-    to catch it. See `doc/gcc_structured_binding_coro_bug.md` for the full technical analysis.
+!!! note "NOTE: Status downgraded — likely a false alarm, kept here only as a watch-item"
+    This section used to document what we believed was a confirmed GCC compiler defect: structured
+    bindings (`auto [a, b] = expr`) allegedly leaking when the bound variables span a real `co_await`
+    suspension inside a coroutine. A full retest — reverting every workaround in the test suite back
+    to plain structured bindings and rerunning under ASan+LSan (`detect_leaks=1`) — found **zero
+    leaks**, including in the specific case that originally reported one. We now think this was more
+    likely a bug in our own channel/future code than a compiler defect, but that isn't proven either
+    way — hence "potential," not "ruled out." **Use structured bindings normally; don't avoid the
+    pattern.** If you ever see an LSan/ASan leak that traces back to a structured binding inside a
+    coroutine, treat it as a real lead worth investigating from scratch rather than assuming it's
+    this issue.
 
-### GCC.1 — Never use structured bindings inside a coroutine body for variables that may be live across a `co_await`
+### GCC.1 — Structured bindings in coroutines are fine to use; a past leak report tied to this pattern did not reproduce on retest
 
-**Reason:** This is a GCC implementation defect (related to GCC PR 100611). The C++ standard
-requires all automatic-duration locals — including the anonymous storage object `__e` created by
-`auto [a, b] = expr` — to have their destructors called before `final_suspend` fires. GCC does not
-do this for structured bindings whose hidden `__e` variable is placed in the coroutine frame (i.e.,
-when a variable bound from `__e` is still in scope at a real `co_await` point). The result is a
-silent memory leak of anything `__e` holds on the heap: strings, channel handles, `unique_ptr`s,
-and so on.
+**Background:** The original theory was a GCC implementation defect (related to GCC PR 100611 and
+siblings) where the anonymous storage object `__e` created by `auto [a, b] = expr` allegedly never
+had its destructor called when `__e` was placed in the coroutine frame (i.e., a variable bound from
+`__e` was still in scope at a real `co_await` point). If real, this would leak anything `__e` holds
+on the heap: strings, channel handles, `unique_ptr`s, and so on. It was "confirmed" at the time by
+stepping through `Coro::poll()` in a debugger and observing `Destroy` call `m_handle.destroy()` on a
+done handle without the bound type's destructor appearing to fire.
 
-To be clear: **the syntax is correct, the semantics are standard-conforming, and this is purely a
-GCC bug.** We work around it by avoiding structured bindings in coroutine bodies whenever the bound
-variables could cross a suspension.
+**What changed:** This theory drove a defensive workaround — manually unpacking
+(`auto ch = expr; auto a = std::move(ch.first); ...`) instead of using structured bindings — across
+dozens of call sites in the test suite (`test_oneshot.cpp`, `test_mpsc.cpp`, `test_watch.cpp`), most
+of which didn't even exercise a genuine suspension point — a sign the workaround had become a
+reflexive habit rather than something actively re-verified. The long-term mitigation floated at the
+time (changing every channel factory to return a non-aggregate named struct so structured bindings
+would be a compile error) was never implemented — `oneshot_channel`, `mpsc_channel`, and
+`watch_channel` still return plain `std::pair` today.
 
-This applies to **any** type that supports structured bindings — `std::pair`, `std::tuple`,
-aggregates, third-party tuple-like types — whenever unpacked inside a coroutine body. The library's
-own channel types (`oneshot_channel`, `mpsc_channel`, `watch_channel`) prevent this at compile time
-by returning non-aggregate named structs that do not support structured bindings (see CH.6). For all
-other types the only protection is this rule.
+On retest, reverting all of the workarounds back to plain `auto [a, b] = expr` and rerunning the
+full suite under ASan+LSan found no leaks anywhere, including in the originally-reported case
+(`OneshotTest.ReceiverSuspendsUntilSend`, which genuinely suspends via `co_await coro::spawn(...)`).
+Separately, this same investigation found a real, confirmed bug in `IntrusiveList::is_linked()`
+(it couldn't disambiguate a never-linked node from a node that was the sole element of a list) that
+produced symptoms — an ASan heap-use-after-free — initially suspected to be "the framework is
+broken" but that turned out to be ordinary application-level logic going wrong on a specific edge
+case. That track record makes "our own bug, not the compiler" the more likely explanation here too,
+though it remains unproven.
 
-**Trigger condition — `__e` spans a real suspension:**
-
-```cpp
-// The hidden variable __e (of type pair<size_t, string>) is placed in the coroutine
-// frame because 'data' (__e.second) is read AFTER the co_await on the next line.
-auto [written, data] = co_await file.write(std::string("hello, world"));
-file = co_await File::open(path, FileMode::Read);  // <-- real suspension; __e spans it
-EXPECT_EQ(data, "hello, world");  // data is __e.second — but __e's dtor was never called
-```
-
-**Safe pattern — unpack into a named variable:**
-
-```cpp
-// wr is a named frame variable; GCC correctly destroys it on coroutine completion.
-auto wr   = co_await file.write(std::string("hello, world"));
-auto data = std::move(wr.second);
-file = co_await File::open(path, FileMode::Read);  // suspension — data is safe
-EXPECT_EQ(data, "hello, world");
-```
-
-**Safe pattern — channel types enforce this at compile time:**
+**Current guidance:** Use structured bindings freely in coroutine bodies, including across real
+suspension points:
 
 ```cpp
-// Compile error — the library's channel factory returns a non-aggregate struct:
-auto [tx, rx] = oneshot_channel<int>();   // error: structured binding not supported
-
-// Correct — access named members directly or move them out:
-auto ch = oneshot_channel<int>();
-ch.tx.send(42);
-auto val = co_await ch.rx.recv();
+// Fine — no known leak, including across the suspension on the next line:
+auto [tx, rx] = oneshot_channel<int>();
+co_await coro::spawn([](OneshotSender<int> tx) -> Coro<void> {
+    tx.send(7);
+    co_return;
+}(std::move(tx)));
+auto result = co_await rx.recv();
 ```
 
-**Safe when `__e` does NOT span a suspension** (no leak, but avoid for consistency):
-
-```cpp
-Coro<void> ok() {
-    auto [a, b] = some_pair();
-    use(a, b);
-    co_return;  // no co_await after the binding — __e stays on the stack, no leak
-}
-```
-
-Note that whether `__e` "spans a suspension" is a runtime property — if a `co_await` always
-resolves immediately without suspending, no leak occurs. But this is fragile: adding a slow path
-later silently re-introduces the leak. Treat the rule as static: if a `co_await` textually follows
-the binding in the same scope, avoid the structured binding.
+If you ever observe an LSan/ASan leak that traces back to a structured binding spanning a
+suspension point, capture a minimal standalone repro (no test framework, no runtime) before
+assuming it's a compiler issue.
 
 ---
 

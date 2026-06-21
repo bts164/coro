@@ -8,20 +8,16 @@ namespace coro::detail {
 /**
  * @brief Base node for an intrusive doubly-linked list.
  *
- * Embed this (or inherit from it) in any struct that needs to participate in
- * an @ref IntrusiveList. The containing object owns its own storage — the list
- * holds raw non-owning pointers.
- *
  * A node must not be destroyed while it is still linked. Callers are
  * responsible for removing nodes before destruction (typically in a future's
- * destructor under the channel mutex).
+ * destructor under the channel mutex) — `IntrusiveList::remove()` is always
+ * safe to call on a node regardless of whether it is currently linked, so
+ * callers should call it unconditionally rather than trying to track
+ * linkage themselves.
  */
- struct IntrusiveListNode {
+struct IntrusiveListNode {
     IntrusiveListNode* prev = nullptr;
     IntrusiveListNode* next = nullptr;
-
-    /// @brief Returns true if this node is currently in a list.
-    bool is_linked() const noexcept { return prev != nullptr || next != nullptr; }
 };
 
 /**
@@ -69,6 +65,7 @@ public:
         while (auto node = m_head) {
             m_head->prev = nullptr;
             m_head = node->next;
+            node->next = nullptr;
         }
         m_tail = nullptr;
     }
@@ -163,10 +160,14 @@ public:
     }
 
     /// @brief Unlinks @p node from wherever it sits in the list.
-    /// Safe to call on a node that is not currently in this list — no-op.
+    ///
+    /// Safe to call unconditionally on any node, whether or not it is
+    /// currently linked into this list — a no-op if not. Nodes with null
+    /// `prev`/`next` are ambiguous (never-linked vs. sole element), so this
+    /// is disambiguated via `m_head`, which only this list has access to;
+    /// callers should not try to track linkage themselves and should always
+    /// call `remove()` rather than guessing first.
     void remove(NodePtr node) noexcept {
-        // A non-member node has prev == next == nullptr and is not the head.
-        // The single-element case also has prev == next == nullptr, but IS the head.
         if (!node->prev && !node->next && m_head != node) return;
         if (node->prev) node->prev->next = node->next;
         else            m_head = node->next;

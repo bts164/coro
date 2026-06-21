@@ -1,16 +1,18 @@
 # Channels
 
-Async channels for inter-task communication. Three variants are implemented; `broadcast` is
-deferred.
+Async channels for inter-task communication. `oneshot`, `mpsc`, and `watch` are
+implemented; `broadcast` is Phase 1 design only — see its section below for status and
+open questions before Phase 2 stubs are written.
 
 | Variant | Producers | Consumers | Buffering |
 |---|---|---|---|
 | `oneshot` | 1 | 1 | none — single value |
 | `mpsc` | N (cloneable sender) | 1 | bounded ring buffer |
 | `watch` | N (cloneable sender) | N (cloneable receiver) | 1 — last value only |
+| `broadcast` | N (cloneable sender) | N (cloneable receiver) | bounded ring buffer, every value delivered to every receiver |
 
-All three live under `include/coro/sync/`. The interface and internal design follows
-Tokio's implementation as closely as C++ allows.
+All four live (or, for `broadcast`, will live) under `include/coro/sync/`. The interface
+and internal design follows Tokio's implementation as closely as C++ allows.
 
 ---
 
@@ -361,8 +363,11 @@ was suspended and not yet woken), the destructor re-acquires the channel mutex a
 unlinks the node. This is always safe because the destructor holds a `shared_ptr` to the
 channel state, keeping it alive for the duration of the unlink.
 
-This requirement applies to `SenderNode` (mpsc) and `ReceiverNode` (mpsc and watch) and
-must be implemented in their respective future destructors.
+This requirement applies to `SenderNode` (mpsc) and `ReceiverNode` (mpsc, watch, and
+broadcast — see `broadcast`'s `receiver_waiters` in its Internal state section) and must
+be implemented in their respective future destructors. `broadcast`'s `select()`-heavy usage
+pattern (e.g. selecting across several `recv()` calls and dropping the losing branches each
+iteration) makes this a frequently-exercised path, not just an edge case.
 
 ---
 
@@ -446,6 +451,116 @@ receiver independently re-reads the value via `borrow()`.
 
 ---
 
+## `broadcast`
+
+Multi-producer, multi-consumer channel. Every value sent is delivered to every receiver
+subscribed at the time it was sent — unlike `watch`, which only retains the latest value,
+`broadcast` retains up to `capacity` not-yet-seen-by-every-receiver values so receivers can
+each consume at their own pace. Send is synchronous (never suspends); receive is async.
+`broadcast_channel(0)` throws `std::invalid_argument` — a zero-capacity channel can never
+hold a value for any receiver to read, and unlike a fixed-size buffer this isn't something
+the type system can rule out at compile time, so it's a recoverable runtime error rather
+than an `assert()`.
+
+```cpp
+auto ch  = coro::broadcast_channel<int>(/*capacity=*/16);
+auto tx  = std::move(ch.tx);
+auto rx1 = std::move(ch.rx);
+auto rx2 = tx.subscribe();              // independent receiver; sees only future sends
+
+tx.send(10);
+tx.send(20);
+
+int a = (co_await rx1.recv()).value();  // 10
+int b = (co_await rx2.recv()).value();  // 10 — both receivers see every value
+```
+
+- `BroadcastSender<T>` — `send(T)` is synchronous, never suspends; returns
+  `std::expected<size_t, T>` — the number of receivers notified on success, or the unsent
+  value back to the caller if there were zero receivers (nobody to deliver it to).
+  `subscribe()` creates an independent receiver that sees only values sent after the call —
+  no replay of channel history. Cloneable; the channel closes from the sender side only
+  when the last sender clone is dropped.
+- `BroadcastReceiver<T>` — `recv()` returns `Future<std::expected<T, BroadcastRecvError>>`;
+  `try_recv()` is the non-suspending equivalent; `resubscribe()` creates an independent
+  receiver, also starting from "after this call." Not cloneable — there is no operation
+  that hands back a second receiver sharing the same cursor; `resubscribe()` is the only
+  way to get an additional handle, and it always starts fresh rather than at the
+  original's current position.
+
+!!! note "send() has one failure case, not two"
+    `send()` fails only when there are zero current receivers — there is no "buffer full"
+    failure case at all: a full ring buffer never blocks or rejects a `send()`, it silently
+    evicts the oldest unread slot instead (see Internal state below), and the cost of that
+    eviction is paid later, per-receiver, as `Lagged` on their next `recv()`. The sender
+    never learns which receivers, if any, were affected.
+
+    Zero current receivers is also a normal, fully recoverable state, not a sign the channel
+    is done: dropping every receiver does not close the channel or invalidate the sender — a
+    later `subscribe()` call on that same sender works exactly as it would have before any
+    receiver ever existed. Closing happens only when every `Sender` clone is dropped;
+    receivers coming and going has no bearing on it.
+
+A receiver that falls too far behind — the channel had to evict a value it hadn't yet
+consumed in order to stay within `capacity` — receives `BroadcastRecvError{Kind::Lagged,
+skipped}` on its next `recv()`/`try_recv()`, where `skipped` is the number of values it
+missed. Its position then snaps forward to the oldest value still buffered, so the call
+after that succeeds normally.
+
+!!! note "Why evict-and-report instead of backpressure"
+    This is deliberate, not a fallback for a missing flow-control mechanism: `send()` is
+    synchronous and shared by every receiver, so if it had to wait for a slow receiver to
+    catch up before returning, every other receiver — and the sender itself — would stall on
+    that one slow consumer. Evicting and reporting `Lagged` instead means one slow receiver
+    only ever loses its own data; it can never hold up the sender or any other receiver. This
+    is the same tradeoff `tokio::sync::broadcast` makes for the same reason.
+
+```cpp
+auto r = co_await rx.recv();
+if (!r && r.error().kind == BroadcastRecvError::Kind::Lagged)
+    log("missed {} messages", r.error().skipped);
+```
+
+For a `T` that is expensive to copy (e.g. one holding a buffer), wrap it in
+`coro::detail::Rc<T>` and use `broadcast_channel<coro::detail::Rc<T>>` — copying an `Rc<T>`
+handle is a refcount bump, not a deep copy of the value.
+
+### Internal state
+
+```
+BroadcastShared<T>:
+    mutex
+    RingSlot<T>[]     ring_buffer       // fixed-capacity, allocated once at construction
+    uint64_t          next_seq          // sequence number assigned to the next send()
+    size_t            sender_count
+    size_t            receiver_count
+    IntrusiveList     receiver_waiters  // ReceiverNode list — suspended receivers
+```
+
+```
+RingSlot<T>:
+    uint64_t          seq               // this slot's sequence number
+    T                 value
+    size_t            remaining_readers // decremented as each subscribed receiver reads it
+```
+
+Each `BroadcastReceiver` tracks its own `next_seq` cursor, initialised to the channel's
+`next_seq` at the time it was created (`subscribe()`/`resubscribe()`) — this is what makes
+a new receiver see only future values without any backlog-replay logic.
+
+`send()` writes a new `RingSlot` at the head, stamped with the current `next_seq` and a
+`remaining_readers` count equal to `receiver_count`; if the buffer was full, the oldest slot
+is evicted. It then wakes every entry in `receiver_waiters` — all of them, not just one,
+since every receiver needs a chance to observe the new value.
+
+`recv()`/`try_recv()` read the slot at the receiver's cursor, decrement that slot's
+`remaining_readers`, and advance the cursor by one. If the cursor points behind the oldest
+slot still in the buffer (it was evicted before this receiver got to it), the call instead
+returns `BroadcastRecvError::Lagged` with the skipped count, and the cursor snaps to the
+oldest remaining slot.
+
+---
+
 ## Error codes
 
 ```cpp
@@ -487,3 +602,20 @@ if (auto r = tx.try_send(std::move(v)); !r) {
     buffer_for_retry(std::move(r.error().value));
 }
 ```
+
+### `BroadcastRecvError`
+
+`broadcast`'s `recv()`/`try_recv()` can fail for reasons `ChannelError` can't express —
+specifically, `Lagged` needs to carry how many values were skipped — so it gets its own
+error type, following the same shape as `TrySendError<T>`:
+
+```cpp
+struct BroadcastRecvError {
+    enum class Kind { Empty, Lagged, Closed } kind;
+    uint64_t skipped = 0;  // valid only when kind == Lagged
+};
+```
+
+`Kind::Empty` is `try_recv()`-only (nothing buffered right now); `recv()` never produces it
+— the same "try_recv only" convention `ChannelError::Empty` already uses. `Kind::Closed`
+means every sender has been dropped and the buffer is drained.

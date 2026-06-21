@@ -12,9 +12,6 @@ pico_sdk_init()
 set(CORO_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 include(${CORO_ROOT}/cmake/platforms/pico.cmake)
 include(${CORO_ROOT}/cmake/platforms/pico_hal.cmake)
-# lwipopts.h lives alongside this CMakeLists.txt — add it to coro_pico's
-# compile path so lwIP finds it when building the library sources.
-target_include_directories(coro_pico PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ---------------------------------------------------------------------------
 # WiFi credentials — copy wifi_credentials.h.example to wifi_credentials.h

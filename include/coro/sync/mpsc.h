@@ -104,17 +104,16 @@ public:
         : m_shared(std::move(other.m_shared))
         , m_node(std::move(other.m_node))
     {
-        assert(!m_node.is_linked() && "MpscSendFuture moved while linked — undefined behaviour");
+        assert(!m_node.prev && !m_node.next && "MpscSendFuture moved while linked — undefined behaviour");
     }
 
     MpscSendFuture& operator=(MpscSendFuture&&) = delete;
 
     ~MpscSendFuture() {
         if (!m_shared) return;
-        if (m_node.is_linked()) {
+        {
             std::lock_guard lock(m_shared->mutex);
-            if (m_node.is_linked())
-                m_shared->sender_waiters.remove(&m_node);
+            m_shared->sender_waiters.remove(&m_node);
         }
     }
 
@@ -137,8 +136,7 @@ public:
 
         // Woken because receiver was dropped while we were suspended.
         if (!m_shared->receiver_alive) {
-            if (m_node.is_linked())
-                m_shared->sender_waiters.remove(&m_node);
+            m_shared->sender_waiters.remove(&m_node);
             return OutputType(std::unexpected(std::move(*m_node.value)));
         }
 
@@ -147,8 +145,7 @@ public:
             m_shared->buffer.push_back(std::move(*m_node.value));
             auto waker = std::move(m_shared->receiver_waiter->waker);
             m_shared->receiver_waiter.reset();
-            if (m_node.is_linked())
-                m_shared->sender_waiters.remove(&m_node);
+            m_shared->sender_waiters.remove(&m_node);
             m_shared->cv.notify_all();
             lock.unlock();
             waker->wake();
@@ -164,8 +161,8 @@ public:
 
         // Buffer full — suspend.
         m_node.waker = ctx.getWaker();
-        if (!m_node.is_linked())
-            m_shared->sender_waiters.push_back(&m_node);
+        m_shared->sender_waiters.remove(&m_node);
+        m_shared->sender_waiters.push_back(&m_node);
         return PollPending;
     }
 

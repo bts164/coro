@@ -105,11 +105,7 @@ TYPED_TEST(OneshotTest, ReceiverErrorWhenSenderDropped) {
 
 TYPED_TEST(OneshotTest, ReceiverSuspendsUntilSend) {
     this->traits.rt.block_on([]() -> Coro<void> {
-        // GCC bug: structured bindings in coroutines don't have their destructors
-        // called when the hidden __e variable spans a suspension point. Unpack manually.
-        auto ch = oneshot_channel<int>();
-        auto tx = std::move(ch.first);
-        auto rx = std::move(ch.second);
+        auto [tx, rx] = oneshot_channel<int>();
         co_await coro::spawn([](OneshotSender<int> tx) -> Coro<void> {
             tx.send(7);
             co_return;
@@ -278,11 +274,7 @@ TYPED_TEST(OneshotVoidTest, ReceiverErrorWhenSenderDropped) {
 
 TYPED_TEST(OneshotVoidTest, ReceiverSuspendsUntilSend) {
     this->traits.rt.block_on([]() -> Coro<void> {
-        // GCC bug: structured bindings in coroutines don't have their destructors
-        // called when the hidden __e variable spans a suspension point. Unpack manually.
-        auto ch = oneshot_channel<void>();
-        auto tx = std::move(ch.first);
-        auto rx = std::move(ch.second);
+        auto [tx, rx] = oneshot_channel<void>();
         co_await coro::spawn([](OneshotSender<void> tx) -> Coro<void> {
             tx.send();
             co_return;

@@ -1,0 +1,40 @@
+# Copy to .envrc and `direnv allow` to pick this up automatically.
+# .envrc itself is gitignored — this sample is the tracked template.
+#
+# CORO_SANITIZE selects the sanitizer used by `conan install`/`conan create`
+# for both the coro package and test/ package (conanfile.py's init() hook
+# reads this to set the with_sanitize option's default). No extra `-o`
+# flags needed on the conan CLI; an explicit `-o with_sanitize=...` still
+# overrides this if you pass one.
+#
+# Valid values: none (default), asan, tsan
+#
+# export CORO_SANITIZE=asan
+# export CORO_SANITIZE=tsan
+
+# Recommended runtime options for whichever sanitizer is selected above —
+# see BUILD.md "Recommended environment variables when running sanitizer
+# builds" for what each flag does. Uncomment alongside the matching
+# CORO_SANITIZE line.
+#
+# export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
+# export UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1
+# export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1
+
+# CORO_SHARED / CORO_WITH_GPERFTOOLS / CORO_WITH_LOCAL_RUN_QUEUE set the
+# defaults for the matching boolean options (conanfile.py's and
+# test/conanfile.py's config_options() hooks both read these), desktop
+# builds only — baremetal (Pico) removes these options entirely. As with
+# CORO_SANITIZE, an explicit -o on the conan CLI still overrides the value
+# set here.
+#
+# Note that toggling any of these produces a distinct Conan package binary
+# (they're part of the package ID, same as with_sanitize) — switching values
+# means a fresh `conan create`/`conan install`, not a rebuild of the same
+# cached package.
+#
+# Valid values: true/false (also accepts 1/0, yes/no, on/off)
+#
+# export CORO_SHARED=false               # static lib instead of the default shared
+# export CORO_WITH_GPERFTOOLS=false      # disable gperftools dependency/integration
+# export CORO_WITH_LOCAL_RUN_QUEUE=false # disable the local-run-queue executor opt-in

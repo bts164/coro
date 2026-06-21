@@ -10,8 +10,18 @@
 #
 # Usage:
 #   set(CORO_ROOT /path/to/coro)   # optional — defaults to two levels above this file
+#   set(CORO_PICO_WITH_MQTT ON)    # optional — bakes LWIP_MQTT 1 into the default lwipopts.h
 #   include(${CORO_ROOT}/cmake/platforms/pico.cmake)
 #   target_link_libraries(my_firmware PRIVATE coro_pico)
+#
+# lwipopts.h: coro_pico owns it. By default it's generated from
+# src/io/lwip/lwipopts.h.in (see doc/design/lwip_config.md for why this is
+# centralized rather than left to each application). To supply a completely
+# custom file instead — for tuning beyond what CORO_PICO_WITH_MQTT covers —
+# set CORO_PICO_LWIPOPTS_DIR to a directory containing your own lwipopts.h
+# before including this file. Whichever is used, it applies to every target
+# that links coro_pico/coro_pico_mqtt in this configure run — see
+# pico_mqtt.cmake, which must see the same directory.
 
 include_guard(GLOBAL)
 
@@ -22,6 +32,17 @@ endif()
 
 set(_CORO_SRC     ${CORO_ROOT}/src)
 set(_CORO_INCLUDE ${CORO_ROOT}/include)
+
+if(DEFINED CORO_PICO_LWIPOPTS_DIR)
+    set(CORO_PICO_LWIPOPTS_INCLUDE_DIR ${CORO_PICO_LWIPOPTS_DIR})
+else()
+    option(CORO_PICO_WITH_MQTT "Bake LWIP_MQTT 1 into the bundled default lwipopts.h" OFF)
+    set(LWIP_MQTT ${CORO_PICO_WITH_MQTT})
+    set(_CORO_LWIPOPTS_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/coro_pico_lwipopts)
+    configure_file(${_CORO_SRC}/io/lwip/lwipopts.h.in
+        ${_CORO_LWIPOPTS_GEN_DIR}/lwipopts.h)
+    set(CORO_PICO_LWIPOPTS_INCLUDE_DIR ${_CORO_LWIPOPTS_GEN_DIR})
+endif()
 
 # ---------------------------------------------------------------------------
 # coro_pico — full coro stack for Pico W: portable core + executor + lwIP TCP.
@@ -44,7 +65,7 @@ add_library(coro_pico STATIC
     ${_CORO_SRC}/io/lwip/tcp_listener_lwip.cpp
 )
 target_include_directories(coro_pico PUBLIC  ${_CORO_INCLUDE})
-target_include_directories(coro_pico PRIVATE ${_CORO_SRC}/io/lwip)
+target_include_directories(coro_pico PRIVATE ${_CORO_SRC}/io/lwip ${CORO_PICO_LWIPOPTS_INCLUDE_DIR})
 target_compile_features(coro_pico PUBLIC cxx_std_23)
 target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP)
 # Coroutine frame pooling (CoroPromiseBase's pooled operator new/delete in

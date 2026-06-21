@@ -187,16 +187,15 @@ public:
         , m_last_seen(other.m_last_seen)
         , m_node(std::move(other.m_node))
     {
-        assert(!m_node.is_linked() &&
+        assert(!m_node.prev && !m_node.next &&
                "WatchChangedFuture moved while linked — undefined behaviour");
     }
 
     ~WatchChangedFuture() {
         if (!m_shared) return;
-        if (m_node.is_linked()) {
+        {
             std::lock_guard lock(m_shared->waker_mutex);
-            if (m_node.is_linked())
-                m_shared->receiver_waiters.remove(&m_node);
+            m_shared->receiver_waiters.remove(&m_node);
         }
     }
 
@@ -533,12 +532,9 @@ WatchChangedFuture<T>::poll(coro::detail::Context& ctx) {
         std::shared_lock vl(m_shared->value_mutex);
         uint64_t current = m_shared->version;
         if (current != m_last_seen) {
-            if (m_node.is_linked()) {
-                vl.unlock();
-                std::lock_guard wl(m_shared->waker_mutex);
-                if (m_node.is_linked())
-                    m_shared->receiver_waiters.remove(&m_node);
-            }
+            vl.unlock();
+            std::lock_guard wl(m_shared->waker_mutex);
+            m_shared->receiver_waiters.remove(&m_node);
             m_rx.mark_seen(current);
             return OutputType{};
         }
@@ -548,15 +544,14 @@ WatchChangedFuture<T>::poll(coro::detail::Context& ctx) {
     {
         std::lock_guard wl(m_shared->waker_mutex);
         if (m_shared->sender_count == 0) {
-            if (m_node.is_linked())
-                m_shared->receiver_waiters.remove(&m_node);
+            m_shared->receiver_waiters.remove(&m_node);
             return OutputType(std::unexpected(ChannelError::SenderDropped));
         }
         // Register waker and suspend.
         m_node.waker     = ctx.getWaker();
         m_node.last_seen = m_last_seen;
-        if (!m_node.is_linked())
-            m_shared->receiver_waiters.push_back(&m_node);
+        m_shared->receiver_waiters.remove(&m_node);
+        m_shared->receiver_waiters.push_back(&m_node);
     }
     return PollPending;
 }

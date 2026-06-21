@@ -49,11 +49,7 @@ TEST(FileTest, BasicOpenWriteReadClose) {
     rt.block_on([](std::string path) -> Coro<void> {
         // Write
         auto file = co_await File::open(path, FileMode::Write | FileMode::Create | FileMode::Truncate);
-        // GCC bug: structured bindings in coroutines leak when spanning a suspension.
-        // 'data' must survive the co_await File::open() below, so it must be a named frame variable.
-        auto wr      = co_await file.write(std::string("Hello, File I/O!"));
-        auto written = wr.first;
-        auto data    = std::move(wr.second);
+        auto [written, data] = co_await file.write(std::string("Hello, File I/O!"));
         EXPECT_EQ(written, data.size());
         // Drop file to close, then re-open read-only
         file = co_await File::open(path, FileMode::Read);  // assignment closes previous fd

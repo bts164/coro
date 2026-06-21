@@ -1,0 +1,72 @@
+# Example Conan host profile for building pico_led (and, later, KitchenLED)
+# for the RP2040 (Cortex-M0+, ARMv6-M, no OS). Copy to
+# rp2040-arm-none-eabi.profile and adjust — this file is gitignored since
+# exact paths/versions vary by machine.
+#
+# UNVERIFIED — written without a conan binary available to test against.
+# `arch=armv6` is the closest entry in Conan's predefined settings.yml to
+# Cortex-M0+ (there's no exact match); `os=baremetal` is the standard choice
+# for no-OS embedded targets. Check both against your installed Conan's
+# settings.yml (`conan profile show -pr:h <this file>`) before trusting it.
+#
+# tools.cmake.cmaketoolchain:* below is REQUIRED, not optional.
+#
+# pico_led's conanfile.py still generates a CMakeToolchain (for
+# CMakePresets.json, so the stock CMake build helper works), pared down to
+# the "find_paths" block (writes CMAKE_PREFIX_PATH/CMAKE_MODULE_PATH, the
+# only thing find_package() needs) plus "user_toolchain". Do NOT add
+# "generic_system" or "compilers" — those would set CMAKE_SYSTEM_NAME /
+# CMAKE_<LANG>_COMPILER directly and fight pico_sdk_init() the obvious way.
+#
+# But there's a non-obvious second conflict even with only "find_paths"
+# enabled: Conan's CMake build helper always passes
+# `-DCMAKE_TOOLCHAIN_FILE=generators/conan_toolchain.cmake` on the cmake
+# command line (that's what the generated preset does), which makes
+# CMAKE_TOOLCHAIN_FILE a DEFINED cache variable from the moment CMake starts
+# — before any of pico_sdk_init.cmake's own code runs. pico_sdk's
+# cmake/pico_pre_load_toolchain.cmake has:
+#   if (NOT (DEFINED PICO_COMPILER OR DEFINED CMAKE_TOOLCHAIN_FILE)) ...
+# i.e. it assumes a DEFINED CMAKE_TOOLCHAIN_FILE means the user deliberately
+# picked their own cross toolchain, and skips selecting arm-none-eabi-gcc
+# entirely — silently falling back to the host's gcc/g++ (confirmed: caused
+# ARM assembly to be fed to the host's `as`, producing nonsense "unknown
+# pseudo-op"/"no such instruction" errors).
+#
+# Fix: use Conan's "user_toolchain" block to make our own conan_toolchain.cmake
+# chain-include the real Pico ARM toolchain file, so CMAKE_C_COMPILER/
+# CMAKE_CXX_COMPILER/CMAKE_SYSTEM_NAME end up set correctly regardless of
+# pico_sdk's own auto-selection being bypassed. The path below is RP2040 /
+# Cortex-M0+ specific (matches PICO_PLATFORM=rp2040 below) — for RP2350 use
+# pico_arm_cortex_m33_gcc.cmake instead.
+# See doc/design/pico_led_conan_packaging.md.
+
+[settings]
+os=baremetal
+arch=armv6
+compiler=gcc
+compiler.version=14
+compiler.libcxx=libstdc++
+compiler.cppstd=23
+build_type=Release
+
+[conf]
+tools.cmake.cmaketoolchain:enabled_blocks=["user_toolchain", "find_paths"]
+tools.cmake.cmaketoolchain:user_toolchain=["/home/brad/pico-sdk/cmake/preload/toolchains/pico_arm_cortex_m0plus_gcc.cmake"]
+
+[buildenv]
+# Not required if arm-none-eabi-gcc/g++ are already first on PATH, but
+# pinned explicitly to avoid ambiguity on a machine with multiple
+# toolchains installed (e.g. a desktop arm-none-eabi-gcc alongside one
+# bundled with a different SDK version).
+CC=arm-none-eabi-gcc
+CXX=arm-none-eabi-g++
+
+# REQUIRED — conan_build/CMakeLists.txt's include($ENV{PICO_SDK_PATH}/...)
+# runs inside conan's build()-environment subprocess, which doesn't
+# necessarily inherit an interactively-exported shell variable. Set it here
+# so it's reproducible regardless of which shell `conan` is invoked from.
+# If left unset, include() fails non-fatally and CMake silently configures
+# against the host's gcc instead of arm-none-eabi-gcc, only crashing later
+# and confusingly at pico_sdk_init() — see conan_build/CMakeLists.txt's
+# explicit guard for that failure mode.
+PICO_SDK_PATH=/home/brad/pico-sdk

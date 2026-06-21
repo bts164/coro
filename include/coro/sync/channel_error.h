@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <utility>
 
 namespace coro {
@@ -36,6 +37,22 @@ struct TrySendError {
     T value; ///< The unsent value, always present on failure.
 
     TrySendError(Kind k, T v) : kind(k), value(std::move(v)) {}
+};
+
+/**
+ * @brief Error type returned by `broadcast`'s `recv`/`try_recv` on failure.
+ *
+ * `Lagged` needs to carry how many values were skipped, which `ChannelError`
+ * cannot express, so `broadcast` gets its own error type.
+ */
+struct BroadcastRecvError {
+    enum class Kind {
+        Empty,  ///< try_recv only — channel open but nothing buffered at the cursor yet.
+        Lagged, ///< The cursor fell behind the oldest buffered value; `skipped` values were lost.
+        Closed, ///< Every sender has been dropped and no buffered values remain unread.
+    } kind;
+
+    uint64_t skipped = 0; ///< Valid only when `kind == Lagged`.
 };
 
 } // namespace coro
