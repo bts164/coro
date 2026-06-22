@@ -65,7 +65,14 @@ add_library(coro_pico STATIC
     ${_CORO_SRC}/io/lwip/tcp_listener_lwip.cpp
 )
 target_include_directories(coro_pico PUBLIC  ${_CORO_INCLUDE})
-target_include_directories(coro_pico PRIVATE ${_CORO_SRC}/io/lwip ${CORO_PICO_LWIPOPTS_INCLUDE_DIR})
+# CORO_PICO_LWIPOPTS_INCLUDE_DIR is PUBLIC, not PRIVATE: lwipopts.h must be
+# visible to any target that #includes Pico SDK/lwIP headers (e.g.
+# <pico/cyw43_arch.h>), not just to coro_pico's own .cpp files — see
+# doc/design/lwip_config.md ("coro owns lwipopts.h exclusively... transitively
+# through coro"). ${_CORO_SRC}/io/lwip stays PRIVATE — it's coro's own
+# internal lwIP-backend headers, not meant for consumers.
+target_include_directories(coro_pico PRIVATE ${_CORO_SRC}/io/lwip)
+target_include_directories(coro_pico PUBLIC  ${CORO_PICO_LWIPOPTS_INCLUDE_DIR})
 target_compile_features(coro_pico PUBLIC cxx_std_23)
 target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP)
 # Coroutine frame pooling (CoroPromiseBase's pooled operator new/delete in

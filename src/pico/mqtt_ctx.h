@@ -6,10 +6,11 @@
 #include <coro/detail/waker.h>
 #include <coro/detail/rc.h>
 #include <coro/pico/mqtt.h>
-#include <coro/sync/mpsc.h>
+#include <coro/sync/broadcast.h>
 #include <lwip/apps/mqtt.h>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace coro::detail {
@@ -23,11 +24,14 @@ struct MqttCtx {
     std::optional<mqtt_connection_status_t> connect_status;
     bool                                    connected = false;
 
-    // Active subscription. At most one at a time — set by MqttClient::subscribe(),
-    // which displaces whatever was here before (single-consumer model, same
-    // restriction as TcpStream::read(); see mqtt.h).
-    std::string                            sub_topic;
-    std::optional<MpscSender<MqttMessage>> sub_tx;
+    // One broadcast channel per distinct subscribed topic, keyed by exact topic
+    // string — set up by MqttClient::subscribe(). Entries are never removed, even
+    // once their receiver_count drops to zero: this MqttCtx holds the only sender
+    // clone for each entry, so an empty entry is still a fully valid channel a later
+    // subscribe() to the same topic can attach to (see kitchen_led.md's "Prerequisite
+    // change" section for the full rationale). Exact-match only — no wildcard
+    // (`+`/`#`) topic filters in this iteration.
+    std::unordered_map<std::string, BroadcastSender<MqttMessage>> channels;
 
     // Incoming publish currently being assembled across mqtt_incoming_data_cb_t
     // fragments (lwIP may deliver one publish's payload in several chunks).

@@ -14,8 +14,8 @@
 //   #define LWIP_MQTT 1   // in lwipopts.h
 
 #include <coro/coro.h>
-#include <coro/coro_stream.h>
 #include <coro/detail/rc.h>
+#include <coro/sync/broadcast.h>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -38,13 +38,16 @@ struct MqttMessage {
  * Wraps lwIP's `apps/mqtt` client. Only QoS 0/1 are supported — lwIP itself does not
  * implement QoS 2 or persistent sessions (`clean_session` is always set on CONNECT).
  *
- * **Concurrency:** only one `subscribe()` stream may be outstanding at a time — a
- * second call to `subscribe()` displaces the first. This is the same single-consumer
- * restriction `TcpStream::read()` documents for the same reason (one underlying
- * channel, one reader).
+ * **Concurrency:** `subscribe()` may be called for any number of distinct topics
+ * concurrently — each call returns its own `BroadcastReceiver<MqttMessage>`, filtered
+ * to that exact topic string, independent of every other subscription. Calling
+ * `subscribe()` again with the *same* topic string returns another independent
+ * receiver on the same underlying channel (both see every message on that topic from
+ * the point they subscribed onward) — it does not displace anything.
  *
- * **Destruction:** destroying an `MqttClient` while `publish()` or a `subscribe()`
- * stream is in flight is UB, same as `TcpStream`.
+ * **Destruction:** destroying an `MqttClient` while `publish()` is in flight is UB,
+ * same as `TcpStream`. Outstanding `BroadcastReceiver`s from `subscribe()` may safely
+ * outlive or be dropped independently of the `MqttClient` and of each other.
  */
 class MqttClient {
 public:
@@ -57,10 +60,25 @@ public:
 
     /**
      * @brief Resolves host, opens the TCP connection, and performs the MQTT CONNECT handshake.
+     *
+     * @param will_topic  If non-empty, registered as the connection's Last Will and
+     *                    Testament: the broker publishes `will_payload` to `will_topic`
+     *                    if this client disconnects uncleanly. Empty (the default) disables
+     *                    the LWT entirely — `will_payload`/`will_qos`/`will_retain` are then
+     *                    ignored.
+     * @param username    If non-empty, sent as the CONNECT packet's User Name field. Empty
+     *                    (the default) omits it — the User Name Flag is left clear.
+     * @param password    If non-empty, sent as the CONNECT packet's Password field. Empty
+     *                    (the default) omits it — the Password Flag is left clear. Ignored
+     *                    if `username` is empty, since lwIP's MQTT client only sends a
+     *                    password alongside a user name.
      * @throws std::runtime_error on DNS failure, connection failure, or a non-accepted CONNACK.
      */
     [[nodiscard]] static Coro<MqttClient> connect(
-        std::string host, uint16_t port, std::string client_id);
+        std::string host, uint16_t port, std::string client_id,
+        std::string will_topic = {}, std::string will_payload = {},
+        uint8_t will_qos = 0, bool will_retain = false,
+        std::string username = {}, std::string password = {});
 
     /**
      * @brief Publishes `payload` to `topic`.
@@ -76,13 +94,20 @@ public:
         uint8_t qos = 0, bool retain = false);
 
     /**
-     * @brief Sends SUBSCRIBE and returns a stream of every message that arrives on
-     * `topic` for as long as the returned stream is read. Displaces any previously
-     * returned `subscribe()` stream — see the single-consumer note above.
+     * @brief Sends SUBSCRIBE and returns a receiver of every message that arrives on
+     * `topic` from this point onward.
+     *
+     * Internally, one broadcast channel is kept per distinct topic string for the
+     * lifetime of the `MqttClient`; `capacity` only takes effect the first time a given
+     * topic is subscribed (later calls for the same topic ignore it and just attach
+     * another receiver to the channel that already exists). See the class-level
+     * concurrency note — multiple topics, and multiple receivers on the same topic, may
+     * all be live at once.
      *
      * @throws std::runtime_error on subscribe failure (e.g. broker refusal).
      */
-    [[nodiscard]] CoroStream<MqttMessage> subscribe(std::string topic, uint8_t qos = 0);
+    [[nodiscard]] Coro<BroadcastReceiver<MqttMessage>> subscribe(
+        std::string topic, uint8_t qos = 0, size_t capacity = 8);
 
 private:
     explicit MqttClient(detail::Rc<detail::MqttCtx> impl);

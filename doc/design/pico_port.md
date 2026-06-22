@@ -365,15 +365,31 @@ fires synchronously inside `cyw43_arch_poll()`, on the executor thread):
 
 - **Connect** (`mqtt_client_connect()` + `mqtt_connection_cb_t`) is one-shot — wrapped
   with `LwipCallbackResult<mqtt_connection_status_t>`, exactly like `TcpStream::connect()`.
+  `connect()` also accepts optional Last Will and Testament parameters, forwarded
+  directly to `mqtt_connect_client_info_t::will_topic`/`will_msg`/`will_qos`/`will_retain`;
+  an empty `will_topic` (the default) disables the LWT entirely. It likewise accepts
+  optional `username`/`password` parameters, forwarded to `client_user`/`client_pass`;
+  an empty `username` (the default) omits both fields (lwIP only sends a password
+  alongside a user name, so a non-empty `password` with an empty `username` is ignored).
 - **Publish acknowledgement** (`mqtt_publish()`'s per-call request callback, used for
   QoS 1/2) is also one-shot per call — same `LwipCallbackResult` pattern.
 - **Incoming messages** are different: `mqtt_set_inpub_callback()` registers a single
   pair of callbacks (`mqtt_incoming_publish_cb_t` / `mqtt_incoming_data_cb_t`) for the
-  *whole client*, firing repeatedly for the life of the connection. These get pushed onto
-  an `mpsc::Sender<MqttMessage>` held by `MqttClient`; the application reads them via the
-  paired `mpsc::Receiver<MqttMessage>` returned from `subscribe()`. This is the same
-  single-consumer model `TcpStream` already documents as a known limitation — one reader
-  per client, not per topic.
+  *whole client*, firing repeatedly for the life of the connection. `MqttCtx` keeps one
+  `BroadcastSender<MqttMessage>` per distinct subscribed topic string, in an
+  `std::unordered_map<std::string, BroadcastSender<MqttMessage>>`; `on_incoming_data()`
+  looks up the incoming message's topic in that map and `send()`s into the single
+  matching entry (or drops the message if nobody has ever subscribed to that topic).
+  `subscribe(topic, qos, capacity)` finds-or-creates the map entry for `topic` and
+  returns `entry.subscribe()`'s `BroadcastReceiver<MqttMessage>` — already filtered to
+  that exact topic, since every message reaching that channel was looked up by it.
+  Any number of topics, and any number of receivers per topic (via repeated
+  `subscribe()` calls on the same topic string), may be live concurrently — there is no
+  single-consumer restriction here, unlike `TcpStream::read()`. Map entries are never
+  evicted when their receiver count drops to zero: `MqttCtx` holds the entry's only
+  sender clone, so the channel stays valid for a later `subscribe()` on the same topic
+  to reattach to without re-sending a wire-level SUBSCRIBE. This iteration is exact
+  topic-string match only — no MQTT wildcard (`+`/`#`) filters.
 
 ```cpp
 // include/coro/pico/mqtt.h
@@ -385,8 +401,13 @@ struct MqttMessage {
 class MqttClient {
 public:
     // Resolves host, opens the TCP connection, and performs the MQTT CONNECT handshake.
+    // An empty will_topic (the default) disables the Last Will and Testament. An empty
+    // username (the default) omits the User Name/Password fields entirely.
     [[nodiscard]] static coro::Coro<MqttClient> connect(
-        std::string_view host, uint16_t port, std::string_view client_id);
+        std::string_view host, uint16_t port, std::string_view client_id,
+        std::string_view will_topic = {}, std::string_view will_payload = {},
+        uint8_t will_qos = 0, bool will_retain = false,
+        std::string_view username = {}, std::string_view password = {});
 
     // Publishes a message. Suspends until the broker PUBACK for QoS 1/2; returns
     // immediately after the write completes for QoS 0.
@@ -394,15 +415,16 @@ public:
         std::string_view topic, std::span<const std::byte> payload,
         uint8_t qos = 0, bool retain = false);
 
-    // Sends SUBSCRIBE and returns a stream of every message that arrives on `topic`
-    // for the lifetime of this client. Only one subscribe() call may be outstanding
-    // at a time — see the single-consumer note above.
-    [[nodiscard]] coro::CoroStream<MqttMessage> subscribe(
-        std::string_view topic, uint8_t qos = 0);
+    // Sends SUBSCRIBE and returns a receiver of every message that arrives on `topic`
+    // from this point onward. Concurrent subscriptions to distinct topics, and
+    // multiple receivers on the same topic, are both fully supported — see the
+    // per-topic channel map note above.
+    [[nodiscard]] coro::Coro<coro::BroadcastReceiver<MqttMessage>> subscribe(
+        std::string_view topic, uint8_t qos = 0, size_t capacity = 8);
 
 private:
-    mqtt_client_t*           m_client;
-    mpsc::Sender<MqttMessage> m_tx;
+    mqtt_client_t* m_client;
+    std::unordered_map<std::string, coro::BroadcastSender<MqttMessage>> m_channels;
 };
 ```
 
@@ -417,13 +439,14 @@ sequenceDiagram
     M-->>C: conn_cb fires: connect_result.complete(status)
 
     C->>M: mqtt_subscribe(topic, sub_request_cb)
+    Note over C: find-or-create channels[topic] before awaiting SUBACK
     C->>E: co_await lwip_wait(sub_result)
     M-->>C: sub_request_cb fires: sub_result.complete(err)
 
-    loop every broker PUBLISH on topic
+    loop every broker PUBLISH on a subscribed topic
         M-->>C: incoming_publish_cb / incoming_data_cb
-        Note over C: MqttMessage pushed onto mpsc channel
-        C->>C: co_await stream.next() resumes with the message
+        Note over C: channels.find(topic)->send(MqttMessage) —\nfans out to every receiver on that topic
+        C->>C: co_await rx.recv() resumes with the message
     end
 ```
 

@@ -15,6 +15,7 @@
 #include <lwip/dns.h>
 #include <lwip/err.h>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -60,12 +61,14 @@ void MqttCtx::on_incoming_data(void* arg, const uint8_t* data, uint16_t len, uin
     if (!(flags & MQTT_DATA_FLAG_LAST))
         return;
 
-    // Message complete. Deliver only if it matches the currently active
-    // subscription — at most one subscribe() stream is live at a time (see
-    // mqtt.h). Best-effort: a full channel buffer silently drops the message
-    // rather than blocking this callback, which cannot suspend.
-    if (ctx->sub_tx.has_value() && ctx->in_topic == ctx->sub_topic) {
-        ctx->sub_tx->try_send(MqttMessage{ctx->in_topic, std::move(ctx->in_payload)});
+    // Message complete. Deliver to the channel registered for this exact topic, if
+    // any — see the `channels` map note in mqtt_ctx.h. No entry means nobody is
+    // subscribed to this topic; the message is simply dropped. Best-effort: if the
+    // ring buffer is full, send() silently overwrites the oldest unread value rather
+    // than blocking this callback, which cannot suspend.
+    auto it = ctx->channels.find(ctx->in_topic);
+    if (it != ctx->channels.end()) {
+        it->second.send(MqttMessage{ctx->in_topic, std::move(ctx->in_payload)});
     }
     ctx->in_payload.clear();
 }
@@ -89,7 +92,10 @@ MqttClient::~MqttClient() {
     m_impl->client = nullptr;
 }
 
-Coro<MqttClient> MqttClient::connect(std::string host, uint16_t port, std::string client_id) {
+Coro<MqttClient> MqttClient::connect(
+    std::string host, uint16_t port, std::string client_id,
+    std::string will_topic, std::string will_payload, uint8_t will_qos, bool will_retain,
+    std::string username, std::string password) {
     // ---- Step 1: DNS resolution (same pattern as TcpStream::connect) ----
     LwipCallbackResult<ip_addr_t, bool> dns_cb;
     ip_addr_t addr{};
@@ -118,6 +124,17 @@ Coro<MqttClient> MqttClient::connect(std::string host, uint16_t port, std::strin
 
     mqtt_connect_client_info_t info{};
     info.client_id = client_id.c_str();
+    if (!will_topic.empty()) {
+        info.will_topic = will_topic.c_str();
+        info.will_msg   = will_payload.c_str();
+        info.will_qos   = will_qos;
+        info.will_retain = will_retain ? 1 : 0;
+    }
+    if (!username.empty()) {
+        info.client_user = username.c_str();
+        if (!password.empty())
+            info.client_pass = password.c_str();
+    }
 
     err_t conn_err = mqtt_client_connect(
         ctx->client, &addr, port, detail::MqttCtx::on_connect, ctx.get(), &info);
@@ -185,7 +202,8 @@ Coro<void> MqttClient::publish(
         throw std::runtime_error("MqttClient::publish: broker did not acknowledge");
 }
 
-CoroStream<MqttMessage> MqttClient::subscribe(std::string topic, uint8_t qos) {
+Coro<BroadcastReceiver<MqttMessage>> MqttClient::subscribe(
+    std::string topic, uint8_t qos, size_t capacity) {
     // Capture ctx before any suspension so we don't hold a dangling `this` if
     // the MqttClient object is moved while this coroutine is parked.
     auto ctx_ptr = m_impl;
@@ -204,27 +222,26 @@ CoroStream<MqttMessage> MqttClient::subscribe(std::string topic, uint8_t qos) {
     if (err != ERR_OK)
         throw std::runtime_error("MqttClient::subscribe: mqtt_subscribe failed");
 
-    // Displaces any previously active subscription — see the single-consumer
-    // note in mqtt.h. Unpacked manually rather than `auto [tx, rx] = mpsc_channel(...)`
-    // out of caution for a potential GCC issue with structured bindings spanning a
-    // coroutine suspension (see doc/guidelines.md GCC.1) — unconfirmed on desktop
-    // GCC and not yet retested against this embedded (arm-none-eabi-gcc) toolchain.
-    //
-    // Registered before awaiting the SUBACK below: on_incoming_data() can fire
-    // as soon as the broker acks the subscription, so sub_tx/sub_topic must
-    // already be armed or an immediately-following PUBLISH is silently dropped.
-    auto chan = mpsc_channel<MqttMessage>(16);
-    ctx_ptr->sub_topic = topic;
-    ctx_ptr->sub_tx    = std::move(chan.first);
-    auto rx            = std::move(chan.second);
+    // Find-or-create the channel for this exact topic and attach a receiver to it
+    // before awaiting the SUBACK below: on_incoming_data() can fire as soon as the
+    // broker acks the subscription, so the channel entry must already exist or an
+    // immediately-following PUBLISH is silently dropped. See the `channels` map note
+    // in mqtt_ctx.h.
+    std::optional<BroadcastReceiver<MqttMessage>> rx;
+    auto it = ctx_ptr->channels.find(topic);
+    if (it != ctx_ptr->channels.end()) {
+        rx = it->second.subscribe();
+    } else {
+        auto chan = broadcast_channel<MqttMessage>(capacity);
+        rx = std::move(chan.second);
+        ctx_ptr->channels.emplace(topic, std::move(chan.first));
+    }
 
     auto [ack] = co_await lwip_wait(result);
     if (ack != ERR_OK)
         throw std::runtime_error("MqttClient::subscribe: broker refused subscription");
 
-    while (auto item = co_await coro::next(rx)) {
-        co_yield std::move(*item);
-    }
+    co_return std::move(*rx);
 }
 
 } // namespace coro

@@ -64,6 +64,20 @@
 // MQTT client — only when coro_pico_mqtt is being built (see
 // CORO_PICO_WITH_MQTT in cmake/platforms/pico.cmake).
 #cmakedefine01 LWIP_MQTT
+#if LWIP_MQTT
+// mqtt_publish() appends the whole packet (fixed header + topic + payload)
+// into this ring buffer in one call — it does not stream/chunk across
+// multiple calls — so it must be sized for the single largest publish an
+// application will ever issue, not just "a typical message." The default
+// (mqtt_opts.h) is 256 bytes, which is too small for anything beyond short
+// sensor readings: e.g. a Home Assistant MQTT discovery config payload
+// (topic + retained JSON device descriptor) commonly runs 300-500+ bytes,
+// and mqtt_publish() returns ERR_MEM synchronously (no ack callback, no
+// PollPending — just an immediate error) if it doesn't fit, which the
+// MqttClient wrapper turns into an exception thrown straight out of
+// publish(). 2048 gives generous headroom for discovery-sized JSON.
+#define MQTT_OUTPUT_RINGBUF_SIZE 2048
+#endif
 
 // Misc
 #define LWIP_NETIF_STATUS_CALLBACK  1

@@ -87,6 +87,63 @@ std::string build_puback(uint16_t pkt_id) {
     return p;
 }
 
+// Decodes just enough of a CONNECT packet's variable header + payload to verify
+// LWT registration: the connect-flags byte (bit 2 = will flag) and, if set, the
+// will topic/message. Assumes a 1-byte remaining-length field, true for every
+// CONNECT built by MqttClient::connect() in these tests.
+struct ParsedConnect {
+    uint8_t                    flags = 0;
+    std::optional<std::string> will_topic;
+    std::optional<std::string> will_message;
+    std::optional<std::string> username;
+    std::optional<std::string> password;
+};
+
+ParsedConnect parse_connect(const std::string& packet) {
+    ParsedConnect out;
+    std::size_t idx = 2;       // fixed header
+    idx += 2 + 4;               // protocol name length + "MQTT"
+    idx += 1;                   // protocol level
+    out.flags = static_cast<uint8_t>(packet[idx]);
+    idx += 1;
+    idx += 2;                   // keep alive
+
+    auto read_u16 = [&packet](std::size_t i) {
+        return static_cast<uint16_t>(static_cast<uint8_t>(packet[i]) << 8) |
+               static_cast<uint8_t>(packet[i + 1]);
+    };
+
+    uint16_t cid_len = read_u16(idx);
+    idx += 2 + cid_len;          // skip client id
+
+    if (out.flags & 0x04) {      // will flag
+        uint16_t wt_len = read_u16(idx);
+        idx += 2;
+        out.will_topic = packet.substr(idx, wt_len);
+        idx += wt_len;
+
+        uint16_t wm_len = read_u16(idx);
+        idx += 2;
+        out.will_message = packet.substr(idx, wm_len);
+        idx += wm_len;
+    }
+
+    if (out.flags & 0x80) {       // user name flag
+        uint16_t un_len = read_u16(idx);
+        idx += 2;
+        out.username = packet.substr(idx, un_len);
+        idx += un_len;
+    }
+
+    if (out.flags & 0x40) {       // password flag
+        uint16_t pw_len = read_u16(idx);
+        idx += 2;
+        out.password = packet.substr(idx, pw_len);
+        idx += pw_len;
+    }
+    return out;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -207,8 +264,8 @@ TEST_F(MqttLoopback, SubscribeAndReceive) {
 
         try {
             auto client = co_await coro::MqttClient::connect("127.0.0.1", 19892, "test-client");
-            auto stream = client.subscribe("test/topic");
-            auto msg = co_await coro::next(stream);
+            auto rx = co_await client.subscribe("test/topic");
+            auto msg = co_await rx.recv();
             EXPECT_TRUE(msg.has_value());
             if (msg.has_value()) {
                 received_topic = msg->topic;
@@ -252,9 +309,8 @@ TEST_F(MqttLoopback, SubscribeRefused) {
 
         try {
             auto client = co_await coro::MqttClient::connect("127.0.0.1", 19893, "test-client");
-            auto stream = client.subscribe("test/topic");
-            auto msg = co_await coro::next(stream);
-            (void)msg;
+            auto rx = co_await client.subscribe("test/topic");
+            (void)rx;
         } catch (...) {
             caught = std::current_exception();
         }
@@ -298,8 +354,8 @@ TEST_F(MqttLoopback, SubscribeIgnoresNonMatchingTopic) {
 
         try {
             auto client = co_await coro::MqttClient::connect("127.0.0.1", 19894, "test-client");
-            auto stream = client.subscribe("test/topic");
-            auto msg = co_await coro::next(stream);
+            auto rx = co_await client.subscribe("test/topic");
+            auto msg = co_await rx.recv();
             EXPECT_TRUE(msg.has_value());
             if (msg.has_value()) {
                 received_topic = msg->topic;
@@ -348,9 +404,9 @@ TEST_F(MqttLoopback, SubscribeDeliversMultipleMessages) {
 
         try {
             auto client = co_await coro::MqttClient::connect("127.0.0.1", 19895, "test-client");
-            auto stream = client.subscribe("test/topic");
+            auto rx = co_await client.subscribe("test/topic");
             for (int i = 0; i < 3; ++i) {
-                auto msg = co_await coro::next(stream);
+                auto msg = co_await rx.recv();
                 EXPECT_TRUE(msg.has_value());
                 if (msg.has_value()) {
                     received_payloads.emplace_back(
@@ -372,18 +428,16 @@ TEST_F(MqttLoopback, SubscribeDeliversMultipleMessages) {
     EXPECT_EQ(received_payloads[2], "third");
 }
 
-TEST_F(MqttLoopback, SubscribeDisplacesPreviousSubscription) {
+TEST_F(MqttLoopback, ConcurrentSubscriptionsToDistinctTopicsAreIndependent) {
     coro::Runtime rt;
     bool done = false;
     std::exception_ptr caught;
-    bool stream_a_closed_after_displacement = false;
     std::string received_topic_a;
     std::string received_payload_a;
     std::string received_topic_b;
     std::string received_payload_b;
 
     rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
-                bool& stream_a_closed_after_displacement,
                 std::string& received_topic_a, std::string& received_payload_a,
                 std::string& received_topic_b, std::string& received_payload_b) -> coro::Coro<void> {
         auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19896);
@@ -399,31 +453,28 @@ TEST_F(MqttLoopback, SubscribeDisplacesPreviousSubscription) {
             sub_pkt_a.resize(n2);
             uint16_t pkt_id_a = extract_subscribe_pkt_id(sub_pkt_a);
             co_await stream.write(build_suback(pkt_id_a, /*granted_qos=*/0));
-            co_await stream.write(build_publish_qos0("topicA", "first"));
 
             auto [n3, sub_pkt_b] = co_await stream.read(std::string(256, '\0')); // SUBSCRIBE topicB
             sub_pkt_b.resize(n3);
             uint16_t pkt_id_b = extract_subscribe_pkt_id(sub_pkt_b);
             co_await stream.write(build_suback(pkt_id_b, /*granted_qos=*/0));
+
+            // Both subscriptions are live by this point — interleave the two
+            // topics' messages to prove neither channel sees the other's traffic.
+            co_await stream.write(build_publish_qos0("topicA", "first"));
             co_await stream.write(build_publish_qos0("topicB", "second"));
         }(std::move(listener))).detach();
 
         try {
             auto client = co_await coro::MqttClient::connect("127.0.0.1", 19896, "test-client");
 
-            auto stream_a = client.subscribe("topicA");
-            auto msg_a1 = co_await coro::next(stream_a);
-            EXPECT_TRUE(msg_a1.has_value());
-            if (msg_a1.has_value()) {
-                received_topic_a = msg_a1->topic;
-                received_payload_a = std::string(
-                    reinterpret_cast<const char*>(msg_a1->payload.data()), msg_a1->payload.size());
-            }
+            // Both subscriptions must be established before the broker script above
+            // sends either message — otherwise an early PUBLISH for a topic without
+            // a channel entry yet would be silently dropped (see on_incoming_data()).
+            auto rx_a = co_await client.subscribe("topicA");
+            auto rx_b = co_await client.subscribe("topicB");
 
-            // Subscribing to topicB displaces topicA's channel — see the
-            // single-consumer note on MqttClient::subscribe().
-            auto stream_b = client.subscribe("topicB");
-            auto msg_b = co_await coro::next(stream_b);
+            auto msg_b = co_await rx_b.recv();
             EXPECT_TRUE(msg_b.has_value());
             if (msg_b.has_value()) {
                 received_topic_b = msg_b->topic;
@@ -431,26 +482,92 @@ TEST_F(MqttLoopback, SubscribeDisplacesPreviousSubscription) {
                     reinterpret_cast<const char*>(msg_b->payload.data()), msg_b->payload.size());
             }
 
-            // stream_a's channel sender was dropped when stream_b displaced
-            // it — the stream must end (nullopt), not hang.
-            auto msg_a2 = co_await coro::next(stream_a);
-            stream_a_closed_after_displacement = !msg_a2.has_value();
+            // topicA's message arrived first on the wire but is read second here —
+            // it must still be sitting in topicA's own channel, untouched by topicB's
+            // traffic, proving the two channels are isolated from each other.
+            auto msg_a = co_await rx_a.recv();
+            EXPECT_TRUE(msg_a.has_value());
+            if (msg_a.has_value()) {
+                received_topic_a = msg_a->topic;
+                received_payload_a = std::string(
+                    reinterpret_cast<const char*>(msg_a->payload.data()), msg_a->payload.size());
+            }
         } catch (...) {
             caught = std::current_exception();
         }
         done = true;
-    }(rt, done, caught, stream_a_closed_after_displacement,
+    }(rt, done, caught,
       received_topic_a, received_payload_a, received_topic_b, received_payload_b)).detach();
 
     poll_until(rt, done);
     EXPECT_TRUE(done) << "test timed out";
-    EXPECT_EQ(caught, nullptr) << "subscribe displacement path threw unexpectedly";
+    EXPECT_EQ(caught, nullptr) << "concurrent subscription path threw unexpectedly";
     EXPECT_EQ(received_topic_a, "topicA");
     EXPECT_EQ(received_payload_a, "first");
     EXPECT_EQ(received_topic_b, "topicB");
     EXPECT_EQ(received_payload_b, "second");
-    EXPECT_TRUE(stream_a_closed_after_displacement)
-        << "displaced subscription's stream should end, not hang";
+}
+
+TEST_F(MqttLoopback, SecondSubscribeToSameTopicGetsIndependentReceiverOnSameChannel) {
+    coro::Runtime rt;
+    bool done = false;
+    std::exception_ptr caught;
+    std::string payload1;
+    std::string payload2;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                std::string& payload1, std::string& payload2) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19899);
+
+        rt.spawn([](coro::TcpListener l) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+
+            auto [n1, conn_pkt] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            (void)n1;
+            co_await stream.write(build_connack());
+
+            // lwIP's mqtt_subscribe() re-sends SUBSCRIBE on the wire even for a topic
+            // already subscribed to — MqttCtx's channel map only affects local fan-out.
+            auto [n2, sub_pkt_1] = co_await stream.read(std::string(256, '\0'));
+            sub_pkt_1.resize(n2);
+            co_await stream.write(build_suback(extract_subscribe_pkt_id(sub_pkt_1), 0));
+
+            auto [n3, sub_pkt_2] = co_await stream.read(std::string(256, '\0'));
+            sub_pkt_2.resize(n3);
+            co_await stream.write(build_suback(extract_subscribe_pkt_id(sub_pkt_2), 0));
+
+            co_await stream.write(build_publish_qos0("shared/topic", "broadcast"));
+        }(std::move(listener))).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect("127.0.0.1", 19899, "test-client");
+            auto rx1 = co_await client.subscribe("shared/topic");
+            auto rx2 = co_await client.subscribe("shared/topic");
+
+            // Both receivers were created before the single PUBLISH above was sent,
+            // so both must independently observe it — that's the point of broadcast
+            // fan-out vs. a single-consumer channel.
+            auto msg1 = co_await rx1.recv();
+            auto msg2 = co_await rx2.recv();
+            EXPECT_TRUE(msg1.has_value());
+            EXPECT_TRUE(msg2.has_value());
+            if (msg1.has_value())
+                payload1 = std::string(
+                    reinterpret_cast<const char*>(msg1->payload.data()), msg1->payload.size());
+            if (msg2.has_value())
+                payload2 = std::string(
+                    reinterpret_cast<const char*>(msg2->payload.data()), msg2->payload.size());
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, payload1, payload2)).detach();
+
+    poll_until(rt, done);
+    EXPECT_TRUE(done) << "test timed out";
+    EXPECT_EQ(caught, nullptr) << "shared-topic subscription path threw unexpectedly";
+    EXPECT_EQ(payload1, "broadcast");
+    EXPECT_EQ(payload2, "broadcast");
 }
 
 TEST_F(MqttLoopback, PublishQos1WaitsForPuback) {
@@ -549,4 +666,154 @@ TEST_F(MqttLoopback, PublishThrowsAfterServerDisconnect) {
     ASSERT_TRUE(publish_done) << "test timed out waiting for publish";
     ASSERT_NE(caught, nullptr) << "publish() should throw once the broker connection has dropped";
     EXPECT_THROW(std::rethrow_exception(caught), std::runtime_error);
+}
+
+TEST_F(MqttLoopback, ConnectWithLastWillSetsWillFlagAndFields) {
+    coro::Runtime rt;
+    bool done = false;
+    std::exception_ptr caught;
+    ParsedConnect parsed;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                ParsedConnect& parsed) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19900);
+
+        rt.spawn([](coro::TcpListener l, ParsedConnect& parsed) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n, buf] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            buf.resize(n);
+            parsed = parse_connect(buf);
+            co_await stream.write(build_connack());
+        }(std::move(listener), parsed)).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect(
+                "127.0.0.1", 19900, "test-client",
+                "kitchen/led/status", "offline", /*will_qos=*/1, /*will_retain=*/false);
+            (void)client;
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, parsed)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(caught, nullptr) << "MqttClient::connect with LWT threw unexpectedly";
+    EXPECT_TRUE(parsed.flags & 0x04) << "will flag should be set in CONNECT flags byte";
+    ASSERT_TRUE(parsed.will_topic.has_value());
+    ASSERT_TRUE(parsed.will_message.has_value());
+    EXPECT_EQ(*parsed.will_topic, "kitchen/led/status");
+    EXPECT_EQ(*parsed.will_message, "offline");
+}
+
+TEST_F(MqttLoopback, ConnectWithoutLastWillLeavesWillFlagClear) {
+    coro::Runtime rt;
+    bool done = false;
+    std::exception_ptr caught;
+    ParsedConnect parsed;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                ParsedConnect& parsed) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19901);
+
+        rt.spawn([](coro::TcpListener l, ParsedConnect& parsed) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n, buf] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            buf.resize(n);
+            parsed = parse_connect(buf);
+            co_await stream.write(build_connack());
+        }(std::move(listener), parsed)).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect("127.0.0.1", 19901, "test-client");
+            (void)client;
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, parsed)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(caught, nullptr) << "MqttClient::connect threw unexpectedly";
+    EXPECT_FALSE(parsed.flags & 0x04) << "will flag should be clear when no LWT is given";
+    EXPECT_FALSE(parsed.will_topic.has_value());
+}
+
+TEST_F(MqttLoopback, ConnectWithCredentialsSetsUsernameAndPasswordFields) {
+    coro::Runtime rt;
+    bool done = false;
+    std::exception_ptr caught;
+    ParsedConnect parsed;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                ParsedConnect& parsed) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19902);
+
+        rt.spawn([](coro::TcpListener l, ParsedConnect& parsed) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n, buf] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            buf.resize(n);
+            parsed = parse_connect(buf);
+            co_await stream.write(build_connack());
+        }(std::move(listener), parsed)).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect(
+                "127.0.0.1", 19902, "test-client",
+                /*will_topic=*/{}, /*will_payload=*/{}, /*will_qos=*/0, /*will_retain=*/false,
+                "bruno", "NoCloudSky");
+            (void)client;
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, parsed)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(caught, nullptr) << "MqttClient::connect with credentials threw unexpectedly";
+    EXPECT_TRUE(parsed.flags & 0x80) << "user name flag should be set when username is given";
+    EXPECT_TRUE(parsed.flags & 0x40) << "password flag should be set when password is given";
+    ASSERT_TRUE(parsed.username.has_value());
+    ASSERT_TRUE(parsed.password.has_value());
+    EXPECT_EQ(*parsed.username, "bruno");
+    EXPECT_EQ(*parsed.password, "NoCloudSky");
+}
+
+TEST_F(MqttLoopback, ConnectWithoutCredentialsLeavesUsernameFlagsClear) {
+    coro::Runtime rt;
+    bool done = false;
+    std::exception_ptr caught;
+    ParsedConnect parsed;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                ParsedConnect& parsed) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19903);
+
+        rt.spawn([](coro::TcpListener l, ParsedConnect& parsed) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n, buf] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            buf.resize(n);
+            parsed = parse_connect(buf);
+            co_await stream.write(build_connack());
+        }(std::move(listener), parsed)).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect("127.0.0.1", 19903, "test-client");
+            (void)client;
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, parsed)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(caught, nullptr) << "MqttClient::connect threw unexpectedly";
+    EXPECT_FALSE(parsed.flags & 0x80) << "user name flag should be clear when no username is given";
+    EXPECT_FALSE(parsed.flags & 0x40) << "password flag should be clear when no password is given";
+    EXPECT_FALSE(parsed.username.has_value());
+    EXPECT_FALSE(parsed.password.has_value());
 }

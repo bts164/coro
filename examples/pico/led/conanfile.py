@@ -1,5 +1,8 @@
+import os
+
 from conan import ConanFile
 from conan.tools.cmake import cmake_layout, CMake, CMakeDeps, CMakeToolchain
+from conan.tools.files import copy
 
 
 class PicoLedRecipe(ConanFile):
@@ -23,12 +26,16 @@ class PicoLedRecipe(ConanFile):
     what makes the package relocatable: it no longer reaches outside its
     own exported sources into the live monorepo checkout.
 
-    Scope: color.h/.cpp, led_driver.h/.cpp, pixel_buffer.h, ws2812.pio only
-    — not effects.h/.cpp or effect_runner.h/.cpp (those depend on
-    ws2812_proto/nanopb, unneeded by KitchenLED). The existing
+    Scope: color.h/.cpp, led_driver.h/.cpp, pixel_buffer.h, ws2812.pio, plus
+    effects.h/.cpp + effect_runner.h/.cpp and the ws2812.proto/.options they
+    depend on (KitchenLED's Plasma animation calls led::plasma_effect()
+    directly — see kitchen_led.md). Pulling those in means conan_build's
+    build() step needs the same nanopb codegen as examples/pico/CMakeLists.txt
+    (FetchContent of the nanopb runtime + an `nanopb_generator` on PATH —
+    `pip install -r examples/pico/requirements.txt`). The existing
     examples/pico/led/CMakeLists.txt (coro_pico_led, used by
-    pico_ws2812_tcp) is untouched; this recipe builds its own narrower
-    target via conan_build/CMakeLists.txt.
+    pico_ws2812_tcp) is untouched; this recipe builds its own target via
+    conan_build/CMakeLists.txt.
     """
 
     name = "pico_led"
@@ -37,13 +44,28 @@ class PicoLedRecipe(ConanFile):
 
     settings = "os", "compiler", "build_type", "arch"
 
-    exports_sources = (
-        "color.h", "color.cpp",
-        "led_driver.h", "led_driver.cpp",
-        "pixel_buffer.h",
-        "ws2812.pio",
-        "conan_build/CMakeLists.txt",
-    )
+    def export_sources(self):
+        # exports_sources (a plain attribute) can only reach files at or
+        # below the recipe folder. ws2812.proto/.options live one level up,
+        # in examples/pico/proto/ (shared with the non-Conan
+        # examples/pico/CMakeLists.txt build) — export_sources() is the
+        # documented escape hatch for grabbing files outside the recipe
+        # folder while keeping the package relocatable (no live-checkout
+        # path baked into conan_build/CMakeLists.txt).
+        for pattern in (
+            "color.h", "color.cpp",
+            "led_driver.h", "led_driver.cpp",
+            "pixel_buffer.h",
+            "ws2812.pio",
+            "effects.h", "effects.cpp",
+            "effect_runner.h", "effect_runner.cpp",
+            "conan_build/CMakeLists.txt",
+        ):
+            copy(self, pattern, self.recipe_folder, self.export_sources_folder)
+        # Lands at <export_sources_folder>/proto, i.e. led/proto — see
+        # conan_build/CMakeLists.txt's PROTO_SRC_DIR.
+        copy(self, "*", os.path.join(self.recipe_folder, os.pardir, "proto"),
+             os.path.join(self.export_sources_folder, "proto"))
 
     def requirements(self):
         self.requires("coro/0.1.0",
@@ -64,6 +86,14 @@ class PicoLedRecipe(ConanFile):
         # the parent of source_folder, not source_folder itself.
         self.cpp.source.includedirs = [".."]
         self.cpp.build.libdirs = ["."]
+        # ws2812.pb.h (nanopb-generated, included bare as "ws2812.pb.h" by
+        # effects.h) and nanopb's own runtime header (pb.h) are generated/
+        # fetched into the build folder, not source — see
+        # conan_build/CMakeLists.txt's PROTO_OUT_DIR / NANOPB_DIR, both
+        # relative to CMAKE_CURRENT_BINARY_DIR (== self.build_folder here).
+        # Only exercised in editable mode; package_info() takes over for a
+        # real `conan create`.
+        self.cpp.build.includedirs = ["proto", "_deps/nanopb-src"]
 
     def generate(self):
         # Deliberately NOT calling tc.blocks.enabled(...) here: which blocks
