@@ -14,6 +14,7 @@
 #include <uv.h>
 #include <cstddef>
 #include <exception>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>

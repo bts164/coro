@@ -372,23 +372,32 @@ private:
     //
     // Sets each node's task pointer to nullptr under the mutex — the sentinel that
     // tells on_task_complete() the JoinSet is gone and to discard the result.
-    // The executor's owned map keeps every task alive through completion.
+    //
+    // A node being present in pending_handles guarantees the task hasn't completed
+    // yet ONLY while m_state->mutex is held — on_task_complete() runs concurrently
+    // on another worker and races to remove the same node under the same lock. Once
+    // the lock is released, that guarantee is gone: the task can finish, get erased
+    // from the executor's owned map, and be destroyed before the loop below gets to
+    // call cancel_task() on it. shared_from_this() must therefore be captured while
+    // still holding the lock, turning each entry into a strong ref that keeps the
+    // task alive for the rest of this function — a raw TaskBase* here previously
+    // raced with concurrent destruction (caught by TSan as a vptr data race).
     void cancel_pending() {
         if (!m_state) return;
-        std::vector<detail::TaskBase*> to_cancel;
+        std::vector<detail::Rc<detail::TaskBase>> to_cancel;
         {
             std::lock_guard lock(m_state->mutex);
             to_cancel.reserve(m_state->pending_handles.size());
             while (auto h = m_state->pending_handles.pop_front()) {
-                to_cancel.push_back(h->task);
+                if (h->task) to_cancel.push_back(h->task->shared_from_this());
                 h->task = nullptr;  // sentinel: on_task_complete() discards result
             }
         }
-        for (auto* task : to_cancel)
-            if (task) task->cancel_task();
+        for (auto& task : to_cancel)
+            task->cancel_task();
         if (detail::t_current_coro)
-            for (auto* task : to_cancel)
-                if (task) detail::t_current_coro->add_child(task->weak_from_this());
+            for (auto& task : to_cancel)
+                detail::t_current_coro->add_child(task->weak_from_this());
     }
 
     detail::Rc<detail::JoinSetSharedState<T>> m_state;

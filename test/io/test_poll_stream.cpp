@@ -335,12 +335,19 @@ TEST(PollStreamTest, ReadError_IOFailure) {
     ::close(conn_fd);
 
     std::exception_ptr caught;
-    Runtime rt(1);
-    rt.block_on([](int fd, std::exception_ptr& out) -> Coro<void> {
-        auto stream = PollStream<MockMessage>::open(fd, fixed_decoder);
-        try { co_await next(stream); }
-        catch (...) { out = std::current_exception(); }
-    }(client_fd, caught));
+    {
+        // Runtime must be destroyed (joining the uv thread, which finishes
+        // PollStream::close()'s detached close_impl task) before client_fd is
+        // closed directly below — otherwise the uv thread's epoll_ctl teardown
+        // races with the close() on the main thread (caught by TSan as a real
+        // fd-lifetime race, not a false positive).
+        Runtime rt(1);
+        rt.block_on([](int fd, std::exception_ptr& out) -> Coro<void> {
+            auto stream = PollStream<MockMessage>::open(fd, fixed_decoder);
+            try { co_await next(stream); }
+            catch (...) { out = std::current_exception(); }
+        }(client_fd, caught));
+    }
 
     ::close(client_fd);
     ASSERT_NE(caught, nullptr);

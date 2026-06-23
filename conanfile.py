@@ -34,9 +34,9 @@ class CoroRecipe(ConanFile):
         "with_mqtt": False,
     }
     exports_sources = (
-        "include/**/*.h", "include/**/*.hpp",
-        "src/**/*.cpp", "src/**/*.h", "src/**/*.in",
-        "CMakeLists.txt", "cmake/**/*.cmake",
+        "include/**.h", "include/**.hpp",
+        "src/**.cpp", "src/**.h", "src/**.in",
+        "CMakeLists.txt", "cmake/**.cmake",
     )
 
     # Lets CORO_<OPTION> in the environment (e.g. via .envrc) set a boolean

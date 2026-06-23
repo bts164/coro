@@ -1,4 +1,3 @@
-#include "effects.h"
 #include <chrono>
 #include <cmath>
 #include <numbers>
@@ -6,6 +5,8 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
+
+#include "pico_led/effects.h"
 
 namespace led {
 

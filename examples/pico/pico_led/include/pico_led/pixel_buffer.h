@@ -1,8 +1,9 @@
 #pragma once
-#include "color.h"
+
 #include <vector>
 #include <cstdint>
 
+#include "pico_led/color.h"
 namespace led {
 
 // A frame of pixels stored as packed GRB words ready for DMA transfer.

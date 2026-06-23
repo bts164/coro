@@ -305,9 +305,15 @@ TYPED_TEST(BroadcastTest, MultipleReceiversWokenOnSend) {
             tx.send(1);
             co_return;
         }(std::move(tx)));
-        if ((co_await rx1.recv()).has_value()) ++count;
-        if ((co_await rx2.recv()).has_value()) ++count;
-        if ((co_await rx3.recv()).has_value()) ++count;
+        // GCC fails to deduce the awaited type when .has_value() is chained
+        // directly onto a parenthesized co_await expression — bind to a
+        // local first (see test_watch.cpp for the same workaround).
+        auto r1 = co_await rx1.recv();
+        if (r1.has_value()) ++count;
+        auto r2 = co_await rx2.recv();
+        if (r2.has_value()) ++count;
+        auto r3 = co_await rx3.recv();
+        if (r3.has_value()) ++count;
         co_await producer;
     }(count));
     EXPECT_EQ(count, 3);

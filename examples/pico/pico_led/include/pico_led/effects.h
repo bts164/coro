@@ -1,9 +1,10 @@
 #pragma once
-#include "pixel_buffer.h"
-#include "led_driver.h"
 #include <coro/coro_stream.h>
 #include <memory>
-#include "ws2812.pb.h"
+
+#include "pico_led/pixel_buffer.h"
+#include "pico_led/led_driver.h"
+#include "pico_led/ws2812.pb.h"
 
 namespace led {
 

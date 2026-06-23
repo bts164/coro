@@ -118,6 +118,13 @@ foreach(t src IN ZIP_LISTS TEST_NAMES TEST_SRCS)
     target_link_libraries(${t} PRIVATE coro::coro GTest::gtest GTest::gtest_main GTest::gmock)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
+# test_skynet's coroutine-count is large enough that under TSan's
+# per-thread/per-allocation shadow memory overhead it exhausts memory
+# and locks up the host — still built (so it doesn't bitrot), just
+# excluded from the run.
+if(WITH_SANITIZE STREQUAL "tsan")
+    set_tests_properties(test_skynet PROPERTIES DISABLED TRUE)
+endif()
 
 target_link_libraries(test_pcie_decoder PRIVATE pcie_decoder)
 target_link_libraries(test_pcie_stream_integration PRIVATE pcie_decoder)

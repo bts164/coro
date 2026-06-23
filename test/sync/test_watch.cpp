@@ -207,9 +207,15 @@ TYPED_TEST(WatchTest, MultipleReceiversWokenOnSend) {
         auto rx2 = rx1.clone();
         auto rx3 = rx1.clone();
         tx.send(1);
-        if ((co_await rx1.changed()).has_value()) ++count;
-        if ((co_await rx2.changed()).has_value()) ++count;
-        if ((co_await rx3.changed()).has_value()) ++count;
+        // GCC fails to deduce the awaited type when .has_value() is chained
+        // directly onto a parenthesized co_await expression — bind to a
+        // local first, same as the other tests in this file.
+        auto r1 = co_await rx1.changed();
+        if (r1.has_value()) ++count;
+        auto r2 = co_await rx2.changed();
+        if (r2.has_value()) ++count;
+        auto r3 = co_await rx3.changed();
+        if (r3.has_value()) ++count;
     }(count));
     EXPECT_EQ(count, 3);
 }
@@ -324,9 +330,15 @@ TYPED_TEST(WatchTest, BorrowMutNotifiesMultipleReceivers) {
         auto rx2 = rx1.clone();
         auto rx3 = rx1.clone();
         { auto guard = tx.borrow_mut(); *guard = 42; }
-        if ((co_await rx1.changed()).has_value()) ++count;
-        if ((co_await rx2.changed()).has_value()) ++count;
-        if ((co_await rx3.changed()).has_value()) ++count;
+        // GCC fails to deduce the awaited type when .has_value() is chained
+        // directly onto a parenthesized co_await expression — bind to a
+        // local first, same as the other tests in this file.
+        auto r1 = co_await rx1.changed();
+        if (r1.has_value()) ++count;
+        auto r2 = co_await rx2.changed();
+        if (r2.has_value()) ++count;
+        auto r3 = co_await rx3.changed();
+        if (r3.has_value()) ++count;
     }(count));
     EXPECT_EQ(count, 3);
 }

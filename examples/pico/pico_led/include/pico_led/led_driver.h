@@ -1,11 +1,13 @@
 #pragma once
-#include "pixel_buffer.h"
-#include <coro/coro.h>
-#include <coro/pico/hal/dma.h>
-#include <hardware/pio.h>
 #include <memory>
 #include <cstddef>
 #include <vector>
+
+#include <coro/coro.h>
+#include <coro/pico/hal/dma.h>
+#include <hardware/pio.h>
+
+#include "pico_led/pixel_buffer.h"
 
 namespace led {
 
