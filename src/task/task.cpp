@@ -54,4 +54,20 @@ Rc<Waker> TaskBase::clone() {
     return shared_from_this();
 }
 
+// static member definitions
+std::function<void(const TaskBase&)> TaskBase::on_resume_hook;
+std::function<void(const TaskBase&)> TaskBase::on_suspend_hook;
+
 } // namespace coro::detail
+
+namespace coro {
+
+void set_task_lifecycle_hooks(
+    std::function<void(const Task&)> on_resume,
+    std::function<void(const Task&)> on_suspend)
+{
+    detail::TaskBase::on_resume_hook = std::move(on_resume);
+    detail::TaskBase::on_suspend_hook = std::move(on_suspend);
+}
+
+} //namespace coro

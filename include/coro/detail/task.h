@@ -13,6 +13,8 @@
 #include <coro/detail/rc.h>
 #include <coro/detail/relaxed_state.h>
 #include <atomic>
+#include <functional>
+
 #include <memory>
 #include <optional>
 #include <string>
@@ -172,6 +174,38 @@ public:
     static std::string_view current_name() {
         return current ? std::string_view(current->name) : std::string_view{};
     }
+
+    /**
+     * @brief Global lifecycle hooks invoked on every task resume and suspend,
+     * set via coro::set_task_lifecycle_hooks(). Null by default.
+     *
+     * RACE: these are read on every poll() call, potentially from many executor
+     * threads concurrently (WorkStealingExecutor/WorkSharingExecutor), but
+     * set_task_lifecycle_hooks() assigns to them with no synchronization.
+     * Concurrent assignment racing with a poll()-thread read is a data race.
+     * Callers must install hooks before spawning any tasks / starting the
+     * runtime — there is no safe way to swap hooks while tasks are running.
+     */
+    static std::function<void(const TaskBase&)> on_resume_hook;
+    static std::function<void(const TaskBase&)> on_suspend_hook;
+
+    /**
+     * @brief RAII guard pairing one on_resume_hook/on_suspend_hook call per
+     * poll(): on_resume_hook fires on construction, on_suspend_hook fires on
+     * destruction — exactly once per poll() call, whether poll() returns
+     * because the future is still Pending or because the task just reached
+     * a terminal state. Construct at the top of poll(), after the early
+     * `if (m_completed) return true;` check.
+     */
+    struct LifecycleHookScope {
+        const TaskBase& task;
+        explicit LifecycleHookScope(const TaskBase& t) : task(t) {
+            if (TaskBase::on_resume_hook) TaskBase::on_resume_hook(task);
+        }
+        ~LifecycleHookScope() {
+            if (TaskBase::on_suspend_hook) TaskBase::on_suspend_hook(task);
+        }
+    };
 };
 
 /**
@@ -223,6 +257,8 @@ public:
 
     bool poll(Context& ctx) override {
         if (m_completed) return true;
+
+        LifecycleHookScope hooks{*this};
 
         const bool cancelled = this->cancelled.load(std::memory_order_relaxed);
 
@@ -317,6 +353,8 @@ public:
 
     bool poll(Context& ctx) override {
         if (m_completed) return true;
+
+        LifecycleHookScope hooks{*this};
 
         if (m_cancelled.load(std::memory_order_relaxed)) {
             // Consumer dropped the StreamHandle — close the queue and terminate.
@@ -418,3 +456,24 @@ private:
 };
 
 } // namespace coro::detail
+
+namespace coro {
+
+/// @brief User-facing alias for the type-erased task handed to lifecycle hooks.
+/// `Task` only exposes what `TaskBase` exposes (name, etc.) — it is not constructible
+/// or pollable from user code; only `coro::spawn()` creates the concrete task types.
+using Task = detail::TaskBase;
+
+/**
+ * @brief Installs global task lifecycle hooks, invoked on every task resume and
+ * suspend (see detail::TaskBase::on_resume_hook / on_suspend_hook).
+ *
+ * Must be called before any task is spawned / before the runtime starts —
+ * there is no synchronization between this call and concurrent poll() reads
+ * on executor threads, so swapping hooks while tasks are running is a race.
+ */
+void set_task_lifecycle_hooks(
+    std::function<void(const Task&)> on_resume,
+    std::function<void(const Task&)> on_suspend);
+
+} // namespace coro
