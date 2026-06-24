@@ -1,7 +1,5 @@
 #pragma once
 
-#ifdef CORO_PICO
-
 #include <coro/coro.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/context.h>
@@ -197,5 +195,3 @@ private:
 };
 
 } // namespace coro
-
-#endif // CORO_PICO

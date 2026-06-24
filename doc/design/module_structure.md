@@ -37,6 +37,7 @@ include/coro/
 │   └── spawn_builder.h     SpawnBuilder + StreamSpawnBuilder
 │
 ├── sync/               tokio::sync — synchronization primitives and channels
+│   ├── broadcast.h         broadcast_channel — multi-producer, multi-consumer, lag-detecting
 │   ├── cancellation_token.h
 │   ├── channel_error.h     SendError / RecvError shared by all channel types
 │   ├── event.h             Event — one-shot signal (any-thread set, coroutine wait)
@@ -49,10 +50,11 @@ include/coro/
 │   ├── timeout.h           timeout() — race any future against a deadline
 │   └── watch.h             watch_channel — single latest-value, multi-consumer
 │
-├── io/                 Async I/O — network streams and WebSocket
+├── io/                 Async I/O — network streams, WebSocket, OS signals
 │   ├── tcp_stream.h        TcpStream — async TCP connection
 │   ├── ws_stream.h         WsStream — async WebSocket client connection
-│   └── ws_listener.h       WsListener — async WebSocket server acceptor
+│   ├── ws_listener.h       WsListener — async WebSocket server acceptor
+│   └── signal.h            signal() / signal_stream() — async OS signal delivery (uv_signal_t)
 │
 └── detail/             Internal plumbing — not intended for direct user inclusion
     ├── poll_result.h       stable API for custom Future/Stream implementors
@@ -88,6 +90,7 @@ src/
 │   ├── ws_listener.cpp
 │   ├── file.cpp
 │   ├── pipe.cpp
+│   ├── signal.cpp
 │   ├── circular_byte_buffer.cpp
 │   └── lwip/                    Pico lwIP TCP backend (CORO_PICO)
 │       ├── tcp_stream_lwip.cpp
@@ -130,7 +133,7 @@ configure and submit tasks. This includes:
 
 Types that coordinate between concurrently running tasks. This includes:
 - `Event` — one-shot signal; `set()` from any thread, `co_await wait()` in a coroutine
-- **Channels**: `oneshot` (single-value), `mpsc` (bounded multi-producer), `watch` (latest-value multi-consumer)
+- **Channels**: `oneshot` (single-value), `mpsc` (bounded multi-producer), `watch` (latest-value multi-consumer), `broadcast` (multi-producer multi-consumer, lag-detecting)
 - **Combinators**: `join()`, `select()`, `timeout()`, `sleep_for()`
 - `CancellationToken` — cooperative cancellation signal passed via `Context`
 - `IsrEvent` / `IsrChannel<T>` — ISR-to-coroutine primitives; MCU platforms only (`CORO_PICO`)
@@ -143,6 +146,8 @@ Types that provide async access to network resources. I/O types are built on top
 - `TcpStream` — async TCP connection
 - `WsStream` — async WebSocket client connection
 - `WsListener` — async WebSocket server acceptor
+- `signal()` / `signal_stream()` — async OS signal delivery via libuv's `uv_signal_t`;
+  see `doc/design/signal_handling.md`
 
 ### `detail/` — internal plumbing and low-level extension points
 

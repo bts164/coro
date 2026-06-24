@@ -98,6 +98,7 @@ nav:
       - TCP & WebSocket: design/websocket_stream.md
       - Poll Streams: design/poll_streams.md
       - Pipelined I/O: design/pipe_streaming.md
+      - Signal Handling: design/signal_handling.md
     - Synchronization & Combinators:
       - Channels: design/channels.md
       - JoinSet: design/join_set.md

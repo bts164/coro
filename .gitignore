@@ -11,7 +11,8 @@ build
 **/cmake_install.cmake
 **/Makefile
 doc/cheatsheet.pdf
-examples/pico/wifi_credentials.h
+examples/pico/tcp_echo/wifi_credentials.h
+examples/pico/ws2812_tcp/wifi_credentials.h
 examples/pico/profiles/rp2040-arm-none-eabi.profile
 **/*_pb2.py
 **/__pycache__

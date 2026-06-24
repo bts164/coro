@@ -56,6 +56,7 @@ set(TEST_NAMES
     # test_pipe  # disabled — see io/test_pipe.cpp
     test_circular_byte_buffer
     test_poll_stream
+    test_signal
     # stress/
     test_skynet
     # misc/
@@ -105,6 +106,7 @@ set(TEST_SRCS
     # io/test_pipe.cpp  # disabled
     io/test_circular_byte_buffer.cpp
     io/test_poll_stream.cpp
+    io/test_signal.cpp
     # stress/
     stress/test_skynet.cpp
     # misc/

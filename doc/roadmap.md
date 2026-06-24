@@ -133,39 +133,6 @@ sender/receiver capability and own writes automatically advance `last_seen`.
 The peer channel and cloneable sender interact — cloneable sender may be sufficient
 for the peer use case, or the two may need to be addressed together. Resolve together.
 
-## Channel — `broadcast`
-
-`mpsc`, `oneshot`, and `watch` are implemented in `include/coro/sync/`. The remaining
-variant is `broadcast`:
-
-A channel where every active receiver sees every message. Unlike `watch`, no values are
-dropped as long as the slowest receiver keeps up; a receiver that falls too far behind
-receives a lag error indicating missed messages.
-
-```cpp
-auto [tx, rx] = coro::broadcast::channel<int>(/*capacity=*/64);
-
-// Clone rx to give each subscriber an independent cursor:
-auto rx2 = rx.clone();
-
-// Producer:
-co_await tx.send(1);
-co_await tx.send(2);
-
-// Each receiver sees all messages sent after its creation:
-while (auto item = co_await coro::next(rx))
-    use(*item);
-```
-
-- `BroadcastSender<T>` — `send(T)` returns `Future<void>`; suspends if all receiver
-  buffers are full (slowest receiver applies backpressure).
-- `BroadcastReceiver<T>` — satisfies `Stream<T>`; yields messages in send order.
-  If a receiver falls behind by more than `capacity` messages it receives a lag error
-  on the next `next()` call. Cloneable.
-- Use case: event buses, log fanout, pub/sub within a single runtime.
-
-Lives in `include/coro/sync/channel.h`.
-
 ## Async `Mutex<T>`
 
 `std::mutex` blocks the OS thread, starving the executor. `Mutex<T>` suspends the *task*
@@ -346,38 +313,6 @@ optional token via something like `build_task().with_cancel(token).spawn(...)`.
 
 Modelled on Tokio's `CancellationToken` (`tokio-util` crate). Lives in
 `include/coro/sync/cancellation_token.h`.
-
-## Signal handling
-
-libuv provides `uv_signal_t` for cross-platform OS signal delivery (SIGINT, SIGTERM,
-SIGHUP, etc.; mapped to `SetConsoleCtrlHandler` on Windows). The integration follows
-the same pattern as existing libuv I/O handles — wrap the handle, store a waker in the
-callback, wake the task when the signal fires.
-
-Two variants are needed, mirroring Tokio's `ctrl_c()` / `signal(SignalKind)` split:
-
-- **One-shot future** — `coro::signal(SIGINT)` resolves once and is done. Suitable for
-  shutdown triggers where you only need to know the signal arrived, not count repeats.
-- **Stream** — `coro::signal_stream(SIGHUP)` yields on every delivery. Suitable for
-  reload-on-SIGHUP and similar repeat-signal use cases.
-
-```cpp
-// Shutdown on SIGINT or SIGTERM, whichever arrives first:
-co_await coro::select(coro::signal(SIGINT), coro::signal(SIGTERM));
-begin_shutdown();
-
-// Combined OS signal + internal shutdown channel:
-co_await coro::select(coro::signal(SIGINT), shutdown_rx.changed());
-```
-
-**Effort:** low. The libuv plumbing is already established; this is a new handle type
-following the existing I/O handle pattern. Estimated one day of implementation plus
-tests.
-
-**Follow-up:** once implemented, add a "Shutdown on OS signal" pattern to
-`doc/patterns.md` covering the combined-conditions form (`select` over a signal future
-and an internal watch channel), which is the idiomatic way to support both operator
-interrupts and programmatic shutdown from the same code path.
 
 ## libuv I/O primitives
 

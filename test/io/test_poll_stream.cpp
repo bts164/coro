@@ -10,11 +10,13 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -78,7 +80,13 @@ struct PipePair {
         if (write_fd >= 0) ::close(write_fd);
     }
 
-    void write_message(const MockMessage& msg) { ::write(write_fd, &msg, sizeof(msg)); }
+    void write_message(const MockMessage& msg) {
+        // MockMessage is well under PIPE_BUF, so POSIX guarantees this write is atomic
+        // (no short write) as long as it doesn't fail outright.
+        ssize_t n = ::write(write_fd, &msg, sizeof(msg));
+        if (n != static_cast<ssize_t>(sizeof(msg)))
+            throw std::system_error(errno, std::generic_category(), "write_message: write() failed");
+    }
 
     void close_write_end() {
         if (write_fd >= 0) { ::close(write_fd); write_fd = -1; }
@@ -361,7 +369,9 @@ TEST(PollStreamTest, ReadError_IOFailure) {
 TEST(PollStreamTest, MessageSpansMultipleReads) {
     PipePair pipe;
     MockMessage msg{42, 99};
-    ::write(pipe.write_fd, &msg, sizeof(msg) / 2);
+    ssize_t n1 = ::write(pipe.write_fd, &msg, sizeof(msg) / 2);
+    if (n1 != static_cast<ssize_t>(sizeof(msg) / 2))
+        throw std::system_error(errno, std::generic_category(), "write() failed");
 
     std::optional<MockMessage> received;
     Runtime rt(1);
@@ -371,7 +381,9 @@ TEST(PollStreamTest, MessageSpansMultipleReads) {
         auto writer = spawn_blocking([&pipe, &msg] {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             const auto* ptr = reinterpret_cast<const char*>(&msg);
-            ::write(pipe.write_fd, ptr + sizeof(msg) / 2, sizeof(msg) - sizeof(msg) / 2);
+            ssize_t n2 = ::write(pipe.write_fd, ptr + sizeof(msg) / 2, sizeof(msg) - sizeof(msg) / 2);
+            if (n2 != static_cast<ssize_t>(sizeof(msg) - sizeof(msg) / 2))
+                throw std::system_error(errno, std::generic_category(), "write() failed");
         });
 
         out = co_await next(stream);

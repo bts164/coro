@@ -43,6 +43,9 @@ Dependencies are managed with Conan.
 - **`TcpStream`** — async connect, read, write
 - **`WsStream` / `WsListener`** — async WebSocket client and server via libwebsockets
   sharing the libuv event loop; full and partial frame modes, TLS, subprotocol negotiation
+- **`coro::signal()` / `coro::signal_stream()`** — async OS signal delivery via libuv's
+  `uv_signal_t`; one-shot `Future<void>` and a coalesced `Stream<SignalEvent>` variant;
+  see [Signal Handling](signal_handling.md)
 
 ### Task Primitives
 - **`spawn()` / `SpawnBuilder`** — schedule a `Coro<T>` on the runtime; returns a
@@ -72,6 +75,10 @@ Dependencies are managed with Conan.
   intrusive waiter nodes; zero-copy direct-handoff paths; `blocking_recv()` for OS threads
 - **`watch`** — latest-value; synchronous overwrite; `changed()` + `borrow()` (returns
   `WatchBorrowGuard<T>` holding a shared read lock); cloneable sender and receiver
+- **`broadcast`** — fixed-capacity ring buffer; every receiver sees every value sent
+  while subscribed; synchronous, non-suspending `send()`; a receiver whose cursor falls
+  behind the oldest buffered value is reported `Lagged` rather than served stale data;
+  cloneable sender, `resubscribe()`-able receiver
 
 All channels use `std::expected<T, ChannelError>` for fallible operations; `try_send`
 returns `std::expected<void, TrySendError<T>>` so the caller recovers unsent values on
@@ -627,6 +634,29 @@ while suspended, blocking all future `send()` calls.
 Each receiver stores its own `last_seen` version number. `changed()` suspends if
 `last_seen == current_version`; returns immediately if a newer value has been sent.
 
+### `broadcast`
+
+Multiple producers, multiple consumers, every receiver sees every value sent while it is
+subscribed (unlike `watch`, which only exposes the latest value).
+
+`BroadcastShared<T>` holds a fixed-capacity ring buffer (`std::vector<std::optional<T>>`,
+allocated once at construction) plus a monotonic `next_seq` counter. Each receiver tracks
+its own cursor — a sequence number — independent of every other receiver's read progress.
+`send()` writes to `ring[next_seq % capacity]`, overwriting the oldest slot on wraparound,
+and wakes every currently-suspended receiver; it never blocks or fails except when there
+are currently zero receivers (`std::unexpected(value)`, handing the value back).
+
+A receiver whose cursor has fallen below `next_seq - capacity` (the oldest sequence number
+still held in the ring) has lagged: the value(s) it hadn't read were overwritten by faster
+producers. Rather than silently skip or serve wrong data, `recv()`/`try_recv()` report
+`BroadcastRecvError::Lagged{skipped}` and snap the cursor forward to the oldest remaining
+value — the same pattern Tokio's `broadcast::Receiver` uses.
+
+Both `BroadcastSender<T>` and `BroadcastReceiver<T>` are reference-counted via the shared
+`Rc<BroadcastShared<T>>`: the channel closes from the sender side only when the last sender
+clone (`BroadcastSender::clone()`) is dropped; receivers are independent and one dropping
+has no effect on the others or on senders (`subscribe()`/`resubscribe()` to add more).
+
 ---
 
 ## Combinators
@@ -795,6 +825,7 @@ include/coro/
     oneshot.h               oneshot_channel<T>
     mpsc.h                  mpsc_channel<T>
     watch.h                 watch_channel<T>
+    broadcast.h             broadcast_channel<T>
     isr_event.h             IsrEvent, IsrChannel<T> — ISR-to-coroutine (CORO_PICO only)
     mutex.h                 Mutex, MutexGuard
     join.h                  join() combinator
@@ -806,6 +837,7 @@ include/coro/
     tcp_listener.h          TcpListener
     ws_stream.h             WsStream
     ws_listener.h           WsListener
+    signal.h                signal(), signal_stream(), SignalEvent
 
   detail/
     poll_result.h           PollResult<T>

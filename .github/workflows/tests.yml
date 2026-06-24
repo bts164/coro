@@ -1,0 +1,82 @@
+name: Sanitizer builds
+
+# Mirrors docker/run-sanitizer-build.sh — see that script and
+# docker/Dockerfile.ubuntu2404 for the local dry-run equivalent of this job.
+# Runs natively on ubuntu-24.04 rather than through Docker since the GitHub
+# runner image already matches what the Dockerfile mirrors (Ubuntu 24.04,
+# GCC 13) — no need to pay for a Docker build/pull in CI itself.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sanitize:
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+    runs-on: ubuntu-24.04
+    env:
+      CORO_SANITIZE: ${{ matrix.sanitizer }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            git \
+            pkg-config \
+            python3 \
+            python3-pip \
+            python3-venv \
+            libcap-dev \
+            ca-certificates
+
+      - name: Install Conan and CMake
+        run: pip install --break-system-packages --no-cache-dir conan "cmake>=3.31"
+
+      - name: Write Conan default profile
+        run: |
+          mkdir -p ~/.conan2/profiles
+          cat > ~/.conan2/profiles/default <<'EOF'
+          [settings]
+          arch=x86_64
+          build_type=Release
+          compiler=gcc
+          compiler.cppstd=gnu23
+          compiler.libcxx=libstdc++11
+          compiler.version=13
+          os=Linux
+
+          [conf]
+          tools.compilation:verbosity=verbose
+          EOF
+
+      - name: Export coro package to the Conan cache
+        run: conan export .
+
+      - name: Conan install (test package)
+        working-directory: test
+        run: |
+          mkdir -p build
+          conan install . --build=missing -f json > build/graph.json
+
+      - name: Conan build (test package)
+        working-directory: test
+        run: conan build . --build=missing
+
+      - name: Run tests under ${{ matrix.sanitizer }}
+        working-directory: test/build/Release
+        run: |
+          if [ "${{ matrix.sanitizer }}" = asan ]; then
+            export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
+            export UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1
+          else
+            export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1
+          fi
+          ctest -V

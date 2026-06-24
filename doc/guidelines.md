@@ -29,6 +29,8 @@ each rule has a short title, a rationale, and concrete examples.
 - [Select and Timeout](#select-and-timeout)
 - [Silent Cancellation](#silent-cancellation)
 - [Error Handling](#error-handling)
+- [Signal Safety](#signal-safety)
+    - SG.1 — Never install a raw `sigaction`/`signal()` handler that touches coro primitives; use `coro::signal`/`coro::signal_stream` instead
 - [ISR Safety](#isr-safety-mcu-platforms--coro_pico-only)
     - IS.1 — Only call `signal_from_isr()` or `send_from_isr()` from an interrupt handler
     - IS.2 — Keep interrupt handlers minimal: write a flag or value and return immediately
@@ -1053,6 +1055,52 @@ try {
     // task's exception rethrown here
 }
 ```
+
+---
+
+## Signal Safety
+
+### SG.1 — Never install a raw `sigaction`/`signal()` handler that touches coro primitives; use `coro::signal`/`coro::signal_stream` instead
+
+**Reason:** A POSIX signal handler runs in a severely restricted async-signal-safe
+context — the same category of restriction as an ISR (see ISR Safety below), just
+delivered by the kernel to a regular thread instead of to hardware. Almost every coro
+primitive is unsafe to call from inside one: `Event::set()`, channel `send()`,
+`coro::spawn()`, and `Waker::wake()` all touch `shared_ptr` ref-counts, heap allocation,
+or a mutex — none of which are guaranteed reentrant or signal-safe, and a handler that
+interrupts the program mid-allocation or mid-lock can deadlock or corrupt state.
+
+`coro::signal(signum)` and `coro::signal_stream(signums)` (`include/coro/io/signal.h`)
+exist specifically so user code never needs to write a raw handler at all. They are
+built on libuv's `uv_signal_t`, which already solves the signal-safety problem
+internally via a self-pipe: the actual OS-level handler libuv installs only writes one
+byte to a pipe (the one operation POSIX guarantees is async-signal-safe), and all real
+dispatch — coalescing repeat deliveries, waking the waiting coroutine — happens
+afterward on the uv loop thread, in ordinary (non-handler) context. See
+`doc/design/signal_handling.md` for the full design.
+
+```cpp
+// BAD — touches coro primitives directly from a signal handler; UB in general,
+// regardless of whether it happens to "work" in casual testing.
+coro::Event g_shutdown;
+void sigint_handler(int) {
+    g_shutdown.set();   // touches a mutex from signal-handler context — unsafe
+}
+int main() {
+    std::signal(SIGINT, sigint_handler);
+    // ...
+}
+
+// GOOD — coro::signal does the equivalent safely, with no handler to write at all.
+coro::Coro<void> run() {
+    co_await coro::signal(SIGINT);
+    begin_shutdown();
+}
+```
+
+This rule is specific to desktop builds (`coro::signal` is built on libuv, which is not
+available under `CORO_PICO`). The MCU analogue of this rule — for hardware interrupts
+rather than OS signals — is **IS.1** below.
 
 ---
 

@@ -31,6 +31,7 @@ $endif$
 % Override Shaded environment to use our compact style
 \renewenvironment{Shaded}{%
   \begin{mdframed}[
+    nobreak=true,
     backgroundcolor=codebg,
     linewidth=0pt,
     innerleftmargin=4pt,
@@ -49,6 +50,7 @@ $endif$
   [\vspace{-2pt}\textcolor{rulecolor}{\hrule height 0.4pt}\vspace{2pt}]
 \titlespacing{\section}{0pt}{6pt}{2pt}
 
+% Markdown's "##" headings (used throughout cheatsheet.md) map to \subsection.
 \titleformat{\subsection}
   {\needspace{3\baselineskip}\small\bfseries}
   {}{0em}{}

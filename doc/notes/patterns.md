@@ -357,6 +357,51 @@ coro::Coro<void> cancellable_upload(coro::WatchReceiver<bool> cancel,
 No changes to `upload()` are needed. This pattern composes — nest `select` calls to
 cancel based on multiple independent signals.
 
+### Shutdown on OS signal
+
+**Problem:** A long-running server needs to shut down cleanly on `SIGINT`/`SIGTERM`
+(operator interrupt).
+
+`coro::signal()` (see `doc/design/signal_handling.md`) is a one-shot `Future<void>` that
+resolves on the next delivery of a given signal. `select` it against the running server
+task so either source triggers the same exit path:
+
+```cpp
+coro::Coro<int> async_main(int argc, char *argv[]) {
+    auto run_server_handle = coro::spawn(run_server(argc, argv));
+    auto result = co_await coro::select(
+        coro::ref(run_server_handle),
+        coro::signal(SIGINT),
+        coro::signal(SIGTERM)
+    );
+    if (result.index() == 0) {
+        // run_server exited normally
+        co_return std::get<0>(result).value;
+    }
+    // SIGINT or SIGTERM received. Cancel run_server & wait for it to drain.
+    // Cancel itself does not throw an exception, but rather stops polling
+    // and runs RAII cleanup of all coroutine frames in drain order. We
+    // should still co_await the handle here to receive any exceptions that
+    // may have already happened in the background before the cancel was
+    // requested.
+    co_return co_await std::move(run_server_handle).cancel_and_join();
+}
+
+int main(int argc, char *argv[]) {
+    coro::Runtime rt;
+    try {
+        return rt.block_on(async_main(argc, argv));
+    } catch (std::exception const &e) {
+        std::cerr << e.what() << "\n";
+    }
+    return -1;
+}
+```
+
+Never install a raw `sigaction` handler to do this — see guidelines.md SG.1. `coro::signal`
+already handles the async-signal-safety concerns internally (libuv's self-pipe trick) and
+delivers the result as an ordinary pollable `Future`.
+
 ---
 
 ## Coordination

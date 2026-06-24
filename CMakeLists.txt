@@ -40,9 +40,31 @@ if(CORO_PLATFORM STREQUAL "pico")
     if(CORO_PICO_WITH_MQTT)
         install(TARGETS coro_pico_mqtt)
     endif()
+    # The following are libuv/libwebsockets-only, or are desktop-only Executor
+    # implementations other than CurrentThreadExecutor (the only Executor pico uses)
+    # — none have a CORO_PICO backend-flag fallback, unlike tcp_stream.h/tcp_listener.h
+    # which are whole-file #ifdef CORO_TCP_BACKEND_LWIP/libuv. Excluded so they can't
+    # be included at all on the pico package, rather than relying on a header guard
+    # to produce a clean error if a user includes one by mistake.
     install(DIRECTORY include/coro
         DESTINATION include
-        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
+        FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+        PATTERN "signal.h" EXCLUDE
+        PATTERN "ws_stream.h" EXCLUDE
+        PATTERN "ws_listener.h" EXCLUDE
+        PATTERN "file.h" EXCLUDE
+        PATTERN "file.hpp" EXCLUDE
+        PATTERN "poll_stream.h" EXCLUDE
+        PATTERN "poll_stream.hpp" EXCLUDE
+        PATTERN "uv_future.h" EXCLUDE
+        PATTERN "single_threaded_uv_executor.h" EXCLUDE
+        PATTERN "single_threaded_executor.h" EXCLUDE
+        PATTERN "work_sharing_executor.h" EXCLUDE
+        PATTERN "work_stealing_executor.h" EXCLUDE
+        # spawn_blocking.h declares BlockingPool unconditionally (no CORO_PICO guard)
+        # and calls Runtime::blocking_pool(), which only exists in the non-CORO_PICO
+        # Runtime — desktop-only, would fail to compile on pico.
+        PATTERN "spawn_blocking.h" EXCLUDE)
 else()
     option(WITH_GPERFTOOLS "Build with gperftools" OFF)
     option(CORO_USE_LOCAL_RUN_QUEUE "Use lock-free local run queue in WorkStealingExecutor (experimental)" ON)
@@ -81,6 +103,7 @@ else()
         src/io/file.cpp
         #src/io/pipe.cpp
         src/io/circular_byte_buffer.cpp
+        src/io/signal.cpp
     )
     if(CORO_USE_LOCAL_RUN_QUEUE)
         target_compile_definitions(coro PUBLIC CORO_USE_LOCAL_RUN_QUEUE)
@@ -98,9 +121,20 @@ else()
     # The pico unit tests (test/pico/) are a source-build-only artifact: anyone
     # running them is building from source and has the headers directly. Consumers
     # of the installed Conan package never need them.
+    #
+    # include/coro/io/lwip/ is excluded for the same reason, just not caught by the
+    # "pico" pattern above since it lives directly under io/ rather than under pico/.
+    # lwip_callback_result.h backs the lwIP TCP backend (tcp_stream_lwip.cpp) and
+    # pico/mqtt.cpp — the desktop build always uses the libuv backend instead (see
+    # tcp_stream.h's CORO_TCP_BACKEND_LWIP #ifdef), so it has no use here either.
     install(DIRECTORY include/coro
         DESTINATION include
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+        PATTERN "lwip" EXCLUDE
+        # isr_event.h is whole-file #ifdef CORO_PICO — harmless no-op if included on
+        # desktop, but has no use here (no hardware ISRs), so excluded for consistency
+        # with the rest of this list rather than relying on the guard.
+        PATTERN "isr_event.h" EXCLUDE
         PATTERN "pico" EXCLUDE
     )
 endif()

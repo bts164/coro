@@ -17,12 +17,14 @@
 #include <coro/sync/oneshot.h>      // oneshot_channel<T>
 #include <coro/sync/mpsc.h>         // mpsc_channel<T>
 #include <coro/sync/watch.h>        // watch_channel<T>
+#include <coro/sync/broadcast.h>    // broadcast_channel<T>
 #include <coro/sync/event.h>         // Event
 #include <coro/io/tcp_stream.h>     // TcpStream
 #include <coro/io/tcp_listener.h>   // TcpListener
 #include <coro/io/ws_stream.h>      // WsStream
 #include <coro/io/ws_listener.h>    // WsListener
 #include <coro/io/file.h>           // File
+#include <coro/io/signal.h>         // signal(), signal_stream()
 ```
 
 ## Async functions
@@ -212,6 +214,22 @@ if (!r) co_return;  // sender dropped
 { WatchBorrowMutGuard<int> g = tx.borrow_mut(); *g = 99; }
 ```
 
+## broadcast — every receiver sees every message, lag-detecting
+
+```cpp
+// BroadcastSender<int>, BroadcastReceiver<int>
+auto [tx, rx] = coro::broadcast_channel<int>(/*capacity=*/16);
+BroadcastSender<int> tx2 = tx.clone();        // independent sender clone
+BroadcastReceiver<int> rx2 = rx.resubscribe(); // independent receiver, starts at current seq
+// expected<size_t, T> — Err(value) if there are currently zero receivers
+tx.send(42);
+// expected<int, BroadcastRecvError> — Lagged{skipped} if the ring overwrote unread values,
+// Closed if every sender dropped and nothing buffered remains
+std::expected<int, coro::BroadcastRecvError> r = co_await rx.recv();
+// non-suspending attempt; also returns Empty if nothing new since the last read
+std::expected<int, coro::BroadcastRecvError> r2 = rx.try_recv();
+```
+
 ## Capturing-lambda safety
 
 ```cpp
@@ -314,4 +332,19 @@ auto& [n3, buf3] = co_await f.read_exact(std::vector<std::byte>(4096));
 auto& [n4, buf4] = co_await f.read_at_exact(std::vector<std::byte>(4096), /*offset=*/512);
 co_await out.write_exact(std::move(buf));
 co_await out.write_at_exact(std::move(buf2), /*offset=*/512);
+```
+
+## OS signals
+
+```cpp
+// One-shot: resolves once, on the next delivery of SIGINT.
+co_await coro::signal(SIGINT);
+
+// Shutdown on whichever of SIGINT/SIGTERM arrives first:
+co_await coro::select(coro::signal(SIGINT), coro::signal(SIGTERM));
+
+// Stream: coalesced {signum, count} event per distinct signal since the last poll.
+coro::SignalStream sigs = coro::signal_stream({SIGHUP, SIGUSR1});
+while (std::optional<coro::SignalEvent> event = co_await coro::next(sigs))
+    handle(event->signum, event->count);  // count is a lower bound, never exact
 ```
