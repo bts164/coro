@@ -90,14 +90,15 @@ class PicoLedRecipe(ConanFile):
         # override needed here — unlike before this package's headers/
         # sources were reorganized into include/ and src/ subdirectories.
 
-        # ws2812.pb.h (nanopb-generated, included bare as "ws2812.pb.h" by
-        # effects.h) is generated into the build folder, not source — see
-        # CMakeLists.txt's PROTO_OUT_DIR, relative to
-        # CMAKE_CURRENT_BINARY_DIR (== self.build_folder here). pb.h itself
-        # now comes from the nanopb dependency's own includedirs (CMakeDeps),
-        # not a path here. Only exercised in editable mode; package_info()
-        # takes over for a real `conan create`.
-        self.cpp.build.includedirs = ["proto"]
+        # ws2812.pb.h (nanopb-generated, included as "pico_led/ws2812.pb.h" by
+        # effects.h) is generated into <build_folder>/pico_led/ — see
+        # CMakeLists.txt's PROTO_OUT_DIR. The include root is the build folder
+        # itself (".") so that the pico_led/ prefix resolves correctly, matching
+        # the installed layout (include/pico_led/ws2812.pb.h). pb.h comes from
+        # the nanopb dependency's own includedirs (CMakeDeps), not from here.
+        # Only exercised in editable mode; package_info() takes over for a real
+        # `conan create`.
+        self.cpp.build.includedirs = ["."]
 
     def generate(self):
         # Deliberately NOT calling tc.blocks.enabled(...) here: which blocks

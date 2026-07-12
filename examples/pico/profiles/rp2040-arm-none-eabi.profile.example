@@ -61,12 +61,12 @@ tools.cmake.cmaketoolchain:user_toolchain=["/home/brad/pico-sdk/cmake/preload/to
 CC=arm-none-eabi-gcc
 CXX=arm-none-eabi-g++
 
-# REQUIRED — conan_build/CMakeLists.txt's include($ENV{PICO_SDK_PATH}/...)
+# REQUIRED — each example's CMakeLists.txt include($ENV{PICO_SDK_PATH}/...)
 # runs inside conan's build()-environment subprocess, which doesn't
 # necessarily inherit an interactively-exported shell variable. Set it here
 # so it's reproducible regardless of which shell `conan` is invoked from.
 # If left unset, include() fails non-fatally and CMake silently configures
 # against the host's gcc instead of arm-none-eabi-gcc, only crashing later
-# and confusingly at pico_sdk_init() — see conan_build/CMakeLists.txt's
-# explicit guard for that failure mode.
+# and confusingly at pico_sdk_init() — see each CMakeLists.txt's explicit
+# guard for that failure mode.
 PICO_SDK_PATH=/home/brad/pico-sdk

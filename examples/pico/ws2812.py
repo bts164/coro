@@ -24,6 +24,14 @@ Or manage the connection manually:
 import math
 import socket
 import struct
+import sys
+from pathlib import Path
+
+# ws2812_pb2.py is generated into pico_led/proto/ (see gen_proto.py) —
+# pico_led/ is a Conan package, not a Python package, so it has no
+# __init__.py; add it to sys.path so "proto" still resolves as an implicit
+# namespace package, same as when proto/ lived directly under examples/pico/.
+sys.path.insert(0, str(Path(__file__).parent.resolve() / "pico_led"))
 
 import proto.ws2812_pb2 as pb
 

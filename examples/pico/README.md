@@ -1,10 +1,12 @@
 # Pico W Examples
 
-Three examples showing `coro` running on a Raspberry Pi Pico W:
+Three examples showing `coro` running on a Raspberry Pi Pico W. Each is its
+own standalone Conan package — there is no in-tree `add_subdirectory()`
+aggregator:
 
-- **`pico_tcp_echo_server`** — binds to `0.0.0.0:8080`, accepts connections, and echoes back everything it receives. Handles multiple concurrent clients via `JoinSet`.
-- **`pico_tcp_echo_client`** — connects to a running echo server, sends 5 messages, and prints the replies.
-- **`pico_ws2812_tcp`** — WS2812B LED controller. Accepts TCP connections on port 2812 and drives LEDs with fill/set/clear commands and animated effects. Comes with a PyQt6 desktop GUI (`ws2812_gui.py`).
+- **`tcp_echo/`** — `pico_tcp_echo_server` binds to `0.0.0.0:8080`, accepts connections, and echoes back everything it receives (handles multiple concurrent clients via `JoinSet`); `pico_tcp_echo_client` connects to a running echo server, sends 5 messages, and prints the replies.
+- **`ws2812_tcp/`** — `pico_ws2812_tcp`, a WS2812B LED controller. Accepts TCP connections on port 2812 and drives LEDs with fill/set/clear commands and animated effects (via `pico_led/`). Comes with a PyQt6 desktop GUI (`ws2812_gui.py`).
+- **`pico_led/`** — the WS2812B driver + animated-effects library consumed by `ws2812_tcp/`, packaged as its own Conan dependency (`pico_led/0.1.0`).
 
 ---
 
@@ -27,6 +29,9 @@ sudo apt install -y \
     git \
     python3
 ```
+
+Also requires Conan 2 (`pip install conan`) and a host profile for the
+RP2040 — see Step 1.5 below.
 
 ---
 
@@ -54,12 +59,37 @@ Then reload your shell or run `source ~/.bashrc`.
 
 ---
 
-## Step 2 — Set your WiFi credentials
+## Step 1.5 — Set up a Conan host profile
 
-Copy the credentials template and fill in your network name and password:
+Each example is a Conan package, cross-compiled for the RP2040 via a host
+profile. Copy the template and fill in your local paths:
 
 ```bash
-cd examples/pico
+cd examples/pico/profiles
+cp rp2040-arm-none-eabi.profile.example rp2040-arm-none-eabi.profile
+$EDITOR rp2040-arm-none-eabi.profile   # set the Pico SDK toolchain path, PICO_SDK_PATH
+```
+
+This file is gitignored (paths vary per machine) — see the comments inside
+it and `doc/design/pico_led_conan_packaging.md` for why each setting is
+required.
+
+Build and cache `coro` itself for the RP2040 once, from the repo root:
+
+```bash
+conan create . -pr:h examples/pico/profiles/rp2040-arm-none-eabi.profile --build=missing
+```
+
+---
+
+## Step 2 — Set your WiFi credentials
+
+Each example that uses WiFi has its own `wifi_credentials.h.example` —
+copy it to `wifi_credentials.h` inside that example's directory and fill in
+your network name and password, e.g.:
+
+```bash
+cd examples/pico/tcp_echo
 cp wifi_credentials.h.example wifi_credentials.h
 $EDITOR wifi_credentials.h   # set WIFI_SSID and WIFI_PASSWORD
 ```
@@ -77,13 +107,12 @@ $EDITOR wifi_credentials.h   # set WIFI_SSID and WIFI_PASSWORD
 ## Step 3 — Build the examples
 
 ```bash
-cd examples/pico
-mkdir -p build && cd build
-cmake ..
-make -j$(nproc) pico_tcp_echo_server
+cd examples/pico/tcp_echo
+conan build . -pr:h ../profiles/rp2040-arm-none-eabi.profile --build=missing
 ```
 
-A successful build produces `pico_tcp_echo_server.uf2` in the build directory.
+A successful build produces `pico_tcp_echo_server.uf2` (and
+`pico_tcp_echo_client.uf2`) under `build/Release/`.
 
 ---
 
@@ -94,7 +123,7 @@ A successful build produces `pico_tcp_echo_server.uf2` in the build directory.
 3. Copy the `.uf2` file to it:
 
 ```bash
-cp build/pico_tcp_echo_server.uf2 /media/$USER/RPI-RP2/
+cp build/Release/pico_tcp_echo_server.uf2 /media/$USER/RPI-RP2/
 ```
 
 The Pico reboots automatically and starts running the firmware.
@@ -158,10 +187,19 @@ echo "hello" | nc 192.168.1.42 8080
 
 ### Build and flash
 
+`pico_ws2812_tcp` depends on `pico_led/0.1.0` — build and cache that
+package first (run from `examples/pico/pico_led/`), then build the example:
+
 ```bash
-cd examples/pico/build
-make -j$(nproc) pico_ws2812_tcp
-cp pico_ws2812_tcp.uf2 /media/$USER/RPI-RP2/
+cd examples/pico/pico_led
+conan create . -pr:h ../profiles/rp2040-arm-none-eabi.profile --build=missing
+
+cd ../ws2812_tcp
+cp wifi_credentials.h.example wifi_credentials.h
+$EDITOR wifi_credentials.h   # set WIFI_SSID, WIFI_PASSWORD, DEVICE_NAME
+conan build . -pr:h ../profiles/rp2040-arm-none-eabi.profile --build=missing
+
+cp build/Release/pico_ws2812_tcp.uf2 /media/$USER/RPI-RP2/
 ```
 
 ### Desktop GUI

@@ -83,3 +83,9 @@ target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP)
 # paths for compiling our sources but must NOT be bundled into the archive.
 # Applications must link them directly (see examples/pico/CMakeLists.txt).
 target_link_libraries(coro_pico PRIVATE pico_stdlib pico_cyw43_arch_lwip_poll)
+
+# Install lwipopts.h into its own subdirectory so the installed package exposes
+# it to consumers. package_info() adds include/coro_pico_lwipopts to coro::pico's
+# includedirs (mirroring the layout() cpp.build entry used in editable mode).
+install(FILES ${CORO_PICO_LWIPOPTS_INCLUDE_DIR}/lwipopts.h
+        DESTINATION include/coro_pico_lwipopts)

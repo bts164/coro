@@ -48,16 +48,19 @@ find_package(nanopb CONFIG REQUIRED)
 # export_sources() like every other file, so this path resolves the same
 # way whether running from a real `conan create` or in editable mode
 # (`conan editable add .`) against the live checkout.
-set(PROTO_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto)
+# Generate into pico_led/ so #include "pico_led/ws2812.pb.h" resolves when
+# ${CMAKE_CURRENT_BINARY_DIR} is on the include path (the build-tree equivalent
+# of the installed include/ root).
+set(PROTO_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/pico_led)
 
 nanopb_generate_cpp(PROTO_SRCS PROTO_HDRS
-    PROTOS proto/ws2812.proto
-    PROTO_PATH proto
+    PROTOS ${CMAKE_CURRENT_SOURCE_DIR}/proto/ws2812.proto
+    PROTO_PATH ${CMAKE_CURRENT_SOURCE_DIR}/proto
     OUT_DIR ${PROTO_OUT_DIR}
 )
 
 add_library(ws2812_proto STATIC ${PROTO_SRCS})
-target_include_directories(ws2812_proto PUBLIC ${PROTO_OUT_DIR})
+target_include_directories(ws2812_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(ws2812_proto PUBLIC nanopb::nanopb)
 
 add_library(pico_led STATIC
@@ -66,7 +69,12 @@ add_library(pico_led STATIC
     src/effect_runner.cpp
     src/effects.cpp
 )
-pico_generate_pio_header(pico_led src/ws2812.pio)
+# OUTPUT_DIR puts ws2812.pio.h under pico_led/ (matching the installed layout).
+# pico_generate_pio_header adds OUTPUT_DIR itself; we add the parent so that
+# #include "pico_led/ws2812.pio.h" resolves against ${CMAKE_CURRENT_BINARY_DIR}.
+pico_generate_pio_header(pico_led ${CMAKE_SOURCE_DIR}/src/ws2812.pio
+    OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/pico_led)
+target_include_directories(pico_led PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 
 # Headers already live under include/pico_led/ in this package's own tree,
 # matching the installed layout below — so a plain "include" (no

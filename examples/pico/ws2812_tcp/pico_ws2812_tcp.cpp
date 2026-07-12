@@ -7,10 +7,8 @@
 //
 // Multiple clients are handled concurrently via JoinSet.
 //
-// Build from examples/pico/build/:
-//   Copy wifi_credentials.h.example to wifi_credentials.h and fill in your
-//   network details, then:
-//     cmake -DPICO_BOARD=pico_w .. && make pico_ws2812_tcp
+// Copy wifi_credentials.h.example to wifi_credentials.h and fill in your
+// network details, then build via Conan (see ./conanfile.py).
 
 #include <pico/stdlib.h>
 #include <pico/stdio_usb.h>
@@ -20,9 +18,9 @@
 
 #include "wifi_credentials.h"
 #include "lcd.h"
-#include "led/led_driver.h"
-#include "led/effect_runner.h"
-#include "led/effects.h"
+#include "pico_led/led_driver.h"
+#include "pico_led/effect_runner.h"
+#include "pico_led/effects.h"
 
 #include <coro/runtime/runtime.h>
 #include <coro/io/tcp_listener.h>
@@ -34,7 +32,7 @@
 #include <coro/sync/sleep.h>
 #include <coro/sync/watch.h>
 
-#include "ws2812.pb.h"
+#include "pico_led/ws2812.pb.h"
 #include <pb_encode.h>
 #include <pb_decode.h>
 

@@ -4,7 +4,7 @@ ws2812_gui.py — PyQt6 desktop GUI for the pico_ws2812_tcp LED controller.
 
 Install dependencies:
     pip install -r requirements.txt
-    python gen_proto.py   # generates proto/ws2812_pb2.py
+    python gen_proto.py   # generates pico_led/proto/ws2812_pb2.py
 
 Usage:
     python ws2812_gui.py [--host 192.168.x.y] [--port 2812]
@@ -13,6 +13,7 @@ Usage:
 import struct
 import sys
 import argparse
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -24,6 +25,12 @@ from PyQt6.QtCore import Qt, QByteArray, QSettings
 from PyQt6.QtGui import QColor, QPalette, QFont
 from PyQt6.QtNetwork import QTcpSocket, QAbstractSocket
 from PyQt6.QtWidgets import QColorDialog
+
+# ws2812_pb2.py is generated into pico_led/proto/ (see gen_proto.py) —
+# pico_led/ is a Conan package, not a Python package, so it has no
+# __init__.py; add it to sys.path so "proto" still resolves as an implicit
+# namespace package, same as when proto/ lived directly under examples/pico/.
+sys.path.insert(0, str(Path(__file__).parent.resolve() / "pico_led"))
 
 import proto.ws2812_pb2 as pb
 
