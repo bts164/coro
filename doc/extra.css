@@ -2,3 +2,69 @@
 .wy-nav-content {
     max-width: 1920px !important;
 }
+
+/* The readthedocs theme only styles the title bar of "!!!" admonitions
+   (<p class="admonition-title">). Collapsible "???" admonitions from
+   pymdownx.details render as <details class="TYPE"><summary>...</summary>
+   with no admonition-title class, so the summary is left unstyled by
+   default. Re-apply the same title-bar treatment (bold, colored
+   background, matching the theme's own per-type colors) to <summary>. */
+.rst-content details > summary {
+    font-weight: 700;
+    display: block;
+    color: #fff;
+    padding: 6px 32px 6px 28px;
+    margin: -12px -12px 12px;
+    cursor: pointer;
+    position: relative;
+    list-style: none;
+}
+.rst-content details > summary::-webkit-details-marker {
+    display: none;
+}
+/* Same FontAwesome exclamation-circle glyph the theme uses for
+   <p class="admonition-title">:before on "!!!" admonitions. */
+.rst-content details > summary::before {
+    font-family: FontAwesome;
+    content: "\f06a";
+    position: absolute;
+    left: 10px;
+}
+.rst-content details > summary::after {
+    content: "\25B8";
+    position: absolute;
+    right: 12px;
+    transition: transform 0.15s ease-in-out;
+}
+.rst-content details[open] > summary::after {
+    transform: rotate(90deg);
+}
+.rst-content details.info > summary,
+.rst-content details.note > summary,
+.rst-content details.seealso > summary {
+    background: #6ab0de;
+}
+/* "info" isn't a real admonition type (unlike note/tip/warning/danger), so it
+   never matches the theme's built-in .rst-content .admonition/.note/etc rule
+   that supplies box padding/background. Give it the same treatment manually,
+   matching the theme's default (note-colored) admonition box. */
+.rst-content details.info {
+    padding: 12px;
+    line-height: 24px;
+    margin-bottom: 24px;
+    background: #e7f2fa;
+}
+.rst-content details.tip > summary,
+.rst-content details.hint > summary,
+.rst-content details.important > summary {
+    background: #1abc9c;
+}
+.rst-content details.warning > summary,
+.rst-content details.caution > summary,
+.rst-content details.attention > summary {
+    background: #f0b37e;
+}
+.rst-content details.danger > summary,
+.rst-content details.error > summary {
+    background: #f29f97;
+}

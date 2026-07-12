@@ -14,6 +14,8 @@ extra_css:
 markdown_extensions:
   - footnotes
   - admonition
+  - pymdownx.details
+  - pymdownx.superfences
   - mkdocs_graphviz
 
 plugins:
