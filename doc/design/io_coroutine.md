@@ -1,42 +1,47 @@
 # IoCoroutine — Coroutine-Native I/O Thread Dispatch
 
-Design for replacing the `IoRequest` polymorphic command pattern with coroutine-native
-primitives that run directly on the libuv I/O thread.
+How coro bridges libuv's callback-based API into coroutine-native `Future` primitives,
+and how `SingleThreadedUvExecutor` integrates the libuv event loop directly into its
+task scheduling loop.
+
+!!! note "NOTE: `IoRequest`/`IoService` history"
+    An earlier architecture bridged libuv callbacks with a polymorphic `IoRequest`
+    command pattern (a virtual `execute()` per operation, submitted to an `IoService`
+    that owned the uv loop on a dedicated thread). That pattern has been fully replaced
+    by the design below and deleted from the codebase — `IoRequest` and `IoService` no
+    longer exist anywhere in `include/`/`src/`. If you come across a design doc elsewhere
+    that still describes `IoRequest` subclasses (e.g. `OpenRequest`, `WsConnectRequest`)
+    as current, that doc is stale — see `doc_inconsistency_audit.md` at the repo root.
 
 ---
 
 ## Motivation
 
-The current `IoRequest` pattern works but involves significant boilerplate. Every
-new libuv operation requires:
+Bridging a one-shot libuv callback into awaitable code does not need a dedicated type
+per operation. A libuv callback is just a resumption point: the callback fires once,
+with a fixed set of result arguments, and something needs to store those results and
+wake whatever was waiting. A coroutine frame is exactly the right place to store that
+state — the frame *is* the closure, and `co_await` *is* the suspend/resume boundary.
 
-1. A concrete `IoRequest` subclass with captured state members
-2. An `execute()` implementation that calls the uv API and parks a `shared_ptr`
-   (or heap-allocated pointer) in `req.data` so the callback can recover state
-3. A callback function that extracts the state, stores results, and calls `waker->wake()`
-
-Looking at `File` alone: `OpenRequest`, `ReadRequest`, `WriteRequest`, `CloseRequest`,
-`CancelRequest` — five structs plus five callbacks, each doing roughly the same thing.
-`PollStream` adds `EnsurePollingRequest` and `CloseRequest` on top.
-
-The core observation: an `IoRequest` is just a resumable unit of work. That is exactly
-what a coroutine is. The coroutine handle *is* the closure; `handle.resume()` *is*
-`execute()`. With the right primitives, new I/O operations require no new types at all.
+This doc describes the two building blocks that make that possible without any new
+type per operation: `UvCallbackResult`/`UvFuture` for bridging a single callback into a
+`Future`, and `SingleThreadedUvExecutor`/`withContext` for running coroutines directly
+on the thread that owns the `uv_loop_t`.
 
 ---
 
-## Proposed Design
+## Design
 
 The design rests on three components:
 
 - **`SingleThreadedUvExecutor`** — a full-featured executor that integrates the libuv
-  event loop into its scheduling loop, replacing `IoService` entirely.
+  event loop into its scheduling loop.
 - **`withContext(executor, coro)`** — runs a coroutine on a specific executor and
   `co_await`s the result, analogous to Kotlin's `withContext(dispatcher)`.
 - **`UvCallbackResult<Args...>` / `UvFuture<Args...>`** — a pair for bridging one-shot
   libuv callbacks into the `Future` machinery.
 
-`spawn_on(Executor&, Coro<T>)` is a small new primitive — analogous to the existing
+`spawn_on(Executor&, Coro<T>)` is a small primitive — analogous to the existing
 `spawn()` but targeting a specific executor — that the above are built on.
 
 ---
@@ -160,7 +165,7 @@ results live in `req->result`, so no args need to be captured. A single
 
 `current_io_loop()` returns the thread-local `uv_loop_t*` set at uv executor startup.
 `current_uv_executor()` returns the thread-local `SingleThreadedUvExecutor*` set by
-`Runtime` at startup — the same pattern as `current_io_service()` today.
+`Runtime` at startup.
 
 ### Cancellation
 
@@ -234,7 +239,7 @@ and `PollCancelled` is returned.
 `SingleThreadedUvExecutor` is a full-featured executor that integrates the libuv
 event loop into its scheduling loop. It satisfies the same `Executor` concept as
 `SingleThreadedExecutor` and the multi-threaded executors and can be used directly
-with `Runtime`. It **replaces `IoService`** entirely.
+with `Runtime`. It owns the `uv_loop_t` outright.
 
 ### Executor modes
 
@@ -247,16 +252,6 @@ with `Runtime`. It **replaces `IoService`** entirely.
 When `SingleThreadedUvExecutor` is used as the sole executor, `withContext` spawns a
 task on the same executor — the cooperative event loop handles suspend and resume without
 any thread hop. `UvFuture` works identically in all modes.
-
-### `IoRequest` is deprecated
-
-With `SingleThreadedUvExecutor` as a proper executor, `IoService::submit(unique_ptr<IoRequest>)`
-has no equivalent. Submitting work to the uv thread is just scheduling a task via
-`withContext` or `spawn_on`.
-
-During migration, existing `IoRequest`-based operations (`File`, `PollStream`,
-`TcpStream`, `WsStream`) can be wrapped as fire-and-forget tasks on
-`SingleThreadedUvExecutor` until each is ported to the coroutine-native approach.
 
 ### `SingleThreadedExecutor` naming note
 
@@ -340,8 +335,7 @@ The key invariant: **`wake()` enqueues; the runtime calls `poll()`.** This keeps
 
 ### One-shot operation: file read
 
-Today a read requires `ReadRequest`, `ReadState`, `ReadFuture::poll()`, and `read_cb`.
-Under this design:
+A one-shot `uv_fs_read` bridged into a coroutine looks like this:
 
 ```cpp
 Coro<std::size_t> async_read(uv_file fd, std::span<std::byte> buf, int64_t offset) {
@@ -364,10 +358,9 @@ Coro<std::size_t> async_read(uv_file fd, std::span<std::byte> buf, int64_t offse
 }
 ```
 
-`ReadState`, `ReadRequest`, `read_cb`, and the `complete`/`waker` atomics all
-disappear. The coroutine frame holds all locals that `ReadState` used to hold.
-`buf` and `offset` are captured by reference safely — the caller is suspended for
-the duration.
+No dedicated state type or callback function is needed — the coroutine frame holds
+every local the operation needs, and `buf`/`offset` are captured by reference safely
+since the caller is suspended for the duration.
 
 ### Repeated callbacks: `uv_poll_t` (simple case)
 
@@ -451,7 +444,8 @@ Coro<void> poll_driver(std::shared_ptr<State> state) {
     co_await CloseEvent{state};   // parks until PollStream::close() signals
 
     uv_poll_stop(&state->poll_handle);
-    // uv_close with shared_ptr<State>-in-handle->data trick — same as CloseRequest today
+    // uv_close needs a stable shared_ptr<State> parked in handle->data — see
+    // "uv_close remains awkward" below.
 }
 ```
 
@@ -492,12 +486,11 @@ void PollStream::close() {
 }
 ```
 
-#### What disappears
+#### Driver coroutine scope
 
-- `EnsurePollingRequest` — replaced by driver coroutine startup.
-- `CloseRequest` — replaced by driver coroutine teardown after `CloseEvent` fires.
-- No changes to `poll_cb`, `State`, `packet_buffer`, `byte_buffer`, decoder, or
-  backpressure modes.
+The driver coroutine owns only setup (`uv_poll_init`/`uv_poll_start`) and teardown
+(`uv_poll_stop`/`uv_close` after `CloseEvent` fires). It makes no changes to `poll_cb`,
+`State`, `packet_buffer`, `byte_buffer`, the decoder, or the backpressure modes.
 
 #### State field migration
 
@@ -587,58 +580,31 @@ resume → read) is acceptable for low-frequency events but rules this approach 
 ## `uv_close` remains awkward
 
 `uv_close` fires its callback *after* the handle memory may logically be gone. The
-close path still needs the same `new shared_ptr<State>` trick in `handle->data` that
-`CloseRequest::execute()` uses today. This is a property of `uv_close` being async —
-not a property of the request model — and is unchanged by this design.
+close path needs a `shared_ptr<State>` parked in `handle->data` (rather than a raw
+pointer to a frame that may already be unwinding) so the callback has something valid
+to free. This is a property of `uv_close` being async, independent of how the rest of
+the operation is bridged into a coroutine.
 
 ---
 
-## Comparison
+## Summary
 
-| | `IoRequest` (today) | Proposed |
-|---|---|---|
-| New operation cost | New struct + `execute()` + callback | `UvFuture<Args...>` inline in `withContext` block; no new types |
-| Per-operation allocation | `unique_ptr<XxxRequest>` + `shared_ptr<XxxState>` | Coroutine frame only (+ `JoinHandle` for `withContext`) |
-| Shared state lifetime | `shared_ptr` + waker atomic + complete atomic | Locals in coroutine frame; captures by reference to caller frame |
-| Thread hop | `IoService::submit(unique_ptr<IoRequest>)` | `co_await withContext(uvExec, co_invoke([&]{...}))` |
-| Cross-thread wakeup | `waker->wake()` in callback | `waker->wake()` in callback (`UvExecutorWaker` enqueues task; uv loop re-polls) |
-| `uv_poll_t` (repeated, latency-critical) | State machine in `State` struct; `poll_cb` does read+decode | `poll_cb` unchanged; thin driver coroutine for lifecycle only |
-| `uv_poll_t` (repeated, non-critical) | State machine in `State` struct | `PollEventFuture` loop; read+decode in coroutine body |
-| `uv_close` safety | `new shared_ptr` in `handle->data` | Same — unchanged |
-| Cancellation | `cancelled` atomic + `CancelRequest` | `cancel_fn` lambda in `UvFuture`; integrates with `JoinHandle` cancellation protocol |
+| | Notes |
+|---|---|
+| New operation cost | `UvFuture<Args...>` inline in a `withContext` block; no new type per operation |
+| Per-operation allocation | Coroutine frame only (+ `JoinHandle` for `withContext`) |
+| Shared state lifetime | Locals in the coroutine frame; captured by reference to the caller frame |
+| Thread hop | `co_await withContext(uvExec, co_invoke([&]{...}))` |
+| Cross-thread wakeup | `waker->wake()` in callback; `UvExecutorWaker` enqueues the task, uv loop re-polls |
+| `uv_poll_t` (repeated, latency-critical) | `poll_cb` does read+decode directly; thin driver coroutine handles lifecycle only |
+| `uv_poll_t` (repeated, non-critical) | `PollEventFuture` loop; read+decode in the coroutine body |
+| `uv_close` safety | `shared_ptr<State>` parked in `handle->data` |
+| Cancellation | `cancel_fn` lambda in `UvFuture`; integrates with `JoinHandle` cancellation protocol |
 
 ---
 
 ## Status
 
-Design complete — implementation in progress.
-
-### Transition strategy
-
-`SingleThreadedUvExecutor` replaces `IoService` entirely from day one. It retains
-`submit(unique_ptr<IoRequest>)` as a deprecated method so all existing
-`IoRequest`-based operations (`File`, `PollStream`, `TcpStream`, `WsStream`) continue
-working without changes. The cooperative event loop gains one extra drain step:
-
-```
-loop:
-  drain_ready_tasks()       // coroutine tasks
-  drain_io_request_queue()  // legacy IoRequest submissions (deprecated)
-  uv_run(UV_RUN_ONCE)
-```
-
-This avoids any period of parallel infrastructure — there is always exactly one uv loop.
-Operations are migrated to the coroutine-native approach incrementally; once all uses of
-`submit()` are removed, the method and `IoRequest` are deleted.
-
-### Implementation order
-
-1. `SingleThreadedUvExecutor` — morph from `IoService`; add coroutine task queue and
-   `Executor` interface; keep `submit(IoRequest)` as deprecated; update `Runtime` to
-   use it in place of `IoService`
-2. `spawn_on(Executor&, Coro<T>)` and `withContext` — new scheduling primitives
-3. `UvCallbackResult`, `UvFuture`, `UvExecutorWaker` — uv callback bridge
-4. Port `File::read` as proof of concept — first operation migrated off `IoRequest`
-5. Port `PollStream` driver coroutine + `CloseEvent`
-6. Migrate remaining operations (`File` write/open/close, `TcpStream`, `WsStream`)
-   incrementally; remove `submit()` and `IoRequest` when complete
+Complete. Every I/O primitive (`File`, `PollStream`, `TcpStream`, `WsStream`) runs on
+the coroutine-native `withContext`/`UvCallbackResult`/`UvFuture` machinery described
+above.

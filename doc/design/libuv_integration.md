@@ -2,29 +2,34 @@
 
 ## Overview
 
-The library uses libuv as its I/O reactor. A dedicated `IoService` class owns a
-`uv_loop_t` and runs it on a background thread. Worker threads submit requests to it
-via a thread-safe queue, and libuv callbacks call `waker->wake()` when events fire,
-routing tasks back into the executor via the standard `enqueue()` injection path.
+The library uses libuv as its I/O reactor. A dedicated `SingleThreadedUvExecutor` — itself
+a full `Executor` implementation — owns a `uv_loop_t` and runs it on a dedicated thread.
+Coroutines that need to make libuv calls are dispatched onto that thread via
+`with_context(exec, coro)`; other executors' worker threads communicate with it only
+through the normal thread-safe `enqueue()` injection path, exactly like any other
+cross-executor task handoff.
 
-`IoService` backs `sleep_for()` / `SleepFuture` today and serves as the foundation for
-all async I/O primitives in `include/coro/io/` (`TcpStream`, `WsStream`, `WsListener`).
-`Waker`, `Context`, and `Executor` are unchanged — leaf futures call `ctx.getWaker()`,
-store it, and the I/O callback fires it when the event arrives.
+`SingleThreadedUvExecutor` backs `sleep_for()` / `SleepFuture` and every async I/O
+primitive in `include/coro/io/`: `TcpStream`, `TcpListener`, `UdpSocket`, `WsStream`,
+`WsListener`, `File`, and `PollStream`. `Waker`, `Context`, and the `Executor` interface
+are unchanged — leaf futures call `ctx.getWaker()`, store it, and the libuv callback
+fires it when the event arrives.
 
 ---
 
 ## The Core Problem: libuv Is Not Thread-Safe
 
 Nearly all libuv API calls (`uv_timer_start`, `uv_read_start`, `uv_tcp_connect`, etc.)
-**must be made from the thread that owns the event loop**. Worker threads that poll tasks
-cannot call these APIs directly.
+**must be made from the thread that owns the event loop**. Tasks running on other
+executors (e.g. a work-stealing pool) cannot call these APIs directly.
 
-The solution is to have a **dedicated I/O thread** that owns the loop. Worker threads
-submit registration requests to this thread through a thread-safe queue, and the I/O
-thread processes them. When events fire, libuv callbacks run on the I/O thread and call
-`waker->wake()`, which routes the task back into the executor's work-stealing queues via
-the existing thread-safe `enqueue()` path.
+The solution is a **dedicated uv thread**, owned by `SingleThreadedUvExecutor`. Any
+coroutine that needs to call libuv APIs is scheduled onto that executor via
+`with_context()`; once running there, it is guaranteed to be on the loop's owning thread
+for its entire lifetime, so calling libuv directly inside it is safe. When libuv fires a
+callback, the callback runs on the uv thread and calls `waker->wake()`, which routes the
+waiting task back into whichever executor scheduled it via the existing thread-safe
+`enqueue()` path.
 
 ---
 
@@ -34,364 +39,327 @@ the existing thread-safe `enqueue()` path.
 `uv_async_send(&async)` from any thread wakes the loop and schedules a callback to fire
 on the loop thread. Critically, multiple sends before the callback fires are
 **coalesced** — the callback fires at least once but not necessarily once per send. The
-callback must therefore drain an entire queue rather than assuming one send = one request.
+callback must therefore drain an entire queue rather than assuming one send = one wakeup.
 
-### Full request flow
+`SingleThreadedUvExecutor` uses this doorbell for its own coroutine scheduling, not just
+for I/O: `enqueue()` called from a remote thread pushes onto `m_incoming_wakes` and calls
+`uv_async_send()`; `enqueue()` called from the uv thread itself pushes directly onto the
+local `m_ready` queue. Either way, the uv thread's own loop iteration is what actually
+drains and polls tasks — see below.
+
+### The uv thread's loop
 
 ```
-Worker thread                         I/O thread (owns uv_loop)
-─────────────────────────────         ──────────────────────────────────────
-SleepFuture::poll():
-  1. allocate shared_ptr<TimerState>
-  2. submit StartTimer{state*, deadline}
-     push to m_io_queue (mutex)
-     uv_async_send(&m_async)  ────────► io_async_cb fires:
-                                          process_queue() drains m_io_queue:
-                                            uv_timer_init(loop, &state->handle)
-                                            state->handle.data = state   // back-pointer
-                                            uv_timer_start(&state->handle,
-                                              timer_cb, delay_ms, 0)
-                                          (loop blocks in uv_run)
+loop:
+  drain_incoming_wakes()      // moves m_incoming_wakes → m_ready (remote enqueue() calls)
+  drain_ready_tasks()         // polls every task currently in m_ready
+  uv_run(loop, UV_RUN_ONCE)   // processes one round of libuv I/O events; blocks when idle
+```
 
-                                          ... deadline expires ...
-                                          timer_cb(uv_timer_t* h):
-                                            state = (TimerState*)h->data
-                                            if (!state->fired.exchange(true))
-                                              state->waker.load()->wake()
-                                              uv_close(h, close_cb)
-                                                                ──────────────► executor->enqueue(task)
-                                          close_cb(uv_handle_t* h):            task re-polled
-                                            delete (TimerState*)h->data
+`uv_run(UV_RUN_ONCE)` blocking is what lets the OS park the uv thread at the kernel level
+(epoll/kqueue) when there's nothing to do — a remote `enqueue()`'s `uv_async_send()` is
+what wakes it back up.
+
+### Example: a libuv callback waking a coroutine
+
+```
+Some executor's worker thread          uv thread (owns uv_loop, runs SingleThreadedUvExecutor)
+──────────────────────────────         ─────────────────────────────────────────────────────
+with_context(uv_exec, coro)             coro begins running on the uv thread:
+  → spawns coro onto uv_exec              uv_timer_init(loop, &handle)
+                                           handle.data = <state pointer>
+                                           uv_timer_start(&handle, timer_cb, delay_ms, 0)
+                                           co_await wait(result)   // suspends; stores Waker
+
+                                         ... uv_run(UV_RUN_ONCE) blocks until deadline ...
+
+                                         timer_cb(uv_timer_t* h):
+                                           result->complete(...)       // stores value
+                                                                       // wakes stored Waker
+                                                                       ──► executor->enqueue(task)
+                                         (task re-polled, sees the value, proceeds)
 ```
 
 ---
 
-## `IoService` Class
+## `SingleThreadedUvExecutor`
 
-Rather than embedding the I/O loop fields directly in `Runtime`, the I/O driver lives in
-its own class `IoService` (in `include/coro/runtime/io_service.h`). This mirrors the
-existing `TimerService` structure and keeps `Runtime` lean.
+The uv loop lives inside `SingleThreadedUvExecutor` (`include/coro/runtime/single_threaded_uv_executor.h`),
+which implements the `Executor` interface directly — there is no separate
+I/O-service-versus-executor split. `Runtime` owns exactly one `m_uv_executor` member;
+there is no second I/O object whose destruction must be sequenced relative to a
+work-stealing executor.
 
 ```cpp
-// include/coro/runtime/io_service.h
-class IoService {
+// include/coro/runtime/single_threaded_uv_executor.h
+class SingleThreadedUvExecutor : public Executor {
 public:
-    IoService();
-    ~IoService();
+    SingleThreadedUvExecutor(Runtime* runtime = nullptr);
+    ~SingleThreadedUvExecutor() override;
 
-    IoService(const IoService&)            = delete;
-    IoService& operator=(const IoService&) = delete;
+    void schedule(std::shared_ptr<detail::TaskBase> task) override;
+    void enqueue(std::shared_ptr<detail::TaskBase> task) override;
+    void wait_for_completion(detail::TaskStateBase& state) override;
 
-    /// Thread-safe. Pushes req onto the queue and signals the I/O thread.
-    void submit(std::unique_ptr<IoRequest> req);
-
-    /// Signals the I/O thread to stop and joins it. Safe to call multiple times.
     void stop();
 
+    lws_context* lws_ctx();               // libwebsockets context, owned here
+    uv_loop_t*   loop() noexcept;          // uv thread only
+
 private:
+    static void io_async_cb(uv_async_t* handle);
     void io_thread_loop();
-    void process_queue();   // called from io_async_cb; drains m_io_queue
+    void drain_incoming_wakes();
+    void drain_ready_tasks();
 
-    uv_loop_t  m_uv_loop;
-    uv_async_t m_async;        // cross-thread doorbell
-    std::thread m_io_thread;
+    uv_loop_t    m_uv_loop;
+    lws_context* m_lws_ctx = nullptr;
+    uv_async_t   m_async;
 
-    std::mutex                          m_io_queue_mutex;
-    std::deque<std::unique_ptr<IoRequest>> m_io_queue;
-    std::atomic<bool>                   m_stopping{false};
+    std::queue<std::shared_ptr<detail::TaskBase>> m_ready;          // uv thread only
+    std::deque<std::shared_ptr<detail::TaskBase>> m_incoming_wakes; // remote injection
+    std::mutex                                    m_remote_mutex;
+
+    std::thread::id   m_uv_thread_id;
+    std::thread       m_uv_thread;
+    std::atomic<bool> m_stopping{false};
+
+    std::mutex                                            m_owned_mutex;
+    std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
 };
 
-/// Sets the thread-local current IoService. Called by Runtime::block_on() and worker threads.
-void set_current_io_service(IoService* svc);
+/// Sets the thread-local current SingleThreadedUvExecutor. Called by Runtime.
+void set_current_uv_executor(SingleThreadedUvExecutor* exec);
 
-/// Returns the thread-local IoService, or throws if called outside a Runtime context.
-IoService& current_io_service();
+/// Returns the thread-local SingleThreadedUvExecutor, or throws if called
+/// outside a Runtime context.
+SingleThreadedUvExecutor& current_uv_executor();
 ```
 
-The `TimerService` class and `set_current_timer_service` / `schedule_wakeup` free
-functions that were used in earlier iterations have been removed. `SleepFuture::poll()`
-now calls `current_io_service().submit(StartRequest{...})` directly.
+Note that `SingleThreadedUvExecutor` also owns the `lws_context*` used by the WebSocket
+primitives (`WsStream`, `WsListener`) — libwebsockets is configured with
+`foreign_loops` pointing at this same `uv_loop_t`, so both libuv and lws callbacks fire
+on the same uv thread. See `doc/design/websocket_stream.md`.
 
 ---
 
-## `IoRequest` — Polymorphic Command
+## `with_context` — Running a Coroutine on the uv Thread
 
-`IoRequest` is an abstract base class following the **command pattern**. Each subclass
-encapsulates the libuv-specific logic for one operation and executes it on the I/O thread
-by overriding `execute()`.
-
-```cpp
-// include/coro/runtime/io_service.h
-
-struct IoRequest {
-    virtual ~IoRequest() = default;
-    /// Called on the I/O thread with exclusive access to the uv_loop.
-    virtual void execute(uv_loop_t* loop) = 0;
-};
-```
-
-`process_queue()` on the I/O thread is trivially simple — it knows nothing about
-individual operation types:
+`include/coro/task/spawn_on.h` provides the two functions that route work onto the uv
+executor (or any executor):
 
 ```cpp
-void IoService::process_queue() {
-    std::deque<std::unique_ptr<IoRequest>> local;
-    { std::lock_guard lk(m_io_queue_mutex); std::swap(local, m_io_queue); }
-    for (auto& req : local)
-        req->execute(&m_uv_loop);
-}
+template<Future F>
+[[nodiscard]] JoinHandle<typename F::OutputType> spawn_on(Executor& exec, F future);
+
+template<Future F>
+[[nodiscard]] JoinHandle<typename F::OutputType> with_context(Executor& exec, F future);
 ```
 
-Follow-on I/O primitives (`TcpConnect`, `TcpRead`, `UdpSend`, `FileRead`, etc.) each add
-a new `IoRequest` subclass without modifying `IoService` or `process_queue()` at all.
+`with_context(exec, future)` schedules `future` onto `exec` and returns a `JoinHandle`;
+`co_await`-ing it suspends the caller until the child completes and resumes the caller on
+whatever executor it was already running on — no explicit "switch back" step is needed.
+This is the *only* way I/O primitives call into libuv: every libuv API call in this
+codebase happens inside a coroutine passed to `with_context(*m_uv_exec, ...)`.
 
-### I/O operation ownership model
-
-**`IoService` is kept completely ignorant of every concrete operation type.** All
-operation-specific state structs, request types, and libuv callbacks are private
-implementation details of the Future that owns them — not shared types in any header.
-
-The rule for where to define them:
-
-- **Private nested types** when one Future owns all the request types. `SleepFuture`
-  is the only type that ever constructs a `StartRequest` or `CancelRequest`, so they
-  are private nested structs of `SleepFuture`. libuv callbacks (`timer_cb`, `close_cb`)
-  are private `static` methods of the same class. No other header needs to know they exist.
-
-- **`coro::detail::<op>` namespace** when two or more sibling Futures need to share
-  state — for example, a future TCP layer where a connect future, a read future, and a
-  write future all share the same `uv_tcp_t` handle. Nesting in either sibling would be
-  arbitrary; a dedicated detail namespace groups them without implying ownership. `friend`
-  declarations across unrelated types are avoided.
-
-This keeps `io_service.h` minimal (only `IoRequest`, `IoService`, and the thread-local
-accessors) and makes each I/O subsystem fully self-contained.
+As covered in CLAUDE.md's conventions, the lambda coroutine passed to `with_context`
+must never capture — all data must be passed as explicit parameters, since the closure
+is destroyed before the first `co_await` runs.
 
 ---
 
-## Timer Handle Lifecycle
+## `UvCallbackResult` / `UvFuture` — Bridging libuv Callbacks to Coroutines
 
-Each `SleepFuture` instance manages exactly one `uv_timer_t` heap allocation:
+`include/coro/runtime/uv_future.h` replaces the old per-operation `IoRequest` subclass
+pattern with a single, reusable, generic bridge. There's no polymorphic command object at
+all — just a small piece of shared state allocated on the coroutine's own frame.
 
-```
-State            Who owns the handle
-─────────────    ────────────────────────────────────────────────────────────
-Pending          SleepFuture holds shared_ptr<State>; has submitted StartRequest
-Fired            timer_cb running on I/O thread; calls wake() then uv_close()
-Closing          libuv closing asynchronously; close_cb will free it
-Cancelled        SleepFuture destructor submitted CancelRequest before firing
-Closed           close_cb ran; handle freed; nothing holds the pointer
-```
+```cpp
+template<typename... Args>
+struct UvCallbackResult {
+    std::mutex                         mutex;
+    std::shared_ptr<detail::Waker>     waker;   // GUARDED BY mutex
+    std::optional<std::tuple<Args...>> value;   // GUARDED BY mutex; set once by complete()
 
-`SleepFuture::State` is allocated on the heap and shared between `SleepFuture` and the
-I/O thread via `shared_ptr`. `CancelRequest` also holds a `shared_ptr<State>` so the
-state stays alive until the I/O thread processes the request, regardless of when
-`SleepFuture` is destroyed.
+    void complete(Args... args);   // called from the uv callback; thread-safe
+};
 
-**Double-close prevention** — both `timer_cb` and `CancelRequest::execute()` claim the
-`uv_close` call via an atomic exchange on `fired`. Whichever side wins `fired.exchange(true)`
-first owns the close; the other side is a safe no-op:
+template<typename... Args>
+class UvFuture {
+public:
+    using OutputType = std::tuple<Args...>;
 
-```
-timer_cb (I/O thread):
-    if (!state->fired.exchange(true))  // wins → owns uv_close
-        waker->wake()
-        uv_close(&state->handle, close_cb)
+    explicit UvFuture(UvCallbackResult<Args...>& result);
+    UvFuture(UvCallbackResult<Args...>& result, std::function<void()> cancel_fn);
 
-CancelRequest::execute() (I/O thread):
-    if (!state->fired.exchange(true))  // wins → owns uv_close
-        uv_timer_stop(&state->handle)
-        uv_close(&state->handle, close_cb)
+    PollResult<OutputType> poll(detail::Context& ctx);
+};
+
+template<typename... Args>
+UvFuture<Args...> wait(UvCallbackResult<Args...>& result);
 ```
 
-`close_cb` deletes the heap-allocated `shared_ptr<State>` wrapper stored in
-`handle->data`, dropping the last reference and freeing the state.
+Usage pattern, taken directly from `TcpStream::write()` (`src/io/tcp_stream.cpp`):
+
+```cpp
+co_await with_context(*m_uv_exec,
+    [](Handle* h, std::vector<std::byte> buf) -> Coro<int> {
+        UvCallbackResult<int> result;
+        uv_buf_t uv_buf = uv_buf_init(reinterpret_cast<char*>(buf.data()), buf.size());
+        uv_write_t req;
+        req.data = &result;
+        uv_write(&req, &h->tcp, &uv_buf, 1, [](uv_write_t* r, int status) {
+            static_cast<UvCallbackResult<int>*>(r->data)->complete(status);
+        });
+        auto [status] = co_await wait(result);
+        co_return status;
+    }(m_handle.get(), std::move(buf))
+);
+```
+
+`UvCallbackResult` is allocated on the coroutine's own stack frame; `co_await wait(result)`
+keeps the coroutine (and therefore the frame) suspended until `complete()` fires, so no
+heap allocation or shared-ownership dance is needed for the common one-shot case. The
+optional cancel-function constructor is used when the future may be destroyed before the
+callback fires (e.g. `TcpStream::read()`'s per-call `uv_read_start`/`uv_read_stop` pair) —
+the cancel function is invoked from `UvFuture`'s destructor.
+
+This single generic type replaces what used to require a bespoke `IoRequest` subclass
+(`StartRequest`, `TcpConnectRequest`, `UdpSendRequest`, etc.) per operation.
 
 ---
 
 ## `SleepFuture` Design
 
-All timer-specific types are private to `SleepFuture`. Nothing outside `sleep.h` needs
-to know they exist — `IoService` in particular has zero knowledge of timers.
+`SleepFuture` (`include/coro/sync/sleep.h`, non-Pico branch) is the simplest example of
+the pattern and a good template for any new primitive:
 
 ```cpp
-// include/coro/sync/sleep.h
-
 class SleepFuture {
 public:
     using OutputType = void;
-    // ... constructor, destructor, poll() ...
+
+    explicit SleepFuture(std::chrono::nanoseconds duration);
+    ~SleepFuture();   // cancels the timer via with_context if not yet fired
+
+    PollResult<void> poll(detail::Context& ctx);
 
 private:
-    // Shared between the worker thread (poll()) and the I/O thread (timer_cb).
     struct State : std::enable_shared_from_this<State> {
-        uv_timer_t                                  handle;  // must be first field
-        std::atomic<std::shared_ptr<detail::Waker>> waker;   // RACE: written by worker, read by I/O thread
+        uv_timer_t                                  handle;
+        std::atomic<std::shared_ptr<detail::Waker>> waker;  // RACE: written by poll(), read by timer_cb
         std::atomic<bool>                           fired{false};
     };
 
-    // Arms the one-shot timer on the I/O thread.
-    struct StartRequest : IoRequest {
-        std::shared_ptr<State>                 state;
-        std::chrono::steady_clock::time_point  deadline;
-        void execute(uv_loop_t* loop) override;
-    };
-
-    // Cancels and closes the timer handle on the I/O thread.
-    struct CancelRequest : IoRequest {
-        std::shared_ptr<State> state;
-        void execute(uv_loop_t* loop) override;
-    };
-
-    // libuv callbacks — static to satisfy C function-pointer ABI.
-    // Both run exclusively on the I/O thread.
     static void timer_cb(uv_timer_t* handle);
     static void close_cb(uv_handle_t* handle);
 
-    std::chrono::steady_clock::time_point m_deadline;
-    std::shared_ptr<State>                m_state;        // null until first poll()
-    IoService*                            m_io_service = nullptr;  // cached on first poll()
+    std::chrono::time_point<std::chrono::steady_clock,
+                            std::chrono::milliseconds> m_deadline;
+    std::shared_ptr<State>    m_state;
+    SingleThreadedUvExecutor* m_uv_exec = nullptr;  // cached on first poll()
 };
 ```
 
-`StartRequest` and `CancelRequest` are private nested structs of `SleepFuture`, so they
-have full access to `SleepFuture`'s private members (including `State`) without any
-`friend` declarations. The callbacks are private `static` methods — they satisfy the C
-function-pointer ABI required by libuv while remaining scoped to `SleepFuture`.
-
-### Waker concurrency
-
-`timer_cb` on the I/O thread reads `state->waker` while a re-polled `SleepFuture` on a
-worker thread may be writing it. `State::waker` is therefore
-`std::atomic<std::shared_ptr<detail::Waker>>` (C++20 specialisation), making the store in
-`poll()` and the load in `timer_cb` race-free without a mutex.
+On the first `poll()`, `SleepFuture` caches `&current_uv_executor()` (so its destructor
+can cancel the timer even if the thread-local has already been cleared by the time it
+runs), allocates a `State`, and calls `with_context(*m_uv_exec, ...)` to register a
+one-shot `uv_timer_t` on the uv thread. `timer_cb` fires the stored waker and closes the
+handle. A `fired.exchange(true)` guards against double-close between `timer_cb` and the
+destructor's cancellation path racing each other.
 
 ### Timer resolution
 
-libuv timers have **millisecond resolution**. `StartRequest::execute()` converts the
-remaining duration to milliseconds using `std::chrono::ceil<milliseconds>` (rounding
-**up**), so the timer never fires before the deadline. A sub-millisecond remainder is
-always rounded up to the next whole millisecond.
-
-> **Rounding caveat:** because the delay is re-derived from `steady_clock::now()` at the
-> moment `execute()` runs on the I/O thread (not at `submit()` time), any queuing latency
-> between the worker thread calling `submit()` and the I/O thread processing the request
-> shortens the effective remaining duration before the ceil. In the worst case the timer
-> still fires at or after the original deadline, but callers must not assume it fires
-> exactly at `deadline` — actual wakeup will typically be 0–2 ms late due to OS scheduling
-> and the round-trip through the I/O thread.
-
-In practice this is not a meaningful limitation: the round-trip through the executor and
-I/O thread already adds latency on the order of microseconds to milliseconds, so
-sub-millisecond timer precision is not achievable regardless.
+libuv timers have **millisecond resolution**, and `loop->time` (frozen at the start of
+each loop iteration) can lag `steady_clock` by up to 1ms, so a timer can fire marginally
+before its logical deadline. `poll()` detects this (`state->fired` true but
+`steady_clock::now() < m_deadline`), discards the state, and reschedules for the small
+remainder — this reschedule is guaranteed not to fire early a second time, since by then
+`loop->time` will have caught up past the original deadline.
 
 ---
 
-## Shutdown Protocol
+## Shutdown
 
 ```
-Runtime::~Runtime():
-  1. m_executor.reset()          // joins all worker threads; no more waker->wake() calls
-  2. m_io_service.stop()         // signals I/O thread and joins it
+SingleThreadedUvExecutor::stop():
+  m_stopping = true
+  uv_async_send(&m_async)     // wake the uv thread one last time
 
-IoService::stop():
-  1. { lock } m_stopping = true
-  2. uv_async_send(&m_async)     // wake loop one last time
-  3. m_io_thread.join()
-
-io_async_cb (I/O thread):
-  process_queue()                // drain any last requests
+io_async_cb (uv thread):
+  drain_incoming_wakes(); drain_ready_tasks()   // finish any last work
   if (m_stopping):
-    uv_close(&m_async, nullptr)  // removing the last ref-counted handle lets uv_run() return
+    uv_close(&m_async, nullptr)   // last ref-counted handle closing lets uv_run() return
 
-// uv_run() returns → io_thread_loop() exits → join() completes.
+// uv_run() returns → io_thread_loop() exits → m_uv_thread.join() completes in the destructor.
 ```
 
-After `uv_run` returns, `uv_loop_close(&m_uv_loop)` is called. If any `uv_timer_t`
-handles were not yet closed (e.g. in-flight cancellations that arrived after `stop()` was
-called), `uv_loop_close` will return `UV_EBUSY`. In that case the implementation must call
-`uv_run` one more time in `UV_RUN_DEFAULT` mode (with `m_stopping` set) to flush
-remaining close callbacks before calling `uv_loop_close` again.
+If any handles (timers, sockets, etc.) are not yet closed when the loop is asked to stop
+(e.g. in-flight cancellations that arrive concurrently with `stop()`), `uv_loop_close`
+returns `UV_EBUSY`; the implementation runs `uv_run` again to flush the remaining close
+callbacks before retrying `uv_loop_close`.
 
-### Declaration order in `Runtime`
-
-`m_io_service` must be declared **before** `m_executor` so that it is destroyed
-**after** the executor (C++ destroys members in reverse declaration order). This guarantees
-no `waker->wake()` arrives on the I/O thread after the loop has been closed.
-
-```cpp
-class Runtime {
-    IoService                 m_io_service;  // destroyed last
-    std::unique_ptr<Executor> m_executor;    // destroyed first
-};
-```
+Because `SingleThreadedUvExecutor` **is** the executor (not a second object alongside
+one), there is no cross-object declaration-order invariant to maintain in `Runtime` the
+way an older design (with a separate I/O-service object) would have needed — `Runtime`
+owns a single `m_uv_executor` member and its destructor handles shutdown directly.
 
 ---
 
-## Why a Dedicated I/O Thread Instead of `UV_RUN_NOWAIT`
+## Why a Dedicated uv Thread Instead of `UV_RUN_NOWAIT`
 
 An alternative design drives the event loop inline — calling
 `uv_run(loop, UV_RUN_NOWAIT)` from a worker thread between task polls. This avoids a
 separate thread but has several drawbacks:
 
 - `uv_run` must still be called by the loop's owner thread. With work-stealing, any
-  worker can end up calling it, which requires strict ownership tracking.
+  worker could end up calling it, which requires strict ownership tracking.
 - `UV_RUN_NOWAIT` is inherently polling — it only processes callbacks that are already
   ready. Timers that expire while no tasks are running still require the loop to tick,
   which needs a dedicated caller.
-- `UV_RUN_DEFAULT` with a dedicated thread lets the OS park the I/O thread at the kernel
-  level between events (epoll/kqueue wait). `UV_RUN_NOWAIT` misses this entirely.
+- `UV_RUN_DEFAULT`/`UV_RUN_ONCE` with a dedicated thread lets the OS park that thread at
+  the kernel level between events (epoll/kqueue wait). `UV_RUN_NOWAIT` misses this
+  entirely.
 
-A dedicated I/O thread is simpler, matches how Tokio structures its I/O driver, and
-cleanly separates scheduling concerns from I/O concerns.
-
----
-
-## Cancellation
-
-When a `SleepFuture` or I/O future is destroyed mid-suspension (e.g. the task is
-cancelled or the losing branch of a `select` is dropped), it must cancel its pending
-libuv registration. Since `uv_timer_stop()` and `uv_close()` must also be called on
-the loop thread, the future's destructor pushes a `CancelTimer` onto the queue and
-calls `uv_async_send()` via `IoService::submit()`. The I/O thread processes the
-cancellation and closes the handle.
-
-The destructor always submits `CancelTimer` (if `m_state` is set). `CancelTimer::execute()`
-uses `fired.exchange(true)` to atomically claim the `uv_close` call. If the timer already
-fired, `timer_cb` will have won the exchange and `CancelTimer` is a no-op. This is simpler
-than a conditional check in the destructor and eliminates the TOCTOU window that a
-`fired.load()` check would leave open.
+A dedicated uv thread is simpler, matches how Tokio structures its I/O driver, and
+cleanly separates scheduling concerns (handled identically to any other `Executor`) from
+I/O concerns (handled by libuv calls made only from coroutines run via `with_context`).
 
 ---
 
-## Relationship to other abstractions
+## Relationship to Other Abstractions
 
 | Abstraction | Notes |
 |---|---|
 | `Waker` / `Context` | Unchanged |
 | `Executor::enqueue()` | Unchanged — I/O callbacks wake tasks via the normal injection path |
-| `SleepFuture` | Submits `StartRequest`/`CancelRequest` to `IoService`; destructor submits cancel |
-| `Runtime` | Owns `m_io_service`; calls `set_current_io_service` in `block_on` and worker thread startup |
+| `SleepFuture` | Runs its timer setup/teardown via `with_context(*m_uv_exec, ...)` |
+| `Runtime` | Owns `m_uv_executor` (a `SingleThreadedUvExecutor`); calls `set_current_uv_executor` at startup |
 | All combinators, `spawn`, `JoinHandle` | Unchanged |
 
 ---
 
 ## I/O Primitives
 
-`include/coro/io/` contains async wrappers built on `IoService`. Each follows the same
-pattern as `SleepFuture`: allocate a handle state struct, submit an `IoRequest`, store the
-`Waker`, and cancel in the destructor if the operation has not yet completed.
+`include/coro/io/` contains async wrappers built on `SingleThreadedUvExecutor`. Each
+follows the same pattern: run a coroutine on the uv executor via `with_context`, arm a
+libuv operation, `co_await wait(result)` on a stack-allocated `UvCallbackResult`, and
+cancel any still-pending operation in the destructor via the same `with_context`
+mechanism.
 
-**Implemented:**
-- **`TcpStream`** — async TCP connection; `connect()`, `read()`, `write()`
-- **`WsStream`** — async WebSocket client; `connect()`, `send()`, `receive()`
-- **`WsListener`** — async WebSocket server; `bind()`, `accept()`
+- **`TcpStream`** — async TCP connection: `connect()`, `read()`, `write()`.
+- **`TcpListener`** — async TCP accept loop: `bind()`, `accept()`.
+- **`UdpSocket`** — async connectionless datagrams: `bind()`, `send_to()`, `recv_from()`.
+  See `doc/design/udp_socket.md` for the full design (including the lwIP/Pico backend).
+- **`WsStream`** — async WebSocket client: `connect()`, `send()`, `receive()`.
+- **`WsListener`** — async WebSocket server: `bind()`, `accept()`.
+- **`File`** — async filesystem I/O via libuv's thread-pool file operations: `open()`,
+  `read()`, `write()`, `close()`.
+- **`PollStream`** — generic `uv_poll_t`-based readiness notification for raw file
+  descriptors that don't fit the above (see `doc/design/poll_streams.md`).
 
-**Planned** (see `roadmap.md`):
-- `TcpListener` — async TCP accept loop
-- `UdpSocket` — async send/recv
-- `File` — async read/write via libuv's thread-pool file I/O
-- DNS resolution
+DNS resolution is not yet a standalone primitive; `TcpStream::connect()` resolves
+hostnames internally via libuv's `uv_getaddrinfo`.
 
 ---
 
@@ -399,33 +367,29 @@ pattern as `SleepFuture`: allocate a handle state struct, submit an `IoRequest`,
 
 Known concurrency concerns and how they are resolved:
 
-**`State::waker` concurrent read/write** — worker thread writes `waker` on re-poll; I/O
-thread reads it in `timer_cb`. Resolved by `std::atomic<std::shared_ptr<Waker>>` in `State`.
+**`State::waker` concurrent read/write** (`SleepFuture` and similar) — the executor
+thread writes `waker` on re-poll; the uv thread reads it in the libuv callback. Resolved
+by `std::atomic<std::shared_ptr<Waker>>` (or, in `UvCallbackResult`, a plain `mutex`
+guarding both `waker` and `value`).
 
-**Double-close of `uv_timer_t`** — `timer_cb` and `CancelRequest::execute()` both call
-`uv_close`. Resolved by `fired.exchange(true)` — the first caller owns the close, the other
-is a safe no-op.
+**Double-close of a libuv handle** — both the success callback (e.g. `timer_cb`) and a
+cancellation path (destructor via `with_context`) may attempt to close the same handle.
+Resolved by a `fired.exchange(true)` (or equivalent) claim: the first caller owns the
+close, the other is a safe no-op.
 
-**`State` freed before `CancelRequest` executes** — if `SleepFuture` is destroyed before
-the I/O thread processes `CancelRequest`, the state must remain alive. Resolved by
-`CancelRequest` holding `shared_ptr<State>`.
+**`UvCallbackResult` state outliving the frame** — since `UvCallbackResult` is stack
+allocated in a coroutine passed to `with_context`, the coroutine must not return until
+the libuv callback either fires or is guaranteed never to fire (cancelled). Operations
+that can outlive a single `co_await` (e.g. `TcpStream::read()`'s persistent
+`uv_read_start`) use the `UvFuture` cancel-function constructor to guarantee the
+callback is disarmed (`uv_read_stop`) before the frame is torn down.
 
-**`m_stopping` read/write race** — `io_async_cb` reads `m_stopping` outside the lock while
-`stop()` writes it. Resolved by `std::atomic<bool> m_stopping`.
+**`m_stopping` read/write race** — `io_async_cb` reads `m_stopping` while `stop()` writes
+it from another thread. Resolved by `std::atomic<bool> m_stopping`.
 
-**`State` is not standard-layout** — `State` contains `std::atomic<std::shared_ptr<>>`,
-making first-field pointer casts UB. Resolved by storing a heap-allocated
-`shared_ptr<State>` wrapper in `handle->data` and recovering it in callbacks via
-`static_cast<std::shared_ptr<State>*>(handle->data)`. `close_cb` deletes the wrapper,
-decrementing the ref count.
-
-**`uv_async_send` after `uv_close(&m_async)`** — calling `submit()` after shutdown is UB.
-Prevented by the shutdown ordering: executor joins (no more `wake()` calls) before
-`IoService::stop()` is called.
-
-**Stray in-flight handles at `uv_loop_close` time** — if cancellation requests arrive
-after the final `process_queue()` drain, `uv_loop_close` returns `UV_EBUSY`. Handled by
-re-running `uv_run` one more time to flush remaining close callbacks.
+**Stray in-flight handles at `uv_loop_close` time** — if cancellations arrive after the
+final drain, `uv_loop_close` returns `UV_EBUSY`. Handled by re-running `uv_run` once more
+to flush remaining close callbacks.
 
 ---
 
@@ -442,34 +406,4 @@ The CMake integration target is `libuv::libuv`. Link it to the `coro` library ta
 
 ```cmake
 target_link_libraries(coro PUBLIC libuv::libuv)
-```
-
----
-
-## Initialization and Shutdown Sequence Diagram
-
-```
-Runtime ctor                 IoService ctor              I/O thread
-────────────────             ──────────────────          ──────────────────────────────────
-                             uv_loop_init(&m_uv_loop)
-                             uv_async_init(&m_uv_loop,
-                               &m_async, io_async_cb)
-                             m_io_thread = thread(...)  → uv_run(&m_uv_loop, UV_RUN_DEFAULT)
-m_executor = make(...)
-set_current_io_service(...)  (worker threads also call
-                              set_current_io_service)
-
-... runtime running ...
-
-Runtime dtor
-m_executor.reset()           ← worker threads join
-m_io_service.stop():
-  m_stopping = true
-  uv_async_send(&m_async)                               io_async_cb:
-                                                          process_queue()  // drain last reqs
-                                                          uv_close(&m_async, nullptr)
-                                                        // loop exits when all handles closed
-                                                        uv_run returns
-m_io_thread.join()           ←─────────────────────────────────────────────
-uv_loop_close(&m_uv_loop)
 ```

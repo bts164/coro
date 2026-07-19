@@ -104,6 +104,8 @@ else()
         #src/io/pipe.cpp
         src/io/circular_byte_buffer.cpp
         src/io/signal.cpp
+        src/io/socket_address.cpp
+        src/io/udp_socket.cpp
     )
     if(CORO_USE_LOCAL_RUN_QUEUE)
         target_compile_definitions(coro PUBLIC CORO_USE_LOCAL_RUN_QUEUE)

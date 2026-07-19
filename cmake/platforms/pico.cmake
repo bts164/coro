@@ -63,6 +63,8 @@ add_library(coro_pico STATIC
     ${_CORO_SRC}/runtime/current_thread_executor.cpp
     ${_CORO_SRC}/io/lwip/tcp_stream_lwip.cpp
     ${_CORO_SRC}/io/lwip/tcp_listener_lwip.cpp
+    ${_CORO_SRC}/io/socket_address.cpp
+    ${_CORO_SRC}/io/lwip/udp_socket_lwip.cpp
 )
 target_include_directories(coro_pico PUBLIC  ${_CORO_INCLUDE})
 # CORO_PICO_LWIPOPTS_INCLUDE_DIR is PUBLIC, not PRIVATE: lwipopts.h must be
@@ -74,7 +76,7 @@ target_include_directories(coro_pico PUBLIC  ${_CORO_INCLUDE})
 target_include_directories(coro_pico PRIVATE ${_CORO_SRC}/io/lwip)
 target_include_directories(coro_pico PUBLIC  ${CORO_PICO_LWIPOPTS_INCLUDE_DIR})
 target_compile_features(coro_pico PUBLIC cxx_std_23)
-target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP)
+target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP CORO_UDP_BACKEND_LWIP)
 # Coroutine frame pooling (CoroPromiseBase's pooled operator new/delete in
 # coro.h) is experimental and off by default. To opt in:
 #   target_compile_definitions(coro_pico PUBLIC CORO_PICO_FRAME_POOL)

@@ -1,5 +1,17 @@
 # WebSocket Stream
 
+!!! danger "FIXME: Heavily out of date — describes a retired architecture"
+    This document still describes `WsStream`/`WsListener` operations as `IoRequest`
+    subclasses (`WsConnectRequest`, `WsWritableRequest`, `WsCloseRequest`,
+    `WsBindRequest`) submitted to an `IoService`. **Neither `IoService` nor
+    `IoRequest` exist in the codebase anymore.** The real implementation
+    (`src/io/ws_stream.cpp`, `src/io/ws_listener.cpp`) runs each operation as a
+    `with_context(*m_uv_exec, ...)` coroutine that calls the lws API directly,
+    following the pattern documented in `doc/design/libuv_integration.md`. The
+    `lws_context*` ownership section is also stale — it's owned by
+    `SingleThreadedUvExecutor`, not `IoService`. This doc needs a full rewrite, not
+    a patch — see `doc_inconsistency_audit.md` at the repo root for details.
+
 `WsStream` and `WsListener` — async WebSocket client and server built on
 [libwebsockets](https://libwebsockets.org/) using the shared libuv event loop as the backend.
 

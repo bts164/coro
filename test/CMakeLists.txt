@@ -57,6 +57,7 @@ set(TEST_NAMES
     test_circular_byte_buffer
     test_poll_stream
     test_signal
+    test_udp_socket
     # stress/
     test_skynet
     # misc/
@@ -107,6 +108,7 @@ set(TEST_SRCS
     io/test_circular_byte_buffer.cpp
     io/test_poll_stream.cpp
     io/test_signal.cpp
+    io/test_udp_socket.cpp
     # stress/
     stress/test_skynet.cpp
     # misc/
@@ -262,6 +264,7 @@ add_library(lwip_host STATIC
     ${LWIP_DIR}/src/core/ipv4/ip4_addr.c
     ${LWIP_DIR}/src/core/ipv4/ip4_frag.c
     ${LWIP_DIR}/src/core/ipv4/icmp.c
+    ${LWIP_DIR}/src/core/ipv4/igmp.c
     ${LWIP_DIR}/src/apps/mqtt/mqtt.c
     pico/lwip_host/sys_now.c
 )
@@ -286,6 +289,31 @@ add_executable(test_tcp_stream_real pico/test_tcp_stream_real.cpp)
 target_link_libraries(test_tcp_stream_real PRIVATE
     coro_lwip_tcp GTest::gtest GTest::gtest_main GTest::gmock)
 add_test(NAME test_tcp_stream_real COMMAND test_tcp_stream_real)
+
+# ---------------------------------------------------------------------------
+# Real lwIP UDP tests — host NO_SYS loopback.
+#
+# Same shape as coro_lwip_tcp above: links udp_socket_lwip.cpp (plus the
+# shared socket_address.cpp, which needs lwip/ip4_addr.h under CORO_PICO)
+# against the same lwip_host used by the TCP tests.
+# ---------------------------------------------------------------------------
+add_library(coro_lwip_udp STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/socket_address.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip/udp_socket_lwip.cpp
+)
+target_include_directories(coro_lwip_udp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip
+)
+# CORO_UDP_BACKEND_LWIP selects udp_socket.h's lwIP branch; without it, the
+# header falls through to its #else (libuv) branch and pulls in uv.h, which
+# this pico-core-based target never links against.
+target_compile_definitions(coro_lwip_udp PUBLIC CORO_UDP_BACKEND_LWIP)
+target_link_libraries(coro_lwip_udp PUBLIC coro_pico_core lwip_host)
+
+add_executable(test_udp_socket_real pico/test_udp_socket_real.cpp)
+target_link_libraries(test_udp_socket_real PRIVATE
+    coro_lwip_udp GTest::gtest GTest::gtest_main GTest::gmock)
+add_test(NAME test_udp_socket_real COMMAND test_udp_socket_real)
 
 # ---------------------------------------------------------------------------
 # MQTT client tests — host NO_SYS loopback, real lwIP apps/mqtt.

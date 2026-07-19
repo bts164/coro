@@ -14,14 +14,17 @@
 #define LWIP_NETCONN            0
 #define LWIP_SOCKET             0
 
-/* Protocols — TCP only, no UDP/ICMP/ARP needed for loopback tests */
+/* Protocols */
 #define LWIP_TCP                1
-#define LWIP_UDP                1   /* required by the DNS module */
+#define LWIP_UDP                1   /* required by the DNS module; also backs UdpSocket */
 #define LWIP_ICMP               0
 #define LWIP_ARP                0
 #define LWIP_IPV4               1
 #define LWIP_IPV6               0
 #define LWIP_RAW                0
+
+/* IGMP — needed for UdpSocket::join_multicast()/leave_multicast() tests */
+#define LWIP_IGMP               1
 
 /* DNS — needed for TcpStream::connect() hostname resolution */
 #define LWIP_DNS                1

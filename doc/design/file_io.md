@@ -1,5 +1,15 @@
 # File I/O
 
+!!! danger "FIXME: Heavily out of date — describes a retired architecture"
+    This document still describes `File` in terms of `IoService` and `IoRequest`
+    subclasses (`OpenRequest`, `ReadRequest`, `WriteRequest`, `CloseRequest`,
+    `CancelRequest`). **Neither `IoService` nor `IoRequest` exist in the codebase
+    anymore.** The real `File` implementation (`src/io/file.cpp`) is built on
+    `SingleThreadedUvExecutor` + `with_context` + `UvCallbackResult`/`UvFuture`,
+    following the pattern documented in `doc/design/libuv_integration.md` and
+    `doc/design/io_coroutine.md`. This doc needs a full rewrite, not a patch — see
+    `doc_inconsistency_audit.md` at the repo root for details on what's stale.
+
 ## Overview
 
 This document describes the design for async filesystem read/write primitives built on top of
