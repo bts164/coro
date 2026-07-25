@@ -207,10 +207,11 @@ public:
                 return;
             }
 
-            if (push_overflow(std::move(task), real, tail, overflow))
+            if (push_overflow(task, real, tail, overflow))
                 return;
-            // CAS lost to a concurrent stealer — reload task and retry.
-            // push_overflow moved task only on success; on failure task is intact.
+            // CAS lost to a concurrent stealer — retry with the same task.
+            // push_overflow takes task by reference and only moves it once the
+            // CAS actually commits, so task is guaranteed intact here.
         }
         push_back_finish(std::move(task), tail);
     }
@@ -256,7 +257,7 @@ private:
     // The second half is chosen so that tasks recycled from the injection queue
     // are not immediately spilled back to it on the very next push.
     template<typename Overflow>
-    bool push_overflow(T task, uint32_t head, uint32_t tail, Overflow& overflow) {
+    bool push_overflow(T& task, uint32_t head, uint32_t tail, Overflow& overflow) {
         static constexpr uint32_t NUM_TAKEN =
             static_cast<uint32_t>(LOCAL_QUEUE_CAPACITY / 2);
 
