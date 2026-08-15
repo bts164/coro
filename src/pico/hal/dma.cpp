@@ -46,11 +46,15 @@ void coro_pico_hal_dma_fire_irq0() {
 
 namespace coro::pico::hal {
 
-AsyncDmaTransfer::AsyncDmaTransfer() {
+AsyncDmaTransfer::AsyncDmaTransfer(bool track_completion)
+    : m_track_completion(track_completion) {
     int ch = dma_claim_unused_channel(true);
     if (ch < 0)
         throw std::runtime_error("AsyncDmaTransfer: no free DMA channels");
     m_channel = ch;
+
+    if (!m_track_completion)
+        return;
 
     std::call_once(s_irq_registered, []() {
         irq_add_shared_handler(DMA_IRQ_0, dma_irq0_handler,
@@ -65,27 +69,32 @@ AsyncDmaTransfer::AsyncDmaTransfer() {
 }
 
 AsyncDmaTransfer::~AsyncDmaTransfer() {
-    // Clear dispatch table entry before aborting so a late-firing IRQ does not
-    // write into a destroyed IsrEvent.
-    s_dispatch[m_channel] = nullptr;
-    dma_channel_set_irq0_enabled(static_cast<uint>(m_channel), false);
+    if (m_track_completion) {
+        // Clear dispatch table entry before aborting so a late-firing IRQ does
+        // not write into a destroyed IsrEvent.
+        s_dispatch[m_channel] = nullptr;
+        dma_channel_set_irq0_enabled(static_cast<uint>(m_channel), false);
+    }
     dma_channel_abort(static_cast<uint>(m_channel));
     dma_channel_unclaim(static_cast<uint>(m_channel));
 }
 
-Coro<void> AsyncDmaTransfer::transfer(const dma_channel_config& ctrl,
-                                       const volatile void*       read_addr,
-                                       volatile void*             write_addr,
-                                       uint                       transfer_count) {
+void AsyncDmaTransfer::start(const dma_channel_config& ctrl,
+                              const volatile void*       read_addr,
+                              volatile void*             write_addr,
+                              uint                       transfer_count) {
     // Register before starting — the IRQ could fire immediately after start.
-    s_dispatch[m_channel] = &m_done;
+    if (m_track_completion)
+        s_dispatch[m_channel] = &m_done;
 
     dma_channel_configure(static_cast<uint>(m_channel), &ctrl,
                           write_addr, read_addr, transfer_count, /*trigger=*/false);
     dma_channel_start(static_cast<uint>(m_channel));
+}
 
-    // AbortGuard: if this coroutine is cancelled while suspended in wait(),
-    // the guard destructor clears the dispatch entry and aborts the channel.
+Coro<void> AsyncDmaTransfer::wait() {
+    // AbortGuard: if this coroutine is cancelled while suspended below, the
+    // guard destructor clears the dispatch entry and aborts the channel.
     struct AbortGuard {
         int         channel;
         bool        active = true;
@@ -101,6 +110,14 @@ Coro<void> AsyncDmaTransfer::transfer(const dma_channel_config& ctrl,
 
     guard.active = false;
     s_dispatch[m_channel] = nullptr;
+}
+
+Coro<void> AsyncDmaTransfer::transfer(const dma_channel_config& ctrl,
+                                       const volatile void*       read_addr,
+                                       volatile void*             write_addr,
+                                       uint                       transfer_count) {
+    start(ctrl, read_addr, write_addr, transfer_count);
+    co_await wait();
 }
 
 } // namespace coro::pico::hal

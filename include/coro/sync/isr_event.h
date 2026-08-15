@@ -34,7 +34,10 @@ class IsrWaitFuture {
 public:
     using OutputType = void;
 
-    explicit IsrWaitFuture(IsrFlagRef ref) : m_ref(ref) {}
+    explicit IsrWaitFuture(IsrFlagRef ref, bool reset) :
+        m_ref(ref),
+        m_reset(reset)
+    {}
 
     ~IsrWaitFuture() {
         // If the awaiting coroutine is cancelled while we are registered with the
@@ -46,16 +49,17 @@ public:
     }
 
     // Move transfers ownership of the registration; source must not deregister.
-    IsrWaitFuture(IsrWaitFuture&& other) noexcept
-        : m_ref(other.m_ref), m_registered(other.m_registered) {
-        other.m_registered = false;
-    }
+    IsrWaitFuture(IsrWaitFuture&& other) noexcept :
+        m_ref(other.m_ref),
+        m_reset(other.m_reset),
+        m_registered(std::exchange(other.m_registered, false))
+    {}
     IsrWaitFuture& operator=(IsrWaitFuture&& other) noexcept {
         if (this != &other) {
             if (m_registered) current_runtime().remove_isr_poll(m_ref);
             m_ref        = other.m_ref;
-            m_registered = other.m_registered;
-            other.m_registered = false;
+            m_reset      = other.m_reset;
+            m_registered = std::exchange(other.m_registered, false);
         }
         return *this;
     }
@@ -64,7 +68,7 @@ public:
 
     PollResult<void> poll(detail::Context& ctx) {
         uint32_t save = spin_lock_blocking(m_ref.lock);
-        bool set = *m_ref.flag;
+        bool set = m_reset ? std::exchange(*m_ref.flag, false) : *m_ref.flag;
         spin_unlock(m_ref.lock, save);
         if (set) {
 #ifdef CORO_DMA_DEBUG
@@ -84,6 +88,7 @@ public:
 
 private:
     IsrFlagRef m_ref;
+    bool       m_reset = false;
     bool       m_registered = false;
 };
 
@@ -133,19 +138,35 @@ public:
         spin_unlock(m_lock, save);
     }
 
+    bool is_set() const noexcept {
+        return m_flag;
+    }
+
     [[nodiscard]] Coro<void> wait() {
         // Do NOT clear m_flag here. If the IRQ fires between the caller setting
         // up the dispatch table and reaching this co_await, the flag is already
         // true and IsrWaitFuture::poll() will return PollReady immediately.
         // Clearing on entry would swallow that signal and park forever.
         // The clear at the end handles stale signals from previous transfers.
-        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}};
+        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}, false};
         uint32_t save = spin_lock_blocking(m_lock);
         m_flag = false;
         spin_unlock(m_lock, save);
     }
 
-private:
+    [[nodiscard]] Coro<void> wait_and_reset() {
+        // Do NOT clear m_flag here. If the IRQ fires between the caller setting
+        // up the dispatch table and reaching this co_await, the flag is already
+        // true and IsrWaitFuture::poll() will return PollReady immediately.
+        // Clearing on entry would swallow that signal and park forever.
+        // The clear at the end handles stale signals from previous transfers.
+        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}, true};
+        uint32_t save = spin_lock_blocking(m_lock);
+        m_flag = false;
+        spin_unlock(m_lock, save);
+    }
+
+    private:
     spin_lock_t*  m_lock;
     volatile bool m_flag = false;
 };

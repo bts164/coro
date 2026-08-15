@@ -102,6 +102,40 @@ TEST_F(AsyncDmaTransferTest, TransferCanBeReusedAfterCompletion) {
     EXPECT_EQ(count, 3);
 }
 
+TEST_F(AsyncDmaTransferTest, StartThenWaitCompletesWhenIrqFires) {
+    AsyncDmaTransfer dma;
+    bool completed = false;
+    uint ch = static_cast<uint>(dma.channel());
+
+    auto trigger = fire_irq_after(ch);
+
+    make_rt().block_on([](AsyncDmaTransfer& dma, bool& done) -> Coro<void> {
+        dma_channel_config cfg = dma_channel_get_default_config(
+            static_cast<uint>(dma.channel()));
+        dma.start(cfg, nullptr, nullptr, 0);
+        // start() itself must not suspend -- assert no time has passed by
+        // simply reaching this point synchronously within the same coroutine
+        // frame before the first co_await below.
+        co_await dma.wait();
+        done = true;
+    }(dma, completed));
+
+    trigger.join();
+    EXPECT_TRUE(completed);
+}
+
+TEST_F(AsyncDmaTransferTest, UntrackedInstanceDoesNotEnableIrq) {
+    AsyncDmaTransfer dma(/*track_completion=*/false);
+    dma_channel_config cfg = dma_channel_get_default_config(
+        static_cast<uint>(dma.channel()));
+    // start() must not register a dispatch entry or hang waiting for
+    // anything -- firing the IRQ for this channel must be a no-op observer
+    // side, i.e. nothing crashes or blocks since wait() is never called.
+    dma.start(cfg, nullptr, nullptr, 0);
+    dma_stub::complete_channel(static_cast<uint>(dma.channel()));
+    coro_pico_hal_dma_fire_irq0();
+}
+
 TEST_F(AsyncDmaTransferTest, OnlyCorrectChannelWakesTransfer) {
     AsyncDmaTransfer a;
     AsyncDmaTransfer b;
