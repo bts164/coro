@@ -26,6 +26,19 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# CORO_VERSION is set via conanfile.py's generate() (cache_variables), which
+# derives it from git — see README.md's "Embedding the version in the built
+# binary". Falls back to "unknown" so a plain non-Conan `cmake` configure
+# never hard-fails just because Conan wasn't involved in producing it.
+if(NOT DEFINED CORO_VERSION)
+    set(CORO_VERSION "unknown")
+endif()
+set(CORO_GENERATED_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/coro_version.h.in
+    ${CORO_GENERATED_INCLUDE_DIR}/coro/version.h
+    @ONLY)
+
 if(CORO_PLATFORM STREQUAL "pico")
     # CORO_PICO_WITH_MQTT (declared as an option() inside pico.cmake) also
     # controls LWIP_MQTT in the bundled default lwipopts.h that pico.cmake
@@ -35,6 +48,9 @@ if(CORO_PLATFORM STREQUAL "pico")
     if(CORO_PICO_WITH_MQTT)
         include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/platforms/pico_mqtt.cmake)
     endif()
+
+    target_include_directories(coro_pico PUBLIC ${CORO_GENERATED_INCLUDE_DIR})
+    install(FILES ${CORO_GENERATED_INCLUDE_DIR}/coro/version.h DESTINATION include/coro)
 
     install(TARGETS coro_pico coro_pico_hal)
     if(CORO_PICO_WITH_MQTT)
@@ -110,13 +126,14 @@ else()
     if(CORO_USE_LOCAL_RUN_QUEUE)
         target_compile_definitions(coro PUBLIC CORO_USE_LOCAL_RUN_QUEUE)
     endif()
-    target_include_directories(coro PUBLIC include)
+    target_include_directories(coro PUBLIC include ${CORO_GENERATED_INCLUDE_DIR})
     target_link_libraries(coro PUBLIC
         libuv::uv_a
         $<$<BOOL:${WITH_GPERFTOOLS}>:gperftools::gperftools>
         websockets)
 
     install(TARGETS coro)
+    install(FILES ${CORO_GENERATED_INCLUDE_DIR}/coro/version.h DESTINATION include/coro)
     # include/coro/pico/ is intentionally excluded from the installed package.
     # Those headers require CORO_PICO and the Pico SDK — they have no use on
     # desktop platforms and would fail to compile without the SDK headers.

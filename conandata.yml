@@ -1,0 +1,8 @@
+# Read by conanfile.py's set_version() — see README.md's "Signaling a
+# minor/major dev-build bump". Only affects the version *string* of
+# not-yet-tagged dev builds; ignored for exact release/rc tags.
+#
+# Set to "minor" or "major" when starting work that will require that scope
+# of bump at the next real release tag; reset to "patch" (or remove the key)
+# once that tag is cut.
+next_bump: patch

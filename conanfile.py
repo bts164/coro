@@ -1,13 +1,27 @@
 import re, os
 from conan import ConanFile
+from conan.errors import ConanException
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
-from conan.tools.files import copy
+from conan.tools.files import copy, update_conandata
+from conan.tools.scm import Git
 
 class CoroRecipe(ConanFile):
     name = "coro"
-    version = "0.1.0"
     package_type = "library"
+
+    # coro is header/template-heavy: consumers compile against its headers
+    # regardless of whether the library binary itself is statically embedded
+    # or dynamically linked, so no patch release can be assumed ABI/API-safe
+    # to drop in without a consumer rebuild. The embed-mode default
+    # ("full_mode") already forces a rebuild on any change for the
+    # static/header-embedding case; non_embed_mode's default ("minor_mode")
+    # is the gap — it's what applies to the common desktop case (an
+    # executable dynamically linking coro as a shared library, coro's
+    # default_options), and it otherwise treats patch bumps as compatible
+    # and skips the consumer rebuild. See README.md's Versioning and
+    # Releases section.
+    package_id_non_embed_mode = "patch_mode"
 
     # Binary configuration
     settings = "os", "compiler", "build_type", "arch"
@@ -36,8 +50,133 @@ class CoroRecipe(ConanFile):
     exports_sources = (
         "include/**.h", "include/**.hpp",
         "src/**.cpp", "src/**.h", "src/**.in",
-        "CMakeLists.txt", "cmake/**.cmake",
+        "CMakeLists.txt", "cmake/**.cmake", "cmake/**.in",
     )
+
+    # Derives the version from git instead of a hand-maintained string — see
+    # README.md's "How the version is derived on non-tagged commits". Requires
+    # at least one reachable vX.Y.Z tag (a one-time bootstrap requirement) and
+    # enough git history to reach it; a shallow clone with no tag in range
+    # fails loudly below rather than silently falling back to a guess.
+    #
+    # set_version() re-runs against the recipe's *cache-exported* copy (e.g.
+    # when a consumer resolves "coro/<version>" from the cache later), and
+    # that copy never has .git — exports_sources only copies source patterns,
+    # never the repo metadata. export() runs right after set_version()'s
+    # first (real-tree) success and persists the computed version into
+    # conandata.yml's scm_version key, which — unlike exports_sources — Conan
+    # always copies into the cache. Checking for that key up front (rather
+    # than trying git first and falling back on failure) skips an always-
+    # doomed `git describe` subprocess call on every later cache-based
+    # recipe evaluation. This relies on the *tracked* conandata.yml (source
+    # tree) never itself containing an scm_version key — only export()'s
+    # write into the cache-exported copy should ever put one there; don't
+    # add one by hand.
+    def set_version(self):
+        cached = (self.conan_data or {}).get("scm_version")
+        if cached:
+            self.version = cached
+            return
+
+        git = Git(self, folder=self.recipe_folder)
+        try:
+            describe = git.run(
+                "describe --tags --long --dirty --match v[0-9]*.[0-9]*.[0-9]*"
+            ).strip()
+        except Exception as e:
+            raise ConanException(
+                "coro: `git describe` could not find a reachable vX.Y.Z tag "
+                f"({e}). Either no such tag exists yet in this history (create "
+                "one, e.g. `git tag v0.1.0`), or this is a shallow clone that "
+                "doesn't include it — fetch full history/tags (e.g. "
+                "`git fetch --unshallow --tags`, or `fetch-depth: 0` / "
+                "`GIT_DEPTH: 0` in CI)."
+            )
+
+        dirty = describe.endswith("-dirty")
+        if dirty:
+            describe = describe[: -len("-dirty")]
+
+        # The --match glob above also matches "vX.Y.Z-rc.N" tags (the trailing
+        # "*" absorbs the "-rc.N" suffix), so a release-candidate tag can be
+        # the "nearest reachable tag" here just like a plain release tag.
+        tag, count, _sha_with_g = describe.rsplit("-", 2)
+        sha = _sha_with_g[1:]  # strip git describe's "g" prefix on the short hash
+
+        match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?", tag)
+        if not match:
+            raise ConanException(
+                f"coro: tag '{tag}' found by `git describe` doesn't match the "
+                "expected vX.Y.Z or vX.Y.Z-rc.N format"
+            )
+        major, minor, patch, rc = match.groups()
+        major, minor, patch = int(major), int(minor), int(patch)
+        exact = count == "0" and not dirty
+
+        if rc is not None:
+            # rc tags already name the pending release, so the patch is not
+            # bumped again — see README.md's "Release candidates".
+            self.version = f"{major}.{minor}.{patch}-rc.{rc}"
+            if not exact:
+                self.version += f".dev.{count}+g{sha}"
+        else:
+            if exact:
+                self.version = f"{major}.{minor}.{patch}"
+            else:
+                # See README.md's "Signaling a minor/major dev-build bump" —
+                # patch is only a safe-for-ordering default, not a claim that
+                # the pending change is actually patch-compatible.
+                next_bump = (self.conan_data or {}).get("next_bump", "patch")
+                if next_bump == "major":
+                    major, minor, patch = major + 1, 0, 0
+                elif next_bump == "minor":
+                    minor, patch = minor + 1, 0
+                elif next_bump == "patch":
+                    patch += 1
+                else:
+                    raise ConanException(
+                        f"coro: conandata.yml's next_bump is '{next_bump}', "
+                        "expected 'patch', 'minor', or 'major'"
+                    )
+                self.version = f"{major}.{minor}.{patch}-dev.{count}+g{sha}"
+
+        if not exact:
+            # Build metadata only — never affects SemVer precedence or Conan
+            # resolution. See README.md's "Metadata: branch name and dirty
+            # state". Exact tags (release or rc) carry none of this.
+            branch = self._branch_metadata(git)
+            if branch:
+                self.version += f".{branch}"
+            if dirty:
+                self.version += ".dirty"
+
+    # Best-effort branch name for build metadata, resolved in the order
+    # documented in README.md: the CI-provided ref first (coro is hosted on
+    # GitHub, so only GitHub Actions' env vars need handling), then a local
+    # git query. Returns None (metadata omitted, not guessed) if neither
+    # resolves, e.g. a detached-HEAD checkout of a bare commit with no CI
+    # context.
+    @staticmethod
+    def _branch_metadata(git):
+        branch = os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME")
+        if not branch:
+            try:
+                branch = git.run("branch --show-current").strip()
+            except Exception:
+                branch = None
+        if not branch:
+            return None
+        sanitized = re.sub(r"[^0-9A-Za-z-]", "-", branch)[:12].strip("-")
+        return sanitized or None
+
+    # Runs once, immediately after set_version() succeeds against the real
+    # working tree (before the recipe is copied into the cache), so this is
+    # the last point .git is guaranteed present. Persists the already-computed
+    # version into conandata.yml — which does get copied into the cache
+    # regardless of exports_sources — so later .git-less invocations of
+    # set_version() (see its comment above) can recover it instead of failing.
+    def export(self):
+        update_conandata(self, {"scm_version": self.version})
 
     # Lets CORO_<OPTION> in the environment (e.g. via .envrc) set a boolean
     # option's default without passing -o on the conan CLI. config_options()
@@ -127,6 +266,16 @@ class CoroRecipe(ConanFile):
             # real CMake target properties, so it needs its own includedirs
             # entry pointing at the build-folder path.
             self.cpp.build.components["pico"].includedirs = ["coro_pico_lwipopts"]
+            # cpp.build.includedirs resolves against the build folder;
+            # include/ lives in the source tree, so it belongs on cpp.source
+            # instead. Must be set explicitly -- same gotcha package_info()
+            # already documents: setting includedirs on a component at all
+            # replaces the default ["include"] rather than adding to it.
+            # Omitting this was a latent bug: any target linking coro::pico
+            # without also linking coro::pico_hal (whose includedirs falls
+            # back to the correct default, masking it) would fail to find
+            # coro/**.h headers entirely.
+            self.cpp.source.components["pico"].includedirs = ["include"]
             # cmake_build_modules path (see package_info()) — lives in the
             # recipe source tree, not the build tree, so it's declared under
             # cpp.source (resolved against self.source_folder, which for an
@@ -144,6 +293,11 @@ class CoroRecipe(ConanFile):
         deps = CMakeDeps(self)
         deps.generate()
         tc = CMakeToolchain(self)
+        # Single source of truth for the version embedded in the built binary
+        # (see README.md's "Embedding the version in the built binary") —
+        # CMakeLists.txt generates include/coro/version.h from this rather
+        # than trying to independently re-derive it via git itself.
+        tc.cache_variables["CORO_VERSION"] = str(self.version)
         # Pico (baremetal): the toolchain itself is owned by pico_sdk_init(),
         # not Conan — see doc/design/pico_led_conan_packaging.md. The host
         # profile is responsible for paring CMakeToolchain's blocks down via
