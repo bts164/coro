@@ -23,6 +23,13 @@ jobs:
       CORO_SANITIZE: ${{ matrix.sanitizer }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # actions/checkout defaults to fetch-depth: 1 with no tags, but
+          # conan_version.py derives the package version from `git describe
+          # --tags --match v[0-9]*.[0-9]*.[0-9]*` (see docker/run-sanitizer-build.sh's
+          # equivalent git config step) -- without full history and tags that
+          # describe finds nothing to match against and version detection fails.
+          fetch-depth: 0
 
       - name: Install system dependencies
         run: |
