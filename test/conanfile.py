@@ -1,12 +1,31 @@
-import re, os
+import os, sys
 from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
 
+# conan_version.py lives at the repo root (one level up from test/), and is
+# a plain sibling module rather than a Conan python_requires -- see its own
+# file comment for why. Shared with the root conanfile.py so this recipe's
+# `coro/<version>` requirement (see requirements() below) can never drift
+# out of sync with what building the repo's own conanfile.py right now
+# would actually produce.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from conan_version import derive_coro_version, load_conandata
+
 class CoroRecipe(ConanFile):
     name = "coro_unit_tests"
-    version = "0.1.0"
     package_type = "library"
+
+    # coro_unit_tests isn't an independently published package -- it's a
+    # thin, disposable wrapper that only exists to build/run this checkout's
+    # tests -- but it still lived with a hand-hardcoded "0.1.0" here, the
+    # same kind of stale-pin problem requirements() used to have with
+    # `coro/[*]` (see below). Deriving it the same way keeps both recipes
+    # describing "this same checkout" consistently instead of leaving a
+    # second easily-forgotten hardcoded version behind.
+    def set_version(self):
+        coro_root = os.path.join(self.recipe_folder, "..")
+        self.version = derive_coro_version(self, coro_root, load_conandata(coro_root))
 
     # Binary configuration
     settings = "os", "compiler", "build_type", "arch"
@@ -66,13 +85,32 @@ class CoroRecipe(ConanFile):
         if self.options.shared:
             self.options.rm_safe("fPIC")
 
+    # Pins the coro/ dependency to exactly the version this same checkout's
+    # root conanfile.py would produce right now -- see conan_version.py's
+    # file comment. That guarantees the test binaries always link against a
+    # coro package built from this tree, not merely *some* coro package
+    # that happens to already be in the cache (which is what `coro/[*]` was
+    # silently doing before, and how the tests ended up quietly built
+    # against a stale coro once the version stopped being a fixed "0.1.0").
+    #
+    # CORO_TEST_VERSION overrides the pin when set, for deliberately running
+    # this same test suite against a different, already-built coro version
+    # (e.g. bisecting a regression against an older release) without editing
+    # this file. Deliberately doesn't affect self.version (set in
+    # set_version() above) -- "what coro build to test against" and "what
+    # checkout is this recipe itself" are different questions; only the
+    # former should move under the override.
+    def _coro_dependency_version(self):
+        return os.environ.get("CORO_TEST_VERSION") or self.version
+
     def requirements(self):
-        self.requires("coro/[0.1.0]", options={
+        self.requires(f"coro/{self._coro_dependency_version()}", options={
             "with_gperftools": self.options.with_gperftools,
             "with_local_run_queue": self.options.with_local_run_queue,
             "with_sanitize": self.options.with_sanitize
         })
         self.requires("gtest/[>=1.14.0 <2]")
+        self.requires("libunicorn/2.1.4")
 
     def layout(self):
         cmake_layout(self)

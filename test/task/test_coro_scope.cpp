@@ -262,7 +262,11 @@ class EventFuture
     struct SharedState {
         std::mutex m_mutex;
         bool m_set = false;
-        Rc<coro::detail::Waker> m_waker;
+        // weak_ptr, not shared_ptr: a leaf future must not hold a strong waker
+        // across a suspension point (doc/design/task_ownership.md, Category 4) —
+        // TaskBase IS the Waker, so a strong clone stored here forms a cycle
+        // back to whichever TaskImpl is polling this future.
+        Weak<coro::detail::Waker> m_waker;
     };
     std::shared_ptr<SharedState> m_state;
 public:
@@ -278,13 +282,13 @@ public:
         if (m_state->m_set) {
             return PollReady;
         }
-        m_state->m_waker = ctx.getWaker();
+        m_state->m_waker = ctx.get_weak_waker();
         return PollPending;
     }
     void set() {
         std::unique_lock lk(m_state->m_mutex);
         if (!std::exchange(m_state->m_set, true)) {
-            if (auto waker = std::exchange(m_state->m_waker, nullptr); waker) {
+            if (auto waker = std::exchange(m_state->m_waker, {}).lock(); waker) {
                 lk.unlock();
                 waker->wake();
             }

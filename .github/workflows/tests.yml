@@ -35,7 +35,8 @@ jobs:
             python3-pip \
             python3-venv \
             libcap-dev \
-            ca-certificates
+            ca-certificates \
+            gcc-arm-none-eabi
 
       - name: Install Conan and CMake
         run: pip install --break-system-packages --no-cache-dir conan "cmake>=3.31"
@@ -59,6 +60,9 @@ jobs:
 
       - name: Export coro package to the Conan cache
         run: conan export .
+
+      - name: Export libunicorn package to the Conan cache
+        run: conan export test/libunicorn
 
       - name: Conan install (test package)
         working-directory: test

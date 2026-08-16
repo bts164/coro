@@ -109,6 +109,9 @@ else()
         src/task/waker.cpp
         src/task/blocking_pool.cpp
         src/task/context.cpp
+        src/task/fiber.cpp
+        # detail/
+        src/detail/fiber_context_posix.cpp
         # sync/
         src/sync/cancellation_token.cpp
         # io/

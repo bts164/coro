@@ -201,7 +201,7 @@ public:
     }
 
     [[nodiscard]] Coro<T> receive() {
-        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}};
+        co_await IsrWaitFuture{IsrFlagRef{&m_flag, m_lock}, false};
         uint32_t save = spin_lock_blocking(m_lock);
         T value = m_value;
         m_flag  = false;

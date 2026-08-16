@@ -15,7 +15,11 @@ markdown_extensions:
   - footnotes
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:mermaid2.fence_mermaid
   - mkdocs_graphviz
 
 plugins:
@@ -87,6 +91,7 @@ nav:
       - Tasks, Wakers, and Context: design/waker_and_context_propagation.md
       - Coroutine Frame Lifetime: design/coroutine_scope.md
       - Task Ownership Model: design/task_ownership.md
+      - Fibers: design/fiber.md
       - Cancellation Token: design/cancellation_token.md
     - Runtime & Scheduling:
       - Runtime, Tasks, and Executors: design/task_and_executor.md

@@ -1,9 +1,12 @@
 cmake_minimum_required(VERSION 3.31)
 
+project(coro_unit_tests LANGUAGES CXX C)
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Sanitize.cmake)
 
 find_package(coro CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
+find_package(libunicorn CONFIG REQUIRED)
 
 enable_testing()
 
@@ -43,6 +46,7 @@ set(TEST_NAMES
     test_stream_handle
     test_coro_scope
     test_spawn_blocking
+    test_fiber
     # sync/
     test_event
     test_select
@@ -94,6 +98,7 @@ set(TEST_SRCS
     task/test_stream_handle.cpp
     task/test_coro_scope.cpp
     task/test_spawn_blocking.cpp
+    task/test_fiber.cpp
     # sync/
     sync/test_event.cpp
     sync/test_select.cpp
@@ -134,6 +139,47 @@ target_link_libraries(test_pcie_decoder PRIVATE pcie_decoder)
 target_link_libraries(test_pcie_stream_integration PRIVATE pcie_decoder)
 
 # ---------------------------------------------------------------------------
+# Unicorn test of the real ARMv6-M switch_context()/init_fiber_entry()/
+# coro_pico_enable_psp_stack() primitives (src/detail/fiber_context_pico.S) --
+# see doc/design/fiber.md's "Testing strategy", "Stack overflow detection",
+# and "Stack model (Pico backend)". Covers the happy path (fresh entry +
+# resume round trip), switch_context()'s SP-range/canary overflow checks, and
+# the one-time CONTROL/PSP switch (test_fiber_context_pico_alloc.cpp above
+# covers alloc_fiber_stack()/free_fiber_stack() on the host instead, since
+# that part has no ARM-specific code). Requires UC_MODE_MCLASS -- plain
+# UC_MODE_THUMB doesn't implement the M-profile MRS/MSR special-register
+# encodings (PSP/MSP/CONTROL) at all and faults with UC_ERR_INSN_INVALID,
+# discovered while adding the PSP-switch test.
+#
+# fiber_context_pico.S is cross-assembled together with the test-only
+# switch_context_harness.S (see that file), linked at a fixed -Ttext=0x10000
+# so the addresses test_switch_context_pico.cpp hardcodes stay stable, and
+# objcopy'd to a flat binary the test loads into Unicorn.
+# ---------------------------------------------------------------------------
+set(SWITCH_CONTEXT_PICO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src/detail/fiber_context_pico.S)
+set(SWITCH_CONTEXT_HARNESS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/task/fixtures/switch_context_harness.S)
+set(SWITCH_CONTEXT_TEST_BIN ${CMAKE_CURRENT_BINARY_DIR}/switch_context_test.bin)
+
+add_custom_command(
+    OUTPUT ${SWITCH_CONTEXT_TEST_BIN}
+    COMMAND arm-none-eabi-gcc -mcpu=cortex-m0plus -mthumb -c ${SWITCH_CONTEXT_PICO_SRC} -o fiber_context_pico.o
+    COMMAND arm-none-eabi-gcc -mcpu=cortex-m0plus -mthumb -c ${SWITCH_CONTEXT_HARNESS_SRC} -o switch_context_harness.o
+    COMMAND arm-none-eabi-ld fiber_context_pico.o switch_context_harness.o -Ttext=0x10000 -o switch_context_test.elf
+    COMMAND arm-none-eabi-objcopy -O binary switch_context_test.elf ${SWITCH_CONTEXT_TEST_BIN}
+    DEPENDS ${SWITCH_CONTEXT_PICO_SRC} ${SWITCH_CONTEXT_HARNESS_SRC}
+    COMMENT "Cross-assembling fiber_context_pico.S + test harness for Unicorn"
+    VERBATIM)
+add_custom_target(switch_context_test_bin DEPENDS ${SWITCH_CONTEXT_TEST_BIN})
+
+add_executable(test_switch_context_pico task/test_switch_context_pico.cpp)
+add_dependencies(test_switch_context_pico switch_context_test_bin)
+target_link_libraries(test_switch_context_pico PRIVATE
+    unicorn::unicorn GTest::gtest GTest::gtest_main)
+target_compile_definitions(test_switch_context_pico PRIVATE
+    SWITCH_CONTEXT_TEST_BIN_PATH="${SWITCH_CONTEXT_TEST_BIN}")
+add_test(NAME test_switch_context_pico COMMAND test_switch_context_pico)
+
+# ---------------------------------------------------------------------------
 # CurrentThreadExecutor tests — no hardware, no libuv, no lwIP.
 #
 # Compiles the portable coro core from source with CORO_PICO defined (selects
@@ -156,6 +202,7 @@ add_library(coro_pico_core STATIC
     ${CORO_SRC}/runtime/executor.cpp
     ${CORO_SRC}/runtime/runtime.cpp
     ${CORO_SRC}/runtime/current_thread_executor.cpp
+    ${CORO_SRC}/detail/fiber_context_pico.cpp
     pico/stub/cyw43_arch_stub.cpp
 )
 target_include_directories(coro_pico_core PUBLIC
@@ -169,6 +216,19 @@ target_include_directories(coro_pico_core PUBLIC
 # builds (cmake/platforms/pico.cmake) don't enable it by default.
 target_compile_definitions(coro_pico_core PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP CORO_PICO_FRAME_POOL)
 target_compile_features(coro_pico_core PUBLIC cxx_std_20)
+
+# alloc_fiber_stack()/free_fiber_stack() (src/detail/fiber_context_pico.cpp,
+# compiled into coro_pico_core above) are ordinary, target-independent C++ --
+# no ARM instructions -- so they're exercised directly on the host here rather
+# than needing Unicorn (contrast with test_switch_context_pico.cpp below,
+# which does need it for the hand-written assembly). See
+# doc/design/fiber.md's "Stack allocation and sizing"/"Stack overflow
+# detection".
+add_executable(test_fiber_context_pico_alloc task/test_fiber_context_pico_alloc.cpp)
+target_include_directories(test_fiber_context_pico_alloc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_fiber_context_pico_alloc PRIVATE
+    coro_pico_core GTest::gtest GTest::gtest_main)
+add_test(NAME test_fiber_context_pico_alloc COMMAND test_fiber_context_pico_alloc)
 
 # test_pico_suite — the converted async test files compiled against coro_pico_core.
 # CORO_PICO narrows AllExecutors to {CurrentThreadTraits} so only the pico executor

@@ -4,6 +4,10 @@
 #include <cstdlib>
 #include <iostream>
 
+#ifdef CORO_PICO
+#include <coro/detail/fiber_context.h>
+#endif
+
 namespace coro {
 
 void CurrentThreadExecutor::schedule(detail::Rc<detail::TaskBase> task) {
@@ -166,6 +170,38 @@ void CurrentThreadExecutor::check_isr_events() {
 #endif // CORO_PICO
 
 void CurrentThreadExecutor::wait_for_completion(detail::TaskStateBase& state) {
+#if defined(CORO_PICO) && defined(__arm__)
+    // One-time CONTROL/PSP switch, before this thread can ever switch_context()
+    // into a fiber -- see doc/design/fiber.md's "Stack model (Pico backend)".
+    // Everything before this point (SDK init, main()) ran on MSP and is never a
+    // switch_context() target, so it needed no separate stack. From here on,
+    // this stack -- whatever wait_for_completion() is already running on --
+    // permanently becomes the "caller-side" FiberContext every switch_context()
+    // call assumes, and MSP is left as the dedicated, shared ISR stack for the
+    // rest of the program's life. Guarded to run only once: wait_for_completion()
+    // can be re-entered (nested block_on()), and coro_pico_enable_psp_stack() is
+    // only meant to be called the first time -- see its own comment in
+    // fiber_context_pico.S. No synchronization needed: CORO_PICO is single-core,
+    // single-threaded.
+    //
+    // Gated on __arm__, not just CORO_PICO: test/CMakeLists.txt's coro_pico_core
+    // also builds this file with CORO_PICO defined, but as a host-side x86
+    // double for testing core logic without real hardware -- it can never link
+    // fiber_context_pico.S (real ARM instructions), so coro_pico_enable_psp_stack()
+    // doesn't exist there. Real device firmware (cmake/platforms/pico.cmake)
+    // compiles for an actual ARM target, so __arm__ is defined there and not on
+    // the host double.
+    static bool psp_stack_enabled = false;
+    if (!psp_stack_enabled) {
+        // Root-caused on real hardware via on-device bisection: the freeze
+        // was coro_pico_enable_psp_stack() aliasing MSP and PSP to the same
+        // address instead of giving MSP its own dedicated buffer -- see
+        // fiber_context_pico.S's big comment at coro_pico_enable_psp_stack_raw()
+        // for the full mechanism. Fixed there; safe to call unconditionally now.
+        detail::coro_pico_enable_psp_stack();
+        psp_stack_enabled = true;
+    }
+#endif
     while (true) {
         {
             std::lock_guard lock(state.mutex);
