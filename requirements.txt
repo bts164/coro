@@ -2,4 +2,4 @@ mkdocs
 #mkdocs-readthedocs
 mkdoxy
 mkdocs-mermaid2-plugin
-mkdocs-graphviz
+mkdocs-graphviz<2  # 2.x drops the markdown.Extension makeExtension() API mkdocs.yml relies on
