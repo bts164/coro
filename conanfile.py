@@ -53,7 +53,7 @@ class CoroRecipe(ConanFile):
     }
     exports_sources = (
         "include/**.h", "include/**.hpp",
-        "src/**.cpp", "src/**.h", "src/**.in",
+        "src/**.cpp", "src/**.h", "src/**.S", "src/**.in",
         "CMakeLists.txt", "cmake/**.cmake", "cmake/**.in",
     )
     # conan_version.py isn't a build source, but set_version() below needs to
