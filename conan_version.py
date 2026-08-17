@@ -45,8 +45,35 @@ def derive_coro_version(conanfile, folder, conandata=None):
     exact/dev/rc version from the nearest reachable vX.Y.Z tag. Raises
     ConanException if no such tag is reachable.
     """
+    # first check if the version number was explicitly set
+    # on the CLI and use that version if so
+    if conanfile.version is not None:
+        conanfile.output.info(
+            f"coro: version '{conanfile.version}' set explicitly (--version=) "
+            "-- skipping git-based derivation"
+        )
+        return conanfile.version
+
+    # CORO_VERSION_OVERRIDE mirrors the CLI `--version=` override for
+    # commands where passing it explicitly every time is inconvenient (e.g.
+    # building tests/examples against a dev version registered via
+    # `conan editable add . --version=...` — see doc/versioning.md's
+    # "Developing against an unreleased coro"). Same effect as the CLI
+    # override, just settable once in the environment.
+    env_override = os.environ.get("CORO_VERSION_OVERRIDE")
+    if env_override:
+        conanfile.output.info(
+            f"coro: version '{env_override}' set via CORO_VERSION_OVERRIDE "
+            "-- skipping git-based derivation"
+        )
+        return env_override
+
     cached = (conandata or {}).get("scm_version")
     if cached:
+        conanfile.output.info(
+            f"coro: version '{cached}' read from conandata.yml's scm_version "
+            "-- this is a cache-exported copy, not a live git checkout"
+        )
         return cached
 
     git = Git(conanfile, folder=folder)
@@ -55,6 +82,10 @@ def derive_coro_version(conanfile, folder, conandata=None):
             "describe --tags --long --dirty --match v[0-9]*.[0-9]*.[0-9]*"
         ).strip()
     except Exception as e:
+        conanfile.output.warning(
+            f"coro: `git describe` against '{folder}' failed -- no version "
+            "could be derived"
+        )
         raise ConanException(
             "coro: `git describe` could not find a reachable vX.Y.Z tag "
             f"({e}). Either no such tag exists yet in this history (create "
@@ -63,6 +94,7 @@ def derive_coro_version(conanfile, folder, conandata=None):
             "`git fetch --unshallow --tags`, or `fetch-depth: 0` / "
             "`GIT_DEPTH: 0` in CI)."
         )
+    conanfile.output.info(f"coro: `git describe` reported '{describe}'")
 
     dirty = describe.endswith("-dirty")
     if dirty:
@@ -109,7 +141,22 @@ def derive_coro_version(conanfile, folder, conandata=None):
                     f"coro: conandata.yml's next_bump is '{next_bump}', "
                     "expected 'patch', 'minor', or 'major'"
                 )
-            version = f"{major}.{minor}.{patch}-dev.{count}+g{sha}"
+            # CORO_VERSION_DEV_AS_METADATA moves "dev.{count}" from the
+            # prerelease part to build metadata (X.Y.Z+dev.N.gSHA instead of
+            # X.Y.Z-dev.N+gSHA) -- see doc/versioning.md's "Developing
+            # against an unreleased coro". Same coordinate information
+            # (commit count, sha, branch, dirty below), but since build
+            # metadata never affects SemVer precedence or Conan's prerelease
+            # filtering, every commit's auto-derived dev build becomes
+            # resolvable against a version range with no per-build
+            # `--version=`/CORO_VERSION_OVERRIDE and no `resolve_prereleases`
+            # needed -- at the cost of every such build now satisfying
+            # ranges as if it *were* the pending X.Y.Z release, so this is
+            # opt-in, not the default.
+            if os.environ.get("CORO_VERSION_DEV_AS_METADATA"):
+                version = f"{major}.{minor}.{patch}+dev.{count}.g{sha}"
+            else:
+                version = f"{major}.{minor}.{patch}-dev.{count}+g{sha}"
 
     if not exact:
         # Build metadata only — never affects SemVer precedence or Conan
@@ -121,6 +168,11 @@ def derive_coro_version(conanfile, folder, conandata=None):
         if dirty:
             version += ".dirty"
 
+    conanfile.output.info(
+        f"coro: version '{version}' derived from tag '{tag}'"
+        + ("" if exact else f", {count} commit(s) past it")
+        + (", dirty working tree" if dirty else "")
+    )
     return version
 
 

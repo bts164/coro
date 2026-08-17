@@ -118,5 +118,7 @@ nav:
   - Examples & Tutorials:
     - Examples: tutorials/examples.md
     - gRPC Tutorial: tutorials/grpc_tutorial.md
+  - Versioning and Releases:
+    - Versioning Overview: versioning.md
   - Roadmap and Future Plans:
     - Roadmap Overview: roadmap.md
