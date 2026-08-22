@@ -29,12 +29,16 @@ class PicoLedRecipe(ConanFile):
     depend on (KitchenLED's Plasma animation calls led::plasma_effect()
     directly — see kitchen_led.md). Pulling those in means build() needs
     nanopb codegen, via experimental/nanopb (see that recipe) instead of
-    FetchContent + a pip-installed generator: the runtime is a regular
-    requires() (transitive — KitchenLED links pb.h types through pico_led's
-    public headers without knowing about nanopb itself), the generator is a
-    build_requirements() tool_requires() (not transitive — a consumer that
-    wants to generate its own .proto files must tool_requires("nanopb/...")
-    itself).
+    FetchContent + a pip-installed generator: a plain requires("nanopb")
+    transitively brings in both the runtime (KitchenLED links pb.h types
+    through pico_led's public headers without knowing about nanopb itself)
+    and the nanopb_generator tool this package's own build() needs for
+    ws2812.proto -> ws2812.pb.c/.h codegen — nanopb's own recipe declares
+    the generator as a visible build requirement, so nothing here has to
+    tool_requires() it explicitly. Split into two packages because
+    nanopb_generator is a frozen native executable that can't be
+    cross-compiled to settings.host, so it can't share a package_id scheme
+    with the (arm-none-eabi) runtime lib.
 
     examples/pico is Conan-only — there is no in-tree add_subdirectory()
     build of this package; ws2812_tcp/ (the consumer that needs effects.h/
@@ -66,18 +70,13 @@ class PicoLedRecipe(ConanFile):
         # Transitive: pico_led's public headers (effects.h -> ws2812.pb.h ->
         # pb.h) need the nanopb runtime visible to whatever links pico_led,
         # e.g. KitchenLED — without that consumer needing to know nanopb is
-        # involved at all.
+        # involved at all. This also transitively pulls in nanopb_generator
+        # (a visible build requirement of nanopb's own recipe), which is
+        # what this package's own build() below actually invokes for
+        # ws2812.proto codegen — no separate tool_requires() needed here.
         self.requires("nanopb/0.4.9.1",
             transitive_headers=True,
             transitive_libs=True)
-
-    def build_requirements(self):
-        # Not transitive — tool_requires() never propagates to consumers.
-        # Only this package's own ws2812.proto -> ws2812.pb.c/.h codegen
-        # needs the generator. A consumer (e.g. KitchenLED) that wants to
-        # generate its own .proto files must tool_requires("nanopb/...")
-        # itself.
-        self.tool_requires("nanopb/0.4.9.1")
 
     def layout(self):
         cmake_layout(self)

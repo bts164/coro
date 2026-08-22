@@ -61,6 +61,15 @@
 // mDNS + IGMP each register timers; bump the pool to avoid MEMP_SYS_TIMEOUT exhaustion
 #define MEMP_NUM_SYS_TIMEOUT        16
 
+// Client-side counterpart to the responder above: lets dns_gethostbyname()
+// (and thus TcpStream::connect()) resolve a ".local" hostname via a one-shot
+// multicast query (RFC 6762 §5.1) instead of routing it to a normal DNS
+// server. Independent of LWIP_MDNS_RESPONDER — this is dns.c's own querier,
+// not mdns_resp.c — so a device only advertising itself (LWIP_MDNS_RESPONDER
+// without this) doesn't need it, and a device only resolving others'
+// .local names (this without LWIP_MDNS_RESPONDER) wouldn't either.
+#define LWIP_DNS_SUPPORT_MDNS_QUERIES 1
+
 // MQTT client — only when coro_pico_mqtt is being built (see
 // CORO_PICO_WITH_MQTT in cmake/platforms/pico.cmake).
 #cmakedefine01 LWIP_MQTT

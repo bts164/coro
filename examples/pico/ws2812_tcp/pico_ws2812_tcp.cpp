@@ -49,7 +49,7 @@ using namespace std::chrono_literals;
 // ---------------------------------------------------------------------------
 
 static constexpr uint     LED_PIN    = 2;
-static constexpr uint     NUM_LEDS   = 8;    // initial active count; changeable via set_leds
+static constexpr uint     NUM_LEDS   = 150;    // initial active count; changeable via set_leds
 static constexpr uint32_t MAX_LEDS   = 300;
 static constexpr uint16_t TCP_PORT   = 2812;
 static constexpr size_t   MAX_PB_MSG = 4096; // SetPixels for 300 LEDs needs ~1.5 KB
@@ -101,6 +101,17 @@ struct AppState {
     std::shared_ptr<led::LedDriver> driver;
     led::EffectRunner&              runner;
     WatchSender<DisplayState>&      display;
+
+    // Power is implemented purely as a brightness gate -- driver->brightness()
+    // is forced to 0 while off, with no effect on the running effect (it
+    // keeps computing and calling show() as normal; only the physical output
+    // goes dark). target_brightness is the authoritative "what brightness
+    // should be showing" value: driver->brightness() itself becomes 0 while
+    // powered off and can't be read back to recover it, and a `brightness`
+    // command received while off (see Command_brightness_tag) must update
+    // this without re-lighting the strip.
+    bool    power_on          = true;
+    uint8_t target_brightness = 128;  // matches driver->set_brightness(128) in async_main
 };
 
 // ---------------------------------------------------------------------------
@@ -272,8 +283,23 @@ static Coro<Response> handle_command(const Command& cmd, AppState& app) {
         co_return ok_response();
 
     case Command_brightness_tag:
-        app.driver->set_brightness(
-            static_cast<uint8_t>(std::min<uint32_t>(cmd.cmd.brightness, 255u)));
+        app.target_brightness =
+            static_cast<uint8_t>(std::min<uint32_t>(cmd.cmd.brightness, 255u));
+        // While off, only the target is recorded (see AppState's comment) --
+        // applying it now would re-light the strip.
+        if (app.power_on) app.driver->set_brightness(app.target_brightness);
+        co_return ok_response();
+
+    case Command_get_brightness_tag: {
+        Response r = Response_init_zero;
+        r.which_result = Response_brightness_tag;
+        r.result.brightness = app.target_brightness;
+        co_return r;
+    }
+
+    case Command_power_tag:
+        app.power_on = cmd.cmd.power;
+        app.driver->set_brightness(app.power_on ? app.target_brightness : 0);
         co_return ok_response();
 
     case Command_get_leds_tag: {
@@ -367,6 +393,7 @@ static Coro<int> async_main(Lcd lcd) {
     LOG("Started async_main");
 
     std::shared_ptr<led::LedDriver> driver = co_await led::LedDriver::create(LED_PIN, NUM_LEDS);
+    driver->set_brightness(128);
     led::EffectRunner runner(driver);
     AppState app{driver, runner, g_display_tx};
 

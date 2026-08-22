@@ -59,15 +59,19 @@ nanopb_generate_cpp(PROTO_SRCS PROTO_HDRS
     OUT_DIR ${PROTO_OUT_DIR}
 )
 
-add_library(ws2812_proto STATIC ${PROTO_SRCS})
-target_include_directories(ws2812_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(ws2812_proto PUBLIC nanopb::nanopb)
-
+# PROTO_SRCS is compiled directly into pico_led (not a separate library) —
+# only the pico_led target is install(TARGETS ...)'d / declared in
+# conanfile.py's cpp_info.libs, so a separate ws2812_proto static lib would
+# never ship in the Conan package, leaving Command_msg/Response_msg (defined
+# in ws2812.pb.c) undefined at link time for any consumer — e.g. ws2812_tcp,
+# which needs those symbols for pb_encode()/pb_decode() and previously hit
+# exactly that: undefined reference to Command_msg/Response_msg.
 add_library(pico_led STATIC
     src/color.cpp
     src/led_driver.cpp
     src/effect_runner.cpp
     src/effects.cpp
+    ${PROTO_SRCS}
 )
 # OUTPUT_DIR puts ws2812.pio.h under pico_led/ (matching the installed layout).
 # pico_generate_pio_header adds OUTPUT_DIR itself; we add the parent so that
@@ -96,7 +100,7 @@ target_link_libraries(pico_led PUBLIC
     coro::pico_hal
     hardware_clocks
     pico_stdlib
-    ws2812_proto
+    nanopb::nanopb
 )
 
 # No install(EXPORT ...) here: the consumer side (KitchenLED) finds this

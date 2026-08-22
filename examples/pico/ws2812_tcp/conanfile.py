@@ -22,8 +22,8 @@ class PicoWs2812TcpRecipe(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
 
     def requirements(self):
-        self.requires("coro/0.1.0")
-        self.requires("pico_led/0.1.0")
+        self.requires("coro/[<1]")
+        self.requires("pico_led/[<1]")
 
     def layout(self):
         cmake_layout(self)
