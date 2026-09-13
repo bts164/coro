@@ -63,21 +63,23 @@ public:
     /// microseconds since the clock epoch. Used by sleep_for().
     void schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> waker);
 
-    /// @brief Registers an ISR flag to be polled once per event loop iteration.
+    /// @brief Registers an ISR-safe waiter to be peeked once per event loop iteration.
     ///
-    /// When the flag becomes true (checked through its paired hardware spin lock —
-    /// see doc/design/isr_safety.md, "Cross-core ISR delivery") the waker is fired
-    /// and the registration is removed. Called by IsrWaitFuture — do not call
-    /// directly. Must be called from the executor thread (i.e. from inside a
-    /// coroutine), never from an ISR.
-    void register_isr_poll(IsrFlagRef ref, detail::Rc<detail::Waker> waker);
+    /// `entry`'s non-mutating is_ready() is checked once per loop iteration; when it
+    /// returns true, the waker is fired (the registration is NOT removed here -- see
+    /// doc/design/isr_safety.md, "Multiple waiters"). Called by IsrWaitFuture and
+    /// friends — do not call directly. Must be called from the executor thread (i.e.
+    /// from inside a coroutine), never from an ISR.
+    void register_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker);
 
-    /// @brief Removes an ISR poll registration before it fires.
+    /// @brief Removes an ISR poll registration.
     ///
-    /// Called by IsrWaitFuture's destructor when the awaiting coroutine is
-    /// cancelled while the flag is still pending. Prevents the executor from
-    /// dereferencing a flag pointer whose backing IsrEvent may have been destroyed.
-    void remove_isr_poll(IsrFlagRef ref);
+    /// Called by the owning waiter's destructor/move-assignment once its wait
+    /// completes or is cancelled. Prevents the executor from dereferencing an
+    /// IsrPollEntry* whose backing object may have been destroyed. Matched by
+    /// `entry`'s own identity, so this always removes exactly the caller's own
+    /// registration, even when other waiters share the same underlying flag/count.
+    void remove_isr_poll(IsrPollEntry* entry);
 
     /// @brief Drains the coroutine ready queue once. Returns true if any task was polled.
     ///

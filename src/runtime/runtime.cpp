@@ -41,12 +41,12 @@ void Runtime::schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> wak
     m_current_thread_executor->schedule_timer(deadline_us, std::move(waker));
 }
 
-void Runtime::register_isr_poll(IsrFlagRef ref, detail::Rc<detail::Waker> waker) {
-    m_current_thread_executor->add_isr_poll(ref, std::move(waker));
+void Runtime::register_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker) {
+    m_current_thread_executor->add_isr_poll(entry, std::move(waker));
 }
 
-void Runtime::remove_isr_poll(IsrFlagRef ref) {
-    m_current_thread_executor->remove_isr_poll(ref);
+void Runtime::remove_isr_poll(IsrPollEntry* entry) {
+    m_current_thread_executor->remove_isr_poll(entry);
 }
 #else
 Runtime::Runtime(std::size_t num_threads)

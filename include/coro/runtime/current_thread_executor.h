@@ -115,19 +115,23 @@ public:
     void check_expired_timers();
 
 #ifdef CORO_PICO
-    /// @brief Registers an ISR flag to be polled once per event loop iteration.
+    /// @brief Registers an ISR-safe waiter to be peeked once per event loop iteration.
     ///
-    /// When the flag becomes true (checked through its paired hardware spin lock —
-    /// see doc/design/isr_safety.md, "Cross-core ISR delivery"), the waker is fired
-    /// and the entry is removed. Called by IsrWaitFuture on its first poll() to park
-    /// a coroutine awaiting an IsrEvent without busy-polling. Safe to call from the
-    /// executor thread only (not from an ISR — registration happens inside the
-    /// coroutine, not the ISR).
-    void add_isr_poll(IsrFlagRef ref, detail::Rc<detail::Waker> waker);
-    void remove_isr_poll(IsrFlagRef ref);
+    /// `entry` must outlive the registration (removed via remove_isr_poll() from the
+    /// waiter's own destructor/move, same as today). Keyed by `entry`'s own identity,
+    /// not by any state it reads — so multiple waiters sharing the same underlying
+    /// flag/count each get their own, independently removable registration. See
+    /// doc/design/isr_safety.md, "Multiple waiters". Safe to call from the executor
+    /// thread only (not from an ISR — registration happens inside the coroutine, not
+    /// the ISR).
+    void add_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker);
+    void remove_isr_poll(IsrPollEntry* entry);
 
-    /// @brief Scans registered ISR event flags; fires wakers for any that are set.
-    /// Called from wait_for_completion() on every loop iteration, after m_poll().
+    /// @brief Scans registered ISR waiters; fires wakers for any whose is_ready()
+    /// peek returns true. Never removes entries itself -- nothing here resolves a
+    /// wait, so there's nothing to react to by removing one; removal stays with the
+    /// owning waiter's destructor. Called from wait_for_completion() on every loop
+    /// iteration, after m_poll().
     void check_isr_events();
 #endif // CORO_PICO
 
@@ -158,13 +162,13 @@ private:
     std::unordered_set<detail::Rc<detail::TaskBase>>     m_owned_tasks;
 
 #ifdef CORO_PICO
-    struct IsrPollEntry {
-        IsrFlagRef                 ref;   // flag + paired hardware spin lock
-        detail::Rc<detail::Waker>  waker;
+    struct IsrPollRegistration {
+        IsrPollEntry*               entry;   // non-owning; entry outlives the registration
+        detail::Rc<detail::Waker>   waker;
     };
-    // Written from coroutine context (executor thread) only; read and cleared
-    // from check_isr_events() on the same thread. No synchronisation needed.
-    std::vector<IsrPollEntry> m_isr_polls;
+    // Written from coroutine context (executor thread) only; read from
+    // check_isr_events() on the same thread. No synchronisation needed.
+    std::vector<IsrPollRegistration> m_isr_polls;
 #endif // CORO_PICO
 };
 

@@ -125,14 +125,18 @@ void CurrentThreadExecutor::check_expired_timers() {
 }
 
 #ifdef CORO_PICO
-void CurrentThreadExecutor::add_isr_poll(IsrFlagRef                 ref,
+void CurrentThreadExecutor::add_isr_poll(IsrPollEntry*               entry,
                                          detail::Rc<detail::Waker>  waker) {
-    m_isr_polls.push_back({ref, std::move(waker)});
+    m_isr_polls.push_back({entry, std::move(waker)});
 }
 
-void CurrentThreadExecutor::remove_isr_poll(IsrFlagRef ref) {
+void CurrentThreadExecutor::remove_isr_poll(IsrPollEntry* entry) {
+    // Matched by entry identity, not by any state it reads -- so with multiple
+    // waiters sharing the same underlying flag/count, each has a distinct
+    // IsrPollEntry* and removing one can never deregister another. See
+    // doc/design/isr_safety.md, "Multiple waiters".
     auto it = std::find_if(m_isr_polls.begin(), m_isr_polls.end(),
-                           [ref](const IsrPollEntry& e) { return e.ref.flag == ref.flag; });
+                           [entry](const IsrPollRegistration& e) { return e.entry == entry; });
     if (it != m_isr_polls.end()) {
         *it = std::move(m_isr_polls.back());
         m_isr_polls.pop_back();
@@ -140,31 +144,18 @@ void CurrentThreadExecutor::remove_isr_poll(IsrFlagRef ref) {
 }
 
 void CurrentThreadExecutor::check_isr_events() {
-    // Each check takes the flag's paired hardware spin lock before reading it —
-    // the same lock the ISR (or the other core) takes to write it. This is what
-    // actually makes the read safe against a write happening concurrently on
-    // the other core; a bare volatile dereference is not (see
-    // doc/design/isr_safety.md, "Cross-core ISR delivery").
-    //
-    // No payload ordering needed here: we are only deciding whether to fire the
-    // waker. The payload itself (IsrChannel<T>) is read inside its own
-    // spin-lock critical section in receive(), after co_await returns.
-    //
-    // Swap-and-pop removes the entry without shifting the remaining vector,
-    // keeping the per-iteration cost O(1).
-    for (std::size_t i = 0; i < m_isr_polls.size(); ) {
-        IsrFlagRef ref = m_isr_polls[i].ref;
-        uint32_t save = spin_lock_blocking(ref.lock);
-        bool set = *ref.flag;
-        spin_unlock(ref.lock, save);
-        if (set) {
-            auto waker = std::move(m_isr_polls[i].waker);
-            m_isr_polls[i] = std::move(m_isr_polls.back());
-            m_isr_polls.pop_back();
-            waker->wake();
-        } else {
-            ++i;
-        }
+    // Pure peek: is_ready() takes the entry's paired hardware spin lock
+    // internally (see doc/design/isr_safety.md, "Cross-core ISR delivery")
+    // but never mutates anything. It only decides whether to fire this tick's
+    // wake -- the real, consuming claim happens exactly once, inside the real
+    // Future::poll(), invoked only via the woken task's own top-down
+    // traversal (Coro<T>::poll()'s spurious-wake guard). So this loop never
+    // removes entries itself: nothing here resolves a wait, so there's
+    // nothing to react to by removing one. Removal stays with the owning
+    // waiter's destructor, exactly as before.
+    for (auto& reg : m_isr_polls) {
+        if (reg.entry->is_ready())
+            reg.waker->wake();
     }
 }
 #endif // CORO_PICO
