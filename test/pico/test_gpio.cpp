@@ -214,6 +214,42 @@ TEST_F(GpioPinTest, AlreadySatisfiedLevelWaitNeverArmsAnything) {
     EXPECT_EQ(gpio_stub::irq_enable_call_count(16), 0);
 }
 
+// Level IRQs are not cleared by acknowledge (unlike edge IRQs) -- they stay
+// pending for as long as the physical level holds, per hardware/gpio.h's
+// gpio_acknowledge_irq() doc comment. If notify_irq() didn't disable the bit
+// itself, this would storm the ISR forever on real hardware instead of
+// giving the executor a chance to resume and disarm it the normal way. The
+// stub can't reproduce a real re-entrant storm, but it can confirm the bit
+// actually comes back off immediately after one simulated firing -- which is
+// the mechanism the fix relies on.
+TEST_F(GpioPinTest, LevelIrqIsDisabledImmediatelyOnFiringNotOnlyOnRelease) {
+    GpioPin pin(20, Direction::In);
+
+    auto level_future = pin.wait_for_low();
+    EXPECT_EQ(gpio_stub::enabled_mask(20), GPIO_IRQ_LEVEL_LOW);
+
+    gpio_stub::set_level(20, false);
+    coro_pico_hal_gpio_fire_irq(20, GPIO_IRQ_LEVEL_LOW);
+
+    // Disarmed by notify_irq() itself, before the future has resolved or
+    // been destroyed -- release_mask() hasn't run yet at this point.
+    EXPECT_EQ(gpio_stub::enabled_mask(20), 0u);
+}
+
+TEST_F(GpioPinTest, EdgeIrqStaysArmedAfterFiringUntilFutureReleases) {
+    GpioPin pin(21, Direction::In);
+
+    auto edge_future = pin.wait_for_edge(Edge::Rising);
+    EXPECT_EQ(gpio_stub::enabled_mask(21), GPIO_IRQ_EDGE_RISE);
+
+    gpio_stub::set_level(21, true);
+    coro_pico_hal_gpio_fire_irq(21, GPIO_IRQ_EDGE_RISE);
+
+    // Unlike the level case, edge IRQs don't need notify_irq() to disarm
+    // them -- the bit stays armed until the future itself releases it.
+    EXPECT_EQ(gpio_stub::enabled_mask(21), GPIO_IRQ_EDGE_RISE);
+}
+
 // ---------------------------------------------------------------------------
 // GpioEdgeFuture: eager-arm-then-defer-await pattern
 // ---------------------------------------------------------------------------

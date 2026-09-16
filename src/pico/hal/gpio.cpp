@@ -188,7 +188,24 @@ GpioPin::~GpioPin() {
 }
 
 void GpioPin::notify_irq(uint32_t event_mask) {
-    constexpr uint32_t kEdgeMask = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
+    constexpr uint32_t kEdgeMask  = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
+    constexpr uint32_t kLevelMask = GPIO_IRQ_LEVEL_LOW | GPIO_IRQ_LEVEL_HIGH;
+
+    // Level events, unlike edge events, are not cleared by
+    // gpio_acknowledge_irq() (already called by the SDK's shared handler
+    // before this runs) -- per hardware/gpio.h's gpio_acknowledge_irq() doc
+    // comment, a level interrupt "remains pending while the GPIO is at the
+    // specified level" and must be explicitly disabled or it refires
+    // immediately on return, storming this ISR forever and starving the
+    // executor of the CPU time it needs to resume whatever's co_await-ing
+    // wait_for_level() and disarm it via the normal release_mask() path.
+    // Force-disabling here, ahead of that path, is safe/idempotent: the
+    // eventual GpioEdgeFuture destructor still calls release_mask(), which
+    // just re-disables an already-disabled bit. wait_for_edge()/edges()
+    // never arm these bits (edge_irq_mask() only ever returns the EDGE_*
+    // bits), so this can't clobber an edge waiter's armed mask.
+    if (event_mask & kLevelMask)
+        gpio_set_irq_enabled(m_pin, event_mask & kLevelMask, false);
 
     // edges()/m_edge_count only cares about edge occurrences, not level
     // occurrences -- route those separately from the broadcast signal below,
