@@ -224,6 +224,9 @@ TEST_F(GpioPinTest, AlreadySatisfiedLevelWaitNeverArmsAnything) {
 // the mechanism the fix relies on.
 TEST_F(GpioPinTest, LevelIrqIsDisabledImmediatelyOnFiringNotOnlyOnRelease) {
     GpioPin pin(20, Direction::In);
+    // Starts high so wait_for_low() can't take its already-satisfied fast
+    // path (stub pins default low) -- this test needs the real arm path.
+    gpio_stub::set_level(20, true);
 
     auto level_future = pin.wait_for_low();
     EXPECT_EQ(gpio_stub::enabled_mask(20), GPIO_IRQ_LEVEL_LOW);
