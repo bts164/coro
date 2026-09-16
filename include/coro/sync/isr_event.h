@@ -91,6 +91,30 @@ public:
     // Defined below IsrWaitFuture, which it constructs.
     [[nodiscard]] Coro<void> wait();
 
+    // Non-blocking snapshot of the current epoch, for callers that must arm
+    // hardware (e.g. gpio_set_irq_enabled()) and only start waiting some time
+    // later -- capturing the baseline here, before arming, and passing it to
+    // wait_from() below closes the gap that plain wait() cannot: wait()'s
+    // baseline isn't captured until IsrWaitFuture's constructor runs, which
+    // for a lazily-started Coro<void> is only once the caller actually
+    // co_awaits it -- i.e. strictly after arming, not atomically with it. Any
+    // edge landing in between would bump the epoch before that baseline is
+    // read, so wait() would just fold it into its own baseline and never
+    // resolve for it. See doc/design/isr_safety.md and gpio.cpp's
+    // arm_and_wait() for the motivating bug.
+    [[nodiscard]] uint64_t epoch() const noexcept {
+        uint32_t save = spin_lock_blocking(m_lock);
+        uint64_t e = m_epoch;
+        spin_unlock(m_lock, save);
+        return e;
+    }
+
+    // Like wait(), but resolves on the first signal_from_isr() strictly after
+    // `baseline` (as returned by epoch()) rather than after this call itself.
+    // Use this together with epoch() to snapshot the baseline before arming
+    // hardware that might signal before wait() is reached.
+    [[nodiscard]] Coro<void> wait_from(uint64_t baseline);
+
 private:
     friend class IsrWaitFuture;
 
@@ -129,6 +153,13 @@ public:
         m_baseline = m_event->m_epoch;
         spin_unlock(m_event->m_lock, save);
     }
+
+    // Resolves on the first signal_from_isr() strictly after `baseline` (an
+    // epoch value the caller captured earlier via IsrEvent::epoch()), rather
+    // than capturing a fresh baseline here. See IsrEvent::wait_from().
+    IsrWaitFuture(IsrEvent& event, uint64_t baseline) :
+        m_event(&event), m_baseline(baseline)
+    {}
 
     ~IsrWaitFuture() {
         // If the awaiting coroutine is cancelled while we are registered with the
@@ -221,6 +252,10 @@ inline Coro<void> IsrEvent::wait() {
     // repeated wait()s and concurrent broadcast waiters both correct with
     // no explicit reset step.
     co_await IsrWaitFuture{*this};
+}
+
+inline Coro<void> IsrEvent::wait_from(uint64_t baseline) {
+    co_await IsrWaitFuture{*this, baseline};
 }
 
 // ---------------------------------------------------------------------------

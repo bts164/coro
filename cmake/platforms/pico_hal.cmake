@@ -23,5 +23,6 @@ endif()
 
 add_library(coro_pico_hal STATIC
     ${CORO_ROOT}/src/pico/hal/dma.cpp
+    ${CORO_ROOT}/src/pico/hal/gpio.cpp
 )
-target_link_libraries(coro_pico_hal PUBLIC coro_pico hardware_dma hardware_irq hardware_pio)
+target_link_libraries(coro_pico_hal PUBLIC coro_pico hardware_dma hardware_irq hardware_pio hardware_gpio)

@@ -114,6 +114,7 @@ nav:
     - Platform & Integration:
       - Raspberry Pi Pico Port: design/pico_port.md
       - ISR Safety: design/isr_safety.md
+      - GpioPin: design/gpio_pin.md
     - Module Structure: design/module_structure.md
   - Examples & Tutorials:
     - Examples: tutorials/examples.md

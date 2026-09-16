@@ -1,5 +1,5 @@
-# Re-establishes the hardware_dma/hardware_irq/hardware_pio link requirement
-# that coro_pico_hal has PUBLIC in-tree (cmake/platforms/pico_hal.cmake),
+# Re-establishes the hardware_dma/hardware_irq/hardware_pio/hardware_gpio
+# link requirement that coro_pico_hal has PUBLIC in-tree (cmake/platforms/pico_hal.cmake),
 # which a packaged Conan cpp_info can't express on its own: these are raw
 # Pico SDK CMake targets, freshly created by each consuming project's own
 # pico_sdk_init() call, not anything coro's package exports. CMakeDeps
@@ -20,5 +20,8 @@ if(TARGET coro::pico_hal)
     endif()
     if(TARGET hardware_pio)
         target_link_libraries(coro::pico_hal INTERFACE hardware_pio)
+    endif()
+    if(TARGET hardware_gpio)
+        target_link_libraries(coro::pico_hal INTERFACE hardware_gpio)
     endif()
 endif()

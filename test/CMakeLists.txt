@@ -256,15 +256,18 @@ target_link_libraries(test_pico_suite PRIVATE
 add_test(NAME test_pico_suite COMMAND test_pico_suite)
 
 # ---------------------------------------------------------------------------
-# AsyncDmaTransfer tests — coro_pico_hal layer with DMA hardware stubs.
+# AsyncDmaTransfer / GpioPin tests — coro_pico_hal layer with hardware stubs.
 #
-# Compiles src/pico/hal/dma.cpp against coro_pico_core + hardware/dma.h stub.
-# CORO_PICO_TEST exposes coro_pico_hal_dma_fire_irq0() for test use.
+# Compiles src/pico/hal/{dma,gpio}.cpp against coro_pico_core + the
+# hardware/{dma,gpio}.h stubs. CORO_PICO_TEST exposes
+# coro_pico_hal_dma_fire_irq0()/coro_pico_hal_gpio_fire_irq() for test use.
 # Tests use std::thread to simulate IRQ completion.
 # ---------------------------------------------------------------------------
 add_library(coro_pico_hal_core STATIC
     ${CORO_SRC}/../src/pico/hal/dma.cpp
+    ${CORO_SRC}/../src/pico/hal/gpio.cpp
     pico/stub/hardware/dma.cpp
+    pico/stub/hardware/gpio.cpp
 )
 target_include_directories(coro_pico_hal_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
@@ -282,6 +285,15 @@ target_include_directories(test_async_dma PRIVATE
 target_link_libraries(test_async_dma PRIVATE
     coro_pico_hal_core GTest::gtest GTest::gtest_main GTest::gmock)
 add_test(NAME test_async_dma COMMAND test_async_dma)
+
+add_executable(test_gpio pico/test_gpio.cpp)
+target_include_directories(test_gpio PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    pico/stub
+)
+target_link_libraries(test_gpio PRIVATE
+    coro_pico_hal_core GTest::gtest GTest::gtest_main GTest::gmock)
+add_test(NAME test_gpio COMMAND test_gpio)
 
 # ---------------------------------------------------------------------------
 # Real lwIP TCP tests — host NO_SYS loopback.

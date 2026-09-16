@@ -52,7 +52,24 @@ class Runtime {
 public:
 #ifdef CORO_PICO
     /// @brief Constructs a Runtime backed by CurrentThreadExecutor.
-    explicit Runtime();
+    ///
+    /// `enable_network` gates whether the event loop calls `cyw43_arch_poll()`
+    /// each iteration. Pass `false` for firmware that never touches WiFi/lwIP
+    /// (`coro::pico`/`coro::pico_hal` still unconditionally link
+    /// `pico_cyw43_arch_lwip_poll` -- see cmake/platforms/pico.cmake -- so the
+    /// symbol is always present; this only controls whether it's ever called).
+    /// Skipping the call matters on boards with no CYW43 chip wired up at all
+    /// (a plain, non-W Pico): `cyw43_arch_poll()` touches driver state that was
+    /// never initialized there, since `cyw43_arch_init()` was never called --
+    /// calling it anyway is undefined behavior, not just a wasted poll.
+    ///
+    /// Leave at the default (`true`) for any firmware that does call
+    /// `cyw43_arch_init()` (Pico W boards) -- including firmware that connects
+    /// to WiFi from a coroutine after the Runtime has already started, since
+    /// unlike `cyw43_arch_wifi_connect_blocking()`'s hand-rolled wait loop, an
+    /// async connect (`cyw43_arch_wifi_connect_async()`) depends on this
+    /// same per-iteration `cyw43_arch_poll()` to make progress.
+    explicit Runtime(bool enable_network = true);
     ~Runtime() = default;
 
     /// @brief Returns the current time in microseconds from the executor's clock.

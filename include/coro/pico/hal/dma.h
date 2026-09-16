@@ -105,6 +105,12 @@ private:
     int      m_channel;
     bool     m_track_completion;
     IsrEvent m_done;
+    // Epoch snapshot taken by start(), before the transfer is armed/triggered
+    // -- see start()'s definition for why wait() must resolve against this
+    // exact baseline (via m_done.wait_from()) rather than capturing its own
+    // baseline when it happens to be called, which may be long after the
+    // transfer has already completed.
+    uint64_t m_wait_baseline = 0;
     // m_done is registered in a module-internal IsrEvent* dispatch table indexed
     // by channel number. The shared DMA_IRQ_0 handler calls
     // dispatch_table[ch]->signal_from_isr() when the channel completes.

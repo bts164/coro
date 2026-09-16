@@ -321,6 +321,20 @@ handler is registered once (via `irq_add_shared_handler`) when the first
 !!! note "NOTE: DMA_IRQ_1 available"
     For applications that need lower IRQ latency on high-priority channels,
     `AsyncDmaTransfer` could be extended to support `DMA_IRQ_1` as an alternative.
+
+!!! warning "WARNING: dispatch table is lock-protected, but not fully use-after-free-safe across cores"
+    The snippet above is illustrative; the real dispatch table (`s_dispatch` in
+    `src/pico/hal/dma.cpp`) is guarded by a dedicated striped spin lock around
+    every read and write, since nothing restricts `AsyncDmaTransfer`
+    construction/destruction to the core that services `DMA_IRQ_0`. The lock
+    is released, however, before calling `signal_from_isr()` on the looked-up
+    `IsrEvent*`, because holding one striped spin lock while acquiring another
+    (`IsrEvent`'s own internal lock) risks a same-core self-deadlock if the
+    two alias the same underlying hardware lock — the striped pool's contract
+    forbids nesting them. This leaves a narrow window where an
+    `AsyncDmaTransfer` destructed on another core between the dispatch lookup
+    and the call is a use-after-free; see the identical, more fully explained
+    tradeoff in `doc/design/gpio_pin.md`'s matching warning for `GpioPin`.
     This is deferred until a concrete need arises.
 
 

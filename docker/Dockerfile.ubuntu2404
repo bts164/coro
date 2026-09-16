@@ -1,0 +1,57 @@
+# Mirrors the ubuntu-24.04 runner used by .github/workflows/tests.yml's asan/tsan
+# jobs, for dry-running them locally before pushing. See docker/run-sanitizer-build.sh.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# build-essential's default gcc/g++ on 24.04 is GCC 13 — same as the runner
+# image. libcap-dev is here for the same reason it's in conanfile.py's
+# system_requirements(): libwebsockets' own CMakeLists.txt probes for it via
+# find_path/find_library at its own (Conan-driven) build time.
+#
+# Noble's apt cmake package is 3.28.3 — test/CMakeLists.txt requires >=3.31
+# (cmake_minimum_required), so cmake is deliberately left out here and
+# installed via pip below instead (PyPI's cmake wheel ships Kitware's own
+# prebuilt binary, no need for the Kitware apt repo).
+#
+# gcc-arm-none-eabi provides arm-none-eabi-gcc/ld/objcopy — test/CMakeLists.txt's
+# test_switch_context_pico target cross-assembles fiber_context_pico.S +
+# switch_context_harness.S with these directly (see that target's
+# add_custom_command), not through CMake's own toolchain machinery, so it has
+# to be on PATH regardless of the host build's own compiler settings.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        pkg-config \
+        python3 \
+        python3-pip \
+        python3-venv \
+        libcap-dev \
+        ca-certificates \
+        gcc-arm-none-eabi \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --break-system-packages --no-cache-dir conan "cmake>=3.31"
+
+COPY <<EOF /root/.conan2/profiles/default
+[settings]
+arch=x86_64
+build_type=Release
+compiler=gcc
+compiler.cppstd=gnu23
+compiler.libcxx=libstdc++11
+compiler.version=13
+os=Linux
+
+[conf]
+tools.compilation:verbosity=verbose
+# run-sanitizer-build.sh bind-mounts /workspace read-only and routes all
+# writes into named volumes (test/build + the Conan cache) instead — this
+# disables CMakeUserPresets.json, the one file CMakeToolchain otherwise
+# writes straight into the (read-only) source folder root. Not needed here
+# since the script drives the build via `conan build .`, not a manual
+# `cmake --preset`.
+tools.cmake.cmaketoolchain:user_presets=
+EOF
+
+WORKDIR /workspace

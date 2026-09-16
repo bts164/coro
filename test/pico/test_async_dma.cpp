@@ -136,6 +136,30 @@ TEST_F(AsyncDmaTransferTest, UntrackedInstanceDoesNotEnableIrq) {
     coro_pico_hal_dma_fire_irq0();
 }
 
+TEST_F(AsyncDmaTransferTest, CompletionBetweenStartAndWaitIsNotMissed) {
+    AsyncDmaTransfer dma;
+    bool completed = false;
+
+    make_rt().block_on([](AsyncDmaTransfer& dma, bool& done) -> Coro<void> {
+        dma_channel_config cfg = dma_channel_get_default_config(
+            static_cast<uint>(dma.channel()));
+        dma.start(cfg, nullptr, nullptr, 0);
+
+        // Fire the completion synchronously, in the gap between start() and
+        // wait() -- exercises m_wait_baseline being captured in start()
+        // rather than lazily inside wait(). If wait() captured its own
+        // baseline instead, this completion would be invisible to it and
+        // the co_await below would hang forever.
+        dma_stub::complete_channel(static_cast<uint>(dma.channel()));
+        coro_pico_hal_dma_fire_irq0();
+
+        co_await dma.wait();
+        done = true;
+    }(dma, completed));
+
+    EXPECT_TRUE(completed);
+}
+
 TEST_F(AsyncDmaTransferTest, OnlyCorrectChannelWakesTransfer) {
     AsyncDmaTransfer a;
     AsyncDmaTransfer b;

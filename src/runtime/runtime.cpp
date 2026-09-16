@@ -20,10 +20,18 @@ namespace {
 } // namespace
 
 #ifdef CORO_PICO
-Runtime::Runtime() {
+Runtime::Runtime(bool enable_network) {
+    // See runtime.h's doc comment: skipping cyw43_arch_poll() entirely (rather
+    // than e.g. having it check a flag on every call) matters on boards with
+    // no CYW43 chip at all -- calling it there touches driver state that was
+    // never initialized (cyw43_arch_init() never ran), which is undefined
+    // behavior, not just a no-op.
+    CurrentThreadExecutor::PollFn poll_fn = enable_network
+        ? CurrentThreadExecutor::PollFn([]() { cyw43_arch_poll(); })
+        : CurrentThreadExecutor::PollFn([]() {});
     auto exec = std::make_unique<CurrentThreadExecutor>(
         []() -> uint64_t { return time_us_64(); },
-        []() { cyw43_arch_poll(); }
+        std::move(poll_fn)
     );
     m_current_thread_executor = exec.get();
     m_executor = std::move(exec);

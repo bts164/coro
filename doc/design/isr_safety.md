@@ -198,6 +198,38 @@ by never entering that code from ISR context.
 
 ---
 
+## When in doubt, add the lock
+
+When it's unclear whether some piece of state shared with an ISR actually needs a
+spin lock, default to adding one. The cost of guessing wrong is wildly asymmetric
+in each direction:
+
+**Cost of an unnecessary spin lock**: on RP2040, `spin_lock_blocking()` /
+`spin_unlock()` compile to `mrs`/`cpsid i` and `msr PRIMASK` — direct Cortex-M0+
+core-register instructions, not a peripheral or bus access. On this core they're
+single-cycle with no pipeline-flush penalty. The only real cost is the SIO
+register read/write the spin loop itself performs, and — under contention — how
+long interrupts stay disabled while spinning. Kept to a genuinely brief critical
+section (a handful of instructions, no calls out to unbounded or arbitrary code),
+that cost stays negligible even under a moderate amount of striped-lock aliasing
+(see "Cross-core ISR delivery" above for the striped pool's own tradeoffs).
+
+**Cost of a missing spin lock where one is genuinely needed**: a data race under
+the C++ memory model — undefined behavior, not merely "probably fine in
+practice." It can manifest as silent memory corruption or a hang that doesn't
+reproduce on demand, showing up far away in time and space from the code that
+actually caused it, which makes it disproportionately expensive to diagnose
+compared to almost any other class of bug.
+
+That asymmetry — bounded, small, easily-measured cost on one side; unbounded,
+silent, hard-to-diagnose cost on the other — is the same logic behind two of this
+project's general conventions: "prefer mutexes over atomics" and "document
+potential race conditions even when not 100% sure" (see `CLAUDE.md`). Applied to
+spin locks specifically: when uncertain, lock. The reverse mistake is far more
+expensive than the one you're guarding against.
+
+---
+
 ## ISR-safe primitives
 
 ### `IsrEvent` — reusable signal with no value, broadcast to every waiter
