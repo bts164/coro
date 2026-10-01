@@ -348,6 +348,6 @@ Suggested events to instrument once logging exists:
 - Task created / scheduled / polled / completed / cancelled
 - `SchedulingState` transitions (at `TRACE` level)
 - CAS failures that indicate bugs (`FATAL`)
-- `IoService` timer wakeup firing
+- `SingleThreadedUvExecutor` timer wakeup firing
 - Worker thread start / stop
 - Injection queue drain counts (task budget enforcement)

@@ -511,18 +511,20 @@ owns the close; the other is a no-op.
 ### `TcpStream`
 
 Wraps `uv_tcp_t`. Async connect, read, and write futures each hold a `shared_ptr` to a
-shared connection state. The connect future submits a `TcpConnectRequest`; read submits
-`TcpReadRequest`; write submits `TcpWriteRequest`. Callbacks on the I/O thread store
-results and call `waker->wake()`.
+shared connection state and run as `with_context(*m_uv_exec, ...)` coroutines that call
+`uv_tcp_connect`/`uv_read_start`/`uv_write` directly, completing a `UvCallbackResult<T>`
+from the libuv callback. Callbacks on the I/O thread store results and call
+`waker->wake()`.
 
 ### `WsStream` / `WsListener`
 
 Built on [libwebsockets](https://libwebsockets.org/) with `LWS_SERVER_OPTION_LIBUV` so
 lws registers all its handles on the existing `uv_loop_t` — no extra thread.
 
-The `lws_context*` is owned by `IoService`, created on the I/O thread at startup and
-destroyed in `stop()`. All lws operations (connect, send, close) are submitted as
-`IoRequest` commands.
+The `lws_context*` is owned by `SingleThreadedUvExecutor` directly (`lws_ctx()`), created
+on the I/O thread at startup and destroyed in `stop()`. All lws operations (connect, send,
+close) run as `with_context(*m_uv_exec, ...)` coroutines that call into lws directly, the
+same pattern `TcpStream` uses.
 
 A single `protocol_cb` C function dispatches all events (`ESTABLISHED`, `RECEIVE`,
 `WRITEABLE`, `CLOSED`, `CONNECTION_ERROR`) to the appropriate sub-state in

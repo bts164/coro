@@ -34,8 +34,8 @@ Runtime::Runtime(std::size_t num_threads) {
 
 ## Local Wake vs. Remote Wake
 
-When the `IoService` background thread calls `Waker::wake()` (e.g. from a libuv timer or
-I/O callback), it originates from a thread that is not the poll loop.
+When the `SingleThreadedUvExecutor` background thread calls `Waker::wake()` (e.g. from a
+libuv timer or I/O callback), it originates from a thread that is not the poll loop.
 Every executor must therefore handle wakeups from threads it does not own.
 
 Tokio and similar runtimes distinguish two categories of wakeup:
@@ -514,7 +514,7 @@ CASes to `Notified` and re-enqueues.
 ```
 worker_loop():
     set_current_runtime(m_runtime)
-    set_current_io_service(&m_runtime->io_service())
+    set_current_uv_executor(&m_runtime->uv_executor())
 
     loop:
         // Try local queue first (no lock), then injection queue.
@@ -544,7 +544,7 @@ worker_loop():
                 enqueue(task)
 
     set_current_runtime(nullptr)
-    set_current_io_service(nullptr)
+    set_current_uv_executor(nullptr)
 ```
 
 **Key invariants:**
@@ -563,7 +563,7 @@ Two thread-locals are set on each worker at startup:
 | Thread-local | Set by | Used by |
 |---|---|---|
 | `t_current_runtime` | Worker thread startup | `coro::spawn()`, `JoinSet::spawn()`, `spawn_blocking()` |
-| `t_current_io_service` | Worker thread startup | `SleepFuture::poll()`, any future that submits to `IoService` |
+| `t_current_uv_executor` | Worker thread startup | `SleepFuture::poll()`, any future that touches the reactor via `SingleThreadedUvExecutor` |
 
 ### Shutdown
 
