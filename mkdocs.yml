@@ -98,6 +98,7 @@ nav:
       - Executor Scheduling Design: design/executor_design.md
       - Work-Stealing Scheduler: design/work_stealing_executor.md
       - Blocking Thread Pool: design/spawn_blocking.md
+      - blocking_wait / blocking_next: design/blocking_wait.md
     - I/O Subsystem:
       - libuv Integration: design/libuv_integration.md
       - I/O Coroutines: design/io_coroutine.md

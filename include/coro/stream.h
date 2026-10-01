@@ -81,4 +81,24 @@ NextFuture<S> next(S& stream) {
     return NextFuture<S>(stream);
 }
 
+#ifndef CORO_PICO
+
+/**
+ * @brief Pulls exactly one item from @p stream, blocking the calling OS thread until it's
+ * available. Equivalent to `blocking_wait(next(stream))`.
+ *
+ * Same runtime-context requirement as @ref blocking_wait: a future that touches the
+ * reactor requires an active `current_runtime()`/`current_uv_executor()` on the calling
+ * thread (ambient on a `spawn_blocking` thread). See doc/design/blocking_wait.md.
+ *
+ * @return `nullopt`/`false` once the stream is exhausted (matching `next()`'s return type
+ * for the stream's `ItemType` — `bool` for `void` streams, `optional<T>` otherwise).
+ */
+template<Stream S>
+detail::StreamItem<typename S::ItemType> blocking_next(S& stream) {
+    return blocking_wait(next(stream));
+}
+
+#endif // CORO_PICO
+
 } // namespace coro

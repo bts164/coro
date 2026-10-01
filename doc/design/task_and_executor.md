@@ -464,6 +464,117 @@ public:
 };
 ```
 
+`Runtime` owns the executor, the libuv reactor (`SingleThreadedUvExecutor`), and the
+blocking thread pool (`BlockingPool`) directly, as plain members — not behind a `pimpl`.
+Every place that needs to reach one of these from off the `Runtime` object itself (the
+free `spawn()`/`current_runtime()` thread-locals, `BlockingPool::worker_loop`'s
+`set_current_runtime`/`set_current_uv_executor` calls) stores a raw `Runtime*` and relies
+on a *structural* lifetime guarantee rather than shared ownership: `block_on()` runs on a
+call stack that has `Runtime` alive by construction, and `BlockingPool`'s worker threads
+are joined by `~BlockingPool()` before the rest of `~Runtime()` runs, so the pointer is
+never read after the `Runtime` it points to is gone. This is cheaper than an extra
+allocation and indirection level — worthwhile as long as every consumer of the pointer is
+one the library itself controls the lifetime of.
+
+#### Proposed: `Handle` and `Runtime::enter()` (not yet implemented)
+
+!!! warning "PROPOSED: not yet implemented"
+    `Runtime::Handle`, `Runtime::enter()`, and the `Impl` split below do not exist yet.
+    `Runtime` today is the flat, directly-owning type described above. This section
+    describes the target design for giving an arbitrary foreign thread (one not managed
+    by `spawn_blocking` or `block_on`) valid access to a `Runtime`'s context.
+
+The raw-pointer guarantee above only holds for threads the library itself creates and
+retires (`block_on`'s caller, `BlockingPool` workers). It does not extend to a thread the
+*application* owns independently — there is no structural relationship forcing such a
+thread to stop using a `Runtime*` before that `Runtime` is destroyed. Tokio solves the
+equivalent problem by making its `Runtime` a thin wrapper around an `Arc`-shared inner
+struct: cloning a `Handle` bumps a refcount, so the shared state stays alive for exactly as
+long as any `Handle` (or `EnterGuard`) referencing it does, independent of whether the
+original `Runtime` value is still around.
+
+The C++ equivalent is `shared_ptr`-based `pimpl`:
+
+```cpp
+// Everything Runtime currently owns directly moves into Impl.
+struct Runtime::Impl {
+    SingleThreadedUvExecutor  uv_executor;
+    BlockingPool              blocking_pool;
+    std::unique_ptr<Executor> executor;
+};
+
+class Runtime {
+public:
+    explicit Runtime(std::size_t num_threads = std::thread::hardware_concurrency());
+
+    template<Future F>
+    typename F::OutputType block_on(F future);
+
+    // Returns a cheaply-cloneable handle to this runtime's shared state.
+    Handle handle() const;
+
+private:
+    std::shared_ptr<Impl> m_impl;
+};
+
+// Handle is the copyable, thread-safe reference type — what free spawn()/current_runtime()
+// actually store, and what BlockingPool keeps a *weak* reference to (see below).
+class Handle {
+public:
+    template<Future F>
+    [[nodiscard]] JoinHandle<typename F::OutputType> spawn(F future) const;
+
+    // Makes this runtime's context (current-runtime + current-uv-executor thread-locals)
+    // active on the calling thread for the guard's lifetime. Restores whatever was active
+    // before on drop, so nested enter() calls are safe.
+    [[nodiscard]] EnterGuard enter() const;
+
+private:
+    friend class Runtime;
+    explicit Handle(std::shared_ptr<Runtime::Impl> impl);
+    std::shared_ptr<Runtime::Impl> m_impl;
+};
+
+class [[nodiscard]] EnterGuard {
+public:
+    ~EnterGuard();  // restores the previous thread-local Handle + uv executor (if any)
+
+    EnterGuard(const EnterGuard&)            = delete;
+    EnterGuard& operator=(const EnterGuard&) = delete;
+    EnterGuard(EnterGuard&&) noexcept            = default;
+    EnterGuard& operator=(EnterGuard&&) noexcept = default;
+
+private:
+    friend class Handle;
+    explicit EnterGuard(std::shared_ptr<Runtime::Impl> impl);
+    std::shared_ptr<Runtime::Impl> m_impl;  // keeps Impl alive for the guard's lifetime
+    Handle                         m_prev;  // whatever was thread-locally active before
+};
+```
+
+`Runtime` itself stays non-copyable — it is still the one object an application
+constructs and typically keeps alive for the process lifetime, exactly as today. `Handle`
+is the freely-copyable reference type everything else works through, mirroring Tokio's
+`Runtime`/`Handle` split.
+
+`BlockingPool` cannot store a `Handle` (a strong `shared_ptr<Impl>`) as a permanent
+member — `Impl` contains `BlockingPool`, so that would be a reference cycle and `Impl`
+would never be destroyed. It stores a `std::weak_ptr<Impl>` instead, and each worker
+thread `lock()`s it into a strong `Handle` once at the top of its loop, exactly where
+`set_current_runtime`/`set_current_uv_executor` are called today. This generalizes the
+same structural guarantee `spawn_blocking.md` describes for the current flat design (the
+worker thread's own reference keeps what it needs alive for as long as it's running) into
+one that also covers `enter()`: an `EnterGuard` on a foreign thread holds its own strong
+`shared_ptr<Impl>` clone, so `Impl` — and everything reachable through it — stays alive for
+the guard's lifetime regardless of what happens to the original `Runtime` value or any
+other `Handle`.
+
+This is a change to `Runtime`'s public shape, not just its internals: `set_current_runtime`
+and `current_runtime()` change from storing/returning `Runtime*` to storing/returning
+`Handle`, and every call site that currently holds a `Runtime&` for spawning purposes
+(rather than for `block_on()` itself) would move to `Handle` instead. Treat this as one
+scoped refactor when it's picked up, not an incremental change.
+
 ### Free spawn() function
 
 A free `spawn()` function mirrors Tokio's `tokio::spawn()`. It retrieves the thread-local
@@ -536,10 +647,10 @@ cleanest approach is to store a `Context*` in the `promise_type` on each `poll()
 
 ### libuv integration point
 
-libuv callbacks run on the `IoService` thread. When a callback fires (e.g. a timer or read
-completes), it calls `waker->wake()`, which posts the task back to the executor via the
-injection queue. The `IoService` runs on a dedicated thread inside `Runtime` and communicates
-with worker threads via `uv_async_t` notifications.
+libuv callbacks run on the `SingleThreadedUvExecutor` thread. When a callback fires (e.g. a
+timer or read completes), it calls `waker->wake()`, which posts the task back to the
+executor via the injection queue. `SingleThreadedUvExecutor` runs on a dedicated thread
+inside `Runtime` and communicates with worker threads via `uv_async_t` notifications.
 
 ### spawn() ownership
 

@@ -329,6 +329,31 @@ TYPED_TEST(NextFutureAsyncTest, SelectWinningBranchDeliversItem) {
     EXPECT_EQ(*got, 42);
 }
 
+// -----------------------------------------------------------------------
+// blocking_next — desktop-only (guarded per test_pico_suite's convention:
+// "Desktop-only code (spawn_blocking, timeout, etc.) is guarded with
+// #ifndef CORO_PICO in each test file.")
+// -----------------------------------------------------------------------
+
+#ifndef CORO_PICO
+
+TEST(BlockingNextTest, DrainsAllItemsThenNullopt) {
+    FiniteStream<int> s({1, 2, 3});
+    EXPECT_EQ(blocking_next(s), std::optional<int>(1));
+    EXPECT_EQ(blocking_next(s), std::optional<int>(2));
+    EXPECT_EQ(blocking_next(s), std::optional<int>(3));
+    EXPECT_EQ(blocking_next(s), std::nullopt);
+}
+
+TEST(BlockingNextTest, VoidStreamYieldsCountThenFalse) {
+    VoidStream s(2);
+    EXPECT_TRUE(blocking_next(s));
+    EXPECT_TRUE(blocking_next(s));
+    EXPECT_FALSE(blocking_next(s));
+}
+
+#endif // CORO_PICO
+
 TYPED_TEST(NextFutureAsyncTest, SelectRepeatedRoundsCollectsAllItems) {
     std::vector<int> results;
     this->traits.rt.block_on([](std::vector<int>& results) -> Coro<void> {

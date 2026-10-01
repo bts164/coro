@@ -2,7 +2,12 @@
 #include <gmock/gmock.h>
 #include <coro/future.h>
 
+#include <chrono>
+#include <future>
+#include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
 
 using namespace coro;
 using namespace coro::detail;
@@ -82,4 +87,103 @@ TEST(ImmediateFutureTest, PollReturnsReady) {
     auto result = f.poll(ctx);
     EXPECT_TRUE(result.isReady());
     EXPECT_EQ(result.value(), 42);
+}
+
+// --- coro::never<T>() / coro::NeverFuture<T> ---
+//
+// Qualified as coro::NeverFuture below: this file's own NeverFuture<T> stub (above) is
+// declared directly in this (global) scope, which hides the `using namespace coro;`-imported
+// coro::NeverFuture for unqualified lookup here.
+
+static_assert(Future<coro::NeverFuture<int>>);
+static_assert(Future<coro::NeverFuture<void>>);
+static_assert(!Cancellable<coro::NeverFuture<int>>);
+
+TEST(CoroNeverFutureTest, PollAlwaysReturnsPending) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    coro::NeverFuture<int> f;
+    EXPECT_TRUE(f.poll(ctx).isPending());
+    EXPECT_TRUE(f.poll(ctx).isPending());
+}
+
+TEST(CoroNeverFutureTest, NeverFactoryReturnsPending) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    auto f = coro::never<int>();
+    EXPECT_TRUE(f.poll(ctx).isPending());
+}
+
+TEST(CoroNeverFutureTest, VoidOutputTypeCompiles) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    auto f = coro::never<void>();
+    EXPECT_TRUE(f.poll(ctx).isPending());
+}
+
+// --- blocking_wait ---
+
+namespace {
+
+struct ImmediateVoidFuture {
+    using OutputType = void;
+    PollResult<void> poll(detail::Context&) { return PollReady; }
+};
+
+struct ErrorFuture {
+    using OutputType = int;
+    PollResult<int> poll(detail::Context&) {
+        return PollError(std::make_exception_ptr(std::runtime_error("boom")));
+    }
+};
+
+// Pends on the first poll, handing the caller's waker out through `promise` so a
+// test thread can wake it later; ready on the second poll.
+class DelayedFuture {
+public:
+    using OutputType = int;
+    DelayedFuture(std::shared_ptr<std::promise<Rc<detail::Waker>>> promise, int value)
+        : m_promise(std::move(promise)), m_value(value) {}
+    PollResult<int> poll(detail::Context& ctx) {
+        if (!m_polled) {
+            m_polled = true;
+            m_promise->set_value(ctx.getWaker());
+            return PollPending;
+        }
+        return m_value;
+    }
+private:
+    std::shared_ptr<std::promise<Rc<detail::Waker>>> m_promise;
+    int                                               m_value;
+    bool                                              m_polled = false;
+};
+
+} // namespace
+
+TEST(BlockingWaitTest, ReturnsReadyValueImmediately) {
+    EXPECT_EQ(blocking_wait(ImmediateFuture<int>(42)), 42);
+}
+
+TEST(BlockingWaitTest, HandlesVoidOutput) {
+    blocking_wait(ImmediateVoidFuture{});
+    SUCCEED();
+}
+
+TEST(BlockingWaitTest, RethrowsException) {
+    EXPECT_THROW(blocking_wait(ErrorFuture{}), std::runtime_error);
+}
+
+TEST(BlockingWaitTest, BlocksUntilWokenFromAnotherThread) {
+    auto promise = std::make_shared<std::promise<Rc<detail::Waker>>>();
+    auto waker_future = promise->get_future();
+
+    std::thread waker_thread([waker_future = std::move(waker_future)]() mutable {
+        auto waker = waker_future.get();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        waker->wake();
+    });
+
+    auto result = blocking_wait(DelayedFuture(std::move(promise), 99));
+    EXPECT_EQ(result, 99);
+    waker_thread.join();
 }
