@@ -110,6 +110,15 @@ expected to be joined by the pool.
 Switching to joinable threads with lazy reaping is a contained change to `BlockingPool`
 internals if needed later — no user-facing API is affected.
 
+**Thread-local runtime context:** each worker thread sets both `current_runtime()` and
+`current_uv_executor()` once, at the top of its loop, before pulling any work item. This
+is what makes recursive `spawn_blocking()`, `blocking_get()`, and a nested `block_on()`
+(see "Running a Future on a blocking thread" below) work from inside a blocking-pool
+thread — and it is also what makes a blocking-pool thread a valid place to poll *any*
+future or stream that touches the reactor (timers, file I/O, `poll_stream`), not just
+ones that stay in-memory. Without the `current_uv_executor()` half of this, only futures
+that never touch the reactor could safely be polled from a blocking-pool thread.
+
 **Pool sizing:**
 - The pool grows on demand, up to a configurable maximum (default: 512, matching Tokio).
 - Idle threads time out after a keep-alive period (default: 10 seconds) and exit,
@@ -444,6 +453,20 @@ call site rather than hidden behind a convenience wrapper.
 
 ---
 
+## `blocking_wait` / `blocking_next` — driving a `Future`/`Stream` from a blocking thread
+
+!!! note "See blocking_wait.md"
+    `blocking_wait`/`blocking_next` are a general-purpose primitive, not something
+    specific to `spawn_blocking` — they're meant to be usable from any thread
+    with an active runtime context (a `spawn_blocking` thread today; any thread that has
+    called the proposed `Runtime::enter()` in the future). Full design, API, and rationale
+    live in [blocking_wait.md](blocking_wait.md). The connection to this doc: a
+    `spawn_blocking` compute loop is the concrete use case that motivated the design, and
+    `spawn_blocking` threads are the one place today where the required runtime context is
+    already ambient (see "Thread-local runtime context" above).
+
+---
+
 ## Comparison with alternatives
 
 | Approach | Pros | Cons |
@@ -452,6 +475,8 @@ call site rather than hidden behind a convenience wrapper.
 | `oneshot` channel + `std::thread` | No library support needed | Boilerplate; caller manages thread lifetime |
 | libuv thread pool (`uv_queue_work`) | Reuses existing pool | Pool is shared with libuv internals; size capped at `UV_THREADPOOL_SIZE` (default 4) |
 | `co_await` blocking future inline | None | Blocks an executor worker — should never be done |
+| `blocking_wait`/`blocking_next` (see [blocking_wait.md](blocking_wait.md)) | No second reactor/executor allocation; works with any `Future`/`Stream` | Requires an already-active `Runtime` context (ambient on `spawn_blocking` threads, or via the proposed `Runtime::enter()`) for futures that touch the reactor |
+| Nested `Runtime` + `block_on` (above) | Fully isolated reactor; no ambient-context requirement | Full second executor + `uv_loop_t` allocated per call |
 
 The libuv thread pool (`uv_queue_work`) was considered but rejected: its default size cap
 of 4 threads (max 128 via `UV_THREADPOOL_SIZE`) is too restrictive for general-purpose
