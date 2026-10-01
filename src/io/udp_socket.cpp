@@ -3,8 +3,15 @@
 #include <coro/task/spawn_on.h>
 #include <coro/coro.h>
 #include <coro/io/socket_address_uv.h>
+#include <cerrno>
 #include <cstring>
 #include <system_error>
+
+#ifdef __linux__
+#include <netinet/in.h>
+#include <netinet/udp.h>
+#include <sys/socket.h>
+#endif
 
 namespace coro {
 
@@ -103,6 +110,76 @@ JoinHandle<void> UdpSocket::set_broadcast(bool enabled) {
             co_return;
         }(m_handle, enabled)
     );
+}
+
+// ---------------------------------------------------------------------------
+// set_segment_size
+// ---------------------------------------------------------------------------
+
+void UdpSocket::set_segment_size(std::size_t bytes) {
+#ifdef __linux__
+    // Only the kernel socket is touched, never handle->handle, so this runs on
+    // the calling thread. Potential race: a send() in flight on another thread
+    // (fast path on the caller's thread, or a queued uv_udp_send() on the uv
+    // thread) may be segmented with either the old or the new size — the kernel
+    // reads the option once per send, so each datagram is still one or the other.
+    int seg = static_cast<int>(bytes);
+    if (setsockopt(m_handle->raw_fd, IPPROTO_UDP, UDP_SEGMENT, &seg, sizeof(seg)) != 0)
+        throw std::system_error(errno, std::system_category(), "UdpSocket::set_segment_size");
+#else
+    (void)bytes;
+    throw std::system_error(std::make_error_code(std::errc::not_supported),
+                            "UdpSocket::set_segment_size");
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// set_gro, recv_segments
+// ---------------------------------------------------------------------------
+
+void UdpSocket::set_gro(bool enabled) {
+#ifdef __linux__
+    // Kernel socket only, like set_segment_size(). Potential race: a datagram
+    // queued before the change keeps the form it was queued in, so a receive
+    // just after set_gro(false) may still return a coalesced buffer (which
+    // recv_segments_from() splits correctly; recv_from() would not).
+    int on = enabled ? 1 : 0;
+    if (setsockopt(m_handle->raw_fd, IPPROTO_UDP, UDP_GRO, &on, sizeof(on)) != 0)
+        throw std::system_error(errno, std::system_category(), "UdpSocket::set_gro");
+#else
+    (void)enabled;
+    throw std::system_error(std::make_error_code(std::errc::not_supported), "UdpSocket::set_gro");
+#endif
+}
+
+ssize_t detail::recv_segments(int fd, std::byte* data, std::size_t size,
+                              SocketAddress& sender, std::size_t& segment_size) {
+    sockaddr_storage storage;
+    iovec iov{data, size};
+    msghdr msg{};
+    msg.msg_name    = &storage;
+    msg.msg_namelen = sizeof(storage);
+    msg.msg_iov     = &iov;
+    msg.msg_iovlen  = 1;
+#ifdef __linux__
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))];
+    msg.msg_control    = control;
+    msg.msg_controllen = sizeof(control);
+#endif
+    ssize_t n = ::recvmsg(fd, &msg, MSG_DONTWAIT);
+    if (n < 0) return n;
+    sender = detail::from_sockaddr(reinterpret_cast<sockaddr*>(&storage));
+    segment_size = static_cast<std::size_t>(n);
+#ifdef __linux__
+    for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == IPPROTO_UDP && c->cmsg_type == UDP_GRO) {
+            int gso_size;
+            std::memcpy(&gso_size, CMSG_DATA(c), sizeof(gso_size));
+            if (gso_size > 0) segment_size = static_cast<std::size_t>(gso_size);
+        }
+    }
+#endif
+    return n;
 }
 
 JoinHandle<void> UdpSocket::set_membership(std::shared_ptr<Handle> handle,

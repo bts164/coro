@@ -226,6 +226,24 @@ directly (not fire-and-forget: the caller needs the result). `UdpSocket::recv_fr
 `send()`/`connect()` (which still call real libuv functions and so still need
 `with_context`).
 
+**`send_to()`/`send()` return a hand-written `UdpSendFuture<Buf>`, not a `Coro`.** The
+first `poll()` (run eagerly by `FutureAwaitable::await_ready()`) does the non-blocking
+`sendto()`/`send()` and returns `PollReady` on success, so the common case allocates no
+coroutine frame and no `CoroutineScope`. Only on `EAGAIN` does the future spawn the
+`uv_udp_send()` slow-path coroutine on the uv executor (once) and forward `poll()`/`cancel()`
+to its `JoinHandle`. Motivated by `bench/udp_bench_coro.cpp`, which showed a fixed
+per-call coroutine overhead versus raw `send()`.
+
+**`recv_from()`/`recv()` likewise return a hand-written `UdpRecvFuture<Buf, WithSender>`**
+(`WithSender` selects `{n, buf, sender}` vs `{n, buf}`), replacing the former
+`recv_from_impl` coroutine. Same structure: the first `poll()` does the non-blocking
+`recvfrom()`; on `EAGAIN` it spawns the single-shot `uv_udp_recv_start()` coroutine on the
+uv executor and forwards `poll()`/`cancel()` to its `JoinHandle`. Caveat: the fast path only
+hits when a datagram is already queued, so a consumer that keeps up with the sender will
+take the slow path (uv hop) most of the time; the win is mostly for bursty/backlogged
+receivers. (The code sketch below predates this and shows the equivalent logic as a
+coroutine.)
+
 ### Fast path safety: mutually exclusive by construction
 
 Could the fast-path `recvfrom()` above race with `recv_cb`, which also calls `recvfrom()`
@@ -318,6 +336,23 @@ public:
     /// [Multicast and broadcast](#multicast-and-broadcast).
     [[nodiscard]] /* Future<void> */ set_broadcast(bool enabled);
 
+    /// libuv backend on Linux only: UDP GSO. Later send()/send_to() buffers longer
+    /// than bytes go out as consecutive datagrams of bytes each (last may be
+    /// shorter) in one syscall. 0 disables. See [Segmented sends
+    /// (GSO)](#segmented-sends-gso).
+    void set_segment_size(std::size_t bytes);
+
+    /// libuv backend on Linux only: UDP GRO. The kernel may coalesce consecutive
+    /// same-sized datagrams from one sender into one queued buffer; read them with
+    /// recv_segments_from(). See [Coalesced receives (GRO)](#coalesced-receives-gro).
+    void set_gro(bool enabled);
+
+    /// libuv backend only: like recv_from(), but returns {n, buf, sender,
+    /// segment_size} -- buf[0, n) holds one or more datagrams of segment_size
+    /// bytes each (the last may be shorter).
+    template<ByteBuffer Buf>
+    [[nodiscard]] /* Future<UdpSegments<Buf>> */ recv_segments_from(Buf buf);
+
     /// Joins multicast group so recv_from()/recv() start receiving datagrams sent to
     /// it. iface selects which local interface to join on; the default
     /// (Ipv4Address{}) lets the OS (libuv) or the single Pico interface (lwIP) choose.
@@ -338,6 +373,8 @@ per-backend split, with one exception carved out for the fast path described in
 | libuv (desktop) | `send_to()`, `send()`, `connect()` | `JoinHandle<T>` | Calls a real libuv function, so it still runs via `with_context(uv_exec, ...)` — same as every `TcpStream`/`TcpListener` method today |
 | libuv (desktop) | `recv_from()`, `recv()` | `Coro<T>` | The raw-fd fast-path read runs directly on the caller's thread — no uv-thread hop needed except on the (rare) slow path, which does need one `with_context` hop (awaited, since the result comes from there), unlike `PollStream`'s always-armed model |
 | libuv (desktop) | `set_broadcast()`, `join_multicast()`, `leave_multicast()` | `JoinHandle<void>` | `uv_udp_set_broadcast()`/`uv_udp_set_membership()` are libuv calls on the handle, so — same as `connect()` — they go via `with_context(uv_exec, ...)` even though neither one itself suspends |
+| libuv (desktop) | `set_segment_size()`, `set_gro()` | `void` | A plain `setsockopt()` on the cached raw fd; never touches the uv handle, so no hop |
+| libuv (desktop) | `recv_segments_from()` | `UdpRecvSegmentsFuture<Buf>` | Same fast path as `recv_from()`, with `recvmsg()`; the slow path only waits for readability on the uv thread (see [Coalesced receives (GRO)](#coalesced-receives-gro)) |
 | lwIP (Pico) | all | `Coro<T>` | Callbacks fire synchronously inside the caller's own executor tick — no thread hop, so a plain `Coro` suffices, same as `TcpStream`'s lwIP methods |
 
 **Concurrency** (matches the existing `TcpStream` restriction): only one receive
@@ -348,27 +385,25 @@ must not be called concurrently with a send or receive already in flight, since 
 mutates the same `Handle`/`LwipUdpCtx` those operations read.
 
 **Mixing `_to`/`_from` calls with `connect()`:** once `connect()` has been called,
-`recv_from()` remains callable on both backends, but `send_to()` does not — the two
-backends disagree on whether an explicit destination is even accepted:
+both `recv_from()` and `send_to()` remain callable on both backends.
 
-!!! warning "WARNING: `send_to()` always throws EISCONN after connect() on the libuv/Linux backend"
-    On Linux, once a UDP socket has been `connect()`-ed, the kernel rejects
-    *any* `sendto()` that specifies a destination address with `EISCONN`
-    ("Transport endpoint is already connected") — this holds even if the address
-    given is exactly the address passed to `connect()`. Per `sendto(2)`: "the
-    connection-mode socket was connected already but a recipient was specified" —
-    Linux does not special-case a recipient that happens to match the connected
-    peer. In practice this means `send_to()` is unusable after `connect()` on this
-    backend; callers must switch to `send()` once connected. `recv_from()` is
-    unaffected: the kernel only ever delivers datagrams from the connected peer
-    once `connect()` has run, so `recv_from()` and `recv()` behave identically on
-    this backend.
+`sendto(2)`'s manpage documents `EISCONN` ("a connection-mode socket was
+connected already but a recipient was specified") as a possible error, which
+earlier revisions of this doc took to mean `send_to()` becomes unusable after
+`connect()` on the libuv/Linux backend. That turned out not to hold in
+practice: verified via `strace` that the raw `sendto(2)` syscall accepts an
+explicit destination on an already-`connect()`-ed UDP socket without error on
+this platform's kernel, and libuv's own `uv__udp_send()` (`src/unix/udp.c`)
+adds no check on top of that — the manpage's `EISCONN` case is evidently not
+triggered by this combination on Linux. `send_to()`'s fast path (a raw
+`sendto()` on the calling thread) and its `with_context`/`uv_udp_send()` slow
+path therefore both simply forward the explicit destination as given,
+`connect()`-ed or not. `recv_from()` is unaffected either way: the kernel only
+ever delivers datagrams from the connected peer once `connect()` has run, so
+`recv_from()` and `recv()` behave identically on this backend.
 
-    The lwIP backend has no such restriction — `udp_sendto()` always accepts an
-    explicit destination regardless of connected state, since lwIP never filters
-    sends by the connected peer the way the Linux kernel does. Portable code that
-    needs `send_to()` to keep working after `connect()` should not rely on this
-    across backends; see [Known limitations](#known-limitations--future-work).
+The lwIP backend has never had this restriction — `udp_sendto()` always accepts
+an explicit destination regardless of connected state.
 
 ---
 
@@ -640,6 +675,82 @@ JoinHandle<void> UdpSocket::leave_multicast(Ipv4Address group, Ipv4Address iface
     return set_membership(m_handle, m_uv_exec, group, iface, UV_LEAVE_GROUP);
 }
 ```
+
+### Segmented sends (GSO)
+
+`set_segment_size(bytes)` sets Linux's `UDP_SEGMENT` socket option on the raw fd. From
+then on the kernel splits any send longer than `bytes` into datagrams of `bytes` each
+(only the last may be shorter), after one syscall and one pass through the UDP/IP stack.
+The send path itself is unchanged: the fast-path `send()`/`sendto()` and the slow-path
+`uv_udp_send()` both just hand the kernel a longer buffer.
+
+This matters because the per-datagram cost of the kernel stack, not syscall entry,
+dominates small-datagram sends. Measured on an i5-11500H over loopback with 1468-byte
+datagrams (performance governor, CPU µs per datagram): one `send()` per datagram 1.75,
+`sendmmsg()` of 20 datagrams 1.67, GSO with 10 segments 0.54, GSO with 20 segments 0.46.
+That is why there is no `sendmmsg()`-style batch API: it saves only the syscall entry.
+
+```cpp
+Coro<void> send_packets(UdpSocket& sock, std::vector<std::byte> packed) {
+    sock.set_segment_size(1468);           // once
+    co_await sock.send(std::move(packed)); // up to 44 x 1468-byte datagrams
+}
+```
+
+Limits (all enforced by the kernel):
+
+- One buffer carries at most 65507 bytes and 64 segments (128 on newer kernels);
+  larger sends fail with `EMSGSIZE`.
+- The segments are equal-sized, so datagrams of different sizes need separate sends.
+  A send no larger than `bytes` goes out as an ordinary single datagram, so it's fine to
+  send short packets on the same socket.
+- The outgoing interface needs checksum offload; without it the send fails with `EIO`.
+  Loopback and common NICs have it.
+
+!!! note "NOTE: race with in-flight sends"
+    `set_segment_size()` runs on the caller's thread. A send already in flight
+    on another thread (or queued on the uv thread's slow path) may be segmented with
+    either the old or the new size. The kernel reads the option once per send, so each
+    send uses one size or the other, never a mix.
+
+### Coalesced receives (GRO)
+
+`set_gro(true)` sets Linux's `UDP_GRO` socket option: the kernel may then hand the socket
+several consecutive same-sized datagrams from one sender as one buffer. Datagrams sent with
+GSO stay coalesced end to end over loopback; from a NIC, the driver's GRO coalesces them.
+`recv_segments_from()` reads such a buffer and reports the segment size (from the
+`UDP_GRO` control message), and the caller splits it. `recv_from()` can't: it would return
+the coalesced datagrams as one.
+
+It does two things for a receiver of many small datagrams:
+
+- **Faster receive.** Kernel cost per datagram drops from about 0.56 µs (`recv()`) to
+  0.14 µs (same machine and datagrams as the GSO figures above).
+- **Deeper receive buffer.** One coalesced buffer takes less of `SO_RCVBUF` than the same
+  datagrams queued separately: with the default 212992-byte buffer and 1468-byte datagrams
+  sent in GSO batches, the socket holds 176 datagrams instead of 88 before the kernel drops.
+
+libuv's receive callback never reads control messages, so the slow path can't use it to
+read. Instead it only waits for readability: `uv_udp_recv_start()` with an alloc callback
+that returns an empty buffer, which libuv answers with `UV_ENOBUFS` without reading
+anything. The future then retries its `recvmsg()` on the caller's thread.
+
+```cpp
+Coro<void> receive(UdpSocket& sock) {
+    sock.set_gro(true);
+    auto [n, buf, sender, seg] = co_await sock.recv_segments_from(std::vector<std::byte>(65535));
+    for (std::size_t off = 0; off < n; off += seg)
+        handle_datagram(std::span(buf).subspan(off, std::min(seg, n - off)));
+}
+```
+
+The buffer should hold 65535 bytes: a coalesced read that doesn't fit is truncated, losing
+whole datagrams.
+
+!!! note "NOTE: race with queued datagrams"
+    Datagrams queued before `set_gro()` changes keep the form they were queued in, so a
+    receive just after `set_gro(false)` can still return a coalesced buffer.
+    `recv_segments_from()` splits it correctly; `recv_from()` would not.
 
 ### `bind` and destructor
 
@@ -964,13 +1075,18 @@ port)` run once up front and `udp_send(pcb, pbuf)` (no address) replacing `udp_s
   behavior difference callers relying on this backend need to be aware of — bursty senders
   faster than the receiver's polling cadence will lose datagrams on Pico that an equivalent
   desktop program would not.
-- **`send_to()` throws unconditionally after `connect()` on the libuv/Linux backend
-  (even to the connected peer's own address), but succeeds on lwIP.** See the warning
-  in [Mixing `_to`/`_from` calls with `connect()`](#connect-send-recv-fixed-peer-mode) —
-  this is a genuine kernel (`EISCONN`) vs. lwIP behavior asymmetry, not a bug to be
-  fixed; callers on the libuv backend must use `send()` once connected, and callers who
-  need portable arbitrary-peer addressing after `connect()` should use a second,
-  unconnected socket instead.
+- **`set_segment_size()` (GSO) and `set_gro()` are libuv-on-Linux only.** They throw
+  `std::system_error` (`ENOTSUP`) elsewhere under libuv and aren't declared on the lwIP
+  backend, nor is `recv_segments_from()` (which off Linux returns one datagram per read).
+  There is no `recv()`-style variant for connected sockets, and no `recvmmsg()` batching.
+  See [Segmented sends (GSO)](#segmented-sends-gso) and
+  [Coalesced receives (GRO)](#coalesced-receives-gro).
+- **`send_to()` remains usable after `connect()` on both backends.** An earlier
+  revision of this doc claimed the libuv/Linux backend throws `EISCONN`
+  unconditionally in this case, matching a caveat in `sendto(2)`'s manpage —
+  that was never actually verified and turned out not to hold on this
+  platform (confirmed via `strace`; see
+  [Mixing `_to`/`_from` calls with `connect()`](#connect-send-recv-fixed-peer-mode)).
 - **`SocketAddress` supports IPv6 (with `scope_id`), but the lwIP/Pico backend does
   not.** `send_to`/`recv_from`/`connect` throw at runtime if given an `Ipv6Address` on
   that backend, consistent with the existing IPv4-only `TcpStream`/`TcpListener`

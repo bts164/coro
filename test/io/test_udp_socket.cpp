@@ -3,6 +3,8 @@
 #include <coro/io/socket_address.h>
 #include <coro/runtime/runtime.h>
 #include <coro/coro.h>
+#include <coro/sync/sleep.h>
+#include <chrono>
 #include <string>
 #include <system_error>
 #include <variant>
@@ -15,6 +17,7 @@ using namespace coro;
 
 static_assert(Future<JoinHandle<UdpSocket>>);
 static_assert(Future<JoinHandle<void>>);
+static_assert(Future<UdpRecvSegmentsFuture<std::string>>);
 
 // ---------------------------------------------------------------------------
 // SocketAddress
@@ -116,17 +119,17 @@ TEST(UdpSocketTest, ConnectSendRecvRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
-// UdpSocket — send_to() throws on the libuv/Linux backend once connect() has
-// fixed a peer, *regardless* of whether the explicit destination matches the
-// connected peer or not: per sendto(2), Linux returns EISCONN whenever a
-// recipient is specified at all on an already-connected socket, not only when
-// it differs from the connected peer. This is a real platform-specific
-// behavior difference from the lwIP backend (whose udp_sendto() is never
-// filtered by the connected state) — see doc/design/udp_socket.md's "Known
-// limitations" section.
+// UdpSocket — send_to() with an explicit destination remains usable on the
+// libuv/Linux backend even after connect() has fixed a peer. This was
+// previously assumed to throw EISCONN (mirroring a documented BSD/manpage
+// caveat), but verified via strace not to hold on this platform: the raw
+// sendto(2) syscall accepts an explicit destination on an already-connected
+// UDP socket without error, and libuv's uv__udp_send() (see
+// src/unix/udp.c) has no additional check on top of that. See
+// doc/design/udp_socket.md's "Known limitations" section.
 // ---------------------------------------------------------------------------
 
-TEST(UdpSocketTest, SendToThrowsAfterConnectEvenToSamePeer) {
+TEST(UdpSocketTest, SendToStillWorksAfterConnectToSamePeer) {
     Runtime rt;
     rt.block_on([]() -> Coro<void> {
         auto server = co_await UdpSocket::bind("127.0.0.1", 30031);
@@ -135,18 +138,14 @@ TEST(UdpSocketTest, SendToThrowsAfterConnectEvenToSamePeer) {
         auto server_addr = SocketAddress::parse("127.0.0.1", 30031).value();
         co_await client.connect(server_addr);
 
-        bool threw = false;
-        try {
-            co_await client.send_to(std::string("explicit-same-peer"), server_addr);
-        } catch (const std::system_error&) {
-            threw = true;
-        }
-        EXPECT_TRUE(threw);
-        (void)server;
+        co_await client.send_to(std::string("explicit-same-peer"), server_addr);
+        auto [n, buf, sender] = co_await server.recv_from(std::string(64, '\0'));
+        buf.resize(n);
+        EXPECT_EQ(buf, "explicit-same-peer");
     }());
 }
 
-TEST(UdpSocketTest, SendToThrowsAfterConnectToDifferentPeer) {
+TEST(UdpSocketTest, SendToStillWorksAfterConnectToDifferentPeer) {
     Runtime rt;
     rt.block_on([]() -> Coro<void> {
         auto server = co_await UdpSocket::bind("127.0.0.1", 30031);
@@ -157,14 +156,10 @@ TEST(UdpSocketTest, SendToThrowsAfterConnectToDifferentPeer) {
         co_await client.connect(server_addr);
 
         auto other_addr = SocketAddress::parse("127.0.0.1", 30033).value();
-        bool threw = false;
-        try {
-            co_await client.send_to(std::string("explicit"), other_addr);
-        } catch (const std::system_error&) {
-            threw = true;
-        }
-        EXPECT_TRUE(threw);
-        (void)other;
+        co_await client.send_to(std::string("explicit"), other_addr);
+        auto [n, buf, sender] = co_await other.recv_from(std::string(64, '\0'));
+        buf.resize(n);
+        EXPECT_EQ(buf, "explicit");
         (void)server;
     }());
 }
@@ -216,3 +211,113 @@ TEST(UdpSocketTest, MulticastLoopbackDelivery) {
         co_await receiver.leave_multicast(group, Ipv4Address{});
     }());
 }
+
+// ---------------------------------------------------------------------------
+// UdpSocket — set_segment_size (UDP GSO)
+// ---------------------------------------------------------------------------
+
+#ifdef __linux__
+TEST(UdpSocketTest, SegmentSizeSplitsOneSendIntoDatagrams) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto server = co_await UdpSocket::bind("127.0.0.1", 30071);
+        auto client = co_await UdpSocket::bind("127.0.0.1", 30072);
+        co_await client.connect(SocketAddress::parse("127.0.0.1", 30071).value());
+        client.set_segment_size(4);
+
+        // Three full segments and a short tail.
+        co_await client.send(std::string("aaaabbbbccccd"));
+        for (std::string want : {"aaaa", "bbbb", "cccc", "d"}) {
+            auto [n, buf, sender] = co_await server.recv_from(std::string(64, '\0'));
+            (void)sender;
+            buf.resize(n);
+            EXPECT_EQ(buf, want);
+        }
+
+        // A send no longer than the segment size is one datagram; 0 disables.
+        co_await client.send(std::string("xyz"));
+        client.set_segment_size(0);
+        co_await client.send(std::string("unsegmented"));
+        for (std::string want : {"xyz", "unsegmented"}) {
+            auto [n, buf, sender] = co_await server.recv_from(std::string(64, '\0'));
+            (void)sender;
+            buf.resize(n);
+            EXPECT_EQ(buf, want);
+        }
+    }());
+}
+#else
+TEST(UdpSocketTest, SegmentSizeUnsupportedOffLinux) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto sock = co_await UdpSocket::bind("127.0.0.1", 30071);
+        EXPECT_THROW(sock.set_segment_size(4), std::system_error);
+    }());
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// UdpSocket — set_gro / recv_segments_from (UDP GRO)
+// ---------------------------------------------------------------------------
+
+#ifdef __linux__
+TEST(UdpSocketTest, GroKeepsSegmentedSendCoalesced) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto server = co_await UdpSocket::bind("127.0.0.1", 30073);
+        auto client = co_await UdpSocket::bind("127.0.0.1", 30074);
+        co_await client.connect(SocketAddress::parse("127.0.0.1", 30073).value());
+        server.set_gro(true);
+        client.set_segment_size(4);
+
+        // Queued before the receive: the fast path reads it.
+        co_await client.send(std::string("aaaabbbbccccd"));
+        {
+            auto [n, buf, sender, seg] = co_await server.recv_segments_from(std::string(65535, '\0'));
+            EXPECT_EQ(sender, SocketAddress::parse("127.0.0.1", 30074).value());
+            EXPECT_EQ(seg, 4u);
+            buf.resize(n);
+            EXPECT_EQ(buf, "aaaabbbbccccd");
+        }
+
+        // Receive started on an empty socket: the slow path waits for readability,
+        // then reads. A lone datagram reports segment_size == size.
+        auto pending = coro::spawn(server.recv_segments_from(std::string(65535, '\0')));
+        co_await coro::sleep_for(std::chrono::milliseconds(50));
+        co_await client.send(std::string("xyz"));
+        auto [n, buf, sender, seg] = co_await pending;
+        (void)sender;
+        EXPECT_EQ(n, 3u);
+        EXPECT_EQ(seg, 3u);
+        buf.resize(n);
+        EXPECT_EQ(buf, "xyz");
+    }());
+}
+
+TEST(UdpSocketTest, RecvSegmentsWithoutGroIsOneDatagramPerRead) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto server = co_await UdpSocket::bind("127.0.0.1", 30075);
+        auto client = co_await UdpSocket::bind("127.0.0.1", 30076);
+        co_await client.connect(SocketAddress::parse("127.0.0.1", 30075).value());
+        client.set_segment_size(4);
+
+        co_await client.send(std::string("aaaabb"));
+        for (std::string want : {"aaaa", "bb"}) {
+            auto [n, buf, sender, seg] = co_await server.recv_segments_from(std::string(65535, '\0'));
+            (void)sender;
+            EXPECT_EQ(seg, n);
+            buf.resize(n);
+            EXPECT_EQ(buf, want);
+        }
+    }());
+}
+#else
+TEST(UdpSocketTest, GroUnsupportedOffLinux) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto sock = co_await UdpSocket::bind("127.0.0.1", 30073);
+        EXPECT_THROW(sock.set_gro(true), std::system_error);
+    }());
+}
+#endif
