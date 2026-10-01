@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <system_error>
 #include <climits>
+#include <span>
+#include <utility>
 
 namespace coro {
 
@@ -62,43 +64,10 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
     }
 
     case LWS_CALLBACK_CLIENT_RECEIVE: {
-        // lws_is_final_fragment / lws_frame_is_binary must be called before the lock
-        // since they query lws state only valid during this callback.
-        bool final_fragment = lws_is_final_fragment(wsi);
-        bool is_text        = (lws_frame_is_binary(wsi) == 0);
-        auto* bytes         = static_cast<const std::byte*>(in);
-
-        LOGSTDOUT("received %zu bytes (final=%d, text=%d)\n", len, final_fragment, is_text);
-        std::shared_ptr<detail::Waker> waker_to_wake;
-        {
-            std::lock_guard lk(state.receive.mutex);
-            if (state.receive.cancelled) {
-                LOGSTDOUT("receive cancelled, discarding data\n");
-                state.receive.buffer.clear();
-                break;
-            }
-            state.receive.buffer.insert(state.receive.buffer.end(), bytes, bytes + len);
-
-            // Enforce max_message_size: if the assembled buffer exceeds the limit,
-            // surface an EMSGSIZE error to the waiting ReceiveFuture.
-            if (state.max_message_size > 0 &&
-                    state.receive.buffer.size() > state.max_message_size) {
-                LOGSTDOUT("message too large (%zu > %zu), waking with error\n",
-                          state.receive.buffer.size(), state.max_message_size);
-                state.receive.error    = EMSGSIZE;
-                state.receive.complete = true;
-                waker_to_wake = state.receive.waker.load();
-            } else if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
-                LOGSTDOUT("message complete, waking receiver\n");
-                state.receive.is_text  = is_text;
-                state.receive.is_final = final_fragment;
-                state.receive.complete = true;
-                waker_to_wake = state.receive.waker.load();
-            } else {
-                LOGSTDOUT("message fragment received, waiting for more\n");
-            }
-        }
-        if (waker_to_wake) waker_to_wake->wake();
+        // lws_is_final_fragment / lws_frame_is_binary query lws state only valid during this callback.
+        LOGSTDOUT("received %zu bytes\n", len);
+        on_receive(state, std::span(static_cast<const std::byte*>(in), len),
+                   lws_frame_is_binary(wsi) == 0, lws_is_final_fragment(wsi));
 
         // Re-arm rx delivery. Without this, lws (especially on the libuv backend)
         // pauses further LWS_CALLBACK_CLIENT_RECEIVE events after the first message
@@ -207,6 +176,40 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
         break;
     }
     return 0;
+}
+
+void on_receive(ConnectionState& state, std::span<const std::byte> fragment,
+                bool is_text, bool is_final_fragment) {
+    auto& rx = state.receive;
+    std::shared_ptr<detail::Waker> waker_to_wake;
+    {
+        std::lock_guard lk(rx.mutex);
+        if (!rx.discarding) {
+            rx.message_size += fragment.size();
+            if (state.max_message_size > 0 && rx.message_size > state.max_message_size) {
+                // Surface one EMSGSIZE in the message's place and drop the rest of it, so
+                // the connection stays usable for the messages after it.
+                LOGSTDOUT("message too large (%zu > %zu), queuing error\n",
+                          rx.message_size, state.max_message_size);
+                rx.buffer.clear();
+                rx.ready.push_back({.is_text = is_text, .is_final = true, .error = EMSGSIZE});
+                rx.discarding = true;
+                waker_to_wake = rx.waker.load();
+            } else {
+                rx.buffer.insert(rx.buffer.end(), fragment.begin(), fragment.end());
+                if (state.frame_mode == WsStream::FrameMode::Partial || is_final_fragment) {
+                    LOGSTDOUT("message complete, queuing\n");
+                    rx.ready.push_back({std::exchange(rx.buffer, {}), is_text, is_final_fragment, 0});
+                    waker_to_wake = rx.waker.load();
+                }
+            }
+        }
+        if (is_final_fragment) {
+            rx.message_size = 0;
+            rx.discarding   = false;
+        }
+    }
+    if (waker_to_wake) waker_to_wake->wake();
 }
 
 ParsedUrl parse_ws_url(std::string_view url) {
@@ -418,44 +421,22 @@ WsStream::ReceiveFuture::ReceiveFuture(std::shared_ptr<detail::ws::ConnectionSta
     : m_state(std::move(state))
     , m_uv_exec(uv_exec) {}
 
-WsStream::ReceiveFuture::~ReceiveFuture() {
-    // Only cancel if this future was never consumed. poll() resets complete=false
-    // after consuming the message, so checking complete alone is insufficient —
-    // m_done distinguishes "already returned PollReady" from "still in flight".
-    if (m_state && !m_done) {
-        std::lock_guard lk(m_state->receive.mutex);
-        if (!m_state->receive.complete) {
-            LOGSTDOUT("receive future dropped, cancelling receive\n");
-            m_state->receive.cancelled = true;
-        }
-    }
-}
-
 PollResult<WsStream::Message> WsStream::ReceiveFuture::poll(detail::Context& ctx) {
     std::lock_guard lk(m_state->receive.mutex);
 
-    if (m_state->receive.complete) {
-        int    error    = m_state->receive.error;
-        auto   buf      = std::move(m_state->receive.buffer);
-        bool   is_text  = m_state->receive.is_text;
-        bool   is_final = m_state->receive.is_final;
-
-        // Reset sub-state atomically under the lock so protocol_cb cannot
-        // append to the buffer or set complete again until we're done.
-        m_state->receive.buffer    = {};
-        m_state->receive.complete  = false;
-        m_state->receive.cancelled = false;
-        m_state->receive.error     = 0;
-
-        m_done = true;
-
-        if (error != 0)
-            throw std::system_error(std::error_code(error, std::system_category()),
+    auto& ready = m_state->receive.ready;
+    if (!ready.empty()) {
+        detail::ws::ReceivedMessage msg = std::move(ready.front());
+        ready.pop_front();
+        if (msg.error != 0)
+            throw std::system_error(std::error_code(msg.error, std::system_category()),
                                     "WsStream::receive");
-
-        return Message{std::move(buf), is_text, is_final};
+        return Message{std::move(msg.data), msg.is_text, msg.is_final};
     }
 
+    // Checked after the queue, so messages that arrived before the close are still delivered.
+    // The CLOSED callback sets closed before taking the mutex to load the waker, so either
+    // this sees closed or the callback sees the waker stored below.
     if (m_state->closed.load(std::memory_order_acquire))
         throw std::runtime_error("WsStream::receive: connection closed");
 

@@ -118,11 +118,12 @@ public:
     /**
      * @brief Future<Message> returned by @ref WsStream::receive().
      *
-     * On first poll, stores the waker in `ReceiveSubState`. When
-     * `LWS_CALLBACK_CLIENT_RECEIVE` assembles a complete message (Full mode) or any
-     * fragment (Partial mode), it wakes this future.
+     * Resolves to the oldest message in `ReceiveSubState::ready`. The receive callback
+     * queues each complete message (Full mode) or fragment (Partial mode) there as it
+     * arrives, whether or not a receive is pending, and wakes this future.
      *
-     * Dropping this future sets `cancelled`; buffered data is discarded on the I/O thread.
+     * Cancel-safe: dropping this future before it resolves loses nothing. Messages that
+     * arrive meanwhile stay queued for the next `receive()`.
      */
     class ReceiveFuture {
     public:
@@ -130,7 +131,6 @@ public:
 
         ReceiveFuture(std::shared_ptr<detail::ws::ConnectionState> state,
                       SingleThreadedUvExecutor*                                    uv_exec);
-        ~ReceiveFuture();
 
         ReceiveFuture(ReceiveFuture&&) noexcept            = default;
         ReceiveFuture& operator=(ReceiveFuture&&) noexcept = default;
@@ -142,9 +142,6 @@ public:
     private:
         std::shared_ptr<detail::ws::ConnectionState> m_state;
         SingleThreadedUvExecutor*                                   m_uv_exec;
-        // Set to true when poll() returns PollReady so the destructor knows the
-        // future was already consumed and must not set cancelled on the shared state.
-        bool                                         m_done = false;
     };
 
     /**
@@ -268,18 +265,27 @@ struct ConnectSubState {
     int                                                error = 0;         // set before complete=true
 };
 
+// One entry of ReceiveSubState::ready: a complete message (Full mode), a fragment
+// (Partial mode), or an error (e.g. EMSGSIZE) that receive() throws in its place.
+struct ReceivedMessage {
+    std::vector<std::byte> data;
+    bool                   is_text  = false;
+    bool                   is_final = false;
+    int                    error    = 0;
+};
+
 struct ReceiveSubState {
-    // mutex guards buffer, is_text, is_final, complete, cancelled, and error.
-    // Both protocol_cb (I/O thread) and ReceiveFuture::poll (worker thread) must hold
-    // it when reading or writing any of these fields.
+    // mutex guards everything below except waker. Both the receive callbacks (I/O thread)
+    // and ReceiveFuture::poll (worker thread) must hold it.
     std::mutex                                         mutex;
     std::atomic<std::shared_ptr<coro::detail::Waker>> waker;
-    bool                                               complete{false};
-    bool                                               cancelled{false};  // set by ReceiveFuture dtor
-    int                                                error    = 0;      // e.g. EMSGSIZE
-    std::vector<std::byte>                             buffer;    // assembled on I/O thread
-    bool                                               is_text  = false;
-    bool                                               is_final = false;
+    std::vector<std::byte>                             buffer;            // message being assembled
+    std::size_t                                        message_size = 0;  // bytes of it so far, for max_message_size
+    bool                                               discarding = false;  // dropping the rest of an oversized message
+    // Filled by the I/O thread, drained in order by receive().
+    // FIXME: unbounded -- rx flow control isn't applied, so a peer sending faster than the
+    // application receives grows this without limit.
+    std::deque<ReceivedMessage>                        ready;
 };
 
 struct SendSubState {
@@ -341,5 +347,14 @@ ParsedUrl parse_ws_url(std::string_view url);
 // ---------------------------------------------------------------------------
 int protocol_cb(lws* wsi, lws_callback_reasons reason,
                 void* user, void* in, std::size_t len);
+
+// ---------------------------------------------------------------------------
+// on_receive -- the RECEIVE logic shared by the client (protocol_cb) and server
+// (WsListener) callbacks: appends one fragment of an incoming message and, once
+// the message is complete (or per fragment in Partial mode), queues it on
+// state.receive.ready and wakes the receiver. Runs on the I/O thread.
+// ---------------------------------------------------------------------------
+void on_receive(ConnectionState& state, std::span<const std::byte> fragment,
+                bool is_text, bool is_final_fragment);
 
 } // namespace coro::detail::ws

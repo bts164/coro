@@ -183,13 +183,20 @@ struct ConnectSubState {
     int                                 error = 0;   // 0 = success; set before complete=true
 };
 
+struct ReceivedMessage {
+    std::vector<std::byte> data;
+    bool                   is_text  = false;
+    bool                   is_final = false;
+    int                    error    = 0;   // e.g. EMSGSIZE; receive() throws it
+};
+
 struct ReceiveSubState {
+    std::mutex                          mutex;     // guards everything below except waker
     std::atomic<std::shared_ptr<Waker>> waker;
-    std::atomic<bool>                   complete{false};
-    std::atomic<bool>                   cancelled{false};  // set by ReceiveFuture destructor
-    std::vector<std::byte>              buffer;    // assembled across partial frames on I/O thread
-    bool                                is_text  = false;  // set before complete=true
-    bool                                is_final = false;  // set before complete=true
+    std::vector<std::byte>              buffer;    // message being assembled on the I/O thread
+    std::size_t                         message_size = 0;   // for max_message_size
+    bool                                discarding = false; // dropping the rest of an oversized message
+    std::deque<ReceivedMessage>         ready;     // complete messages, drained in order by receive()
 };
 
 struct SendSubState {
@@ -291,21 +298,12 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason, void* /*user*/,
         break;
 
     case LWS_CALLBACK_CLIENT_RECEIVE: {
-        // Discard if ReceiveFuture was dropped.
-        if (state.receive.cancelled.load(std::memory_order_acquire)) {
-            state.receive.buffer.clear();
-            break;
-        }
-        auto* bytes = static_cast<const std::byte*>(in);
-        state.receive.buffer.insert(state.receive.buffer.end(), bytes, bytes + len);
-        bool final_fragment = lws_is_final_fragment(wsi);
-
-        if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
-            state.receive.is_text    = (lws_frame_is_binary(wsi) == 0);
-            state.receive.is_final   = final_fragment;
-            state.receive.complete.store(true, std::memory_order_release);
-            if (auto w = state.receive.waker.load()) w->wake();
-        }
+        // Shared with the server's LWS_CALLBACK_RECEIVE. Appends the fragment to
+        // receive.buffer; on the final fragment (or every fragment in Partial mode)
+        // moves it onto receive.ready and wakes the ReceiveFuture, if any.
+        on_receive(state, std::span(static_cast<const std::byte*>(in), len),
+                   lws_frame_is_binary(wsi) == 0, lws_is_final_fragment(wsi));
+        lws_rx_flow_control(wsi, 1);
         break;
     }
 
@@ -423,12 +421,34 @@ struct ConnectSubState {
 
 ---
 
-## Receive Cancellation
+## Receive Queue and Cancellation
 
-Dropping a `ReceiveFuture` sets `cancelled` on `ReceiveSubState`. In
-`LWS_CALLBACK_CLIENT_RECEIVE`, if `cancelled` is set, any buffered data is discarded and
-no wake is issued. In `Partial` mode this prevents unbounded buffer growth when the caller
-abandons a mid-stream receive.
+Incoming messages are queued on `ReceiveSubState::ready` as they arrive, whether or not a
+`receive()` is pending, and each `receive()` pops the oldest. So messages that arrive back to
+back stay separate, and dropping a `ReceiveFuture` (e.g. the losing branch of a `select()` or
+`timeout()`) is cancel-safe: nothing is discarded, and the next `receive()` gets whatever
+arrived meanwhile.
+
+```mermaid
+sequenceDiagram
+    participant IO as I/O thread (on_receive)
+    participant Q as receive.ready
+    participant App as ReceiveFuture::poll
+    IO->>Q: push "A" (final fragment), wake
+    IO->>Q: push "B", wake
+    App->>Q: pop -> "A"
+    App->>Q: pop -> "B"
+    App->>Q: empty and not closed -> store waker, Pending
+```
+
+A message larger than `max_message_size` is queued as a single `EMSGSIZE` entry, which
+`receive()` throws. The rest of that message is dropped and the connection stays usable.
+When the connection closes, `receive()` still returns the queued messages first, then
+throws.
+
+!!! warning "FIXME: The receive queue is unbounded"
+    rx flow control isn't applied, so a peer that sends faster than the application
+    receives grows `ready` without limit.
 
 ---
 
@@ -438,9 +458,8 @@ abandons a mid-stream receive.
 (set at connect time, read-only thereafter). `protocol_cb` reads it from `ConnectionState`
 — not from a member variable, since `protocol_cb` is a plain C function with no `this`.
 
-In `Partial` mode, after the caller consumes a fragment, `WsStream::receive()` resets
-`ReceiveSubState` (clears buffer, sets `complete = false`) before returning, so the next
-`receive()` call sees a clean slate.
+In `Partial` mode, each fragment is queued on `ReceiveSubState::ready` as its own entry,
+with `is_final` set on the last one of a message.
 
 ---
 

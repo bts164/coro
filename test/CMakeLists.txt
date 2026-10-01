@@ -50,6 +50,7 @@ set(TEST_NAMES
     # sync/
     test_event
     test_select
+    test_when
     test_sleep
     test_oneshot
     test_mpsc
@@ -62,6 +63,7 @@ set(TEST_NAMES
     test_poll_stream
     test_signal
     test_udp_socket
+    test_ws_stream
     # stress/
     test_skynet
     # misc/
@@ -102,6 +104,7 @@ set(TEST_SRCS
     # sync/
     sync/test_event.cpp
     sync/test_select.cpp
+    sync/test_when.cpp
     sync/test_sleep.cpp
     sync/test_oneshot.cpp
     sync/test_mpsc.cpp
@@ -114,6 +117,7 @@ set(TEST_SRCS
     io/test_poll_stream.cpp
     io/test_signal.cpp
     io/test_udp_socket.cpp
+    io/test_ws_stream.cpp
     # stress/
     stress/test_skynet.cpp
     # misc/
@@ -240,6 +244,7 @@ add_executable(test_pico_suite
     sync/test_watch.cpp
     sync/test_event.cpp
     sync/test_select.cpp
+    sync/test_when.cpp
     sync/test_mpsc.cpp
     sync/test_oneshot.cpp
     sync/test_broadcast.cpp

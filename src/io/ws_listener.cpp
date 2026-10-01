@@ -169,39 +169,10 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
         if (!slot || !*slot) break;
         auto& state = **static_cast<std::shared_ptr<ConnectionState>*>(*slot);
 
-        bool final_fragment = lws_is_final_fragment(wsi);
-        bool is_text        = (lws_frame_is_binary(wsi) == 0);
-        auto* bytes         = static_cast<const std::byte*>(in);
-
-        LOGSTDOUT("received %zu bytes (final=%d, text=%d)\n", len, final_fragment, is_text);
-        std::shared_ptr<detail::Waker> waker_to_wake;
-        {
-            std::lock_guard lk(state.receive.mutex);
-            if (state.receive.cancelled) {
-                LOGSTDOUT("receive cancelled, discarding data\n");
-                state.receive.buffer.clear();
-                break;
-            }
-            state.receive.buffer.insert(state.receive.buffer.end(), bytes, bytes + len);
-
-            if (state.max_message_size > 0 &&
-                    state.receive.buffer.size() > state.max_message_size) {
-                LOGSTDOUT("message too large (%zu > %zu), waking with error\n",
-                          state.receive.buffer.size(), state.max_message_size);
-                state.receive.error    = EMSGSIZE;
-                state.receive.complete = true;
-                waker_to_wake = state.receive.waker.load();
-            } else if (state.frame_mode == WsStream::FrameMode::Partial || final_fragment) {
-                LOGSTDOUT("message complete, waking receiver\n");
-                state.receive.is_text  = is_text;
-                state.receive.is_final = final_fragment;
-                state.receive.complete = true;
-                waker_to_wake = state.receive.waker.load();
-            } else {
-                LOGSTDOUT("message fragment received, waiting for more\n");
-            }
-        }
-        if (waker_to_wake) waker_to_wake->wake();
+        // lws_is_final_fragment / lws_frame_is_binary query lws state only valid during this callback.
+        LOGSTDOUT("received %zu bytes\n", len);
+        on_receive(state, std::span(static_cast<const std::byte*>(in), len),
+                   lws_frame_is_binary(wsi) == 0, lws_is_final_fragment(wsi));
         break;
     }
 
