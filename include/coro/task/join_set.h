@@ -357,6 +357,19 @@ public:
     }
 
     /**
+     * @brief Returns true if no tasks are currently pending or awaiting consumption.
+     *
+     * Useful to skip awaiting `next(js)` when the set has nothing running — an empty
+     * `JoinSet`'s `poll_next()` resolves immediately (end-of-stream), so a bare
+     * `co_await next(js)` in a `select()` would otherwise win every round without
+     * ever suspending. Pair with `coro::when(!js.empty(), [&]{ return next(js); })`.
+     */
+    [[nodiscard]] bool empty() const {
+        std::lock_guard lock(m_state->mutex);
+        return m_state->pending_handles.empty() && m_state->idle_handles.empty();
+    }
+
+    /**
      * @brief Returns a `Future<void>` that completes once all spawned tasks finish.
      *
      * Result values are discarded. The first exception encountered is rethrown after

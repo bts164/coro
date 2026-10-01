@@ -47,7 +47,7 @@ Common headers:
 // Core coroutine types
 #include <coro/coro.h>                    // Coro<T> — async function return type
 #include <coro/coro_stream.h>             // CoroStream<T> — async generator return type
-#include <coro/future.h>                  // Future/Cancellable concepts, FutureRef, coro::ref()
+#include <coro/future.h>                  // Future/Cancellable concepts, FutureRef, coro::ref(), coro::never()
 #include <coro/stream.h>                  // Stream concept, coro::next()
 #include <coro/co_invoke.h>               // co_invoke() — safe capturing-lambda coroutines
 
@@ -62,6 +62,7 @@ Common headers:
 
 // Sync primitives
 #include <coro/sync/select.h>             // select()
+#include <coro/sync/when.h>               // when() — conditional select() branch
 #include <coro/sync/join.h>               // join()
 #include <coro/sync/sleep.h>              // sleep_for()
 #include <coro/sync/timeout.h>            // timeout()
@@ -885,7 +886,9 @@ Back to the server. In section 6 we spawned a `handle_connection` task per conne
 collected the `JoinHandle`s in a vector, but that required knowing the connection count
 upfront. `JoinSet` removes that constraint: it accepts tasks as they arrive and tracks them
 internally without a fixed size. We can `co_await coro::next(sessions)` at any point to
-receive the next completed result or propagate an error.
+receive the next completed result or propagate an error. `sessions.empty()` reports
+whether any task is currently pending or awaiting consumption — useful for guarding
+`next(sessions)` when racing it against another branch (section 9).
 
 ```cpp
 #include <coro/task/join_set.h>
@@ -1056,8 +1059,12 @@ coro::Coro<int> run_server() {
         try {
             // variant<SelectBranch<0, TcpStream>, SelectBranch<1, bool>>
             auto sel = co_await coro::select(
-                listener.accept(),    // branch 0: new connection ready
-                coro::next(sessions)  // branch 1: a session completed (throws if it threw)
+                listener.accept(),  // branch 0: new connection ready
+                // branch 1: a session completed (throws if it threw). Gated on
+                // !sessions.empty() — see "Selecting a branch that isn't always
+                // available" below for why an ungated coro::next(sessions) here
+                // would busy-spin while sessions is empty.
+                coro::when(!sessions.empty(), [&] { return coro::next(sessions); })
             );
             if (sel.index() == 0) {
                 coro::TcpStream& stream = std::get<0>(sel).value;
@@ -1110,6 +1117,47 @@ coro::Coro<void> run() {
       `coro::ref(slow_task())` is a compile error.
     - If the `coro::ref(f)` branch wins and delivers a result, the result is moved out of `f`.
       Do not await `f` again — it is logically consumed even though it was not moved.
+
+#### Selecting a branch that isn't always available — `coro::when()`
+
+`select()` needs the same set of branches, with the same types, on every round —
+but sometimes a branch is only meaningful *some* of the time. The recurring example is
+`coro::next(a_join_set)`: an **empty** `JoinSet`'s `next()` resolves immediately
+(`Ready`, end-of-stream — see section 7), so racing it unconditionally means that branch
+wins on every single poll while the set is empty. Since a synchronously-Ready branch
+never suspends the awaiting coroutine, `co_await select(..., coro::next(sessions))`
+does not give control back to the executor at all in that state — the calling coroutine
+busy-loops instead of waiting for real work.
+
+`coro::when(cond, make_future)` fixes this: it evaluates `cond` once and, only if
+true, calls `make_future()` to build the branch. While disengaged (`cond` was false),
+it behaves exactly like `coro::never<T>()` — always `Pending`, so it simply never wins.
+Crucially, `make_future` is not called at all when disengaged, so the branch's future
+is never constructed — this matters when construction has side effects, is expensive,
+or (as with some futures) isn't even valid to attempt in the disabled case:
+
+```cpp
+coro::JoinSet<void> sessions;
+// ...
+auto sel = co_await coro::select(
+    listener.accept(),
+    coro::when(!sessions.empty(), [&] { return coro::next(sessions); })
+);
+```
+
+`JoinSet<T>::empty()` is the query used to gate this: true when there are no pending or
+completed-but-unconsumed tasks.
+
+!!! warning "Key points"
+    - `make_future` runs at most once per `when()` call, only when `cond` is true.
+    - A disengaged `WhenFuture` polls `Pending` forever on its own — it only makes sense
+      as a `select()` branch racing against something that can actually complete.
+    - If `make_future` would be expensive to re-invoke every loop iteration, build the
+      inner future once outside the loop and hold it with `coro::ref()` instead.
+
+`coro::never<T>()` is the lower-level primitive `when()` is built on: a future that never
+completes. Reach for it directly when you want a permanent placeholder branch rather than
+a conditional one.
 
 ### Joining futures — `join()`
 
@@ -1746,6 +1794,7 @@ The server brings together the runtime entry point, async I/O, a task per connec
 #include <coro/io/tcp_stream.h>
 #include <coro/task/join_set.h>
 #include <coro/sync/timeout.h>
+#include <coro/sync/when.h>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -1784,7 +1833,7 @@ static Coro<int> run_server() {
         try {
             auto sel = co_await coro::select(
                 listener.accept(),
-                coro::next(sessions)
+                coro::when(!sessions.empty(), [&] { return coro::next(sessions); })
             );
             if (sel.index() == 0) {
                 TcpStream& stream = std::get<0>(sel).value;

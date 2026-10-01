@@ -6,11 +6,13 @@
 #include <coro/coro.h>              // Coro<T>
 #include <coro/coro_stream.h>       // CoroStream<T>
 #include <coro/co_invoke.h>         // co_invoke()
+#include <coro/future.h>            // Future/Cancellable concepts, coro::ref(), coro::never()
 #include <coro/runtime/runtime.h>   // Runtime, spawn(), build_task()
 #include <coro/task/join_handle.h>  // JoinHandle<T>
 #include <coro/task/join_set.h>     // JoinSet<T>
 #include <coro/sync/join.h>         // join()
 #include <coro/sync/select.h>       // select()
+#include <coro/sync/when.h>         // when() — conditional select() branch
 #include <coro/sync/sleep.h>        // sleep_for()
 #include <coro/sync/timeout.h>      // timeout()
 #include <coro/sync/mutex.h>        // Mutex
@@ -110,6 +112,8 @@ co_await coro::co_invoke([&]() -> coro::Coro<void> {
 
 // wait for all tasks; discard results
 co_await js.drain();
+
+js.empty();  // true iff no task is pending or awaiting consumption
 ```
 
 ## join — concurrent fixed fan-out
@@ -137,6 +141,16 @@ while (true) {
         coro::ref(task), coro::sleep_for(100ms));
     if (sel.index() == 0) { use(std::get<0>(sel).value); break; }
 }
+
+// coro::when — branch only exists if cond is true; make_future() is not
+// called (the branch future is never constructed) when cond is false
+coro::JoinSet<void> sessions;
+auto sel2 = co_await coro::select(
+    listener.accept(),
+    coro::when(!sessions.empty(), [&] { return coro::next(sessions); }));
+
+// coro::never<T>() — a branch that never wins; what a disengaged when() polls as
+co_await coro::select(fast(), coro::never<void>());
 ```
 
 ## timeout & sleep_for

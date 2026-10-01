@@ -4,6 +4,7 @@
 #include <coro/co_invoke.h>
 #include <coro/sync/join.h>
 #include <coro/sync/select.h>
+#include <coro/sync/when.h>
 #include <coro/task/join_set.h>
 #include <coro/runtime/runtime.h>
 #include <stdexcept>
@@ -32,6 +33,12 @@ struct ReadyFuture {
 struct ReadyVoidFuture {
     using OutputType = void;
     PollResult<void> poll(detail::Context&) { return PollReady; }
+};
+
+class MockWaker : public detail::Waker {
+public:
+    void wake() override {}
+    detail::Rc<detail::Waker> clone() override { return detail::make_rc<MockWaker>(); }
 };
 
 struct ThrowingFuture {
@@ -137,6 +144,21 @@ TYPED_TEST(JoinSetTest, EmptyJoinSetNextReturnsNulloptImmediately) {
         got_nullopt = !item.has_value();
     }(got_nullopt));
     EXPECT_TRUE(got_nullopt);
+}
+
+TYPED_TEST(JoinSetTest, EmptyReflectsSpawnAndDrain) {
+    bool empty_before = false, empty_after_spawn = true, empty_after_drain = false;
+    this->traits.rt.block_on([](bool& before, bool& after_spawn, bool& after_drain) -> Coro<void> {
+        JoinSet<int> js;
+        before = js.empty();
+        js.spawn(ReadyFuture<int>{1});
+        after_spawn = js.empty();
+        co_await js.drain();
+        after_drain = js.empty();
+    }(empty_before, empty_after_spawn, empty_after_drain));
+    EXPECT_TRUE(empty_before);
+    EXPECT_FALSE(empty_after_spawn);
+    EXPECT_TRUE(empty_after_drain);
 }
 
 TYPED_TEST(JoinSetTest, DrainRethrowsFirstException) {
@@ -316,6 +338,36 @@ TYPED_TEST(JoinSetTest, NextInSelectRepeatedRoundsCollectsAll) {
     }(results));
     std::sort(results.begin(), results.end());
     EXPECT_EQ(results, (std::vector<int>{10, 20, 30, 40}));
+}
+
+// --- Gating next() on empty() via when() ---
+//
+// An empty JoinSet's next() resolves Ready(exhausted) synchronously (see
+// EmptyJoinSetNextReturnsNulloptImmediately above) -- so a bare
+// select(other, next(js)) on an empty js never suspends: it "wins" on branch 1 every
+// single poll, and a caller looping on that select() spins the calling thread instead
+// of yielding to the executor. coro::when(!js.empty(), ...) is the fix: it keeps the
+// branch genuinely Pending until there's something to actually wait on.
+
+TEST(JoinSetEmptyGatingTest, GatedNextIsPendingWhileJoinSetEmpty) {
+    auto waker = detail::make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    JoinSet<int> js;
+    auto gated = when(!js.empty(), [&js] { return next(js); });
+    EXPECT_TRUE(gated.poll(ctx).isPending());
+}
+
+TYPED_TEST(JoinSetTest, GatedNextDelegatesOnceNonEmpty) {
+    std::optional<int> got;
+    this->traits.rt.block_on([](std::optional<int>& got) -> Coro<void> {
+        JoinSet<int> js;
+        js.spawn(ReadyFuture<int>{7});
+        auto sel = co_await select(never<void>(), when(!js.empty(), [&js] { return next(js); }));
+        if (std::holds_alternative<SelectBranch<1, std::optional<int>>>(sel))
+            got = *std::get<SelectBranch<1, std::optional<int>>>(sel).value;
+    }(got));
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, 7);
 }
 
 // ---------------------------------------------------------------------------
