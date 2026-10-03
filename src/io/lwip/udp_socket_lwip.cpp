@@ -194,7 +194,7 @@ Coro<void> UdpSocket::set_broadcast(bool enabled) {
     // opt.h default, left unset in this project's lwipopts.h.in), so udp_sendto_if()
     // never checks an SOF_BROADCAST pcb flag in the first place — see
     // doc/design/udp_socket.md's "Multicast and broadcast" section. Kept only for
-    // API symmetry with the libuv backend.
+    // API symmetry with the desktop backend.
     (void)enabled;
     co_return;
 }

@@ -304,16 +304,16 @@ optional token via something like `build_task().with_cancel(token).spawn(...)`.
 Modelled on Tokio's `CancellationToken` (`tokio-util` crate). Lives in
 `include/coro/sync/cancellation_token.h`.
 
-## libuv I/O primitives
+## I/O primitives
 
-`TcpStream`/`TcpListener`, `WsStream`/`WsListener`, and `File` are implemented in `include/coro/io/`. Remaining:
+`TcpStream`/`TcpListener`, `WsStream`/`WsListener`, `UdpSocket`, `Pipe`, `File`,
+`lookup_host()` and `signal()` are implemented in `include/coro/io/`. Remaining:
 
-- **`UdpSocket`** — async send/recv.
-- **DNS resolution** — `resolve(hostname)` returning `Future<IpAddress>`.
 - **Process** — Child process management including support for signals, child process I/O, and parent-child IPC
 
-Each wraps the corresponding libuv handle, storing a `Waker` in the callback and waking
-the task when the operation completes.
+Fd-based primitives register with the runtime's `IoDriver` and wake on epoll readiness;
+blocking calls with no readiness model go through `spawn_blocking`.
+See [I/O driver](design/io_driver.md).
 
 ## Logging
 

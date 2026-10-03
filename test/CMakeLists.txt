@@ -397,8 +397,8 @@ target_include_directories(coro_lwip_udp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip
 )
 # CORO_UDP_BACKEND_LWIP selects udp_socket.h's lwIP branch; without it, the
-# header falls through to its #else (libuv) branch and pulls in uv.h, which
-# this pico-core-based target never links against.
+# header falls through to its #else (IoDriver) branch and pulls in the epoll
+# driver, which this pico-core-based target never links against.
 target_compile_definitions(coro_lwip_udp PUBLIC CORO_UDP_BACKEND_LWIP)
 target_link_libraries(coro_lwip_udp PUBLIC coro_pico_core lwip_host)
 

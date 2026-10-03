@@ -1,8 +1,8 @@
 # UDP Socket
 
 `UdpSocket` — async, connectionless UDP send/recv. Mirrors `TcpStream`/`TcpListener`'s
-dual-backend structure: a libuv implementation for desktop builds, and an lwIP
-implementation for the Pico port (`CORO_PICO`).
+dual-backend structure: on desktop it runs on the Runtime's [I/O Driver](io_driver.md),
+and on the Pico port (`CORO_PICO`) on lwIP's raw API.
 
 ---
 
@@ -38,9 +38,9 @@ ever escapes the I/O operation (see [`ByteBuffer`](../../include/coro/io/byte_bu
 Unlike `send_to`/`send`, `recv_from`/`recv` can't know the datagram's size ahead of time,
 so oversized datagrams are truncated to fit the caller's buffer, same as POSIX
 `recvfrom()`. There is no internal receive queue — `coro` does not buffer datagrams in
-userspace on either backend. On the desktop (libuv) backend, `recv_from`/`recv` first
-attempt a direct, non-blocking read on the calling thread; if nothing is available yet,
-the call suspends and the kernel's own per-socket receive buffer holds any datagrams that
+userspace on either backend. On the desktop backend, `recv_from`/`recv` first try a
+non-blocking read on the calling thread; if nothing is queued yet, the call waits for
+read readiness and the kernel's own per-socket receive buffer holds any datagrams that
 arrive in the meantime, exactly as it would for any other UDP socket — see
 [Receive path](#receive-path) below. lwIP has no equivalent OS-level buffer, so a datagram
 that arrives while nothing is awaiting `recv_from`/`recv` on the Pico backend is dropped;
@@ -98,9 +98,9 @@ struct SocketAddress {
 `Ipv4Address` and `Ipv6Address` are trivially-copyable, fixed-size value types (5 and 20
 bytes respectively) — no heap allocation, which matters as much for the Pico port as for
 avoiding an unnecessary allocation on every desktop `send_to`/`recv_from`. Validation
-happens once, at `parse()`, rather than being deferred to whatever eventually calls
-`uv_ip4_addr`/`inet_pton` on a stored string. `parse()` is implemented with `inet_pton()`
-on the libuv backend and `ip4addr_aton`/`ip6addr_aton` on the lwIP backend.
+happens once, at `parse()`, rather than being deferred to whatever eventually converts
+a stored string. `parse()` is implemented with `inet_pton()` on the desktop backend and
+`ip4addr_aton`/`ip6addr_aton` on the lwIP backend.
 
 Shared by both backends and placed alongside `byte_buffer.h` under `include/coro/io/`
 since, like `ByteBuffer`, it's a plain value type with no backend-specific code.
@@ -112,174 +112,26 @@ the Pico/lwIP backend only supports IPv4 in this design, consistent with the exi
 
 ## Receive path
 
-Every earlier draft of this section assumed `coro` needed to buffer arriving datagrams
-itself, in userspace, between the libuv/lwIP callback and whenever the caller next awaits
-`recv_from()`/`recv()` — first via a standalone `BufferPool`/`PooledBuffer` abstraction,
-then via a `PollStream`-style internal `RingBuffer<DatagramEntry>` queue with a
-`BackpressureMode` policy. Both were dropped: on the desktop (libuv) backend, the kernel's
-own per-socket receive buffer already does exactly this job "for free," the same way it
-does for any other UDP socket in any other language — duplicating it in userspace only
-added bookkeeping (queue capacity, drop policy) without adding any real capability, since
-the one thing our own queue could do differently from the kernel — drop the *oldest*
-queued datagram instead of the newest when full — isn't something this design needs to
-provide. So `coro` does not buffer datagrams itself at all. Instead:
+`coro` does not buffer datagrams in userspace. A userspace queue between the socket and
+`recv_from()`/`recv()`, with its own capacity and drop policy, was considered and
+rejected: on the desktop backend the kernel's own per-socket receive buffer already does
+that job, the same way it does for any other UDP socket in any other language. The one
+thing a userspace queue could do differently — drop the *oldest* queued datagram instead
+of the newest when full — isn't something this design needs to provide. Instead:
 
-- **Desktop (libuv):** `recv_from()`/`recv()` first attempt a direct, non-blocking
-  `recvfrom()` on the raw socket fd, on whichever thread called them — no uv-thread hop.
-  If a datagram is already sitting in the kernel's receive buffer, this returns
-  immediately with zero suspension and zero extra copies. Only if that comes up empty
-  does the call suspend, arming `uv_udp_recv_start()` for exactly this one call and
-  handing libuv the caller's own buffer directly (no scratch buffer, no intermediate
-  copy) — the kernel buffers everything that arrives in between, same as it always does.
-- **Pico (lwIP):** there is no raw-fd fast path (lwIP has no socket fd to read from
-  directly, and no OS-level receive buffer underneath it at all) and no internal queue
-  either, so `recv_from()`/`recv()` always suspend, registering `udp_recv()` for exactly
-  this one call. A datagram that arrives while nothing is registered — i.e. while no
-  `recv_from()`/`recv()` call is currently awaiting — is simply dropped by lwIP itself,
-  with no buffer anywhere to catch it. This is a real, backend-specific behavior
-  difference from the desktop backend, called out again in
-  [Known limitations](#known-limitations--future-work).
-
-### libuv: raw-fd fast path, arm-and-wait inside a single `with_context` hop
-
-`Handle` caches the raw fd once (`uv_fileno()`, in `bind()`) — that's the only thing it
-holds. There's no per-call state on `Handle` at all: the slow path's arm/wait both happen
-*inside* the one `with_context` coroutine that runs on the uv thread, using the exact
-same `UvCallbackResult`/`wait()` bridge `TcpStream::connect()` and `~TcpStream()` already
-use (`include/coro/runtime/uv_future.h`) — no bespoke synchronization primitive needed:
-
-```cpp
-struct Handle {
-    uv_udp_t handle;
-    int      raw_fd = -1;   // cached via uv_fileno() in bind(); lets recv_from()
-                            // attempt a raw read without a uv-thread hop — see below
-};
-```
-
-`recv_from_impl` tries the fast path first; only on `EAGAIN` does it hop to the uv thread,
-where a small per-call `RecvCtx` (stack-local to that hop, not stored on `Handle`) carries
-the caller's buffer pointer to `alloc_cb` and the `UvCallbackResult` to `recv_cb`:
-
-```cpp
-template<ByteBuffer Buf>
-Coro<std::tuple<std::size_t, Buf, SocketAddress>> recv_from_impl(
-        std::shared_ptr<Handle> handle, SingleThreadedUvExecutor* uv_exec, Buf buf) {
-    // Fast path: try a non-blocking recvfrom() directly, on whichever thread called us.
-    // Safe unconditionally — see "Fast path safety" below.
-    sockaddr_storage storage;
-    socklen_t addrlen = sizeof(storage);
-    ssize_t n = ::recvfrom(handle->raw_fd, buf.data(), buf.size(), MSG_DONTWAIT,
-                           reinterpret_cast<sockaddr*>(&storage), &addrlen);
-    if (n >= 0) {
-        co_return {static_cast<std::size_t>(n), std::move(buf),
-                   detail::from_sockaddr(reinterpret_cast<sockaddr*>(&storage))};
-    }
-    if (errno != EAGAIN && errno != EWOULDBLOCK)
-        throw_errno_error(errno, "UdpSocket::recv_from");
-
-    // Slow path: genuinely nothing available yet. Hop to the uv thread; arming and
-    // waiting both happen inside this one with_context coroutine, so recv_cb firing
-    // is what resumes it directly — no separate waker/ready flag to manage.
-    auto [nread, sender] = co_await with_context(*uv_exec,
-        [](std::shared_ptr<Handle> handle, std::byte* buf, std::size_t len)
-                -> Coro<std::tuple<ssize_t, SocketAddress>> {
-            UvCallbackResult<ssize_t, SocketAddress> result;
-            struct RecvCtx {
-                std::byte*                            buf;
-                std::size_t                           len;
-                UvCallbackResult<ssize_t, SocketAddress>* result;
-            } ctx{buf, len, &result};
-            handle->handle.data = &ctx;
-
-            uv_udp_recv_start(&handle->handle,
-                [](uv_handle_t* h, std::size_t, uv_buf_t* out) {
-                    auto* ctx = static_cast<RecvCtx*>(h->data);
-                    // No scratch buffer: libuv reads straight into the caller's own
-                    // buffer. Safe because the coroutine owning it is suspended
-                    // (pinned in memory) for the entire duration of this call.
-                    out->base = reinterpret_cast<char*>(ctx->buf);
-                    out->len  = static_cast<unsigned>(ctx->len);
-                },
-                [](uv_udp_t* h, ssize_t nread, const uv_buf_t*,
-                   const struct sockaddr* addr, unsigned /*flags*/) {
-                    if (nread == 0 && addr == nullptr) return; // no more data this tick
-
-                    uv_udp_recv_stop(h); // single-shot: exactly one datagram per armed call
-                    auto* ctx = static_cast<RecvCtx*>(reinterpret_cast<uv_handle_t*>(h)->data);
-                    SocketAddress sender = nread >= 0 ? detail::from_sockaddr(addr) : SocketAddress{};
-                    ctx->result->complete(nread, sender);
-                });
-
-            co_return co_await wait(result);
-        }(handle, reinterpret_cast<std::byte*>(buf.data()), buf.size())
-    );
-
-    if (nread < 0) throw_uv_error(static_cast<int>(nread), "UdpSocket::recv_from");
-    co_return {static_cast<std::size_t>(nread), std::move(buf), sender};
-}
-```
-
-`recv_from_impl` itself is a plain `Coro`, not wrapped in `with_context` — the fast path
-never touches the uv thread at all, and the slow path hops there exactly once, awaited
-directly (not fire-and-forget: the caller needs the result). `UdpSocket::recv_from()`/
-`recv()` no longer force a uv-thread round trip on every call, unlike `send_to()`/
-`send()`/`connect()` (which still call real libuv functions and so still need
-`with_context`).
-
-**`send_to()`/`send()` return a hand-written `UdpSendFuture<Buf>`, not a `Coro`.** The
-first `poll()` (run eagerly by `FutureAwaitable::await_ready()`) does the non-blocking
-`sendto()`/`send()` and returns `PollReady` on success, so the common case allocates no
-coroutine frame and no `CoroutineScope`. Only on `EAGAIN` does the future spawn the
-`uv_udp_send()` slow-path coroutine on the uv executor (once) and forward `poll()`/`cancel()`
-to its `JoinHandle`. Motivated by `bench/udp_bench_coro.cpp`, which showed a fixed
-per-call coroutine overhead versus raw `send()`.
-
-**`recv_from()`/`recv()` likewise return a hand-written `UdpRecvFuture<Buf, WithSender>`**
-(`WithSender` selects `{n, buf, sender}` vs `{n, buf}`), replacing the former
-`recv_from_impl` coroutine. Same structure: the first `poll()` does the non-blocking
-`recvfrom()`; on `EAGAIN` it spawns the single-shot `uv_udp_recv_start()` coroutine on the
-uv executor and forwards `poll()`/`cancel()` to its `JoinHandle`. Caveat: the fast path only
-hits when a datagram is already queued, so a consumer that keeps up with the sender will
-take the slow path (uv hop) most of the time; the win is mostly for bursty/backlogged
-receivers. (The code sketch below predates this and shows the equivalent logic as a
-coroutine.)
-
-### Fast path safety: mutually exclusive by construction
-
-Could the fast-path `recvfrom()` above race with `recv_cb`, which also calls `recvfrom()`
-under the hood via libuv? No — and unlike an earlier draft where `uv_udp_recv_start`
-stayed continuously armed (requiring an argument about the kernel's receive queue being
-FIFO), there isn't even shared mutable state to reason about here: `Handle` holds nothing
-but the immutable `raw_fd`, and `RecvCtx` is a stack-local temporary that only exists for
-the duration of one armed `with_context` hop. Combined with the existing restriction that
-only one `recv_from()`/`recv()` call may be in flight at a time:
-
-- The fast path only ever runs at the very start of a call, before that call has armed
-  anything.
-- By the time a call reaches its fast-path attempt, any *previous* call has already fully
-  disarmed (its slow path, if it took one, already completed — its `with_context` hop
-  can't return until `recv_cb` has called `uv_udp_recv_stop` and completed the result).
-
-So the raw fast-path read and `recv_cb`'s own read are never live at the same time for the
-same socket — full stop, no kernel-semantics argument required. This also means the
-concern doesn't even arise for `TcpStream` in quite the shape described in an earlier
-draft of this note; see the TODO in [Known limitations](#known-limitations--future-work)
-for what would still need re-deriving there.
-
-!!! note "NOTE: the close race is a pre-existing hazard, not a new one"
-    Could `handle->raw_fd` be closed by a concurrent `uv_close()` between fetching it and
-    calling `recvfrom()`? `UdpSocket` is the RAII owner of `Handle`, and `recv_from()` is a
-    member call — the caller's own instance (or its `shared_ptr`) already keeps the
-    `Handle` alive for the duration of the call, so the socket cannot be destroyed by the
-    same call chain. The only way to close concurrently is an explicit `close()`/destructor
-    call from a *different* coroutine while a `recv_from()` is in flight — already the same
-    class of restriction as any other concurrent operation on one `UdpSocket`, not something
-    this optimization introduces. And even libuv itself is not immune to the single-threaded
-    version of this race: because the uv thread only ever runs one callback at a time,
-    scheduling a close *before* a pending `recv_cb` fires produces the same "handle closes
-    out from under an in-flight read" ordering today, with or without this fast path. Worst
-    case if the raw fd is closed mid-`recvfrom()` is an ordinary `EBADF` error return, not
-    memory corruption.
+- **Desktop (IoDriver):** `recv_from()`/`recv()` try a non-blocking `recvfrom()` on the
+  calling thread. If a datagram is already sitting in the kernel's receive buffer, it is
+  read straight into the caller's buffer with no suspension and no extra copy. Only on
+  `EAGAIN` does the call wait, for read readiness from the IoDriver, and then retry; the
+  kernel buffers everything that arrives in between, same as it always does. See
+  [Send and receive futures](#send-and-receive-futures).
+- **Pico (lwIP):** there is no socket fd to read from directly, and no OS-level receive
+  buffer underneath lwIP at all, and no internal queue either, so `recv_from()`/`recv()`
+  always suspend, registering `udp_recv()` for exactly this one call. A datagram that
+  arrives while nothing is registered — i.e. while no `recv_from()`/`recv()` call is
+  currently awaiting — is simply dropped by lwIP itself, with no buffer anywhere to catch
+  it. This is a real, backend-specific behavior difference from the desktop backend,
+  called out again in [Known limitations](#known-limitations--future-work).
 
 ---
 
@@ -296,8 +148,9 @@ public:
 
     ~UdpSocket();
 
-    /// Binds a UDP socket to host:port. host must be dotted-decimal, an IPv6
-    /// literal, or "0.0.0.0"/"::".
+    /// Binds a UDP socket to host:port. host is an IPv4 or IPv6 literal ("0.0.0.0",
+    /// "::", ...) or, on desktop, a name resolved with lookup_host(); the first
+    /// resolved address that binds is used.
     [[nodiscard]] static /* Future<UdpSocket> */ bind(std::string host, uint16_t port);
 
     /// Sends buf as a single datagram to dest. Returns buf once the send completes.
@@ -307,16 +160,16 @@ public:
     /// Waits for the next datagram, copying it into buf. Returns {n, buf, sender},
     /// where n is the number of bytes written into buf. If the datagram was larger
     /// than buf, it is truncated to fit — same as POSIX recvfrom(). Suspends if none
-    /// has arrived yet; see [Receive path](#receive-path) for the fast-path-then-suspend
-    /// model — there is no internal queue, so datagrams that arrive while nothing is
-    /// awaiting are handled entirely by the kernel (libuv backend) or dropped (lwIP
-    /// backend, which has no equivalent buffer).
+    /// has arrived yet; see [Receive path](#receive-path) — there is no internal
+    /// queue, so datagrams that arrive while nothing is awaiting are held by the
+    /// kernel (desktop backend) or dropped (lwIP backend, which has no equivalent
+    /// buffer).
     template<ByteBuffer Buf>
     [[nodiscard]] /* Future<std::tuple<std::size_t, Buf, SocketAddress>> */ recv_from(Buf buf);
 
     /// Fixes peer as this socket's only correspondent. Once connected, plain
     /// send()/recv() may be used instead of send_to()/recv_from(); datagrams from
-    /// any other address are dropped by the OS (libuv backend) or by pcb->remote_ip
+    /// any other address are dropped by the OS (desktop backend) or by pcb->remote_ip
     /// filtering (lwIP backend) before they ever reach recv().
     [[nodiscard]] /* Future<void> */ connect(SocketAddress peer);
 
@@ -330,24 +183,24 @@ public:
     [[nodiscard]] /* Future<std::tuple<std::size_t, Buf>> */ recv(Buf buf);
 
     /// Enables (or disables) sending to broadcast addresses via send_to()/send().
-    /// Required on the libuv backend before a sendto() to a broadcast address is
+    /// Required on the desktop backend before a sendto() to a broadcast address is
     /// permitted by the OS (SO_BROADCAST) — otherwise it fails with EACCES. A no-op
     /// on the lwIP backend, which doesn't gate broadcast on this build's config; see
     /// [Multicast and broadcast](#multicast-and-broadcast).
     [[nodiscard]] /* Future<void> */ set_broadcast(bool enabled);
 
-    /// libuv backend on Linux only: UDP GSO. Later send()/send_to() buffers longer
+    /// Desktop backend on Linux only: UDP GSO. Later send()/send_to() buffers longer
     /// than bytes go out as consecutive datagrams of bytes each (last may be
     /// shorter) in one syscall. 0 disables. See [Segmented sends
     /// (GSO)](#segmented-sends-gso).
     void set_segment_size(std::size_t bytes);
 
-    /// libuv backend on Linux only: UDP GRO. The kernel may coalesce consecutive
+    /// Desktop backend on Linux only: UDP GRO. The kernel may coalesce consecutive
     /// same-sized datagrams from one sender into one queued buffer; read them with
     /// recv_segments_from(). See [Coalesced receives (GRO)](#coalesced-receives-gro).
     void set_gro(bool enabled);
 
-    /// libuv backend only: like recv_from(), but returns {n, buf, sender,
+    /// Desktop backend only: like recv_from(), but returns {n, buf, sender,
     /// segment_size} -- buf[0, n) holds one or more datagrams of segment_size
     /// bytes each (the last may be shorter).
     template<ByteBuffer Buf>
@@ -355,7 +208,7 @@ public:
 
     /// Joins multicast group so recv_from()/recv() start receiving datagrams sent to
     /// it. iface selects which local interface to join on; the default
-    /// (Ipv4Address{}) lets the OS (libuv) or the single Pico interface (lwIP) choose.
+    /// (Ipv4Address{}) lets the OS (desktop) or the single Pico interface (lwIP) choose.
     /// IPv4 only — see [Multicast and broadcast](#multicast-and-broadcast).
     [[nodiscard]] /* Future<void> */ join_multicast(Ipv4Address group, Ipv4Address iface = {});
 
@@ -364,17 +217,15 @@ public:
 };
 ```
 
-The exact return type (`Coro<T>` vs `JoinHandle<T>`) follows `TcpStream`'s existing
-per-backend split, with one exception carved out for the fast path described in
-[Receive path](#receive-path):
+The exact return type differs per backend:
 
 | Backend | Method | Return type | Why |
 |---|---|---|---|
-| libuv (desktop) | `send_to()`, `send()`, `connect()` | `JoinHandle<T>` | Calls a real libuv function, so it still runs via `with_context(uv_exec, ...)` — same as every `TcpStream`/`TcpListener` method today |
-| libuv (desktop) | `recv_from()`, `recv()` | `Coro<T>` | The raw-fd fast-path read runs directly on the caller's thread — no uv-thread hop needed except on the (rare) slow path, which does need one `with_context` hop (awaited, since the result comes from there), unlike `PollStream`'s always-armed model |
-| libuv (desktop) | `set_broadcast()`, `join_multicast()`, `leave_multicast()` | `JoinHandle<void>` | `uv_udp_set_broadcast()`/`uv_udp_set_membership()` are libuv calls on the handle, so — same as `connect()` — they go via `with_context(uv_exec, ...)` even though neither one itself suspends |
-| libuv (desktop) | `set_segment_size()`, `set_gro()` | `void` | A plain `setsockopt()` on the cached raw fd; never touches the uv handle, so no hop |
-| libuv (desktop) | `recv_segments_from()` | `UdpRecvSegmentsFuture<Buf>` | Same fast path as `recv_from()`, with `recvmsg()`; the slow path only waits for readability on the uv thread (see [Coalesced receives (GRO)](#coalesced-receives-gro)) |
+| desktop (IoDriver) | `send_to()`, `send()` | `UdpSendFuture<Buf>` | A leaf future: the first `poll()` tries the non-blocking send; only on EAGAIN does it wait for write readiness |
+| desktop (IoDriver) | `recv_from()`, `recv()` | `UdpRecvFuture<Buf, WithSender>` | A leaf future: tries `recvfrom()`; on EAGAIN waits for read readiness. Safe to drop at any time |
+| desktop (IoDriver) | `recv_segments_from()` | `UdpRecvSegmentsFuture<Buf>` | Same as `recv_from()`, with `recvmsg()` for the GRO segment size |
+| desktop (IoDriver) | `bind()`, `connect()`, `set_broadcast()`, `join_multicast()`, `leave_multicast()` | `Coro<T>` | Plain syscalls on the calling thread; no thread hop. Errors are thrown on `co_await`. `bind()` throws `std::logic_error` on a runtime whose executor doesn't turn the IoDriver (a `CurrentThreadExecutor` given its own `Parker`) |
+| desktop (IoDriver) | `set_segment_size()`, `set_gro()` | `void` | A plain `setsockopt()` |
 | lwIP (Pico) | all | `Coro<T>` | Callbacks fire synchronously inside the caller's own executor tick — no thread hop, so a plain `Coro` suffices, same as `TcpStream`'s lwIP methods |
 
 **Concurrency** (matches the existing `TcpStream` restriction): only one receive
@@ -382,25 +233,17 @@ per-backend split, with one exception carved out for the fast path described in
 may be in flight at a time. A concurrent receive + send pair is fine — they use
 independent wakers. `connect()` itself does not suspend on either backend (see below) and
 must not be called concurrently with a send or receive already in flight, since it
-mutates the same `Handle`/`LwipUdpCtx` those operations read.
+changes the peer those operations use.
 
 **Mixing `_to`/`_from` calls with `connect()`:** once `connect()` has been called,
 both `recv_from()` and `send_to()` remain callable on both backends.
 
-`sendto(2)`'s manpage documents `EISCONN` ("a connection-mode socket was
-connected already but a recipient was specified") as a possible error, which
-earlier revisions of this doc took to mean `send_to()` becomes unusable after
-`connect()` on the libuv/Linux backend. That turned out not to hold in
-practice: verified via `strace` that the raw `sendto(2)` syscall accepts an
-explicit destination on an already-`connect()`-ed UDP socket without error on
-this platform's kernel, and libuv's own `uv__udp_send()` (`src/unix/udp.c`)
-adds no check on top of that — the manpage's `EISCONN` case is evidently not
-triggered by this combination on Linux. `send_to()`'s fast path (a raw
-`sendto()` on the calling thread) and its `with_context`/`uv_udp_send()` slow
-path therefore both simply forward the explicit destination as given,
-`connect()`-ed or not. `recv_from()` is unaffected either way: the kernel only
-ever delivers datagrams from the connected peer once `connect()` has run, so
-`recv_from()` and `recv()` behave identically on this backend.
+`sendto(2)`'s man page lists `EISCONN` ("a connection-mode socket was connected already
+but a recipient was specified"). That case doesn't arise for UDP on Linux: `sendto(2)`
+accepts an explicit destination on a connected UDP socket without error, so the desktop
+`send_to()` passes the destination through as given, connected or not. `recv_from()` is
+unaffected either way: once `connect()` has run, the kernel only delivers datagrams from
+the connected peer, so `recv_from()` and `recv()` behave identically on this backend.
 
 The lwIP backend has never had this restriction — `udp_sendto()` always accepts
 an explicit destination regardless of connected state.
@@ -412,14 +255,14 @@ an explicit destination regardless of connected state.
 Both are supported in this first iteration rather than deferred, since the underlying
 mechanism already exists on both backends:
 
-- **Multicast (libuv):** `uv_udp_set_membership()` joins/leaves an IGMP group on a raw
-  socket — no new dependency.
+- **Multicast (desktop):** the `IP_ADD_MEMBERSHIP`/`IP_DROP_MEMBERSHIP` socket options
+  join/leave an IGMP group — no new dependency.
 - **Multicast (lwIP):** `LWIP_IGMP` is already `1` in this project's bundled
   `lwipopts.h.in` (enabled for the mDNS responder's own group join), so
   `igmp_joingroup_netif()`/`igmp_leavegroup_netif()` are already compiled into every Pico
   build — nothing to newly enable, just to call.
-- **Broadcast (libuv):** the OS refuses a `sendto()` to a broadcast address with `EACCES`
-  unless `SO_BROADCAST` is set first (`uv_udp_set_broadcast()`), so `set_broadcast(true)`
+- **Broadcast (desktop):** the OS refuses a `sendto()` to a broadcast address with `EACCES`
+  unless `SO_BROADCAST` is set first, so `set_broadcast(true)`
   must be called explicitly before broadcasting.
 - **Broadcast (lwIP):** no explicit enable step is needed. lwIP's raw UDP API only
   enforces an `SO_BROADCAST`-equivalent check (an `SOF_BROADCAST` flag on the pcb) when
@@ -453,236 +296,164 @@ independent components that happen to be enabled together today:
 
 `cmake/platforms/pico.cmake` defines both `CORO_TCP_BACKEND_LWIP` and
 `CORO_UDP_BACKEND_LWIP` for real Pico builds, same as it does today for TCP alone. A
-desktop build defines neither, so `udp_socket.h`'s `#else` branch (libuv) is compiled.
+desktop build defines neither, so `udp_socket.h`'s `#else` branch (IoDriver) is compiled.
 
 ---
 
-## Desktop (libuv) backend
+## Desktop (IoDriver) backend
 
-### `SocketAddress` ⇄ `sockaddr` conversion
+```mermaid
+flowchart TB
+    U["UdpSocket<br/>(udp_socket.h, udp_socket.cpp)"]
+    F["UdpSendFuture / UdpRecvFuture / UdpRecvSegmentsFuture<br/>(udp_socket.hpp)"]
+    S["detail::SocketState<br/>fd + IoRegistration"]
+    Y["detail::sys::udp_*<br/>(sys/udp.h → udp_posix.cpp)"]
+    D["IoDriver<br/>(epoll)"]
+    U --> F
+    U --> S
+    F --> S
+    U --> Y
+    F --> Y
+    S --> D
+```
 
-Both `send_to`/`recv_from` and `connect`/`send`/`recv` need to cross between
-`SocketAddress` and libuv's `sockaddr`/`sockaddr_storage`. Two small internal helpers
-(not part of the public API) handle both directions, dispatching on the `SocketAddress`
-variant / `sockaddr::sa_family` respectively. These live under `include/coro/io/` rather
-than `src/io/` — `udp_socket.hpp`'s template method bodies need them, and `udp_socket.hpp`
-is itself a public header included from `udp_socket.h`:
+Every operation is a non-blocking syscall on the calling thread. An operation that would
+block waits for readiness from the Runtime's [I/O Driver](io_driver.md), and is retried on
+whichever worker the task is next polled on. There is no dedicated I/O thread and no
+thread hop.
 
-```cpp
-// include/coro/io/socket_address_uv.h
-namespace coro::detail {
+### The `sys/udp.h` seam
 
-socklen_t to_sockaddr(const SocketAddress& addr, sockaddr_storage& out) {
-    return std::visit(overloaded{
-        [&](const Ipv4Address& v4) -> socklen_t {
-            auto* sin = reinterpret_cast<sockaddr_in*>(&out);
-            sin->sin_family = AF_INET;
-            sin->sin_port   = htons(addr.port);
-            std::memcpy(&sin->sin_addr, v4.octets.data(), 4);
-            return sizeof(sockaddr_in);
-        },
-        [&](const Ipv6Address& v6) -> socklen_t {
-            auto* sin6 = reinterpret_cast<sockaddr_in6*>(&out);
-            sin6->sin6_family   = AF_INET6;
-            sin6->sin6_port     = htons(addr.port);
-            sin6->sin6_scope_id = v6.scope_id;
-            std::memcpy(&sin6->sin6_addr, v6.octets.data(), 16);
-            return sizeof(sockaddr_in6);
-        },
-    }, addr.address);
-}
+`UdpSocket` and its futures make no syscall themselves. Every one goes through
+`include/coro/detail/sys/udp.h`, in the style of the driver's
+[`sys` layer](io_driver.md#the-sys-layer), so a new platform implements that file and
+reuses `UdpSocket` unchanged (see
+[Porting to a new platform](io_driver.md#porting-to-a-new-platform)).
 
-SocketAddress from_sockaddr(const sockaddr* addr) {
-    if (addr->sa_family == AF_INET) {
-        auto* sin = reinterpret_cast<const sockaddr_in*>(addr);
-        Ipv4Address v4;
-        std::memcpy(v4.octets.data(), &sin->sin_addr, 4);
-        return SocketAddress{v4, ntohs(sin->sin_port)};
+| Function | Syscall (POSIX backend, `src/detail/sys/udp_posix.cpp`) |
+|---|---|
+| `udp_open(local)` | `socket` (non-blocking, close-on-exec, `local`'s family) + `bind` |
+| `udp_connect(fd, peer)` | `connect` |
+| `udp_set_broadcast(fd, on)` | `SO_BROADCAST` |
+| `udp_set_membership(fd, group, iface, join)` | `IP_ADD_MEMBERSHIP` / `IP_DROP_MEMBERSHIP` |
+| `udp_set_segment_size(fd, bytes)`, `udp_set_gro(fd, on)` | `UDP_SEGMENT`, `UDP_GRO` (Linux; `ENOTSUP` elsewhere) |
+| `udp_try_send(fd, data, size, dest)` | one `sendto`; `dest == nullptr` sends to the connected peer |
+| `udp_try_recv(fd, data, size, sender)` | one `recvfrom`; `sender == nullptr` skips decoding the address |
+| `udp_try_recv_segments(fd, data, size, sender, seg)` | one `recvmsg`, reading the `UDP_GRO` control message |
+
+The setup functions throw `std::system_error`. The `try_` functions never block and
+return an `IoResult`: a byte count, or an errno, where a would-block errno means "wait for
+readiness and retry".
+
+`SocketAddress` crosses to and from `sockaddr_storage` through `to_sockaddr()` and
+`from_sockaddr()` in `src/detail/sys/sockaddr_posix.h`. They dispatch on the
+`SocketAddress` variant and on `sa_family`, and carry `scope_id` for IPv6. The header is
+private to the POSIX backends; no public header needs it.
+
+### `SocketState`: who owns the fd
+
+```mermaid
+classDiagram
+    class UdpSocket {
+        shared_ptr~SocketState~ m_state
     }
-    auto* sin6 = reinterpret_cast<const sockaddr_in6*>(addr);
-    Ipv6Address v6;
-    std::memcpy(v6.octets.data(), &sin6->sin6_addr, 16);
-    v6.scope_id = sin6->sin6_scope_id;
-    return SocketAddress{v6, ntohs(sin6->sin6_port)};
-}
-
-} // namespace coro::detail
+    class SocketState {
+        IoDriver* driver
+        RawFd fd
+        IoRegistration reg
+        ~SocketState() deregister, then close
+    }
+    class UdpRecvFuture {
+        shared_ptr~SocketState~ m_state
+        Buf m_buf
+    }
+    UdpSocket --> SocketState
+    UdpRecvFuture --> SocketState
 ```
 
-### `send_to` — single-shot, like `TcpStream::write`
+`UdpSocket` holds a `shared_ptr<detail::SocketState>`, and every future it hands out
+copies it. `SocketState` registers the fd with the driver once, for both directions, when
+the socket is created. Its destructor deregisters and then closes the fd. So the fd is
+closed when the socket and every future started on it are gone, on whichever thread drops
+the last share, and never while another worker is in a syscall on it. The other socket
+primitives share the same `SocketState`.
 
-`uv_udp_send()` is asynchronous and takes a destination `sockaddr` directly — no
-separate connect step needed:
+### Send and receive futures
+
+`send_to()`/`send()`, `recv_from()`/`recv()` and `recv_segments_from()` return
+hand-written leaf futures (`udp_socket.hpp`), not coroutines. Each `poll()` is one call to
+the registration's `poll_io`, wrapping one `try_` syscall:
 
 ```cpp
-template<ByteBuffer Buf>
-JoinHandle<Buf> UdpSocket::send_to(Buf buf, SocketAddress dest) {
-    return with_context(*m_uv_exec,
-        [](std::shared_ptr<Handle> handle, Buf buf, SocketAddress dest) -> Coro<Buf> {
-            auto view = std::as_bytes(std::span(buf));
-
-            sockaddr_storage storage;
-            socklen_t addrlen = detail::to_sockaddr(dest, storage);
-
-            UvCallbackResult<int> result;
-            uv_udp_send_t req;
-            uv_buf_t bdesc = uv_buf_init(
-                const_cast<char*>(reinterpret_cast<const char*>(view.data())),
-                static_cast<unsigned>(view.size()));
-            req.data = &result;
-
-            int r = uv_udp_send(&req, &handle->handle, &bdesc, 1,
-                reinterpret_cast<const struct sockaddr*>(&storage),
-                [](uv_udp_send_t* r, int status) {
-                    static_cast<UvCallbackResult<int>*>(r->data)->complete(status);
-                });
-            if (r < 0) throw_uv_error(r, "UdpSocket::send_to");
-
-            auto [status] = co_await wait(result);
-            if (status != 0) throw_uv_error(status, "UdpSocket::send_to");
-            co_return std::move(buf);
-        }(m_handle, std::move(buf), dest)
-    );
+PollResult<OutputType> poll(detail::Context& ctx) {
+    SocketAddress sender;
+    auto result = m_state->reg.poll_io(IoDirection::Read, ctx, [&] {
+        return detail::sys::udp_try_recv(m_state->fd, data, size, &sender);
+    });
+    if (!result) return PollPending;                 // waker stored; the driver wakes it
+    if (!*result) return PollError(detail::socket_error(result->error(), "UdpSocket::recv_from"));
+    return OutputType{**result, std::move(m_buf), sender};
 }
 ```
 
-### `recv_from` — raw-fd fast path, per-call arm/disarm
-
-Unlike `PollStream`'s always-armed model, `uv_udp_recv_start()` here is armed only for
-the duration of one suspended `recv_from()`/`recv()` call, matching `TcpStream`'s
-per-call arm/disarm shape rather than `PollStream`'s. Most calls never arm anything at
-all: the raw-fd fast path attempts a non-blocking `recvfrom()` directly, and only falls
-back to arming when that comes up empty. The `Handle` and `recv_from_impl()` shown here
-are exactly the ones introduced in [Receive path](#receive-path) above — this section
-just places them in context alongside `bind()`/`send_to()`/`connect()`.
-
-### `connect`, `send`, `recv` — fixed-peer mode
-
-`uv_udp_connect()` is synchronous and just stores the peer's `sockaddr` on the kernel
-socket — the OS then filters incoming datagrams to that peer for free. `send()`/`recv()`
-are `send_to()`/`recv_from()` with the address argument dropped: `send()` passes
-`nullptr` as the destination to `uv_udp_send()` (libuv sends to the connected peer in
-that case), and `recv()` reuses the exact same `recv_cb` as `recv_from()` — the sender
-address is still reported by the callback but simply discarded, since libuv doesn't
-distinguish "connected" sockets in `uv_udp_recv_start`'s callback signature:
-
-```cpp
-JoinHandle<void> UdpSocket::connect(SocketAddress peer) {
-    return with_context(*m_uv_exec,
-        [](std::shared_ptr<Handle> handle, SocketAddress peer) -> Coro<void> {
-            sockaddr_storage storage;
-            socklen_t addrlen = detail::to_sockaddr(peer, storage);
-            int r = uv_udp_connect(&handle->handle,
-                reinterpret_cast<const struct sockaddr*>(&storage));
-            if (r < 0) throw_uv_error(r, "UdpSocket::connect");
-            co_return;
-        }(m_handle, peer)
-    );
-}
-
-template<ByteBuffer Buf>
-JoinHandle<Buf> UdpSocket::send(Buf buf) {
-    return with_context(*m_uv_exec,
-        [](std::shared_ptr<Handle> handle, Buf buf) -> Coro<Buf> {
-            auto view = std::as_bytes(std::span(buf));
-
-            UvCallbackResult<int> result;
-            uv_udp_send_t req;
-            uv_buf_t bdesc = uv_buf_init(
-                const_cast<char*>(reinterpret_cast<const char*>(view.data())),
-                static_cast<unsigned>(view.size()));
-            req.data = &result;
-
-            // dest == nullptr requires the handle to already be uv_udp_connect()-ed;
-            // libuv returns UV_EDESTADDRREQ otherwise, surfaced as throw_uv_error below.
-            int r = uv_udp_send(&req, &handle->handle, &bdesc, 1, nullptr,
-                [](uv_udp_send_t* r, int status) {
-                    static_cast<UvCallbackResult<int>*>(r->data)->complete(status);
-                });
-            if (r < 0) throw_uv_error(r, "UdpSocket::send");
-
-            auto [status] = co_await wait(result);
-            if (status != 0) throw_uv_error(status, "UdpSocket::send");
-            co_return std::move(buf);
-        }(m_handle, std::move(buf))
-    );
-}
+```mermaid
+sequenceDiagram
+    participant T as task (any worker)
+    participant R as IoRegistration
+    participant K as kernel
+    participant D as thread turning the IoDriver
+    T->>R: poll(): poll_io(Read, try_recv)
+    R->>K: recvfrom (non-blocking)
+    alt datagram queued
+        K-->>T: n bytes → PollReady
+    else EAGAIN
+        R->>R: clear readiness, store weak waker
+        R-->>T: PollPending
+        K-->>D: epoll: fd readable
+        D->>R: set readiness, wake the task
+        T->>R: poll() again → recvfrom → PollReady
+    end
 ```
 
-`recv()` is `recv_from()` with the `SocketAddress` element of the returned tuple
-dropped — implemented in terms of it rather than duplicated. It goes through the exact
-same `recv_from_impl` machinery; the "connected" restriction is enforced by the OS
-(non-peer datagrams never reach `recv_cb` in the first place), not by anything `recv()`
-itself checks. Like `recv_from()`, it's a plain `Coro` — no `with_context` wrapper —
-since `recv_from_impl` only hops to the uv thread on its slow path:
+- **No allocation in the common case.** `FutureAwaitable::await_ready()` runs the first
+  `poll()` eagerly. A send the kernel accepts at once, or a receive with a datagram already
+  queued, completes without suspending and without a coroutine frame.
+- **Readiness handshake.** `poll_io` is the driver's
+  [readiness handshake](io_driver.md#scheduledio-and-the-readiness-handshake). Readiness
+  that arrives after the syscall saw `EAGAIN` is not lost: `poll_io` retries at once.
+- **Straight into the caller's buffer.** The kernel copies the datagram directly into
+  `buf`. A datagram larger than `buf` is truncated, as with `recvfrom()`.
+- **Atomic sends.** A UDP datagram is sent whole or not at all, so there is no
+  partial-send bookkeeping.
+- **Safe to drop.** The futures have no `cancel()`. While pending, a future has only a
+  weak waker stored in the registration and nothing armed in the kernel. Dropping it (for
+  example when it loses a `timeout()`) leaves a stale waker that causes at most one
+  spurious wake, and the next datagram goes to the next receive.
 
-```cpp
-template<ByteBuffer Buf>
-Coro<std::tuple<std::size_t, Buf>> UdpSocket::recv(Buf buf) {
-    auto [n, out, sender] = co_await recv_from_impl(m_handle, m_uv_exec, std::move(buf));
-    co_return {n, std::move(out)};
-}
-```
+`send()` is `send_to()` with no destination, and `recv()` is `recv_from()` without
+decoding the sender: on a connected socket the kernel already filtered to the peer.
 
-### `set_broadcast`, `join_multicast`, `leave_multicast`
+### `connect` and socket options
 
-All three are synchronous libuv calls on the handle — like `connect()`, they still hop
-via `with_context(uv_exec, ...)` since only the uv thread may touch `handle->handle`, but
-none of them suspend once there. `join_multicast`/`leave_multicast` share one helper,
-parameterized on `uv_membership`, converting the `Ipv4Address` octets to dotted-decimal
-strings via `uv_inet_ntop()` since that's the form `uv_udp_set_membership()` takes. The
-helper is a private static member of `UdpSocket` (not a `coro::detail` free function) —
-`Handle` is a private nested type, so a free function outside the class can't name it:
+`connect()`, `set_broadcast()`, `join_multicast()` and `leave_multicast()` are one
+`connect`/`setsockopt` each, on the calling thread. They never wait, but return
+`Coro<void>` so that errors arrive at `co_await` and the API matches the lwIP backend.
+Each is a private static `_impl` coroutine that takes the `shared_ptr<SocketState>` by
+value, so the lazy coroutine never holds `this` (the socket may be moved before it runs).
 
-```cpp
-JoinHandle<void> UdpSocket::set_broadcast(bool enabled) {
-    return with_context(*m_uv_exec,
-        [](std::shared_ptr<Handle> handle, bool enabled) -> Coro<void> {
-            int r = uv_udp_set_broadcast(&handle->handle, enabled ? 1 : 0);
-            if (r < 0) throw_uv_error(r, "UdpSocket::set_broadcast");
-            co_return;
-        }(m_handle, enabled)
-    );
-}
+After `connect()` the kernel delivers only the peer's datagrams, and `send()` goes to the
+peer. `join_multicast()` passes an all-zero `iface` as `INADDR_ANY`, letting the kernel
+choose the interface.
 
-// private static member — declared in udp_socket.h alongside recv_from_impl
-JoinHandle<void> UdpSocket::set_membership(std::shared_ptr<Handle> handle,
-        SingleThreadedUvExecutor* uv_exec, Ipv4Address group, Ipv4Address iface,
-        uv_membership membership) {
-    return with_context(*uv_exec,
-        [](std::shared_ptr<Handle> handle, Ipv4Address group, Ipv4Address iface,
-           uv_membership membership) -> Coro<void> {
-            char group_str[16];
-            uv_inet_ntop(AF_INET, group.octets.data(), group_str, sizeof(group_str));
-
-            char iface_str[16];
-            bool has_iface = iface.octets != Ipv4Address{}.octets;
-            if (has_iface) uv_inet_ntop(AF_INET, iface.octets.data(), iface_str, sizeof(iface_str));
-
-            int r = uv_udp_set_membership(&handle->handle, group_str,
-                has_iface ? iface_str : nullptr, membership);
-            if (r < 0) throw_uv_error(r, "UdpSocket::join_multicast/leave_multicast");
-            co_return;
-        }(handle, group, iface, membership)
-    );
-}
-
-JoinHandle<void> UdpSocket::join_multicast(Ipv4Address group, Ipv4Address iface) {
-    return set_membership(m_handle, m_uv_exec, group, iface, UV_JOIN_GROUP);
-}
-
-JoinHandle<void> UdpSocket::leave_multicast(Ipv4Address group, Ipv4Address iface) {
-    return set_membership(m_handle, m_uv_exec, group, iface, UV_LEAVE_GROUP);
-}
-```
+`set_segment_size()` and `set_gro()` return `void`: they are plain `setsockopt` calls that
+throw `std::system_error` directly.
 
 ### Segmented sends (GSO)
 
-`set_segment_size(bytes)` sets Linux's `UDP_SEGMENT` socket option on the raw fd. From
-then on the kernel splits any send longer than `bytes` into datagrams of `bytes` each
-(only the last may be shorter), after one syscall and one pass through the UDP/IP stack.
-The send path itself is unchanged: the fast-path `send()`/`sendto()` and the slow-path
-`uv_udp_send()` both just hand the kernel a longer buffer.
+`set_segment_size(bytes)` sets Linux's `UDP_SEGMENT` socket option on the fd. From then
+on the kernel splits any send longer than `bytes` into datagrams of `bytes` each (only
+the last may be shorter), after one syscall and one pass through the UDP/IP stack. The
+send path itself is unchanged: the send future just hands the kernel a longer buffer.
 
 This matters because the per-datagram cost of the kernel stack, not syscall entry,
 dominates small-datagram sends. Measured on an i5-11500H over loopback with 1468-byte
@@ -708,10 +479,9 @@ Limits (all enforced by the kernel):
   Loopback and common NICs have it.
 
 !!! note "NOTE: race with in-flight sends"
-    `set_segment_size()` runs on the caller's thread. A send already in flight
-    on another thread (or queued on the uv thread's slow path) may be segmented with
-    either the old or the new size. The kernel reads the option once per send, so each
-    send uses one size or the other, never a mix.
+    `set_segment_size()` runs on the caller's thread. A send in flight on another worker
+    may be segmented with either the old or the new size. The kernel reads the option once
+    per send, so each send uses one size or the other, never a mix.
 
 ### Coalesced receives (GRO)
 
@@ -730,10 +500,9 @@ It does two things for a receiver of many small datagrams:
   datagrams queued separately: with the default 212992-byte buffer and 1468-byte datagrams
   sent in GSO batches, the socket holds 176 datagrams instead of 88 before the kernel drops.
 
-libuv's receive callback never reads control messages, so the slow path can't use it to
-read. Instead it only waits for readability: `uv_udp_recv_start()` with an alloc callback
-that returns an empty buffer, which libuv answers with `UV_ENOBUFS` without reading
-anything. The future then retries its `recvmsg()` on the caller's thread.
+`UdpRecvSegmentsFuture` is `UdpRecvFuture` with `recvmsg()` in place of `recvfrom()`:
+`poll_io(Read, udp_try_recv_segments)`. When the kernel didn't coalesce (GRO off, or off
+Linux), the reported segment size equals the byte count.
 
 ```cpp
 Coro<void> receive(UdpSocket& sock) {
@@ -754,39 +523,70 @@ whole datagrams.
 
 ### `bind` and destructor
 
-Same shape as `TcpListener::bind`/`~TcpListener`: `uv_udp_init` + `uv_udp_bind` on the uv
-executor for `bind()`. `bind()` also caches `handle->raw_fd = uv_fileno(...)` at this
-point — once, on the uv thread, right after the socket exists — so `recv_from_impl`'s
-fast path never needs to call a libuv accessor off the uv thread later. Unlike an earlier
-draft, `bind()` does **not** arm anything up front — nothing is armed until a
-`recv_from()`/`recv()` call actually needs its slow path, and that arming happens inline
-inside that call's own `with_context` hop (see [Receive path](#receive-path) above), not
-as a separate step `bind()` triggers. The destructor closes `handle->handle`
-asynchronously via `with_context(...).detach()`, same pattern as `TcpStream::~TcpStream()`.
+`bind(host, port)`:
 
-```mermaid
-sequenceDiagram
-    participant C as coroutine (compute executor)
-    participant W as with_context
-    participant U as uv thread
-    participant L as libuv
+1. `detail::socket_io_driver()` checks that the current Runtime's executor turns the
+   IoDriver, and throws `std::logic_error` if not (a `CurrentThreadExecutor` given its
+   own `Parker`). A socket there could never be woken, so it fails up front instead of
+   hanging at its first wait.
+2. `lookup_host(host, port)` resolves the host. A numeric literal returns at once; a name
+   goes to the blocking pool (see [File I/O and DNS](file_io.md#lookup_host)).
+3. `sys::udp_open()` is tried on each address in order. The first that binds is
+   registered with the driver and returned; if none does, the last error is rethrown.
 
-    Note over C,L: ... datagram arrives, nothing armed, kernel SO_RCVBUF holds it ...
+Nothing is armed in the kernel or the driver until an operation has to wait.
 
-    C->>C: co_await sock.recv_from(buf)
-    C->>C: fast path: recvfrom() on raw_fd, directly on this thread
-    C-->>C: data was already in the kernel buffer — resolves immediately, no suspension
+`~UdpSocket()` only drops its share of the `SocketState`. The fd is deregistered and
+closed synchronously once the last in-flight future is gone too, so reopening the same
+port right after every owner is dropped succeeds.
 
-    Note over C,L: ... later, kernel buffer is empty when recv_from() is called ...
-    C->>C: fast path: recvfrom() returns EAGAIN
-    C->>W: co_await with_context(uv_exec, ...) — hops and suspends until it resolves
-    W->>U: arm: uv_udp_recv_start(alloc_cb, recv_cb), alloc_cb hands out buf directly
+### Races
 
-    Note over U,L: ... datagram arrives ...
-    L->>U: alloc_cb: hands out caller's own buffer (no scratch, no copy)
-    L->>U: recv_cb: uv_udp_recv_stop (single-shot); result.complete(nread, sender)
-    U-->>C: with_context's JoinHandle resolves — coroutine resumes with the result
-```
+- **Send and receive on different workers.** Allowed. The registration has one waiter
+  slot per direction, so a concurrent send and receive never overwrite each other's
+  waker. Two concurrent receives (or two sends) are not supported: the second would
+  replace the first's waker, leaving the first unwoken.
+- **Socket destroyed while an operation is pending.** The future holds a share of the
+  `SocketState`, so the fd stays open and registered. The pending operation completes, or
+  is dropped, as usual.
+- **fd reuse.** `~SocketState()` deregisters before it closes, so a new socket that gets
+  the same fd number never inherits the old registration. A stale event that another
+  worker's turn already fetched is handled by the driver: see
+  [Registration lifetime and stale events](io_driver.md#registration-lifetime-and-stale-events).
+- **Socket options during I/O.** `set_segment_size()`/`set_gro()` may race with in-flight
+  operations; each send or receive sees one setting or the other (see the notes above).
+  `connect()` must not run concurrently with a send or receive.
+- **Executor that never turns the driver.** `bind()` throws `std::logic_error` (above),
+  so no operation can wait on a driver that nobody turns.
+
+!!! tip "PERF: one `shared_ptr` copy per operation"
+    Every send or receive future copies the `shared_ptr<SocketState>`: one atomic
+    increment and decrement per operation. It is what lets a future outlive its socket
+    safely. Borrowing a raw pointer instead would need a guarantee that no future
+    outlives the socket, which a droppable leaf future can't give.
+
+!!! tip "TODO: `set_recv_buffer_size()`"
+    A receiver that falls behind a bursty sender loses datagrams once `SO_RCVBUF` fills,
+    and the default is about 200 KB. Add a `set_recv_buffer_size(bytes)` (`SO_RCVBUF`,
+    reporting the size the kernel actually granted) when a workload needs a deeper
+    buffer than `set_gro()` gives.
+
+### Tests
+
+`test/io/test_udp_socket.cpp` covers the API on both executors. These tests target the
+driver backend specifically:
+
+| Test | Checks |
+|---|---|
+| `UdpSocketTest.BindIpv6Loopback` | `bind("::1", ...)` and a round trip over IPv6 (skipped without IPv6 loopback). |
+| `UdpSocketTest.BindAddressInUseThrowsOnAwait` | `EADDRINUSE`, and an unresolvable host (`dns_error_category()`), are `std::system_error`s thrown at `co_await`. |
+| `UdpSocketTest.RecvWaitsThenCompletes*` | A receive with nothing queued waits for readiness, on `Runtime(4)` and `Runtime(1)`. |
+| `UdpSocketTest.DroppedRecvLosesNoDatagram` | A receive dropped by `timeout()` consumes nothing; the next receive gets the datagram. |
+| `UdpSocketTest.SocketDroppedWhileRecvPending` | Destroying the `UdpSocket` under a pending receive neither closes the fd nor loses the wake. |
+| `UdpSocketTest.ConcurrentSendAndRecvOnOneSocket` | A send task and a receive task on one socket, on different workers. |
+| `UdpSocketTest.BindThrowsWithoutDriver` | `bind()` throws `std::logic_error` on a `CurrentThreadExecutor` with its own `Parker`. |
+| `UdpSocketTest.RecvWaitsOnWorkSharing` | A waiting receive is woken by an idle `WorkSharingExecutor` worker turning the driver. |
+| `IoDriver.PollIoWaitsForWritable` (`test_io_driver.cpp`) | `poll_io(Write)` waits out a full send buffer. |
 
 ---
 
@@ -799,10 +599,10 @@ immediately; there is no completion callback to await at all.
 
 ### `LwipUdpCtx` — internal shared state
 
-Unlike the libuv backend, there's no raw-fd fast path here — lwIP has no socket fd and no
-OS-level receive buffer beneath it, so every `recv_from()`/`recv()` call registers
-`on_recv` fresh and suspends. Like the libuv `Handle`, there is exactly one in-flight
-receive at a time, so these fields describe a single pending call, not a queue:
+Unlike the desktop backend, there's no try-the-syscall-first path here — lwIP has no
+socket fd and no OS-level receive buffer beneath it, so every `recv_from()`/`recv()` call
+registers `on_recv` fresh and suspends. As on the desktop backend, there is exactly one
+in-flight receive at a time, so these fields describe a single pending call, not a queue:
 
 ```cpp
 // src/io/lwip/lwip_udp_ctx.h
@@ -920,7 +720,7 @@ Coro<void> UdpSocket::send_to_impl(const std::byte* buf, std::size_t size, Socke
 ```
 
 Because this never suspends, `send_to()` on the Pico backend completes synchronously in
-practice — the `Coro<void>` return type is kept only for API symmetry with the libuv
+practice — the `Coro<void>` return type is kept only for API symmetry with the desktop
 backend and to leave room for a future flow-control mechanism (see below) without an
 API break.
 
@@ -965,20 +765,20 @@ Coro<Buf> UdpSocket::send_impl(Buf buf) {
 
 `recv_impl` is `recv_from_impl` with the precondition check added and the `SocketAddress`
 element of the tuple dropped — it is implemented in terms of `recv_from_impl` rather than
-duplicated, same as the libuv backend's `recv()`.
+duplicated.
 
 ### `set_broadcast_impl`, `join_multicast_impl`, `leave_multicast_impl`
 
 None of these suspend, so — like `send_to_impl`/`connect_impl` — they're plain `Coro<void>`
 kept synchronous in practice, with the `Coro` wrapper only for API symmetry with the
-libuv backend:
+desktop backend:
 
 ```cpp
 Coro<void> UdpSocket::set_broadcast_impl(bool enabled) {
     // No-op: IP_SOF_BROADCAST / IP_SOF_BROADCAST_RECV both default to 0 (lwIP's own
     // opt.h default, left unset in this project's lwipopts.h.in), so udp_sendto_if()
     // never checks an SOF_BROADCAST pcb flag in the first place — see
-    // "Multicast and broadcast" above. Kept only for API symmetry with the libuv backend.
+    // "Multicast and broadcast" above. Kept only for API symmetry with the desktop backend.
     (void)enabled;
     co_return;
 }
@@ -1006,7 +806,7 @@ Coro<void> UdpSocket::leave_multicast_impl(Ipv4Address group, Ipv4Address iface)
 
 Receiving multicast traffic needs no change to `on_recv`/`recv_from_impl` beyond the
 IGMP join itself: `bind()` already binds the `pcb` to `IP_ADDR_ANY`, which (like the
-libuv backend binding `0.0.0.0`) accepts a datagram addressed to any destination IP
+desktop backend binding `0.0.0.0`) accepts a datagram addressed to any destination IP
 matching the port — multicast included — once `igmp_joingroup_netif()` has told the
 network layer to actually deliver that group's traffic up to IP.
 
@@ -1064,7 +864,7 @@ port)` run once up front and `udp_send(pcb, pbuf)` (no address) replacing `udp_s
   and broadcast](#multicast-and-broadcast).
 - **No userspace receive buffering on either backend — datagrams are dropped if nothing
   is awaiting `recv_from`/`recv` at the moment they arrive, on the Pico (lwIP) backend
-  specifically.** On the desktop (libuv) backend this is a non-issue in practice: the
+  specifically.** On the desktop backend this is a non-issue in practice: the
   kernel's own per-socket receive buffer (`SO_RCVBUF`) holds datagrams that arrive between
   calls, exactly as it would for any other UDP socket. lwIP has no equivalent — `on_recv`
   is only ever registered for the duration of one `recv_from_impl()` call, and a datagram
@@ -1075,40 +875,20 @@ port)` run once up front and `udp_send(pcb, pbuf)` (no address) replacing `udp_s
   behavior difference callers relying on this backend need to be aware of — bursty senders
   faster than the receiver's polling cadence will lose datagrams on Pico that an equivalent
   desktop program would not.
-- **`set_segment_size()` (GSO) and `set_gro()` are libuv-on-Linux only.** They throw
-  `std::system_error` (`ENOTSUP`) elsewhere under libuv and aren't declared on the lwIP
-  backend, nor is `recv_segments_from()` (which off Linux returns one datagram per read).
+- **`set_segment_size()` (GSO) and `set_gro()` are desktop-Linux only.** They throw
+  `std::system_error` (`ENOTSUP`) on other desktop platforms and aren't declared on the
+  lwIP backend, nor is `recv_segments_from()` (which off Linux returns one datagram per read).
   There is no `recv()`-style variant for connected sockets, and no `recvmmsg()` batching.
   See [Segmented sends (GSO)](#segmented-sends-gso) and
   [Coalesced receives (GRO)](#coalesced-receives-gro).
-- **`send_to()` remains usable after `connect()` on both backends.** An earlier
-  revision of this doc claimed the libuv/Linux backend throws `EISCONN`
-  unconditionally in this case, matching a caveat in `sendto(2)`'s manpage —
-  that was never actually verified and turned out not to hold on this
-  platform (confirmed via `strace`; see
-  [Mixing `_to`/`_from` calls with `connect()`](#connect-send-recv-fixed-peer-mode)).
+- **`send_to()` remains usable after `connect()` on both backends.** Linux's `sendto(2)`
+  accepts an explicit destination on a connected UDP socket; see the "Mixing `_to`/`_from`
+  calls with `connect()`" paragraph under [Public API](#public-api).
 - **`SocketAddress` supports IPv6 (with `scope_id`), but the lwIP/Pico backend does
   not.** `send_to`/`recv_from`/`connect` throw at runtime if given an `Ipv6Address` on
   that backend, consistent with the existing IPv4-only `TcpStream`/`TcpListener`
-  limitation noted in `pico_port.md`. The libuv (desktop) backend handles both families
-  via `sockaddr_storage`, but `UdpSocket::bind()` accepting an IPv6 host and constructing
-  an `AF_INET6` socket is not yet wired up — worth a follow-up once there's a concrete
-  IPv6 caller.
-
-!!! tip "TODO: apply the same raw-fd fast path to `TcpStream`"
-    `TcpStream::read()` today always hops to the uv thread via `with_context`, even when
-    data is already sitting in the kernel's receive buffer and could be read immediately
-    on the calling thread via `uv_fileno()` — the same opportunity `UdpSocket::recv_from()`
-    now takes advantage of. Encouragingly, `UdpSocket`'s own safety argument (see
-    [Fast path safety](#fast-path-safety-mutually-exclusive-by-construction) above) no
-    longer relies on anything UDP-specific — it falls out of per-call arm/disarm plus the
-    existing one-read-at-a-time restriction, both of which `TcpStream` already has or could
-    adopt. So the argument likely *does* transfer to `TcpStream` fairly directly once
-    attempted, which is a stronger starting point than assumed in an earlier draft of this
-    note — but it still needs its own pass to confirm (e.g. checking level-triggered
-    readiness re-checking behaves correctly across the two paths), not simply asserted by
-    analogy. Deliberately out of scope for this design: no changes to `TcpStream` or any
-    other existing code until the `UdpSocket` design above is implemented and tested.
+  limitation noted in `pico_port.md`. The desktop backend handles both families,
+  including binding to an IPv6 address (`bind("::1", port)`).
 
 ---
 
@@ -1117,20 +897,23 @@ port)` run once up front and `udp_send(pcb, pbuf)` (no address) replacing `udp_s
 ```
 include/coro/io/
   socket_address.h         SocketAddress/Ipv4Address/Ipv6Address — shared address type (both backends)
-  socket_address_uv.h      to_sockaddr()/from_sockaddr() conversion helpers (libuv only) —
-                           lives here, not src/io/, since udp_socket.hpp (public, template
-                           method bodies) needs it
-  udp_socket.h             UdpSocket — dispatches to lwIP or libuv backend
-  udp_socket.hpp           send_to<Buf>()/recv_from<Buf>()/send<Buf>()/recv<Buf>() template
-                           impls (libuv); included from the bottom of udp_socket.h
+  udp_socket.h             UdpSocket — dispatches to the lwIP or desktop (IoDriver) backend
+  udp_socket.hpp           UdpSendFuture / UdpRecvFuture / UdpRecvSegmentsFuture (desktop);
+                           included from the bottom of udp_socket.h
+include/coro/detail/
+  socket_state.h           SocketState: fd + IoRegistration, shared by a socket and its futures
+  sys/udp.h                UDP backend seam: the only place a UDP syscall is made
 
 src/io/
   socket_address.cpp       SocketAddress::parse()/to_string() (both backends)
-  udp_socket.cpp           bind() / connect() / recv_from_impl() / destructor /
-                           set_broadcast() / join_multicast() / leave_multicast() (libuv)
+  udp_socket.cpp           bind() / connect() / socket options (desktop)
   lwip/
     lwip_udp_ctx.h          LwipUdpCtx internal struct
     udp_socket_lwip.cpp     UdpSocket implementation (lwIP)
+src/detail/
+  socket_state.cpp         SocketState, socket_io_driver()
+  sys/udp_posix.cpp        POSIX implementation of sys/udp.h
+  sys/sockaddr_posix.h     to_sockaddr()/from_sockaddr(), private to the POSIX backends
 ```
 
 ---
@@ -1139,32 +922,29 @@ src/io/
 
 Design complete, including `SocketAddress`, fixed-peer `connect()`/`send()`/`recv()`, and
 a no-userspace-buffering receive path: no internal queue on either backend, relying
-instead on the kernel's own per-socket receive buffer on the desktop (libuv) backend, and
-on per-call `on_recv` registration (dropping datagrams that arrive while idle) on the Pico
-(lwIP) backend. This replaces two earlier, successively-abandoned designs — a
-`BufferPool`/`PooledBuffer` draft, then a `PollStream`-style `RingBuffer<DatagramEntry>` +
-`BackpressureMode` draft — in favor of this simpler no-buffering approach. The libuv
-backend additionally gets a raw-fd fast path that lets `recv_from()`/`recv()` resolve
-immediately, with no uv-thread hop and no extra copy, whenever a datagram is already
-sitting in the kernel's receive buffer; only the (now single-shot, per-call) slow path
-touches the uv thread. Multicast (`join_multicast`/`leave_multicast`, via
-`uv_udp_set_membership()`/`igmp_joingroup_netif()`) and broadcast (`set_broadcast()`, via
-`uv_udp_set_broadcast()` on libuv, a no-op on lwIP) are included in this first iteration —
-see [Multicast and broadcast](#multicast-and-broadcast) — rather than deferred.
+instead on the kernel's own per-socket receive buffer on the desktop (IoDriver) backend,
+and on per-call `on_recv` registration (dropping datagrams that arrive while idle) on the
+Pico (lwIP) backend. On desktop every operation first tries its non-blocking syscall on
+the calling thread and waits for readiness from the IoDriver only on `EAGAIN`. Multicast
+(`join_multicast`/`leave_multicast`, via `IP_ADD_MEMBERSHIP`/`igmp_joingroup_netif()`) and
+broadcast (`set_broadcast()`, via `SO_BROADCAST` on desktop, a no-op on lwIP) are
+included in this first iteration — see [Multicast and broadcast](#multicast-and-broadcast)
+— rather than deferred.
 
 **Implemented and tested.** Both backends are in place per the design above:
 `include/coro/io/socket_address.h` + `src/io/socket_address.cpp` (shared), and the
-libuv/lwIP `UdpSocket` split described in [File structure](#file-structure). Real gtest
-coverage exists for both: `test/io/test_udp_socket.cpp` runs against the desktop libuv
-backend (`SocketAddress` parse/format round trips; `send_to`/`recv_from`; truncation of
+desktop/lwIP `UdpSocket` split described in [File structure](#file-structure). Real gtest
+coverage exists for both: `test/io/test_udp_socket.cpp` runs against the desktop
+IoDriver backend (`SocketAddress` parse/format round trips; `send_to`/`recv_from`; truncation of
 oversized datagrams; `connect`/`send`/`recv`; mixing `send_to`/`recv_from` with a
 connected socket; `set_broadcast`; `join_multicast`/`leave_multicast`, including an actual
 multicast loopback delivery test), and `test/pico/test_udp_socket_real.cpp` runs the
 same core scenarios against real lwIP in NO_SYS mode over the host loopback netif
 (multicast excluded there — lwIP's default loopback netif doesn't set `NETIF_FLAG_IGMP`,
 so `igmp_joingroup_netif()` isn't exercisable against it regardless of `UdpSocket`'s own
-correctness). CMake wiring: `src/io/socket_address.cpp` and `src/io/udp_socket.cpp` are
-part of the desktop `coro` target; `cmake/platforms/pico.cmake`'s `coro_pico` target
+correctness). CMake wiring: `src/io/socket_address.cpp`, `src/io/udp_socket.cpp`,
+`src/detail/socket_state.cpp` and `src/detail/sys/udp_posix.cpp` are part of the desktop
+`coro` target; `cmake/platforms/pico.cmake`'s `coro_pico` target
 additionally defines `CORO_UDP_BACKEND_LWIP` and compiles `socket_address.cpp` +
 `udp_socket_lwip.cpp`; `test/CMakeLists.txt` adds `test_udp_socket` (desktop) and a new
 `coro_lwip_udp` library + `test_udp_socket_real` executable (real lwIP), plus

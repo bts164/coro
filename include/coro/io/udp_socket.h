@@ -32,7 +32,7 @@ namespace detail { struct LwipUdpCtx; }
  *
  * See doc/design/udp_socket.md. There is no internal receive queue: a datagram
  * that arrives while nothing is awaiting `recv_from()`/`recv()` is dropped by
- * lwIP, since (unlike the libuv backend) there is no OS-level receive buffer
+ * lwIP, since (unlike the desktop backend) there is no OS-level receive buffer
  * underneath it.
  *
  * **Concurrency:** only one receive (`recv_from()`/`recv()`) and only one send
@@ -89,11 +89,11 @@ public:
     }
 
     /// No-op on this backend — see doc/design/udp_socket.md's "Multicast and
-    /// broadcast" section. Kept for API symmetry with the libuv backend.
+    /// broadcast" section. Kept for API symmetry with the desktop backend.
     [[nodiscard]] Coro<void> set_broadcast(bool enabled);
 
     /// Joins a multicast group via igmp_joingroup_netif(). iface is accepted for
-    /// API symmetry with the libuv backend but ignored — a Pico target has
+    /// API symmetry with the desktop backend but ignored — a Pico target has
     /// exactly one network interface (netif_default).
     [[nodiscard]] Coro<void> join_multicast(Ipv4Address group, Ipv4Address iface = {});
 
@@ -115,19 +115,19 @@ private:
 
 } // namespace coro
 
-#else // !CORO_UDP_BACKEND_LWIP — libuv-backed implementation
+#else // !CORO_UDP_BACKEND_LWIP — desktop implementation on the IoDriver
 
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
+#include <coro/detail/socket_state.h>
 #include <coro/io/byte_buffer.h>
 #include <coro/io/socket_address.h>
-#include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/task/join_handle.h>
+#include <coro/runtime/io_driver.h>
 #include <coro/coro.h>
-#include <uv.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -154,19 +154,26 @@ struct UdpSegments {
     std::size_t   segment_size;
 };
 
+
 /**
  * @brief Async, connectionless UDP socket. Obtain via `co_await UdpSocket::bind()`.
  *
- * See doc/design/udp_socket.md. `recv_from()`/`recv()` and `send_to()`/`send()`
- * all first attempt a direct, non-blocking syscall on the calling thread (no
- * uv-thread hop); only on `EAGAIN` do they hop to the uv thread and suspend.
- * There is no internal receive queue on this backend either — arriving
- * datagrams are held by the kernel's own per-socket receive buffer between
- * calls, exactly as for any other UDP socket.
+ * See doc/design/udp_socket.md, "Desktop (IoDriver) backend". Every
+ * operation is a non-blocking syscall on the calling thread; a send or receive that
+ * would block waits for readiness from the Runtime's IoDriver. There is no internal
+ * receive queue: datagrams that arrive between calls wait in the kernel's own
+ * per-socket receive buffer.
  *
- * **Concurrency:** only one receive (`recv_from()`/`recv()`) and only one send
- * (`send_to()`/`send()`) may be in flight at a time; `connect()` must not run
+ * Requires an executor that turns the IoDriver (`Runtime(n)` for any n);
+ * `bind()` throws `std::logic_error` otherwise.
+ *
+ * **Concurrency:** only one receive (`recv_from()`/`recv()`/`recv_segments_from()`)
+ * and only one send (`send_to()`/`send()`) may be in flight at a time; a receive and
+ * a send may run concurrently, on any threads. `connect()` must not run
  * concurrently with either.
+ *
+ * **Cancellation:** dropping a pending send or receive is always safe; no datagram
+ * is consumed by a dropped receive.
  */
 class UdpSocket {
 public:
@@ -175,19 +182,23 @@ public:
     UdpSocket(const UdpSocket&)            = delete;
     UdpSocket& operator=(const UdpSocket&) = delete;
 
-    /// Closes the socket asynchronously on the uv executor. Does not block.
+    /// Releases this handle. The socket is deregistered and closed synchronously once
+    /// no in-flight future still uses it.
     ~UdpSocket();
 
-    /// Binds a UDP socket to host:port. host must be dotted-decimal, an IPv6
-    /// literal, or "0.0.0.0"/"::".
-    [[nodiscard]] static JoinHandle<UdpSocket> bind(std::string host, uint16_t port);
+    /// Binds a UDP socket to host:port. host is an IPv4 or IPv6 literal ("0.0.0.0",
+    /// "127.0.0.1", "::", "::1") or a name resolved with lookup_host(); the first
+    /// resolved address that binds is used.
+    /// @throws std::system_error (at co_await) if host doesn't resolve, or with the last
+    ///         address's bind() error.
+    /// @throws std::logic_error if the current Runtime's executor doesn't turn the
+    ///         IoDriver (a CurrentThreadExecutor given its own Parker).
+    [[nodiscard]] static Coro<UdpSocket> bind(std::string host, uint16_t port);
 
     /// Sends buf as a single datagram to dest. Returns buf once the send completes.
-    /// Tries a direct non-blocking sendto() on the calling thread first (no uv-thread
-    /// hop) and only falls back to the uv thread if the kernel send buffer is full.
     ///
-    /// Returns a hand-written future (not a Coro): the fast path completes in the
-    /// first poll() with no coroutine frame allocation.
+    /// Returns a hand-written future (not a Coro): when the kernel accepts the
+    /// datagram at once, the first poll() completes it with no allocation.
     template<ByteBuffer Buf>
     [[nodiscard]] UdpSendFuture<Buf> send_to(Buf buf, SocketAddress dest);
 
@@ -202,10 +213,9 @@ public:
     /// Note: on Linux, send_to() with an explicit destination remains usable
     /// even after connect() -- the kernel does not reject it (see
     /// doc/design/udp_socket.md's "Known limitations" section).
-    [[nodiscard]] JoinHandle<void> connect(SocketAddress peer);
+    [[nodiscard]] Coro<void> connect(SocketAddress peer);
 
-    /// Sends buf to the peer fixed by connect(). Throws (UV_EDESTADDRREQ) if not connected.
-    /// Same fast-path-then-uv-thread-fallback strategy as send_to().
+    /// Sends buf to the peer fixed by connect(). Throws (EDESTADDRREQ) if not connected.
     template<ByteBuffer Buf>
     [[nodiscard]] UdpSendFuture<Buf> send(Buf buf);
 
@@ -216,7 +226,7 @@ public:
     /// Enables (or disables) sending to broadcast addresses via send_to()/send().
     /// Required before a sendto() to a broadcast address is permitted by the OS
     /// (SO_BROADCAST) — otherwise it fails with EACCES.
-    [[nodiscard]] JoinHandle<void> set_broadcast(bool enabled);
+    [[nodiscard]] Coro<void> set_broadcast(bool enabled);
 
     /// Enables UDP generic segmentation offload (GSO, Linux UDP_SEGMENT) for
     /// every later send()/send_to(): a buffer longer than bytes goes out as
@@ -226,7 +236,7 @@ public:
     /// most 65507 bytes and 64 segments (128 on newer kernels); larger sends fail
     /// with EMSGSIZE. Sends through an interface without checksum offload fail
     /// with EIO.
-    /// Synchronous: a plain setsockopt() on the socket, no uv-thread hop.
+    /// Synchronous: a plain setsockopt() on the socket.
     /// Throws std::system_error (ENOTSUP) on platforms other than Linux.
     void set_segment_size(std::size_t bytes);
 
@@ -238,7 +248,7 @@ public:
     /// with no way to split them. Datagrams sent with GSO (set_segment_size())
     /// stay coalesced end to end on loopback; from a NIC, the driver's GRO
     /// coalesces them.
-    /// Synchronous: a plain setsockopt() on the socket, no uv-thread hop.
+    /// Synchronous: a plain setsockopt() on the socket.
     /// Throws std::system_error (ENOTSUP) on platforms other than Linux.
     void set_gro(bool enabled);
 
@@ -253,32 +263,24 @@ public:
     /// Joins multicast group so recv_from()/recv() start receiving datagrams sent
     /// to it. iface selects which local interface to join on; the default
     /// (Ipv4Address{}) lets the OS choose. IPv4 only.
-    [[nodiscard]] JoinHandle<void> join_multicast(Ipv4Address group, Ipv4Address iface = {});
+    [[nodiscard]] Coro<void> join_multicast(Ipv4Address group, Ipv4Address iface = {});
 
     /// Leaves a multicast group previously joined with join_multicast().
-    [[nodiscard]] JoinHandle<void> leave_multicast(Ipv4Address group, Ipv4Address iface = {});
+    [[nodiscard]] Coro<void> leave_multicast(Ipv4Address group, Ipv4Address iface = {});
 
 private:
-    template<ByteBuffer B> friend class UdpSendFuture;
-    template<ByteBuffer B, bool S> friend class UdpRecvFuture;
-    template<ByteBuffer B> friend class UdpRecvSegmentsFuture;
+    using State = detail::SocketState;
 
-    // Heap-allocated uv_udp_t — address must be stable across the handle lifetime.
-    struct Handle {
-        uv_udp_t handle;
-        int      raw_fd = -1;   // cached via uv_fileno() in bind(); lets recv_from()
-                                 // attempt a raw read without a uv-thread hop
-    };
+    explicit UdpSocket(std::shared_ptr<State> state);
 
-    explicit UdpSocket(std::shared_ptr<Handle> handle, SingleThreadedUvExecutor* uv_exec);
+    // The coroutine bodies of the setup calls. Static, taking the state by value, so
+    // the coroutine frame never holds `this` (the UdpSocket may move before it runs).
+    static Coro<void> connect_impl(std::shared_ptr<State> state, SocketAddress peer);
+    static Coro<void> set_broadcast_impl(std::shared_ptr<State> state, bool enabled);
+    static Coro<void> set_membership_impl(std::shared_ptr<State> state, Ipv4Address group,
+                                          Ipv4Address iface, bool join);
 
-    // Shared by join_multicast()/leave_multicast(); defined in udp_socket.cpp.
-    static JoinHandle<void> set_membership(std::shared_ptr<Handle> handle,
-        SingleThreadedUvExecutor* uv_exec, Ipv4Address group, Ipv4Address iface,
-        uv_membership membership);
-
-    std::shared_ptr<Handle>   m_handle;
-    SingleThreadedUvExecutor* m_uv_exec = nullptr;
+    std::shared_ptr<State> m_state;
 };
 
 } // namespace coro

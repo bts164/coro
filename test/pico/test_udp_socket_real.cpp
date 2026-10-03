@@ -15,7 +15,7 @@
 // LWIP_HAVE_LOOPIF=1 (set in lwipopts.h). No manual netif_add() needed.
 //
 // Note: multicast (join_multicast/leave_multicast) is exercised only in the
-// desktop libuv test suite (test/io/test_udp_socket.cpp) — lwIP's default
+// desktop test suite (test/io/test_udp_socket.cpp) — lwIP's default
 // loopback netif (netif_loopif_init) does not set NETIF_FLAG_IGMP, so
 // igmp_joingroup_netif() would fail against it here regardless of the
 // UdpSocket implementation.
