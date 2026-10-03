@@ -53,6 +53,8 @@ include/coro/
 │
 ├── io/                 Async I/O — network streams, WebSocket, OS signals
 │   ├── tcp_stream.h        TcpStream — async TCP connection
+│   ├── file.h              File — async file I/O on the blocking pool
+│   ├── lookup_host.h       lookup_host() — DNS resolution on the blocking pool
 │   ├── ws_stream.h         WsStream — async WebSocket client connection
 │   ├── ws_listener.h       WsListener — async WebSocket server acceptor
 │   └── signal.h            signal() / signal_stream() — async OS signal delivery (uv_signal_t)
@@ -117,7 +119,6 @@ Anything that drives tasks to completion or owns I/O infrastructure goes here. T
 - Concrete executor implementations: `CurrentThreadExecutor`, `WorkSharingExecutor`, `WorkStealingExecutor`
 - `IoDriver` — the epoll readiness reactor that executors turn when they park
 - `SingleThreadedUvExecutor` — libuv event loop + task queue on a dedicated thread
-- `CurrentThreadExecutor` — polling executor for MCU targets; runs on the calling thread
 - `uv_future.h` — `UvCallbackResult` / `UvFuture` bridge libuv callbacks to coroutines
 
 ### `task/` — task spawning and handles

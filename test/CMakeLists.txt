@@ -63,6 +63,7 @@ set(TEST_NAMES
     test_broadcast
     # io/
     test_file
+    test_lookup_host
     # test_pipe  # disabled — see io/test_pipe.cpp
     test_circular_byte_buffer
     test_poll_stream
@@ -122,6 +123,7 @@ set(TEST_SRCS
     sync/test_broadcast.cpp
     # io/
     io/test_file.cpp
+    io/test_lookup_host.cpp
     # io/test_pipe.cpp  # disabled
     io/test_circular_byte_buffer.cpp
     io/test_poll_stream.cpp

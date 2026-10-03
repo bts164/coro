@@ -70,6 +70,7 @@ if(CORO_PLATFORM STREQUAL "pico")
         PATTERN "ws_listener.h" EXCLUDE
         PATTERN "file.h" EXCLUDE
         PATTERN "file.hpp" EXCLUDE
+        PATTERN "lookup_host.h" EXCLUDE
         PATTERN "poll_stream.h" EXCLUDE
         PATTERN "poll_stream.hpp" EXCLUDE
         PATTERN "uv_future.h" EXCLUDE
@@ -115,7 +116,10 @@ else()
         src/task/fiber.cpp
         # detail/
         src/detail/fiber_context_posix.cpp
+        src/detail/sys/dns_posix.cpp
+        src/detail/sys/file_posix.cpp
         src/detail/sys/poller_epoll.cpp
+        src/detail/sys/socket_posix.cpp
         src/detail/timer_queue.cpp
         # sync/
         src/sync/cancellation_token.cpp
@@ -126,6 +130,7 @@ else()
         src/io/ws_stream.cpp
         src/io/ws_listener.cpp
         src/io/file.cpp
+        src/io/lookup_host.cpp
         #src/io/pipe.cpp
         src/io/circular_byte_buffer.cpp
         src/io/signal.cpp

@@ -355,6 +355,10 @@ The library provides several other I/O types that follow the same suspend-not-bl
 owned-buffer pattern as `TcpStream` — open, read, write, and the coroutine suspends
 rather than blocking while the operation runs.
 
+Disks have no readiness to wait on, so each operation runs as one job on the Runtime's
+blocking pool (as `tokio::fs` does). A write is complete when its `co_await` returns; call
+`sync_all()` when it must also be on the device.
+
 ```cpp
 #include <coro/io/file.h>
 
@@ -368,6 +372,20 @@ coro::Coro<void> run() {
     co_await out.write(std::move(buf));
 }
 ```
+
+### lookup_host — DNS
+
+`TcpStream::connect`, `TcpListener::bind` and `UdpSocket::bind` accept a hostname as well as
+a numeric address, and try each address it resolves to. To resolve without connecting:
+
+```cpp
+#include <coro/io/lookup_host.h>
+
+std::vector<coro::SocketAddress> addrs = co_await coro::lookup_host("example.com", 443);
+```
+
+Resolution runs `getaddrinfo` on the blocking pool. A failure throws `std::system_error`
+in `coro::dns_error_category()`.
 
 ### WsStream / WsListener — WebSocket
 

@@ -1,595 +1,216 @@
-# File I/O
+# File I/O and DNS
 
-!!! danger "FIXME: Heavily out of date — describes a retired architecture"
-    This document still describes `File` in terms of `IoService` and `IoRequest`
-    subclasses (`OpenRequest`, `ReadRequest`, `WriteRequest`, `CloseRequest`,
-    `CancelRequest`). **Neither `IoService` nor `IoRequest` exist in the codebase
-    anymore.** The real `File` implementation (`src/io/file.cpp`) is built on
-    `SingleThreadedUvExecutor` + `with_context` + `UvCallbackResult`/`UvFuture`,
-    following the pattern documented in `doc/design/libuv_integration.md` and
-    `doc/design/io_coroutine.md`. This doc needs a full rewrite, not a patch — see
-    `doc_inconsistency_audit.md` at the repo root for details on what's stale.
+`File` (async regular files) and `lookup_host()` (name resolution). Neither has any
+readiness to wait for: `epoll_ctl` rejects a regular file with `EPERM`, because a disk
+read is always "ready" and then blocks, and `getaddrinfo` is a blocking library call.
+So neither goes through the [I/O Driver](io_driver.md). Each operation runs as one job
+on the Runtime's blocking pool ([`spawn_blocking`](spawn_blocking.md)), as tokio does
+for `tokio::fs` and `lookup_host`.
 
-## Overview
-
-This document describes the design for async filesystem read/write primitives built on top of
-libuv's thread-pool file I/O. The library already has `IoService` infrastructure and async
-TCP/WebSocket streams; this feature extends the same pattern to files.
-
-Unlike network I/O (which is truly async at the OS level via epoll/kqueue), filesystem
-operations in libuv use a **thread pool** — `uv_fs_*` calls are dispatched to worker threads
-and notify the event loop when complete. From the caller's perspective this is still
-non-blocking: the coroutine suspends and yields the executor thread while the file operation
-runs in the background.
+Both are desktop only. On Pico, `TcpStream::connect` resolves names through lwIP
+itself, and there is no `File`.
 
 ---
 
 ## Goals
 
-- **Provide `File` — an async file handle** with `read()`, `write()`, `close()` operations
-  that return `Future`s, composing naturally with the rest of the library.
-- **Follow the existing `TcpStream` pattern** — all libuv-specific types (`uv_fs_t`,
-  `uv_file`, callbacks) are private to `File`, not exposed in `IoService`.
-- **Support cancellation** — dropping a `ReadFuture` or `WriteFuture` mid-operation must
-  cancel the pending libuv request safely (libuv provides `uv_cancel` for this).
-- **Match libuv's guarantees** — operations are ordered per-file-descriptor but may be
-  reordered across descriptors by the thread pool.
+- **Same owned-buffer API as sockets.** Every read and write takes a
+  `ByteBuffer` by value and hands it back with the byte count.
+- **One thread hop per operation.** The `_exact` variants loop inside one job instead of
+  hopping per chunk.
+- **No write-behind.** A write completes when its syscall has returned, so an error is
+  reported by the call that caused it.
+- **Safe to drop.** Dropping an operation's future, or the `File` itself, never closes
+  the fd under a running syscall.
+- **No driver needed.** Only `current_runtime()`'s blocking pool, so both work on a
+  `CurrentThreadExecutor` with a caller-supplied `Parker`.
+
+## Non-goals
+
+- **Directory operations, metadata, `rename`, `remove`.** Use `spawn_blocking` around
+  `std::filesystem` for now.
+- **Cancelling a running syscall.** A dropped job runs to completion.
 
 ---
 
-## Non-Goals (Future Work)
+## Layers
 
-The initial implementation focuses on the core read/write path. The following are deferred:
+```mermaid
+flowchart LR
+    F["File / lookup_host<br/>(portable)"] -->|spawn_blocking| P["BlockingPool<br/>(Runtime)"]
+    P --> S["sys::file_* / sys::resolve_host<br/>(POSIX backend)"]
+```
 
-- **High-level file utilities** — `read_to_string()`, `write_all()`, buffered readers/writers.
-  These can be built on top of the low-level `File` primitives.
-- **Directory operations** — `readdir()`, `mkdir()`, `stat()`, etc. These follow the same
-  pattern but are a separate feature.
-- **Seeking** — `seek()` / `tell()` can be added once the core read/write path is validated.
-- **Memory-mapped I/O** — libuv does not provide async mmap; this would require platform-specific
-  code outside of libuv.
+The portable layer never makes a syscall itself. Everything goes through two backend
+seams, in the style of the driver's [`sys` layer](io_driver.md#the-sys-layer):
+
+| Seam | Functions | POSIX backend |
+|---|---|---|
+| `detail/sys/file.h` | `file_open`, `file_read`, `file_write`, `file_sync`, `file_close` | `src/detail/sys/file_posix.cpp` |
+| `detail/sys/dns.h` | `resolve_host(host, port)`, `dns_category()` | `src/detail/sys/dns_posix.cpp` |
+
+Unlike the socket seams, these are ordinary blocking calls. `EINTR` is retried inside
+the backend. `file_read`/`file_write` take an `offset`: negative means the file position
+(`read`/`write`), anything else is positional (`pread`/`pwrite`).
 
 ---
 
-## User-Facing API
+## `File`
 
 ```cpp
 #include <coro/io/file.h>
 
-coro::Coro<void> example() {
-    // Open a file for reading
-    auto file = co_await coro::File::open("data.txt", coro::FileMode::Read);
+auto file = co_await coro::File::open("data.bin", coro::FileMode::ReadWrite |
+                                                   coro::FileMode::Create);
 
-    // Read up to 4096 bytes
-    std::array<std::byte, 4096> buf;
-    std::size_t n = co_await file.read(std::span(buf));
+auto [written, out] = co_await file.write_exact(std::string("hello"));
+co_await file.sync_all();
 
-    // Write to a file
-    auto out = co_await coro::File::open("output.txt",
-                                         coro::FileMode::Write | coro::FileMode::Create);
-    co_await out.write(std::span(buf).subspan(0, n));
-
-    // Files are closed automatically in the destructor (async via IoService)
-}
+auto [n, buf] = co_await file.read_at(std::vector<std::byte>(4096), 0);
+buf.resize(n);
 ```
 
-### `FileMode` flags
-
-```cpp
-enum class FileMode : unsigned {
-    Read       = 0x01,  // O_RDONLY
-    Write      = 0x02,  // O_WRONLY
-    ReadWrite  = 0x03,  // O_RDWR
-    Create     = 0x10,  // O_CREAT  — create if not exists
-    Truncate   = 0x20,  // O_TRUNC  — truncate to zero length on open
-    Append     = 0x40,  // O_APPEND — writes always go to end
-};
-```
-
-Users combine flags with `|`: `FileMode::Write | FileMode::Create | FileMode::Truncate`.
-
----
-
-## `File` Class Design
-
-`File` is move-only and owns a libuv file descriptor (`uv_file`). The destructor closes the
-descriptor asynchronously via a `CloseRequest` submitted to `IoService`, matching the
-`TcpStream` close pattern.
-
-All libuv request structs (`uv_fs_t`), state objects, and callbacks are **private
-implementation details** of `File`. `IoService` has no knowledge of filesystem operations —
-it only knows `IoRequest::execute()`.
-
-```cpp
-// include/coro/io/file.h
-
-namespace coro {
-
-class File {
-private:
-    // -----------------------------------------------------------------------
-    // State structs — shared between futures and the I/O thread.
-    //
-    // libuv requires the `uv_fs_t` request struct to remain stable until the
-    // callback fires, so each operation allocates its state on the heap and
-    // holds it via shared_ptr (outlives the future if the future is destroyed).
-    // -----------------------------------------------------------------------
-
-    struct OpenState {
-        uv_fs_t                                     req;    // passed to uv_fs_open; must be stable
-        std::atomic<std::shared_ptr<detail::Waker>> waker;
-        std::atomic<bool>                           complete{false};
-        uv_file                                     result = -1;  // fd or error code
-    };
-
-    struct ReadState {
-        uv_fs_t                                     req;    // passed to uv_fs_read; must be stable
-        uv_buf_t                                    buf_desc; // points into caller's buffer
-        std::atomic<std::shared_ptr<detail::Waker>> waker;
-        std::atomic<bool>                           complete{false};
-        std::atomic<bool>                           cancelled{false};  // set by destructor
-        bool                                        started = false;   // worker thread only
-        ssize_t                                     result = 0;  // bytes read or error code
-    };
-
-    struct WriteState {
-        uv_fs_t                                     req;    // passed to uv_fs_write; must be stable
-        uv_buf_t                                    buf_desc; // points into caller's data
-        std::atomic<std::shared_ptr<detail::Waker>> waker;
-        std::atomic<bool>                           complete{false};
-        std::atomic<bool>                           cancelled{false};
-        bool                                        started = false;   // worker thread only
-        ssize_t                                     result = 0;  // bytes written or error code
-    };
-
-    // -----------------------------------------------------------------------
-    // IoRequest subtypes — submitted via IoService::submit()
-    // -----------------------------------------------------------------------
-
-    struct OpenRequest : IoRequest {
-        std::shared_ptr<OpenState> state;
-        std::string                path;
-        int                        flags;   // libuv O_* flags
-        int                        mode;    // POSIX permissions (0644 default)
-
-        void execute(uv_loop_t* loop) override;
-    };
-
-    struct ReadRequest : IoRequest {
-        std::shared_ptr<ReadState> state;
-        uv_file                    fd;
-        int64_t                    offset;  // -1 = use current file position
-
-        void execute(uv_loop_t* loop) override;
-    };
-
-    struct WriteRequest : IoRequest {
-        std::shared_ptr<WriteState> state;
-        uv_file                     fd;
-        int64_t                     offset;  // -1 = use current file position
-
-        void execute(uv_loop_t* loop) override;
-    };
-
-    struct CloseRequest : IoRequest {
-        uv_file fd;
-
-        void execute(uv_loop_t* loop) override;
-    };
-
-    // -----------------------------------------------------------------------
-    // libuv callbacks — all run on the I/O thread.
-    // -----------------------------------------------------------------------
-
-    static void open_cb(uv_fs_t* req);
-    static void read_cb(uv_fs_t* req);
-    static void write_cb(uv_fs_t* req);
-    static void close_cb(uv_fs_t* req);  // cleanup only; no waker
-
-public:
-    // -----------------------------------------------------------------------
-    // Public nested Future types
-    // -----------------------------------------------------------------------
-
-    /**
-     * @brief Future<File> returned by @ref File::open().
-     *
-     * On first poll, submits an `OpenRequest` to `IoService` which calls
-     * `uv_fs_open()` on the I/O thread. When the thread-pool completes the
-     * open, `open_cb` wakes this future. The next poll constructs the `File`.
-     *
-     * @throws std::system_error on open failure (wraps the libuv error code).
-     */
-    class OpenFuture {
-    public:
-        using OutputType = File;
-
-        OpenFuture(std::string path, FileMode mode, IoService* io_service);
-
-        OpenFuture(OpenFuture&&) noexcept            = default;
-        OpenFuture& operator=(OpenFuture&&) noexcept = default;
-        OpenFuture(const OpenFuture&)                = delete;
-        OpenFuture& operator=(const OpenFuture&)     = delete;
-
-        PollResult<File> poll(detail::Context& ctx);
-
-    private:
-        std::string                  m_path;
-        FileMode                     m_mode;
-        IoService*                   m_io_service;
-        std::shared_ptr<OpenState>   m_state;  // null until first poll
-    };
-
-    /**
-     * @brief Future<std::size_t> returned by @ref File::read().
-     *
-     * On first poll, submits a `ReadRequest` which calls `uv_fs_read()`.
-     * When the thread-pool completes the read, `read_cb` wakes the future.
-     * Returns the number of bytes read, or 0 on EOF.
-     *
-     * **Cancellation:** dropping this future before it completes submits a
-     * cancel request via `uv_cancel()`. The buffer must remain valid until
-     * the future resolves or is destroyed.
-     */
-    class ReadFuture {
-    public:
-        using OutputType = std::size_t;
-
-        ReadFuture(uv_file           fd,
-                   std::span<std::byte> buf,
-                   int64_t           offset,
-                   IoService*        io_service);
-
-        ReadFuture(ReadFuture&&) noexcept;
-        ReadFuture& operator=(ReadFuture&&) noexcept = default;
-        ReadFuture(const ReadFuture&)                = delete;
-        ReadFuture& operator=(const ReadFuture&)     = delete;
-
-        ~ReadFuture();  // submits cancel request if in-flight
-
-        PollResult<std::size_t> poll(detail::Context& ctx);
-
-    private:
-        IoService*                 m_io_service;
-        std::shared_ptr<ReadState> m_state;
-    };
-
-    /**
-     * @brief Future<std::size_t> returned by @ref File::write().
-     *
-     * On first poll, submits a `WriteRequest` which calls `uv_fs_write()`.
-     * When the thread-pool completes the write, `write_cb` wakes the future.
-     * Returns the number of bytes written (libuv guarantees full write or error).
-     *
-     * **Cancellation:** dropping this future before it completes submits a
-     * cancel request via `uv_cancel()`. The data buffer must remain valid
-     * until the future resolves or is destroyed.
-     */
-    class WriteFuture {
-    public:
-        using OutputType = std::size_t;
-
-        WriteFuture(uv_file                    fd,
-                    std::span<const std::byte> data,
-                    int64_t                    offset,
-                    IoService*                 io_service);
-
-        WriteFuture(WriteFuture&&) noexcept;
-        WriteFuture& operator=(WriteFuture&&) noexcept = default;
-        WriteFuture(const WriteFuture&)                = delete;
-        WriteFuture& operator=(const WriteFuture&)     = delete;
-
-        ~WriteFuture();  // submits cancel request if in-flight
-
-        PollResult<std::size_t> poll(detail::Context& ctx);
-
-    private:
-        IoService*                  m_io_service;
-        std::shared_ptr<WriteState> m_state;
-    };
-
-    // -----------------------------------------------------------------------
-    // File public API
-    // -----------------------------------------------------------------------
-
-    File(File&&) noexcept;
-    File& operator=(File&&) noexcept;
-    File(const File&)            = delete;
-    File& operator=(const File&) = delete;
-
-    /// Closes the file asynchronously via IoService. Does not block.
-    ~File();
-
-    /**
-     * @brief Opens a file at `path` with the given mode.
-     * @return An `OpenFuture` that resolves to a `File` handle.
-     */
-    [[nodiscard]] static OpenFuture open(std::string path, FileMode mode);
-
-    /**
-     * @brief Reads up to `buf.size()` bytes from the current file position.
-     * @return A `ReadFuture` that resolves to the number of bytes read, or 0 on EOF.
-     */
-    [[nodiscard]] ReadFuture read(std::span<std::byte> buf);
-
-    /**
-     * @brief Reads up to `buf.size()` bytes starting at `offset` in the file.
-     * @return A `ReadFuture` that resolves to the number of bytes read, or 0 on EOF.
-     *
-     * Does not modify the file's current position (pread-style).
-     */
-    [[nodiscard]] ReadFuture read_at(std::span<std::byte> buf, int64_t offset);
-
-    /**
-     * @brief Writes all of `data` to the current file position.
-     * @return A `WriteFuture` that resolves to the number of bytes written.
-     */
-    [[nodiscard]] WriteFuture write(std::span<const std::byte> data);
-
-    /**
-     * @brief Writes all of `data` starting at `offset` in the file.
-     * @return A `WriteFuture` that resolves to the number of bytes written.
-     *
-     * Does not modify the file's current position (pwrite-style).
-     */
-    [[nodiscard]] WriteFuture write_at(std::span<const std::byte> data, int64_t offset);
-
-private:
-    explicit File(uv_file fd, IoService* io_service);
-
-    uv_file    m_fd = -1;
-    IoService* m_io_service = nullptr;
-};
-
-} // namespace coro
-```
-
----
-
-## Implementation Details
-
-### libuv Filesystem API Primer
-
-libuv's filesystem API is callback-based and backed by a thread pool:
-
-```c
-// Open a file:
-int uv_fs_open(uv_loop_t* loop, uv_fs_t* req, const char* path,
-               int flags, int mode, uv_fs_cb cb);
-
-// Read from a file:
-int uv_fs_read(uv_loop_t* loop, uv_fs_t* req, uv_file file,
-               const uv_buf_t bufs[], unsigned int nbufs, int64_t offset,
-               uv_fs_cb cb);
-
-// Write to a file:
-int uv_fs_write(uv_loop_t* loop, uv_fs_t* req, uv_file file,
-                const uv_buf_t bufs[], unsigned int nbufs, int64_t offset,
-                uv_fs_cb cb);
-
-// Close a file:
-int uv_fs_close(uv_loop_t* loop, uv_fs_t* req, uv_file file, uv_fs_cb cb);
-
-// Cleanup after a request completes:
-void uv_fs_req_cleanup(uv_fs_t* req);
-```
-
-All callbacks fire on the event loop thread (the `IoService` I/O thread in our design).
-The `uv_fs_t*` request struct must remain stable until the callback fires — hence
-`shared_ptr<State>` to outlive the future if it is destroyed.
-
-### Cancellation
-
-libuv provides `uv_cancel((uv_req_t*)req)` to cancel in-flight filesystem requests.
-Cancellation is **best-effort**: if the thread-pool worker has already started the
-operation, it cannot be stopped. The callback will still fire, but with result = `UV_ECANCELED`.
-
-Our cancellation protocol:
-
-1. `~ReadFuture()` / `~WriteFuture()` set `state->cancelled = true` (atomic).
-2. If `started == true`, submit a `CancelRequest` to `IoService` which calls `uv_cancel()`.
-3. `read_cb` / `write_cb` check `state->cancelled` after acquiring `complete`:
-   - If cancelled, do **not** wake the future (it is already destroyed).
-   - If not cancelled, call `waker->wake()` as usual.
-
-This mirrors the `SleepFuture` cancellation pattern but adds the `uv_cancel()` call.
-
-### Open Flags Translation
-
-`FileMode` is a user-friendly enum; `OpenRequest::execute()` translates it to libuv flags:
-
-```cpp
-int translate_flags(FileMode mode) {
-    int flags = 0;
-    if ((mode & FileMode::ReadWrite) == FileMode::ReadWrite)
-        flags |= O_RDWR;
-    else if (mode & FileMode::Write)
-        flags |= O_WRONLY;
-    else
-        flags |= O_RDONLY;
-
-    if (mode & FileMode::Create)   flags |= O_CREAT;
-    if (mode & FileMode::Truncate) flags |= O_TRUNC;
-    if (mode & FileMode::Append)   flags |= O_APPEND;
-
-    return flags;
-}
-```
-
-The `mode` argument to `uv_fs_open` (POSIX permissions) defaults to `0644` (owner rw,
-group/other read-only) when `Create` is set, and is ignored otherwise.
-
-### Offset Handling
-
-- `read()` / `write()` pass `-1` as the offset, telling libuv to use and update the file's
-  current position (like POSIX `read()`/`write()`).
-- `read_at()` / `write_at()` pass an explicit offset, implementing pread/pwrite semantics
-  (position is not modified).
-
----
-
-## Concurrency Hazards
-
-All known concurrency concerns are listed here for validation during Phase 2 and 3.
-
-### RESOLVED — `State::waker` concurrent read/write
-Worker thread writes `waker` on re-poll; I/O thread reads it in the callback. Resolved by
-`std::atomic<std::shared_ptr<Waker>>` in all state structs.
-
-### RESOLVED — `State` freed before the callback fires
-If the future is destroyed before the I/O thread processes the callback, the state must
-remain alive. Resolved by each `IoRequest` subclass holding `shared_ptr<State>`.
-
-### RESOLVED — `cancelled` read without the lock
-`~ReadFuture` / `~WriteFuture` write `cancelled`; the callback reads it. Resolved by
-making `cancelled` `std::atomic<bool>`.
-
-### CAUTION — `uv_cancel()` may fire the callback with `UV_ECANCELED`
-The callback must distinguish "cancelled by us" from "failed naturally". Solution:
-check `state->cancelled` in the callback. If true, do not wake the future (it is gone).
-If false and `req->result == UV_ECANCELED`, treat it as an I/O error and wake normally.
-
-### CAUTION — `uv_fs_req_cleanup()` must be called in every callback
-libuv allocates internal memory for the path string (in `uv_fs_open`) and other metadata.
-`uv_fs_req_cleanup(&state->req)` must be the **first** line in every callback, before
-accessing `req->result`. Failure to call this leaks memory.
-
-### CAUTION — `CloseRequest` has no callback or state
-The destructor submits a `CloseRequest` but does not wait for the close to complete —
-the close happens asynchronously after the `File` is destroyed. This is safe because
-the libuv file descriptor is an integer, not a pointer, so there is no UAF risk. However,
-if the same file is re-opened before the close completes, the OS may recycle the descriptor,
-leading to operations on the wrong file. This is a user-level race (opening the same path
-from multiple tasks) — not preventable at the library level. Document this in the `File`
-class comment.
-
-### CAUTION — `File::open()` must be called from an executor context
-`OpenFuture::poll()` calls `current_io_service()`, which throws if no `IoService` is set
-on the current thread. Users must not call `File::open()` outside of `Runtime::block_on()`
-or a spawned task. This is the same constraint as `SleepFuture` and `TcpStream` — enforce
-via documentation and the existing `current_io_service()` check.
-
----
-
-## Testing Strategy (Phase 2 / 3)
-
-### Unit Tests
-
-Create `test/test_file.cpp` with the following test cases:
-
-1. **Basic open/read/write/close** — open a temp file, write data, close, re-open read-only,
-   read back, verify contents match.
-2. **Read EOF** — read past the end of a file; verify `read()` returns 0.
-3. **Write to a file opened without `Create`** — expect open to fail with `ENOENT`.
-4. **Read from a file opened write-only** — expect read to fail with `EBADF`.
-5. **Positional I/O** — write at offset 100, read at offset 100, verify data.
-6. **Large file** — write 10MB in a loop, read back in chunks, verify correctness.
-7. **Cancellation** — start a read on a large file, drop the future before it completes,
-   verify no crash and no callback fires (check with a canary flag).
-8. **Multiple files concurrently** — open 10 files in parallel, write to all, read from all,
-   verify no cross-contamination.
-
-All tests use the existing `Runtime::block_on()` harness.
-
----
-
-## Example Usage
-
-### Simple read
-
-```cpp
-coro::Coro<std::string> read_file(std::string path) {
-    auto file = co_await coro::File::open(std::move(path), coro::FileMode::Read);
-
-    std::string contents;
-    std::array<std::byte, 4096> buf;
-    while (true) {
-        std::size_t n = co_await file.read(std::span(buf));
-        if (n == 0) break;  // EOF
-        contents.append(reinterpret_cast<const char*>(buf.data()), n);
+| Method | Returns | Syscall |
+|---|---|---|
+| `static open(path, mode)` | `OpenFuture` = `BlockingHandle<File>` | `open`, close-on-exec, mode 0644 with `Create` |
+| `read(buf)` / `write(buf)` | `IoFuture<Buf>` = `BlockingHandle<pair<size_t, Buf>>` | one `read` / `write` at the file position |
+| `read_exact(buf)` / `write_exact(buf)` | `IoFuture<Buf>` | loops until `buf` is full / written, or EOF |
+| `read_at(buf, off)` / `write_at(buf, off)` | `IoFuture<Buf>` | one `pread` / `pwrite` |
+| `read_at_exact` / `write_at_exact` | `IoFuture<Buf>` | positional loops |
+| `sync_all()` | `BlockingHandle<void>` | `fsync` |
+
+`FileMode` flags (`Read`, `Write`, `ReadWrite`, `Create`, `Truncate`, `Append`) combine
+with `|` and are translated to `sys::FileOpenFlags`, then to `O_*` flags by the backend.
+
+Errors are `std::system_error` in `std::system_category()`, thrown at `co_await`. A
+short read returns fewer bytes than `buf.size()`, and 0 means EOF. Any call on a
+moved-from `File` throws `std::logic_error`.
+
+### Ownership of the fd
+
+```mermaid
+classDiagram
+    class File {
+        shared_ptr~FileState~ m_state
     }
-
-    co_return contents;
-}
-```
-
-### Write with error handling
-
-```cpp
-coro::Coro<void> write_log(std::string message) {
-    auto file = co_await coro::File::open("app.log",
-        coro::FileMode::Write | coro::FileMode::Create | coro::FileMode::Append);
-
-    auto data = std::as_bytes(std::span(message));
-    std::size_t written = co_await file.write(data);
-
-    if (written != data.size()) {
-        throw std::runtime_error("partial write");
+    class FileState {
+        RawFd fd
+        ~FileState() file_close(fd)
     }
-}
+    class Job["spawn_blocking job"] {
+        shared_ptr~FileState~ state
+        Buf buf
+    }
+    File --> FileState
+    Job --> FileState
 ```
 
+`File` holds a `shared_ptr<detail::FileState>`, which owns the fd and closes it
+synchronously in its destructor. Every job captures its own share. So the fd closes
+when the `File` and every job started on it are gone, on whichever thread drops the last
+share, and never while a syscall is running on it (the fd can't be reused under a read
+either). Because the close is synchronous, reopening the same path right after dropping
+a `File` sees every completed write.
+
+### Eager operations
+
+The futures are `BlockingHandle`s, not lazy futures: an operation starts when the method
+is called, like a `JoinHandle`. `co_await` hides the difference. Dropping the handle
+detaches the job, which runs to completion and discards its result, buffer included.
+For `read()`/`write()` at the file position, that means the position still moves.
+
+!!! note "NOTE: no write-behind, unlike `tokio::fs::File`"
+    tokio's `File` buffers writes and reports their errors on a later call or on
+    `flush()`. coro's `write()` completes only when the syscall has returned, so dropping
+    a `File` never loses an error that was already reported as success. Completed writes
+    have reached the kernel, not necessarily the disk: `sync_all()` is for that.
+
 ---
 
-## File Placement
+## `lookup_host`
 
-Following `doc/module_structure.md`:
-
-- **Header:** `include/coro/io/file.h` (alongside `tcp_stream.h`, `ws_stream.h`)
-- **Implementation:** `src/io/file.cpp`
-- **Tests:** `test/test_file.cpp`
-
----
-
-## Dependencies
-
-No new dependencies — libuv is already integrated. The filesystem API is part of the core
-libuv library; no additional Conan packages are needed.
-
----
-
-## Open Questions
-
-### Should `File::open()` accept a free function or an OpenFuture factory?
-
-Current design:
 ```cpp
-auto file = co_await File::open(path, mode);  // static method returning OpenFuture
+#include <coro/io/lookup_host.h>
+
+std::vector<coro::SocketAddress> addrs = co_await coro::lookup_host("example.com", 443);
 ```
 
-Alternative (factory pattern):
-```cpp
-auto file = co_await coro::open_file(path, mode);  // free function returning OpenFuture
-```
+- **Numeric literals** (`"127.0.0.1"`, `"::1"`, `"fe80::1%3"`) are parsed by
+  `SocketAddress::parse` and returned at once, without a pool hop.
+- **Anything else** goes to `sys::resolve_host` on the blocking pool:
+  `getaddrinfo(AF_UNSPEC, SOCK_STREAM)`, so `/etc/hosts`, nsswitch and search domains
+  apply. Addresses come back in the resolver's preference order, each with `port`.
+- **Errors** are `std::system_error`, thrown at `co_await`. A resolver failure is in
+  `dns_error_category()` (category name `coro.dns`, `gai_strerror` messages; "no
+  addresses" is `EAI_NONAME`). `EAI_SYSTEM` is reported as its `errno` in
+  `std::system_category()`.
+- **Dropping the future** doesn't cancel the lookup. It finishes on the pool and the
+  result is discarded.
 
-**Decision:** stick with the static method. It matches `TcpStream::connect()` and keeps
-the API surface on the `File` type itself rather than polluting the `coro::` namespace
-with free functions.
+`TcpStream::connect`, `TcpListener::bind` and `UdpSocket::bind` take a host string and
+resolve it with `lookup_host`. They try each address in order and rethrow the last
+failure if all of them fail, as tokio does.
 
-### Should `FileMode` be a class enum or plain flags?
-
-Current design uses `enum class FileMode : unsigned` with bitwise operators. Alternatives:
-- Plain `enum` (pollutes the `coro::` namespace with `Read`, `Write`, etc.)
-- A `struct FileMode { bool read; bool write; ... }` (verbose, no natural `|` syntax)
-
-**Decision:** `enum class` with `operator|` overload is the most ergonomic. Users write
-`FileMode::Write | FileMode::Create`, which is self-documenting.
-
-### Should reads/writes return `std::expected<size_t, std::error_code>` or throw?
-
-The roadmap item "Migrate error-returning futures to `std::expected`" is planned but not
-yet implemented. For consistency with `TcpStream`, the initial `File` implementation will
-**throw** `std::system_error` on I/O errors. Once the `std::expected` migration lands,
-`File` will be updated to match.
-
-**Decision:** throw for now, migrate to `std::expected` in a follow-on pass.
+!!! tip "TODO: asynchronous resolver"
+    `getaddrinfo` holds a pool thread for the whole lookup, up to the resolver's timeout.
+    That is fine at connect-time rates. If a workload resolves many names concurrently,
+    consider an asynchronous resolver (c-ares, or a minimal UDP DNS client on the driver)
+    behind `sys/dns.h`.
 
 ---
 
-## Summary
+## Races
 
-This design extends the existing `IoService` pattern to filesystem I/O. `File` follows the
-same structure as `TcpStream`: all libuv-specific state is private, operations return
-`Future`s, and cancellation is handled via atomic flags + `uv_cancel()`. The implementation
-fits cleanly into the existing runtime without changes to `IoService`, `Executor`, or
-`Waker`.
+- **Close vs. an in-flight job.** Each job holds a share of `FileState`, so the close in
+  its destructor runs on whichever thread drops the last share: possibly a pool thread,
+  after the user has dropped the `File` and every future.
+- **Concurrent operations on one `File`.** Jobs may run in parallel on different pool
+  threads. `read_at`/`write_at` (`pread`/`pwrite`) share no state and may overlap
+  freely. Position-based `read`/`write` calls that overlap run in an unspecified order
+  and interleave at the kernel's discretion: await one before starting the next if order
+  matters. A `File` must not be moved or assigned while another task is calling it.
+- **Dropped open.** If the `OpenFuture` is dropped before its job finishes, the `File`
+  dies with the job's discarded result and closes its fd: no leak.
+- **Runtime shutdown.** The Runtime destroys its executor before its blocking pool, so no
+  task can be left awaiting a job that the pool abandons.
+
+!!! tip "TODO: io_uring backend for files"
+    `sys/file.h` is the seam for an io_uring backend (`IORING_OP_READ`/`WRITE`/`FSYNC`
+    completions reaped by the driver), which would drop the pool hop per operation. The
+    blocking pool would stay as the fallback where io_uring is unavailable or disabled
+    (containers, older kernels).
+
+---
+
+## Tests
+
+| Test | Checks |
+|---|---|
+| `FileTest.BasicOpenWriteReadClose`, `ReadEOF`, `PositionalIO`, `MultipleSequentialReads`, `MultipleConcurrentFiles` | Basic round trips, EOF, positional I/O, several files at once. |
+| `FileTest.OpenNonExistentFileForWrite` | `Write` without `Create` on a missing path throws. |
+| `FileTest.ExactVariantsRoundTripLargeBuffer` | 4 MiB `write_exact`/`read_exact` round trip; a read larger than the file stops short at EOF. |
+| `FileTest.ReadAtExactAndWriteAtExact` | Positional exact variants, overlapping writes. |
+| `FileTest.AppendWritesAtEnd` | `FileMode::Append`, plus `sync_all()`. |
+| `FileTest.OpenMissingFileThrowsEnoent` | The error code is `no_such_file_or_directory`. |
+| `FileTest.PendingWriteOutlivesFile` | Dropping the `File` with a write in flight: the write still lands. |
+| `FileTest.ReopenAfterDropSeesWrites` | Close is synchronous. |
+| `FileTest.MovedFromFileThrowsLogicError` | `write` and `sync_all` on a moved-from `File`. |
+| `FileTest.WorksWithoutDriver` | `CurrentThreadExecutor` with a `PollingParker`. |
+| `LookupHostTest.NumericLiteralsReturnThemselves` | IPv4 and IPv6 literals, port applied. |
+| `LookupHostTest.LocalhostResolvesToLoopbackWithPort` | Every result is loopback with the port. |
+| `LookupHostTest.UnresolvableNameThrowsDnsError` | `nonexistent.invalid` (RFC 6761) fails in `dns_error_category()`. |
+| `LookupHostTest.WorksWithoutDriver` | As for `File`. |
+
+---
+
+## Files
+
+| File | Contents |
+|---|---|
+| `include/coro/io/file.h`, `file.hpp`, `src/io/file.cpp` | `FileMode`, `detail::FileState`, `File` |
+| `include/coro/io/lookup_host.h`, `src/io/lookup_host.cpp` | `lookup_host()`, `dns_error_category()` |
+| `include/coro/detail/sys/file.h`, `src/detail/sys/file_posix.cpp` | File backend seam |
+| `include/coro/detail/sys/dns.h`, `src/detail/sys/dns_posix.cpp` | Resolver backend seam |
+| `test/io/test_file.cpp`, `test/io/test_lookup_host.cpp` | Tests |
+
+`file.h`, `file.hpp` and `lookup_host.h` are excluded from the Pico install.

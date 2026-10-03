@@ -1,116 +1,51 @@
+// Desktop File on the Runtime's blocking pool: no libuv. Every syscall goes through the
+// backend seam in include/coro/detail/sys/file.h. See doc/design/file_io.md.
+
 #include <coro/io/file.h>
-#include <coro/runtime/uv_future.h>
-#include <coro/task/spawn_on.h>
-#include <coro/coro.h>
+#include <stdexcept>
 #include <system_error>
-#include <fcntl.h>
 
 namespace coro {
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 namespace {
 
-[[noreturn]] void throw_uv_error(int status, const char* what) {
-    throw std::system_error(
-        std::error_code(-status, std::system_category()), what);
-}
+bool has(FileMode mode, FileMode flag) { return (mode & flag) != FileMode{}; }
 
-int translate_flags(FileMode mode) {
-    int flags = 0;
-    if ((mode & FileMode::ReadWrite) == FileMode::ReadWrite) flags |= O_RDWR;
-    else if ((mode & FileMode::Write) != FileMode{})         flags |= O_WRONLY;
-    else                                                     flags |= O_RDONLY;
-    if ((mode & FileMode::Create)   != FileMode{}) flags |= O_CREAT;
-    if ((mode & FileMode::Truncate) != FileMode{}) flags |= O_TRUNC;
-    if ((mode & FileMode::Append)   != FileMode{}) flags |= O_APPEND;
+detail::sys::FileOpenFlags translate_flags(FileMode mode) {
+    detail::sys::FileOpenFlags flags;
+    flags.write    = has(mode, FileMode::Write);
+    // Neither Read nor Write still opens read-only, as open(2) with O_RDONLY would.
+    flags.read     = has(mode, FileMode::Read) || !flags.write;
+    flags.create   = has(mode, FileMode::Create);
+    flags.truncate = has(mode, FileMode::Truncate);
+    flags.append   = has(mode, FileMode::Append);
     return flags;
 }
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// File — construction / move / destruction
-// ---------------------------------------------------------------------------
-
-File::File(uv_file fd, SingleThreadedUvExecutor* exec)
-    : m_fd(fd), m_exec(exec) {}
-
-File::File(File&& other) noexcept
-    : m_fd(other.m_fd), m_exec(other.m_exec) {
-    other.m_fd = -1;
+const std::shared_ptr<detail::FileState>& File::state(const char* what) const {
+    if (!m_state) throw std::logic_error(std::string(what) + ": moved-from File");
+    return m_state;
 }
-
-File& File::operator=(File&& other) noexcept {
-    if (this != &other) {
-        if (m_fd >= 0 && m_exec) {
-            with_context(*m_exec, [](SingleThreadedUvExecutor& exec, uv_file fd) -> Coro<void> {
-                uv_fs_t req;
-                UvCallbackResult<uv_fs_t*> result;
-                req.data = &result;
-                uv_fs_close(exec.loop(), &req, fd, [](uv_fs_t *req) {
-                    reinterpret_cast<decltype(result)*>(req->data)->complete(req);
-                });
-                co_await wait(result);
-                uv_fs_req_cleanup(&req);
-            }(*m_exec, m_fd)).detach();
-        }
-        m_fd   = other.m_fd;
-        m_exec = other.m_exec;
-        other.m_fd = -1;
-    }
-    return *this;
-}
-
-File::~File() {
-    if (m_fd >= 0 && m_exec) {
-        with_context(*m_exec, [](SingleThreadedUvExecutor& exec, uv_file fd) -> Coro<void> {
-            uv_fs_t req;
-            UvCallbackResult<uv_fs_t*> result;
-            req.data = &result;
-            uv_fs_close(exec.loop(), &req, fd, [](uv_fs_t *req) {
-                reinterpret_cast<decltype(result)*>(req->data)->complete(req);
-            });
-            co_await wait(result);
-            uv_fs_req_cleanup(&req);
-        }(*m_exec, m_fd)).detach();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// open
-// ---------------------------------------------------------------------------
 
 File::OpenFuture File::open(std::string path, FileMode mode) {
-    int flags = translate_flags(mode);
-    auto& exec = current_uv_executor();
-    return with_context(exec,
-            [](SingleThreadedUvExecutor& exec,
-               std::string path, int flags) -> Coro<File> {
-
-                UvCallbackResult<uv_file> result;
-                uv_fs_t req;
-                req.data = &result;
-
-                int r = uv_fs_open(exec.loop(), &req, path.c_str(), flags, 0644,
-                    [](uv_fs_t* r) {
-                        static_cast<decltype(result)*>(r->data)
-                            ->complete(static_cast<uv_file>(r->result));
-                        uv_fs_req_cleanup(r);
-                    });
-                if (r < 0)
-                    throw_uv_error(r, "uv_fs_open");
-
-                auto [fd] = co_await wait(result);
-                if (fd < 0)
-                    throw_uv_error(static_cast<int>(fd), "uv_fs_open");
-
-                co_return File(fd, &exec);
-            }(exec, std::move(path), flags)
-    );
+    return spawn_blocking([path = std::move(path), flags = translate_flags(mode)]() -> File {
+        auto fd = detail::sys::file_open(path, flags);
+        if (!fd)
+            throw std::system_error(fd.error(), std::system_category(),
+                                    "coro::File::open: " + path);
+        // If the OpenFuture was dropped, this File dies with the job's result and
+        // closes the fd.
+        return File(std::make_shared<detail::FileState>(*fd));
+    });
 }
 
+BlockingHandle<void> File::sync_all() {
+    return spawn_blocking([state = state("coro::File::sync_all")] {
+        if (auto r = detail::sys::file_sync(state->fd); !r)
+            throw std::system_error(r.error(), std::system_category(), "coro::File::sync_all");
+    });
+}
 
 } // namespace coro
