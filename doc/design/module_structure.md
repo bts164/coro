@@ -23,8 +23,9 @@ include/coro/
 │   ├── runtime.h
 │   ├── executor.h
 │   ├── single_threaded_uv_executor.h   libuv I/O reactor + task queue (dedicated thread)
-│   ├── current_thread_executor.h       polling executor — runs on calling thread (MCU)
-│   ├── single_threaded_executor.h
+│   ├── current_thread_executor.h       single-thread executor — runs on calling thread; parks in the I/O driver
+│   ├── parker.h                        Parker — how an executor waits for outside events
+│   ├── io_driver.h                     IoDriver — epoll readiness reactor
 │   ├── work_sharing_executor.h
 │   ├── work_stealing_executor.h
 │   └── uv_future.h         UvCallbackResult / UvFuture — libuv callback bridges
@@ -72,7 +73,6 @@ src/
 │   ├── runtime.cpp
 │   ├── executor.cpp
 │   ├── single_threaded_uv_executor.cpp
-│   ├── single_threaded_executor.cpp
 │   ├── current_thread_executor.cpp
 │   ├── work_sharing_executor.cpp
 │   └── work_stealing_executor.cpp
@@ -114,7 +114,8 @@ exports the `next()` helper that users call in `co_await` loops.
 Anything that drives tasks to completion or owns I/O infrastructure goes here. This includes:
 - The `Runtime` class (entry point for `block_on` and `spawn`)
 - The abstract `Executor` interface
-- Concrete executor implementations: `SingleThreadedExecutor`, `WorkSharingExecutor`, `WorkStealingExecutor`
+- Concrete executor implementations: `CurrentThreadExecutor`, `WorkSharingExecutor`, `WorkStealingExecutor`
+- `IoDriver` — the epoll readiness reactor that executors turn when they park
 - `SingleThreadedUvExecutor` — libuv event loop + task queue on a dedicated thread
 - `CurrentThreadExecutor` — polling executor for MCU targets; runs on the calling thread
 - `uv_future.h` — `UvCallbackResult` / `UvFuture` bridge libuv callbacks to coroutines

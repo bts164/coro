@@ -14,7 +14,7 @@
 #include <atomic>
 
 #ifndef CORO_PICO
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #endif

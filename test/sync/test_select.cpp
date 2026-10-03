@@ -154,7 +154,7 @@ TYPED_TEST(SelectTest, CancelledCoroBranchDrainsChildrenBeforeSelectCompletes) {
 }
 
 // ---------------------------------------------------------------------------
-// Timeout tests — desktop only (libuv-backed sleep_for)
+// Timeout tests — desktop only (sleep_for on the IoDriver's timers)
 // ---------------------------------------------------------------------------
 
 #ifndef CORO_PICO

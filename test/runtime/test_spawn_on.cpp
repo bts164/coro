@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <coro/task/spawn_on.h>
-#include <coro/runtime/single_threaded_uv_executor.h>
+#include <coro/runtime/work_stealing_executor.h>
 #include <coro/runtime/runtime.h>
 #include <coro/coro.h>
 #include <coro/co_invoke.h>
@@ -8,43 +8,58 @@
 
 using namespace coro;
 
+// The target in these tests is a WorkStealingExecutor bound to a second Runtime
+// (`other`), separate from the Runtime driving block_on (`rt`, single-threaded).
+// Its workers set current_runtime() to `other` and run on their own threads, so a
+// child can tell it ran on the target. `other` is declared before `exec` so the
+// executor, which turns other's IoDriver, is destroyed first.
+
+struct Observed {
+    Runtime*        runtime = nullptr;
+    std::thread::id thread;
+};
+
 // ---------------------------------------------------------------------------
 // spawn_on
 // ---------------------------------------------------------------------------
 
-// A future spawned via spawn_on runs on the target executor (verified by checking
-// current_uv_executor() from inside the child coroutine).
+// A future spawned via spawn_on runs on the target executor: on one of its worker
+// threads, with the target's runtime current.
 TEST(SpawnOnTest, RunsOnTargetExecutor) {
     Runtime rt(1);
-    SingleThreadedUvExecutor uv_exec;
+    Runtime other(1);
+    WorkStealingExecutor exec(&other, 2);
 
-    SingleThreadedUvExecutor* observed = nullptr;
+    Observed observed;
     rt.block_on(
-        [](SingleThreadedUvExecutor& exec, SingleThreadedUvExecutor*& obs) -> Coro<void> {
-            co_await spawn_on(exec,
-                [](SingleThreadedUvExecutor*& o) -> Coro<void> {
-                    o = &current_uv_executor();
+        [](Executor& ex, Observed& obs) -> Coro<void> {
+            co_await spawn_on(ex,
+                [](Observed& o) -> Coro<void> {
+                    o.runtime = &current_runtime();
+                    o.thread  = std::this_thread::get_id();
                     co_return;
                 }(obs)
             );
-        }(uv_exec, observed)
+        }(exec, observed)
     );
 
-    EXPECT_EQ(observed, &uv_exec);
+    EXPECT_EQ(observed.runtime, &other);
+    EXPECT_NE(observed.thread, std::this_thread::get_id());
 }
 
 // spawn_on with a value-returning future: the JoinHandle carries the result.
 TEST(SpawnOnTest, ReturnsValue) {
     Runtime rt(1);
-    SingleThreadedUvExecutor uv_exec;
+    Runtime other(1);
+    WorkStealingExecutor exec(&other, 2);
 
     int result = 0;
     rt.block_on(
-        [](SingleThreadedUvExecutor& exec, int& out) -> Coro<void> {
-            out = co_await spawn_on(exec, []() -> Coro<int> {
+        [](Executor& ex, int& out) -> Coro<void> {
+            out = co_await spawn_on(ex, []() -> Coro<int> {
                 co_return 42;
             }());
-        }(uv_exec, result)
+        }(exec, result)
     );
 
     EXPECT_EQ(result, 42);
@@ -58,55 +73,66 @@ TEST(SpawnOnTest, ReturnsValue) {
 // target executor and the result is returned to the awaiting caller.
 TEST(WithContextTest, ReturnsValue) {
     Runtime rt(1);
-    SingleThreadedUvExecutor uv_exec;
+    Runtime other(1);
+    WorkStealingExecutor exec(&other, 2);
 
     int result = 0;
     rt.block_on(
-        [](SingleThreadedUvExecutor& exec, int& out) -> Coro<void> {
-            out = co_await with_context(exec, []() -> Coro<int> {
+        [](Executor& ex, int& out) -> Coro<void> {
+            out = co_await with_context(ex, []() -> Coro<int> {
                 co_return 99;
             }());
-        }(uv_exec, result)
+        }(exec, result)
     );
 
     EXPECT_EQ(result, 99);
 }
 
-// The child coroutine passed to with_context runs on the target executor.
+// The child coroutine passed to with_context runs on the target executor, and the
+// caller resumes back on its own runtime and thread.
 TEST(WithContextTest, ChildRunsOnTargetExecutor) {
     Runtime rt(1);
-    SingleThreadedUvExecutor uv_exec;
+    Runtime other(1);
+    WorkStealingExecutor exec(&other, 2);
 
-    SingleThreadedUvExecutor* observed = nullptr;
+    Observed child;
+    Observed caller_after;
     rt.block_on(
-        [](SingleThreadedUvExecutor& exec, SingleThreadedUvExecutor*& obs) -> Coro<void> {
-            co_await with_context(exec,
-                [](SingleThreadedUvExecutor*& o) -> Coro<void> {
-                    o = &current_uv_executor();
+        [](Executor& ex, Observed& c, Observed& after) -> Coro<void> {
+            co_await with_context(ex,
+                [](Observed& o) -> Coro<void> {
+                    o.runtime = &current_runtime();
+                    o.thread  = std::this_thread::get_id();
                     co_return;
-                }(obs)
+                }(c)
             );
-        }(uv_exec, observed)
+            after.runtime = &current_runtime();
+            after.thread  = std::this_thread::get_id();
+        }(exec, child, caller_after)
     );
 
-    EXPECT_EQ(observed, &uv_exec);
+    EXPECT_EQ(child.runtime, &other);
+    EXPECT_NE(child.thread, std::this_thread::get_id());
+    EXPECT_EQ(caller_after.runtime, &rt);
+    EXPECT_EQ(caller_after.thread, std::this_thread::get_id());
 }
 
 // with_context void overload: completes without returning a value.
 TEST(WithContextTest, VoidFuture) {
     Runtime rt(1);
-    SingleThreadedUvExecutor uv_exec;
+    Runtime other(1);
+    WorkStealingExecutor exec(&other, 2);
 
     bool ran = false;
     rt.block_on(
-        [](SingleThreadedUvExecutor& exec, bool& r) -> Coro<void> {
-            co_await with_context(exec,
+        [](Executor& ex, bool& r) -> Coro<void> {
+            co_await with_context(ex,
                 [](bool& ran) -> Coro<void> {
                     ran = true;
                     co_return;
                 }(r)
             );
-        }(uv_exec, ran)
+        }(exec, ran)
     );
 
     EXPECT_TRUE(ran);
@@ -115,20 +141,21 @@ TEST(WithContextTest, VoidFuture) {
 // Caller resumes after with_context completes — work after the co_await executes.
 TEST(WithContextTest, CallerResumesAfterCompletion) {
     Runtime rt(1);
-    SingleThreadedUvExecutor uv_exec;
+    Runtime other(1);
+    WorkStealingExecutor exec(&other, 2);
 
     int sequence = 0;
     rt.block_on(
-        [](SingleThreadedUvExecutor& exec, int& seq) -> Coro<void> {
+        [](Executor& ex, int& seq) -> Coro<void> {
             seq = 1;
-            co_await with_context(exec,
+            co_await with_context(ex,
                 [](int& s) -> Coro<void> {
                     s = 2;
                     co_return;
                 }(seq)
             );
             seq = 3;
-        }(uv_exec, sequence)
+        }(exec, sequence)
     );
 
     EXPECT_EQ(sequence, 3);

@@ -23,6 +23,13 @@ class Runtime;
  * wakeups. Cross-thread (remote) wakeups go to a shared injection queue
  * protected by `m_mutex`.
  *
+ * **I/O and timers:** an idle worker blocks in the runtime's IoDriver::turn() in
+ * place of the condition variable, if no other worker already holds it. Remote
+ * enqueues then also unpark the driver. Kept deliberately simple (it is mainly a
+ * debugging aid): busy workers never turn the driver, so I/O and timers wait until a
+ * worker goes idle. See doc/design/executor_design.md,
+ * "I/O and timers: the driver handoff".
+ *
  * **Task lifecycle states** (tracked via Task::scheduling_state):
  * | State              | Location                   | Description                          |
  * |--------------------|----------------------------|--------------------------------------|
@@ -60,8 +67,16 @@ public:
     /// @brief Delegates to `state.wait_until_done()`.
     void wait_for_completion(detail::TaskStateBase& state) override;
 
+    /// True: an idle worker turns the runtime's IoDriver when no other worker holds it.
+    bool turns_io_driver() const noexcept override { return true; }
+
 private:
     void worker_loop(int worker_index);
+
+    /// Called with an empty local queue. Pops the injection queue, else turns the
+    /// driver if no other worker holds it, else waits on m_cv. Returns a task, or
+    /// null on shutdown or when a driver turn queued tasks locally.
+    std::shared_ptr<detail::TaskBase> wait_for_task(int worker_index);
 
     // Category 3 (see doc/task_ownership.md): temporary strong references held while
     // a task is Notified (in queue) or Running (local variable in worker loop).
@@ -71,9 +86,12 @@ private:
 
     // Injection queue — same category 3 reasoning as m_local_queues.
     std::deque<std::shared_ptr<detail::TaskBase>> m_injection_queue;
-    std::mutex               m_mutex;   ///< Guards m_injection_queue and m_stop.
+    std::mutex               m_mutex;   ///< Guards m_injection_queue, m_stop and m_driver_held.
     std::condition_variable  m_cv;
     bool                     m_stop{false};
+    /// True while one idle worker is blocked in IoDriver::turn() in place of m_cv.
+    /// At most one worker holds the driver; the others wait on m_cv. GUARDED BY m_mutex.
+    bool                     m_driver_held{false};
 
     std::vector<std::thread> m_workers;
     Runtime*                 m_runtime;

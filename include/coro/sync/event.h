@@ -5,6 +5,7 @@
 #include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
 #include <memory>
+#include <utility>
 #include <coro/detail/mutex.h>
 
 namespace coro {

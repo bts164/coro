@@ -66,7 +66,7 @@ coro::Coro<void> consume() {
 coro::Runtime rt;
 // WorkStealingExecutor, 4 threads
 coro::Runtime rt(4);
-// SingleThreadedExecutor — deterministic, good for tests
+// CurrentThreadExecutor — one thread, deterministic, good for tests
 coro::Runtime rt(1);
 
 int result = rt.block_on(compute());
@@ -74,9 +74,9 @@ rt.block_on(do_work());
 
 // Explicit executor selection:
 #include <coro/runtime/work_stealing_executor.h>
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 coro::Runtime rt(std::in_place_type<coro::WorkStealingExecutor>, 4);
-coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
+coro::Runtime rt(std::in_place_type<coro::CurrentThreadExecutor>);
 ```
 
 ## Spawn & JoinHandle

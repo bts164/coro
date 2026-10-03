@@ -24,9 +24,6 @@ namespace coro {
  *     handle_timeout();
  * @endcode
  *
- * @note Proactive wakeup at the deadline requires libuv integration (see @ref sleep_for).
- *       Until then, the timeout fires on the next poll after the deadline passes.
- *
  * @param duration  Maximum time to wait for `future`.
  * @param future    The future to race against the deadline.
  * @return A `SelectFuture` that resolves to either the future's result or a timeout signal.
@@ -34,6 +31,17 @@ namespace coro {
 template<Future F>
 [[nodiscard]] auto timeout(std::chrono::nanoseconds duration, F future) {
     return select(std::move(future), sleep_for(duration));
+}
+
+/**
+ * @brief Like @ref timeout, but with an absolute deadline.
+ *
+ * @param deadline  The instant after which `future` is abandoned.
+ * @param future    The future to race against the deadline.
+ */
+template<Future F>
+[[nodiscard]] auto timeout_at(Instant deadline, F future) {
+    return select(std::move(future), sleep_until(deadline));
 }
 
 } // namespace coro

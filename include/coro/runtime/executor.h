@@ -13,9 +13,9 @@ namespace coro {
  * Does not own threads or the I/O reactor — those are owned by @ref Runtime.
  *
  * Concrete implementations:
- * - @ref SingleThreadedExecutor — runs all tasks on the calling thread (deterministic, good for tests).
+ * - @ref CurrentThreadExecutor — runs all tasks on the calling thread (`Runtime(1)`, and the Pico port).
+ * - @ref WorkStealingExecutor — multi-threaded, per-worker queues with stealing (`Runtime(n)`).
  * - @ref WorkSharingExecutor — multi-threaded, single shared queue.
- * - @ref CurrentThreadExecutor — cooperative single-threaded polling executor for the Pico port (`CORO_PICO`).
  */
 class Executor {
 public:
@@ -34,12 +34,18 @@ public:
 
     /// @brief Block the calling thread until `state.terminated` is true.
     ///
-    /// `SingleThreadedExecutor` drives its own internal poll loop — it cannot block
+    /// `CurrentThreadExecutor` drives its own internal poll loop — it cannot block
     /// because it is the polling thread.
     /// Multi-threaded executors call `state.wait_until_done()`, blocking on `state.cv`.
     /// Because `terminated` is always set and `cv` notified under `state.mutex`, there
     /// is no lost-wakeup window.
     virtual void wait_for_completion(detail::TaskStateBase& state) = 0;
+
+    /// @brief True if this executor's threads turn the Runtime's @ref IoDriver.
+    ///
+    /// Driver-backed I/O primitives (e.g. `UdpSocket`) require it: on an executor
+    /// that never turns the driver, a wait for readiness would never be woken.
+    virtual bool turns_io_driver() const noexcept { return false; }
 };
 
 } // namespace coro

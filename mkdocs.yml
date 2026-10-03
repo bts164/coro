@@ -48,7 +48,7 @@ nav:
         - Stream (concept): coro/stream_8h.md
       - Runtime & Executors:
         - Runtime: coro/classcoro_1_1Runtime.md
-        - SingleThreadedExecutor: coro/classcoro_1_1SingleThreadedExecutor.md
+        - CurrentThreadExecutor: coro/classcoro_1_1CurrentThreadExecutor.md
         - SingleThreadedUvExecutor: coro/classcoro_1_1SingleThreadedUvExecutor.md
         - WorkStealingExecutor: coro/classcoro_1_1WorkStealingExecutor.md
         - WorkSharingExecutor: coro/classcoro_1_1WorkSharingExecutor.md
@@ -113,6 +113,7 @@ nav:
       - Channels: design/channels.md
       - JoinSet: design/join_set.md
       - Select: design/select.md
+      - Timers: design/timers.md
     - Platform & Integration:
       - Raspberry Pi Pico Port: design/pico_port.md
       - ISR Safety: design/isr_safety.md

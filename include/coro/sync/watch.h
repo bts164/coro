@@ -11,6 +11,7 @@
 #include <expected>
 #include <memory>
 #include <utility>
+#include <vector>
 #include <coro/detail/mutex.h>
 
 namespace coro {

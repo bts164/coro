@@ -506,7 +506,7 @@ include/coro/
 
 src/
   pico_executor.cpp             CurrentThreadExecutor + timer queue implementation
-  runtime.cpp                   Runtime::schedule_timer() (Pico gate)
+  runtime.cpp                   Runtime::add_timer() (Pico gate)
   pico/hal/
     dma.cpp                     AsyncDmaTransfer + DMA_IRQ_0 dispatch table
   pico/
@@ -534,28 +534,32 @@ examples/pico/
 
 ### `CurrentThreadExecutor`
 
-Identical CAS state machine as `SingleThreadedExecutor`
-(`Notified → Running → Idle / RunningAndNotified`). Key differences:
+The same executor as on desktop (see [Executor Design](executor_design.md),
+"CurrentThreadExecutor"), with the same CAS state machine
+(`Notified → Running → Idle / RunningAndNotified`). What differs on Pico:
 
-- **Single-threaded.** No remote injection queue. `enqueue()` pushes directly to
-  `m_ready`, nominally protected by `m_ready_mutex` (a `detail::Mutex` — a no-op on
-  Pico; see [Synchronisation](#synchronisation-and-isr-safety)). Wakers from ISR
+- **Parker.** A `PollingParker` around `cyw43_arch_poll()`, which never blocks, so the
+  loop busy-polls.
+- **Single-threaded.** No other threads. `m_ready_mutex` is a `detail::Mutex` — a no-op
+  on Pico; see [Synchronisation](#synchronisation-and-isr-safety). Wakers from ISR
   handlers must go through `IsrEvent` / `IsrChannel<T>`, not direct `enqueue()` calls.
 - **No `std::condition_variable` in the run loop.** `wait_for_completion()` polls
   `state.terminated` in a loop rather than blocking on a condvar.
-- **Timer queue.** A min-heap of `(deadline_us, waker)` pairs. `schedule_timer()`
-  pushes an entry; `check_expired_timers()` fires wakers on each loop iteration.
-  No hardware alarm or ISR is used — resolution is bounded by poll loop latency
-  (sub-millisecond in practice).
+- **Timer queue.** There is no `IoDriver`, so timers go to the executor's own
+  `detail::TimerQueue`: `Runtime::add_timer()` forwards to
+  `CurrentThreadExecutor::add_timer()`, and `check_expired_timers()` fires wakers on each
+  loop iteration. No hardware alarm or ISR is used — resolution is bounded by poll loop
+  latency (sub-millisecond in practice).
 - **`Runtime` is the public entry point.** Users call `rt.block_on(coro)`, not
   `CurrentThreadExecutor` methods directly. `CurrentThreadExecutor` is an internal implementation detail.
 
 ### `sleep_for` / `timeout` (Pico)
 
-`SleepFuture` records a deadline in microseconds (via `time_us_64()`) and calls
-`current_runtime().schedule_timer(deadline_us, waker)` on the first `poll()` where the
-deadline hasn't passed. `check_expired_timers()` in the executor loop fires the waker
-when the deadline is reached; the next `poll()` returns `PollReady`.
+`SleepFuture` is the same code as on desktop (see [Timers](timers.md)). Its deadline is
+a `coro::Instant` from `coro::Clock`, which on Pico reads `time_us_64()`. On the first
+pending `poll()` it calls `current_runtime().add_timer(deadline, slot)`, which lands in
+the executor's queue. `check_expired_timers()` fires the waker once the deadline has
+passed; the next `poll()` returns `PollReady`.
 
 `timeout<F>` is implemented on top of `sleep_for` and works unchanged on Pico because
 it only depends on `SleepFuture` and `select`.

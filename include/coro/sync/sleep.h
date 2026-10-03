@@ -2,203 +2,74 @@
 
 #include <coro/detail/poll_result.h>
 #include <coro/detail/context.h>
-#include <coro/detail/waker.h>
+#include <coro/detail/rc.h>
+#include <coro/detail/timer_queue.h>
+#include <coro/runtime/clock.h>
 #include <chrono>
 
-// ---------------------------------------------------------------------------
-// Pico port — timer-queue based sleep, no libuv
-// ---------------------------------------------------------------------------
-#ifdef CORO_PICO
-
-#include <coro/runtime/runtime.h>
-
 namespace coro {
 
 /**
- * @brief Future that completes once a wall-clock duration has elapsed.
+ * @brief Future that completes once a @ref Clock deadline has passed.
  *
- * On the first `poll()` call the deadline is registered with the CurrentThreadExecutor's
- * timer queue. `check_expired_timers()` in the executor's poll loop fires the
- * waker when `time_us_64() >= deadline_us`, re-enqueueing the task.
- * The next `poll()` then sees the deadline has passed and returns PollReady.
+ * Satisfies @ref Future<void>. The first pending `poll()` adds a timer to the
+ * current runtime's queue: the IoDriver's on desktop, where the deadline bounds the
+ * driver's `epoll_pwait2` at nanosecond resolution, or the CurrentThreadExecutor's
+ * on Pico. Every later pending poll replaces the stored waker, so the latest
+ * context is the one woken (e.g. under `select`).
  *
- * Timer resolution is bounded by the poll loop iteration time (sub-millisecond
- * in practice since the loop is tight). No ISR or hardware alarm is used.
+ * A leaf future with no `cancel()`: dropping it mid-wait is always safe. It empties
+ * its timer slot, and the queue entry is later popped without a wake.
+ *
+ * `poll()` checks the clock itself, so it is never ready early, and an early or
+ * spurious wake just leaves it pending.
+ *
+ * @throws std::logic_error from the first pending `poll()` if the runtime's executor
+ *         never turns the IoDriver (see `Runtime::add_timer()`).
+ *
+ * Prefer the @ref sleep_for / @ref sleep_until factories over constructing this.
  */
 class SleepFuture {
 public:
     using OutputType = void;
 
-    explicit SleepFuture(std::chrono::nanoseconds duration)
-        : m_deadline_us(current_runtime().now_us() + static_cast<uint64_t>(
-              std::max<int64_t>(0,
-                  std::chrono::duration_cast<std::chrono::microseconds>(duration).count())))
-    {}
+    explicit SleepFuture(Instant deadline) noexcept : m_deadline(deadline) {}
+    ~SleepFuture() { release(); }
 
-    PollResult<void> poll(detail::Context& cx) {
-        if (current_runtime().now_us() >= m_deadline_us) return PollReady;
-        if (!m_registered) {
-            current_runtime().schedule_timer(m_deadline_us, cx.getWaker());
-            m_registered = true;
+    SleepFuture(SleepFuture&& other) noexcept = default;
+    SleepFuture& operator=(SleepFuture&& other) noexcept {
+        if (this != &other) {
+            release();
+            m_deadline = other.m_deadline;
+            m_slot     = std::move(other.m_slot);
         }
-        return PollPending;
+        return *this;
     }
-
-private:
-    uint64_t m_deadline_us;
-    bool     m_registered = false;
-};
-
-[[nodiscard]] inline SleepFuture sleep_for(std::chrono::nanoseconds duration) {
-    return SleepFuture(duration);
-}
-
-} // namespace coro
-
-// ---------------------------------------------------------------------------
-// Desktop / libuv port
-// ---------------------------------------------------------------------------
-#else
-
-#include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/runtime/uv_future.h>
-#include <coro/task/spawn_on.h>
-#include <coro/coro.h>
-#include <uv.h>
-#include <atomic>
-#include <memory>
-
-namespace coro {
-
-/**
- * @brief Future that completes once a wall-clock deadline has passed.
- *
- * Satisfies @ref Future<void>. On the first `poll()` call after the deadline
- * has not yet passed, registers a one-shot libuv timer via the uv executor.
- * The I/O thread fires the timer at the deadline and calls `waker->wake()`,
- * which re-enqueues the task. The next `poll()` then sees `fired == true`
- * and returns `PollReady`.
- *
- * @note Timer resolution is **milliseconds** (libuv limitation). The deadline is
- *       stored in whole milliseconds (ceiled at construction). Because libuv schedules
- *       timers relative to `loop->time` (frozen at the start of each loop iteration),
- *       which can lag `steady_clock` by up to 1ms, the timer may fire marginally before
- *       the deadline. `poll()` detects this, discards the state, and reschedules for the
- *       remaining ~1ms; the rescheduled timer is guaranteed not to fire early because
- *       `loop->time` has already advanced past the original deadline by then. Actual
- *       wake latency is subject to I/O-thread scheduling jitter; sub-millisecond
- *       precision is not achievable regardless.
- *
- * @note `SleepFuture` must not be shared across threads. It is intended to
- *       live inside a coroutine frame and be polled by a single executor thread.
- *
- * Prefer the @ref sleep_for factory function over constructing this directly.
- */
-class SleepFuture {
-public:
-    using OutputType = void;
-
-    explicit SleepFuture(std::chrono::nanoseconds duration)
-        : m_deadline(std::chrono::ceil<std::chrono::milliseconds>(
-              std::chrono::steady_clock::now() + duration)) {}
-
-    ~SleepFuture() {
-        if (m_state) {
-            // Use the cached m_uv_exec rather than current_uv_executor() because
-            // the thread-local may have been cleared by the time the destructor runs.
-            with_context(*m_uv_exec,
-                [](std::shared_ptr<State> state) -> Coro<void> {
-                    // fired.exchange(true) avoids double-close if timer_cb already won.
-                    if (!state->fired.exchange(true)) {
-                        uv_timer_stop(&state->handle);
-                        uv_close(reinterpret_cast<uv_handle_t*>(&state->handle), close_cb);
-                    }
-                    co_return;
-                }(std::move(m_state))
-            ).detach();
-        }
-    }
-
     SleepFuture(const SleepFuture&)            = delete;
     SleepFuture& operator=(const SleepFuture&) = delete;
-    SleepFuture(SleepFuture&&)                 = default;
-    SleepFuture& operator=(SleepFuture&&)      = default;
 
-    PollResult<void> poll(detail::Context& ctx) {
-        if (m_state && m_state->fired.load(std::memory_order_acquire)) {
-            if (std::chrono::steady_clock::now() >= m_deadline)
-                return PollReady;
-            // libuv fired the timer marginally early: loop->time (set at the start of the
-            // current loop iteration) can lag steady_clock by up to 1ms, making the computed
-            // delay 1ms too short. timer_cb already called uv_close so the handle is being
-            // cleaned up — discard the state and fall through to reschedule for the remaining
-            // ~1ms. The rescheduled timer cannot fire early again because by the time it fires,
-            // loop->time will have advanced past the original deadline.
-            m_state = nullptr;
-        }
+    PollResult<void> poll(detail::Context& cx);
 
-        if (std::chrono::steady_clock::now() >= m_deadline)
-            return PollReady;
-
-        if (!m_state) {
-            // First poll (or reschedule after early firing): allocate shared state and register
-            // the timer. Cache the uv executor pointer so the destructor can cancel the timer
-            // even if the thread-local has been cleared before this future is destroyed.
-            m_uv_exec = &current_uv_executor();
-            m_state = std::make_shared<State>();
-            m_state->waker.store(ctx.getWaker());
-            using TimePoint = std::chrono::time_point<std::chrono::steady_clock,
-                                                      std::chrono::milliseconds>;
-            with_context(*m_uv_exec,
-                [](std::shared_ptr<State> state, TimePoint deadline) -> Coro<void> {
-                    uv_timer_init(current_uv_executor().loop(), &state->handle);
-                    state->handle.data = new std::shared_ptr<State>(state);
-                    auto now_ms = std::chrono::floor<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now());
-                    auto ms = (deadline - now_ms).count();
-                    uv_timer_start(&state->handle, timer_cb,
-                                   static_cast<uint64_t>(std::max<int64_t>(0, ms)), 0);
-                    co_return;
-                }(m_state, m_deadline)
-            ).detach();
-        } else {
-            // Re-polled before timer fired (e.g. woken by a select branch).
-            // Atomically update the waker — timer_cb may read it concurrently on the I/O thread.
-            m_state->waker.store(ctx.getWaker());
-        }
-        return PollPending;
-    }
+    /// The instant this future becomes ready.
+    Instant deadline() const noexcept { return m_deadline; }
 
 private:
-    struct State : std::enable_shared_from_this<State> {
-        uv_timer_t                                  handle;
-        std::atomic<std::shared_ptr<detail::Waker>> waker;
-        std::atomic<bool>                           fired{false};
-    };
+    /// Empties the slot's waker, so the queue entry fires nothing. Idempotent.
+    void release() noexcept;
 
-    static void timer_cb(uv_timer_t* handle) {
-        auto* sp    = static_cast<std::shared_ptr<State>*>(handle->data);
-        auto* state = sp->get();
-        if (!state->fired.exchange(true)) {
-            state->waker.load()->wake();
-            uv_close(reinterpret_cast<uv_handle_t*>(handle), close_cb);
-        }
-    }
-
-    static void close_cb(uv_handle_t* handle) {
-        delete static_cast<std::shared_ptr<State>*>(handle->data);
-    }
-
-    std::chrono::time_point<std::chrono::steady_clock,
-                            std::chrono::milliseconds> m_deadline;
-    std::shared_ptr<State>                m_state;
-    SingleThreadedUvExecutor*             m_uv_exec = nullptr;
+    Instant                       m_deadline;
+    // Null until the first pending poll; shared with the timer queue's entry.
+    detail::Rc<detail::TimerSlot> m_slot;
 };
 
+/// @brief Completes once `deadline` has passed.
+[[nodiscard]] inline SleepFuture sleep_until(Instant deadline) {
+    return SleepFuture(deadline);
+}
+
+/// @brief Completes once `duration` has elapsed, measured from this call.
 [[nodiscard]] inline SleepFuture sleep_for(std::chrono::nanoseconds duration) {
-    return SleepFuture(duration);
+    return SleepFuture(Clock::now() + std::chrono::ceil<Clock::duration>(duration));
 }
 
 } // namespace coro
-
-#endif // CORO_PICO

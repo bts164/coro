@@ -2,37 +2,27 @@
 
 Planned work not yet implemented, in rough priority order.
 
-## Single-thread mode: `block_on` drives the uv loop directly
+## WorkStealingExecutor: more than 64 workers
 
-Allow the `Runtime` to run libuv, libwebsockets, and all user coroutine tasks on a
-single thread — including the calling thread in `block_on` — with no background uv
-thread at all.
+`WorkStealingExecutor` tracks parked workers in a single `std::atomic<uint64_t>`
+idle mask, so the pool is capped at `MAX_WORKERS` (64). A larger `num_threads`,
+including the `hardware_concurrency()` default on a >64-core machine, is clamped to
+64. (It used to throw `std::invalid_argument`, which made `Runtime()` fail outright on
+such machines.)
 
-**Motivation:** embedded targets, deterministic testing, and applications where the OS
-scheduler overhead of a second thread is undesirable. Matches the `tokio::runtime::Builder::new_current_thread()` model.
+!!! tip "TODO: Lift the 64-worker cap"
+    Two options:
 
-**Design sketch:**
-
-- `SingleThreadedUvExecutor` gains a "no-thread" construction mode. The uv loop and
-  lws context are initialized on first call to `run_until()` rather than in a spawned
-  thread.
-- A `run_until(predicate)` method (or equivalent) drives `io_thread_loop` on the
-  calling thread, stopping when `predicate()` returns true (e.g. `state.terminated`).
-- `Runtime::block_on` in this mode calls `run_until(state.terminated)` directly instead
-  of scheduling a task and calling `wait_for_completion` (which would deadlock — the
-  loop is not running).
-- The `uv_async_t` doorbell is retained but becomes a no-op wake source since all
-  enqueue calls now originate on the same thread.
-- A new `Runtime` constructor overload (or factory) opts into this mode:
-  ```cpp
-  auto rt = Runtime::single_threaded(); // no background thread
-  rt.block_on([](auto...) -> Coro<void> { ... }());
-  ```
-
-**Key invariant:** `SingleThreadedUvExecutor` must detect whether it owns the calling
-thread (i.e. `run_until` is on the stack) and short-circuit `enqueue` to push directly
-to `m_ready` without the `uv_async_send` cross-thread wake, avoiding a redundant
-doorbell interrupt on every task wake.
+    - **Multi-word idle bitmap** (smallest change): `std::vector<std::atomic<uint64_t>>`
+      with `ceil(n / 64)` chunks. A worker sets and clears its own bit in chunk `i / 64`,
+      and `notify_if_needed()` scans for the first non-zero chunk. The set-bit,
+      re-check, park protocol is unchanged, since each worker touches only its own bit.
+      Tokio's experimental `multi_thread_alt` scheduler used this shape.
+    - **Tokio-style counters plus sleeper list**: one atomic word packs the searching
+      and unparked counts for the enqueue fast path, and the parked worker indices
+      live in a mutex-protected `std::vector`, locked only when a wake is needed.
+      This has no worker limit and wakes workers in LIFO order (warmer caches), but
+      it is a larger rewrite of the park/notify protocol.
 
 ## Migrate error-returning futures to `std::expected`
 

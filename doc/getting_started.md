@@ -409,21 +409,20 @@ int main() {
 
 ### Choosing an executor
 
-The executor determines how tasks are scheduled across threads. Four are available:
+The executor determines how tasks are scheduled across threads. Three are available:
 
 | Executor | Task threads | I/O | Use case |
 |---|---|---|---|
-| `WorkStealingExecutor` | N (default: `hardware_concurrency()`) | Dedicated libuv thread, runs concurrently | Production default — tasks distributed across threads automatically |
-| `WorkSharingExecutor` | N | Dedicated libuv thread, runs concurrently | Rarely needed — see below |
-| `SingleThreadedExecutor` | 1 | Dedicated libuv thread, runs concurrently | Deterministic, unsynchronized task ordering, while still overlapping I/O work (e.g. `PollStream` packet decoding) with task execution |
-| `CurrentThreadExecutor` | 1 (caller's thread) | Interleaved on the same thread, no dedicated thread at all | No OS threads whatsoever — MCU/no-RTOS targets, or a fully isolated nested `Runtime` |
+| `WorkStealingExecutor` | N (default: `hardware_concurrency()`) | Turned by whichever worker parks first | Production default — tasks distributed across threads automatically |
+| `WorkSharingExecutor` | N | Turned by whichever worker parks first | Rarely needed — see below |
+| `CurrentThreadExecutor` | 1 (caller's thread) | Polled on the same thread: the executor waits in the I/O driver when idle | Deterministic, unsynchronized task ordering; tests; MCU/no-RTOS targets; nested `Runtime`s |
 
 The `Runtime` constructor selects the executor based on the thread count argument:
 
 ```cpp
 coro::Runtime rt;       // WorkStealingExecutor, hardware_concurrency() threads
 coro::Runtime rt(4);    // WorkStealingExecutor, 4 threads
-coro::Runtime rt(1);    // SingleThreadedExecutor
+coro::Runtime rt(1);    // CurrentThreadExecutor
 ```
 
 For explicit control over executor type, use `std::in_place_type`:
@@ -431,12 +430,10 @@ For explicit control over executor type, use `std::in_place_type`:
 ```cpp
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/runtime/work_sharing_executor.h>
-#include <coro/runtime/single_threaded_executor.h>
 #include <coro/runtime/current_thread_executor.h>
 
 coro::Runtime rt(std::in_place_type<coro::WorkStealingExecutor>, 4);
 coro::Runtime rt(std::in_place_type<coro::WorkSharingExecutor>, 4);
-coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
 coro::Runtime rt(std::in_place_type<coro::CurrentThreadExecutor>);
 ```
 
@@ -449,28 +446,14 @@ becomes a contention bottleneck under any significant task load. It is occasiona
 useful when debugging to help isolate whether a bug is specific to the work-stealing
 scheduler, but work-stealing should be preferred in virtually every other situation.
 Only reach for this if you understand the trade-offs and have a concrete reason to.
-- **Single-threaded** is ideal for tests and deterministic environments. All coroutines
-run on one task thread — no synchronization is needed for shared state between
-coroutines, and execution order is reproducible. I/O still runs concurrently on its own
-dedicated libuv thread, so, for example, a `PollStream` decoding a packet can do so in
-parallel with your tasks even though the tasks themselves never run concurrently with
-each other — I/O throughput isn't sacrificed just because task scheduling is serial.
-- **Current-thread** gives you the same unsynchronized, deterministic task ordering as
-single-threaded, but without even a separate I/O thread — task polling and I/O polling
-are interleaved on the one calling thread instead of running concurrently. Reach for it
-when you cannot create any OS thread at all (bare-metal/no-RTOS MCU targets), or when you
-want a nested `Runtime` (e.g. inside `spawn_blocking`) that is guaranteed not to spawn any
-threads of its own. Unlike the other three, it is never selected by the `Runtime`
-thread-count constructor and must be requested explicitly via
-`std::in_place_type<coro::CurrentThreadExecutor>`.
-
-??? tip "TODO: CurrentThreadExecutor desktop support is incomplete"
-    `CurrentThreadExecutor` is fully implemented and is the only executor available on
-    MCU targets, but on desktop it currently requires manually supplied `ClockFn`/`PollFn`
-    hooks and the `Runtime` does not yet know how to skip the dedicated libuv thread and
-    blocking pool when it's selected. Full desktop support — a no-arg constructor and a
-    lightweight `Runtime` path that ticks libuv as the poll function instead of running it
-    on its own thread — is planned but not yet implemented.
+- **Current-thread** is ideal for tests and deterministic environments. All coroutines
+run on the one calling thread — no synchronization is needed for shared state between
+coroutines, and execution order is reproducible. When no task is ready, the thread waits
+in the I/O driver (epoll on Linux) until a socket becomes ready, a timer expires, or
+another thread wakes a task, so an idle runtime uses no CPU. It never creates task
+threads of its own, which also makes it the right choice for a nested `Runtime` (e.g.
+inside `spawn_blocking`) and the only executor on MCU targets, where it busy-polls the
+network stack instead of blocking. `Runtime(1)` selects it.
 
 The server code itself is unchanged regardless of which executor you use — the runtime
 is a pure deployment knob. Because the choice is just a constructor argument, it can
@@ -481,7 +464,7 @@ int main(int argc, char* argv[]) {
     bool single = argc > 1 && std::string_view(argv[1]) == "--single-threaded";
 
     if (single) {
-        coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
+        coro::Runtime rt(std::in_place_type<coro::CurrentThreadExecutor>);
         return rt.block_on(run_server());
     } else {
         coro::Runtime rt(std::in_place_type<coro::WorkStealingExecutor>);
@@ -1724,7 +1707,7 @@ coro::Coro<void> handle_connection(coro::TcpStream stream) {
 This compiles and even works, in the sense that it produces the right answer — but
 there's no `co_await` in `legacy_blocking_call()`, so nothing about it tells the executor
 it should run something else in the meantime. The call just blocks the OS thread the way
-it would in any non-async program, for however long it takes. On a `SingleThreadedExecutor`
+it would in any non-async program, for however long it takes. On a `CurrentThreadExecutor`
 every other task in the entire program is frozen for that duration — there's no other
 thread to pick up the slack. On a `WorkStealingExecutor` the other worker threads keep
 going, but the one thread running `handle_connection` is gone from the pool until the
@@ -1788,7 +1771,7 @@ The server brings together the runtime entry point, async I/O, a task per connec
 ```cpp
 #include <coro/coro.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/io/tcp_listener.h>
 #include <coro/io/tcp_stream.h>
@@ -1850,7 +1833,7 @@ int main(int argc, char* argv[]) {
     int threads = (argc > 1) ? std::stoi(argv[1]) : 0;
 
     if (threads == 1) {
-        Runtime rt(std::in_place_type<SingleThreadedExecutor>);
+        Runtime rt(std::in_place_type<CurrentThreadExecutor>);
         return rt.block_on(run_server());
     } else {
         int n = threads > 1 ? threads : (int)std::thread::hardware_concurrency();
@@ -1872,7 +1855,7 @@ into a `JoinSet` so `async_main` waits for every one to finish before returning.
 ```cpp
 #include <coro/coro.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/io/file.h>
 #include <coro/io/tcp_stream.h>
@@ -1973,7 +1956,7 @@ int main(int argc, char* argv[]) {
 
     if (threads == 1) {
         // All 12+ tasks — clients, collector, file I/O — on one OS thread.
-        Runtime rt(std::in_place_type<SingleThreadedExecutor>);
+        Runtime rt(std::in_place_type<CurrentThreadExecutor>);
         return rt.block_on(async_main(std::move(message)));
     } else {
         // Same code, now distributed across N worker threads — nothing else changes.

@@ -135,7 +135,7 @@ The four handler methods use three different names (`Handle`, `Generate`, `Proce
 std::size_t m_request_count = 0;
 ```
 
-Handlers can share state as ordinary member variables. Because this server uses `SingleThreadedExecutor` — all coroutines run on one thread — there are no data races and no mutexes are needed. By default `Runtime` uses a multi-threaded `WorkStealingExecutor`, so be careful if you copy this example. It's only because we explicilty specify `SingleThreadedExecutor` that we get thread safety.
+Handlers can share state as ordinary member variables. Because this server uses `CurrentThreadExecutor` — all coroutines run on one thread — there are no data races and no mutexes are needed. By default `Runtime` uses a multi-threaded `WorkStealingExecutor`, so be careful if you copy this example. It's only because we explicitly specify `CurrentThreadExecutor` that we get thread safety.
 
 ---
 
@@ -143,14 +143,14 @@ Handlers can share state as ordinary member variables. Because this server uses 
 
 ```cpp
 auto server = std::make_shared<HelloWorldServer>();
-coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
+coro::Runtime rt(std::in_place_type<coro::CurrentThreadExecutor>);
 rt.block_on(HelloWorldServer::Serve(server, port));
 ```
 
 Three lines start the entire server:
 
 1. **`make_shared`** — `GrpcServer` uses `shared_from_this` to keep itself alive across spawned coroutines. A `shared_ptr` is required.
-2. **`Runtime`** — creates the async executor. `SingleThreadedExecutor` is deterministic and needs no synchronization between handlers.
+2. **`Runtime`** — creates the async executor. `CurrentThreadExecutor` is deterministic and needs no synchronization between handlers.
 3. **`block_on`** — drives `Serve()` to completion. `Serve()` builds the gRPC server, spawns the initial request listeners, and runs the completion-queue loop until shutdown.
 
 ---

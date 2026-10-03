@@ -660,9 +660,9 @@ executor free — the blocking pool thread pays the cost of `block_on`, not a wo
 while giving the inner code full access to `co_await`, timers, and `spawn`.
 
 Prefer `CurrentThreadExecutor` for the nested runtime: it runs its poll loop directly on
-the calling (blocking pool) thread with no extra threads of its own. `SingleThreadedExecutor`
-and `WorkStealingExecutor` both spawn additional worker threads — wasteful when the
-blocking pool thread is already dedicated to this work and allowed to block.
+the calling (blocking pool) thread with no task threads of its own. `WorkStealingExecutor`
+spawns additional worker threads — wasteful when the blocking pool thread is already
+dedicated to this work and allowed to block.
 
 ```cpp
 Coro<void> run() {
@@ -674,23 +674,10 @@ Coro<void> run() {
 }
 ```
 
-!!! tip "TODO: CurrentThreadExecutor needs desktop defaults"
-    `CurrentThreadExecutor` currently requires explicit `ClockFn` and `PollFn` arguments
-    (designed for Pico, where `time_us_64` and `cyw43_arch_poll` are injected at
-    construction). Two changes are needed before the example above compiles on desktop:
-
-    1. **Default desktop constructor** — add a no-arg (or desktop-defaulted) constructor
-       to `CurrentThreadExecutor` that supplies `std::chrono::steady_clock` for the clock
-       and a no-op for the poll function.
-    2. **Lightweight `Runtime` path** — the desktop `Runtime` constructor currently always
-       creates a dedicated libuv thread (`m_uv_executor`) and a blocking pool, because
-       `SingleThreadedExecutor` and `WorkStealingExecutor` have no hook for interleaving
-       an I/O poll function. `CurrentThreadExecutor` was designed around the opposite
-       model: one thread, everything interleaved — the injected `PollFn` is called on
-       every loop iteration alongside task polling (on Pico: `cyw43_arch_poll()`; on
-       desktop: `uv_run(loop, UV_RUN_NOWAIT)`). When the executor is
-       `CurrentThreadExecutor`, the `Runtime` should skip the dedicated libuv thread and
-       blocking pool and instead pass a `uv_run(UV_RUN_NOWAIT)` tick as the `PollFn`.
+!!! note "NOTE: the nested runtime has its own driver and blocking pool"
+    Every desktop `Runtime`, including this nested one, owns its own `IoDriver` (an
+    epoll fd and an eventfd) and blocking pool. The pool starts threads only when
+    `spawn_blocking` is called on it, so the nested runtime adds no threads otherwise.
 
 ---
 

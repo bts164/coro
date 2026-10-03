@@ -4,7 +4,7 @@
 #include <pico/cyw43_arch.h>
 #include <pico/time.h>
 #else
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #endif
 #include <stdexcept>
@@ -26,13 +26,11 @@ Runtime::Runtime(bool enable_network) {
     // no CYW43 chip at all -- calling it there touches driver state that was
     // never initialized (cyw43_arch_init() never ran), which is undefined
     // behavior, not just a no-op.
-    CurrentThreadExecutor::PollFn poll_fn = enable_network
-        ? CurrentThreadExecutor::PollFn([]() { cyw43_arch_poll(); })
-        : CurrentThreadExecutor::PollFn([]() {});
+    std::function<void()> poll_fn = enable_network
+        ? std::function<void()>([]() { cyw43_arch_poll(); })
+        : std::function<void()>([]() {});
     auto exec = std::make_unique<CurrentThreadExecutor>(
-        []() -> uint64_t { return time_us_64(); },
-        std::move(poll_fn)
-    );
+        std::make_unique<PollingParker>(std::move(poll_fn)));
     m_current_thread_executor = exec.get();
     m_executor = std::move(exec);
 }
@@ -41,12 +39,12 @@ bool Runtime::poll() {
     return m_current_thread_executor->poll_ready_tasks();
 }
 
-uint64_t Runtime::now_us() const {
-    return m_current_thread_executor->now_us();
+PicoClock::time_point PicoClock::now() noexcept {
+    return time_point(duration(static_cast<rep>(time_us_64())));
 }
 
-void Runtime::schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> waker) {
-    m_current_thread_executor->schedule_timer(deadline_us, std::move(waker));
+void Runtime::add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot) {
+    m_current_thread_executor->add_timer(deadline, std::move(slot));
 }
 
 void Runtime::register_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker) {
@@ -61,7 +59,7 @@ Runtime::Runtime(std::size_t num_threads)
     : m_blocking_pool(this)
 {
     if (num_threads <= 1)
-        m_executor = std::make_unique<SingleThreadedExecutor>();
+        m_executor = std::make_unique<CurrentThreadExecutor>(this);
     else
         m_executor = std::make_unique<WorkStealingExecutor>(this, num_threads);
 }
@@ -69,9 +67,19 @@ Runtime::Runtime(std::size_t num_threads)
 Runtime::~Runtime() {
     // Destruction order (reverse declaration order):
     //   1. m_executor — joins all worker threads; no more waker->wake() calls after this.
+    //      Its tasks' IoRegistrations deregister from m_io_driver here.
     //   2. m_blocking_pool — joins blocking pool threads.
-    //   3. m_uv_executor — stops the uv thread and closes the loop last.
+    //   3. m_io_driver — closes the epoll and eventfd.
+    //   4. m_uv_executor — stops the uv thread and closes the loop last.
     // No explicit action needed here; member destructors fire in the right order.
+}
+
+void Runtime::add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot) {
+    if (!turns_io_driver())
+        throw std::logic_error(
+            "coro timer: this runtime's executor never turns the IoDriver, so the "
+            "timer could never fire; use Runtime(n)");
+    m_io_driver.add_timer(deadline, std::move(slot));
 }
 #endif
 

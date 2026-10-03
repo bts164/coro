@@ -1,14 +1,45 @@
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
+#include <cassert>
 #include <cstdlib>
 #include <iostream>
 
 #ifdef CORO_PICO
 #include <coro/detail/fiber_context.h>
+#else
+#include <coro/runtime/io_driver.h>
+#include <coro/runtime/runtime.h>
 #endif
 
 namespace coro {
+
+namespace {
+// The executor whose loop is inside park() on this thread, if any. Lets
+// enqueue() tell a wake fired by the parker itself (an I/O event dispatched
+// inside IoDriver::turn() on this thread) from a wake by another thread: only
+// the latter needs unpark(). Plain static on Pico, like runtime.cpp's
+// t_current_runtime: single core, no threads.
+#ifdef CORO_PICO
+CurrentThreadExecutor* t_parked_executor = nullptr;
+#else
+thread_local CurrentThreadExecutor* t_parked_executor = nullptr;
+#endif
+} // namespace
+
+CurrentThreadExecutor::CurrentThreadExecutor(std::unique_ptr<Parker> parker)
+    : m_parker(std::move(parker))
+{
+    assert(m_parker && "CurrentThreadExecutor needs a Parker");
+}
+
+#ifndef CORO_PICO
+CurrentThreadExecutor::CurrentThreadExecutor(Runtime* rt)
+    : CurrentThreadExecutor(std::make_unique<IoDriverParker>(rt->io_driver()))
+{
+    m_turns_io_driver = true;
+}
+#endif
 
 void CurrentThreadExecutor::schedule(detail::Rc<detail::TaskBase> task) {
     task->owning_executor = this;
@@ -18,16 +49,36 @@ void CurrentThreadExecutor::schedule(detail::Rc<detail::TaskBase> task) {
         std::lock_guard lock(m_owned_mutex);
         m_owned_tasks.insert(task);
     }
-    std::lock_guard lock(m_ready_mutex);
-    m_ready.push(std::move(task));
+    // Through enqueue(), not a bare push: spawn() may run on another thread (e.g. a
+    // blocking-pool thread driving a stream) while this executor is parked with no
+    // limit, and only enqueue() unparks it. A bare push here was a lost wake-up.
+    enqueue(std::move(task));
 }
 
 // May be called from outside the executor thread: an ISR on Pico or an
 // external thread on multi-threaded platforms. m_ready_mutex provides the
 // appropriate serialisation for the current platform (see detail/mutex.h).
 void CurrentThreadExecutor::enqueue(detail::Rc<detail::TaskBase> task) {
+    bool unpark;
+    {
+        std::lock_guard lock(m_ready_mutex);
+        m_ready.push(std::move(task));
+        // m_parked is set under this lock together with park_once()'s empty
+        // check, so either that check sees this task (and parks with a zero
+        // wait), or we see m_parked and unpark. A wake fired from inside park()
+        // on the executor's own thread needs no unpark: the loop runs again as
+        // soon as park() returns.
+        unpark = m_parked && t_parked_executor != this;
+    }
+    // Race (benign): the executor may leave park() for another reason between
+    // the unlock above and this call. The unpark then makes its NEXT park()
+    // return early — one extra loop iteration, nothing lost.
+    if (unpark) m_parker->unpark();
+}
+
+bool CurrentThreadExecutor::empty() const {
     std::lock_guard lock(m_ready_mutex);
-    m_ready.push(std::move(task));
+    return m_ready.empty();
 }
 
 bool CurrentThreadExecutor::poll_ready_tasks() {
@@ -110,18 +161,40 @@ bool CurrentThreadExecutor::poll_ready_tasks() {
     return true;
 }
 
-void CurrentThreadExecutor::schedule_timer(uint64_t deadline_us,
-                                           detail::Rc<detail::Waker> waker) {
-    m_timers.push({deadline_us, std::move(waker)});
+void CurrentThreadExecutor::add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot) {
+    // True only while park_once() is parked for a later deadline, which a timer
+    // added from the executor's own thread can never see.
+    // Race (benign): park() may return for another reason before this unpark(); it
+    // then makes the next park() return early, one extra loop iteration.
+    if (m_timers.insert(deadline, std::move(slot))) m_parker->unpark();
+}
+
+void CurrentThreadExecutor::park_once() {
+    std::optional<std::chrono::nanoseconds> max_wait;
+    {
+        std::lock_guard lock(m_ready_mutex);
+        if (!m_ready.empty()) {
+            max_wait = std::chrono::nanoseconds::zero();
+        } else {
+            // From here until end_wait(), an add_timer() with an earlier deadline
+            // unparks us; see TimerQueue::begin_wait().
+            max_wait = m_timers.begin_wait(std::nullopt);
+            // From here until park() returns, a remote enqueue() must unpark us.
+            m_parked = true;
+        }
+    }
+    t_parked_executor = this;
+    m_parker->park(max_wait);
+    t_parked_executor = nullptr;
+    m_timers.end_wait();
+    {
+        std::lock_guard lock(m_ready_mutex);
+        m_parked = false;
+    }
 }
 
 void CurrentThreadExecutor::check_expired_timers() {
-    const uint64_t now = m_clock();
-    while (!m_timers.empty() && m_timers.top().deadline_us <= now) {
-        auto waker = m_timers.top().waker;
-        m_timers.pop();
-        waker->wake();
-    }
+    m_timers.fire_expired();
 }
 
 #ifdef CORO_PICO
@@ -200,7 +273,13 @@ void CurrentThreadExecutor::wait_for_completion(detail::TaskStateBase& state) {
         }
         poll_ready_tasks();
         check_expired_timers();
-        m_poll();
+        {
+            // The poll above may have finished the root task. Without this
+            // check an empty queue would park with no limit, forever.
+            std::lock_guard lock(state.mutex);
+            if (state.terminated) break;
+        }
+        park_once();
 #ifdef CORO_PICO
         check_isr_events();
 #endif

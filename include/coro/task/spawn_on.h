@@ -12,8 +12,8 @@ namespace coro {
  *
  * Unlike `coro::spawn()` (which targets the current runtime's executor), `spawn_on`
  * lets the caller choose the executor explicitly. Useful for routing work to a
- * specific executor — for example, dispatching I/O-bound coroutines to the
- * @ref SingleThreadedUvExecutor.
+ * specific executor — for example, keeping a latency-sensitive group of tasks on a
+ * dedicated executor, separate from the runtime's general-purpose workers.
  *
  * Use `build_task().name("...").spawn(future)` if you need to set a task name.
  *
@@ -40,11 +40,12 @@ template<Future F>
  * `co_await with_context(...)` suspends the caller until the child completes, this
  * is always satisfied — the caller cannot return before the child finishes.
  *
- * Typical usage (from a coroutine running on a work-stealing executor):
+ * Typical usage (from a coroutine running on another executor; `exec` is some other
+ * Executor, e.g. a WorkStealingExecutor dedicated to a subsystem):
  * @code
- * auto result = co_await with_context(rt.uv_executor(),
+ * auto result = co_await with_context(exec,
  *     co_invoke([&]() -> Coro<int> {
- *         // runs on the uv executor — safe to call libuv APIs here
+ *         // runs on exec's worker threads
  *         co_return 42;
  *     }));
  * // resumes on the original executor

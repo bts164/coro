@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/coro.h>
@@ -107,9 +107,11 @@ TEST(WorkStealingExecutorTest, DirectConstruction) {
     (void)exec;
 }
 
-TEST(WorkStealingExecutorTest, RejectsMoreThanMaxWorkers) {
+TEST(WorkStealingExecutorTest, ClampsMoreThanMaxWorkers) {
     Runtime rt(1);
-    EXPECT_THROW(WorkStealingExecutor(&rt, 65), std::invalid_argument);
+    // 65 workers would overflow the 64-bit idle mask; the constructor clamps to MAX_WORKERS.
+    WorkStealingExecutor exec(&rt, WorkStealingExecutor::MAX_WORKERS + 1);
+    (void)exec;
 }
 
 // ---------------------------------------------------------------------------

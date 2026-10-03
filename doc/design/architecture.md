@@ -202,7 +202,7 @@ alive long enough for the wake call to complete, then it is freed.
 `Runtime` is the top-level object. On desktop it owns:
 - A `SingleThreadedUvExecutor` (`m_uv_executor`) — dedicated thread running the libuv
   event loop and all I/O callbacks; also a full `Executor` for I/O-facing coroutines
-- An `Executor` (`m_executor`) — user-facing task scheduler; `SingleThreadedExecutor` or
+- An `Executor` (`m_executor`) — user-facing task scheduler; `CurrentThreadExecutor` or
   `WorkStealingExecutor` selected by thread count at construction
 - A `BlockingPool` (thread pool for blocking work)
 
@@ -809,8 +809,7 @@ include/coro/
     runtime.h               Runtime — owns executor, SingleThreadedUvExecutor, BlockingPool
     executor.h              Executor interface
     single_threaded_uv_executor.h   SingleThreadedUvExecutor — uv thread + task queue
-    single_threaded_executor.h      SingleThreadedExecutor — calling-thread poll loop
-    current_thread_executor.h       CurrentThreadExecutor — MCU polling executor
+    current_thread_executor.h       CurrentThreadExecutor — calling-thread loop; parks in the I/O driver
     work_sharing_executor.h         WorkSharingExecutor
     work_stealing_executor.h        WorkStealingExecutor
     uv_future.h             UvCallbackResult<Args...>, UvFuture — uv callback bridges

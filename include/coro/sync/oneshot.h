@@ -8,6 +8,7 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <variant>
 #include <coro/detail/mutex.h>
 #include <utility>
 

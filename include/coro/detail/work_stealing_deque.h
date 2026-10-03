@@ -76,6 +76,11 @@ public:
         return std::move(stolen[0]);
     }
 
+    std::size_t size() const {
+        std::lock_guard lock(m_mutex);
+        return m_deque.size();
+    }
+
     bool empty() const {
         std::lock_guard lock(m_mutex);
         return m_deque.empty();

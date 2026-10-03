@@ -1,10 +1,13 @@
 #pragma once
 
 #include <coro/runtime/executor.h>
+#include <coro/runtime/clock.h>
+#include <coro/detail/timer_queue.h>
 #ifndef CORO_PICO
+#include <coro/runtime/io_driver.h>
 #include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/task/spawn_on.h>
 #include <coro/runtime/uv_future.h>
+#include <coro/task/spawn_on.h>
 #include <coro/task/spawn_blocking.h>
 #include <mutex>
 #include <thread>
@@ -39,8 +42,9 @@ Runtime& current_runtime();
 /**
  * @brief Top-level runtime object. Entry point for all async execution.
  *
- * Owns the @ref Executor and, in the standard build, the thread pool and libuv
- * event loop. Construct one `Runtime` per application and call `block_on()` to
+ * Owns the @ref Executor and, in the standard build, the epoll I/O driver, the
+ * blocking pool and the libuv event loop that the I/O primitives not yet on the
+ * driver still use. Construct one `Runtime` per application and call `block_on()` to
  * drive async work from a synchronous context (e.g. `main()`).
  *
  * `Runtime` is not copyable or movable.
@@ -72,13 +76,9 @@ public:
     explicit Runtime(bool enable_network = true);
     ~Runtime() = default;
 
-    /// @brief Returns the current time in microseconds from the executor's clock.
-    /// Used by SleepFuture to read and compare deadlines consistently.
-    uint64_t now_us() const;
-
-    /// @brief Registers a one-shot timer that fires `waker` at `deadline_us`
-    /// microseconds since the clock epoch. Used by sleep_for().
-    void schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> waker);
+    /// @brief Adds a timer that wakes `slot`'s waker once `deadline` has passed, on
+    /// the CurrentThreadExecutor's queue. Used by SleepFuture.
+    void add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot);
 
     /// @brief Registers an ISR-safe waiter to be peeked once per event loop iteration.
     ///
@@ -110,7 +110,8 @@ public:
     bool poll();
 #else
     /// @brief Constructs a Runtime with the default executor for the given thread count.
-    /// `num_threads <= 1` → SingleThreadedExecutor; otherwise → WorkStealingExecutor.
+    /// `num_threads <= 1` → CurrentThreadExecutor (tasks run on the thread calling
+    /// `block_on()`, which also turns the I/O driver); otherwise → WorkStealingExecutor.
     explicit Runtime(std::size_t num_threads = std::thread::hardware_concurrency());
 
     /// @brief Constructs a Runtime with an explicit executor type.
@@ -130,8 +131,22 @@ public:
 
     ~Runtime();
 
-    /// @brief Returns the runtime's SingleThreadedUvExecutor.
+    /// @brief Returns the runtime's SingleThreadedUvExecutor, which runs the I/O
+    /// primitives that are not on the IoDriver yet.
     SingleThreadedUvExecutor& uv_executor() { return m_uv_executor; }
+
+    /// @brief Returns the runtime's epoll I/O driver. See doc/design/io_driver.md.
+    IoDriver& io_driver() { return m_io_driver; }
+
+    /// @brief True if the executor turns io_driver(). Driver-backed I/O primitives
+    /// (e.g. `UdpSocket::bind()`) throw `std::logic_error` when it is false.
+    bool turns_io_driver() const noexcept { return m_executor->turns_io_driver(); }
+
+    /// @brief Adds a timer that wakes `slot`'s waker once `deadline` has passed, on
+    /// the driver's queue. Used by SleepFuture.
+    /// @throws std::logic_error if the executor doesn't turn the driver, where the
+    ///         timer could never fire.
+    void add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot);
 
     /// @brief Returns the runtime's BlockingPool. Used by spawn_blocking().
     BlockingPool& blocking_pool() { return m_blocking_pool; }
@@ -215,13 +230,20 @@ private:
     std::unique_ptr<Executor> m_executor;
 #else
     // Declaration order matters for destruction (members destroyed in reverse order):
-    //   m_uv_executor — owns the uv thread and loop; must outlive everything else.
+    //   m_uv_executor — owns the uv thread and loop; must outlive everything else,
+    //                   since worker threads may wake tasks through it.
+    //   m_io_driver   — must outlive m_executor: tasks own futures that own
+    //                   IoRegistrations, which deregister on destruction, and the
+    //                   executor's IoDriverParker unparks it. Only executor threads
+    //                   turn it, so nothing dispatches once m_executor is gone.
+    //                   Declared before m_blocking_pool so a late wake from a
+    //                   blocking thread can still unpark it.
     //   m_blocking_pool — must outlive m_executor so blocking threads can still
     //                     call current_runtime() during their final work item.
-    //   m_executor    — worker threads may call waker->wake() which routes through
-    //                   m_uv_executor; destroyed first so all wakes land before
-    //                   m_uv_executor shuts down.
+    //   m_executor    — destroyed first: joins its worker threads, so no task runs
+    //                   once the members above start going away.
     SingleThreadedUvExecutor  m_uv_executor;
+    IoDriver                  m_io_driver;
     BlockingPool              m_blocking_pool;
     std::unique_ptr<Executor> m_executor;
 #endif

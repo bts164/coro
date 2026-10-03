@@ -11,7 +11,7 @@
 #include "grpc_server.h"
 
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/io/poll_stream.hpp>
 #include <coro/io/decoder_stream.h>
 #include <coro/io/byte_source.h>
@@ -229,7 +229,7 @@ int main(int argc, char *argv[])
     // for each RPC method it wants to handle.
     auto server = std::make_shared<SignalServer>();
 
-    coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
+    coro::Runtime rt(std::in_place_type<coro::CurrentThreadExecutor>);
     rt.block_on(SignalServer::Serve(server, port));
     return 0;
 }

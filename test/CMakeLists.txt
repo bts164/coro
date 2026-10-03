@@ -36,8 +36,10 @@ set(TEST_NAMES
     # runtime/
     test_runtime
     test_executor_task
+    test_current_thread_executor
     test_work_sharing_executor
     test_work_stealing_executor
+    test_work_stealing_io
     test_single_threaded_uv_executor
     test_uv_future
     test_spawn_on
@@ -93,8 +95,10 @@ set(TEST_SRCS
     # runtime/
     runtime/test_runtime.cpp
     runtime/test_executor_task.cpp
+    runtime/test_current_thread_executor.cpp
     runtime/test_work_sharing_executor.cpp
     runtime/test_work_stealing_executor.cpp
+    runtime/test_work_stealing_io.cpp
     runtime/test_single_threaded_uv_executor.cpp
     runtime/test_uv_future.cpp
     runtime/test_spawn_on.cpp
@@ -209,6 +213,8 @@ add_library(coro_pico_core STATIC
     ${CORO_SRC}/task/task.cpp
     ${CORO_SRC}/task/context.cpp
     ${CORO_SRC}/sync/cancellation_token.cpp
+    ${CORO_SRC}/sync/sleep.cpp
+    ${CORO_SRC}/detail/timer_queue.cpp
     ${CORO_SRC}/runtime/executor.cpp
     ${CORO_SRC}/runtime/runtime.cpp
     ${CORO_SRC}/runtime/current_thread_executor.cpp
@@ -255,6 +261,7 @@ add_executable(test_pico_suite
     sync/test_oneshot.cpp
     sync/test_broadcast.cpp
     sync/test_isr_event.cpp
+    sync/test_sleep_pico.cpp
     task/test_join_set.cpp
     task/test_stream_handle.cpp
     test_co_invoke.cpp

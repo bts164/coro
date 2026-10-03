@@ -10,7 +10,7 @@
 #include "grpc_server.h"
 
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/sync/sleep.h>
 
 using helloworld::Greeter;
@@ -174,7 +174,7 @@ int main(int argc, char *argv[])
     // for each RPC method it wants to handle.
     auto server = std::make_shared<HelloWorldServer>();
 
-    coro::Runtime rt(std::in_place_type<coro::SingleThreadedExecutor>);
+    coro::Runtime rt(std::in_place_type<coro::CurrentThreadExecutor>);
     rt.block_on(HelloWorldServer::Serve(server, port));
     return 0;
 }

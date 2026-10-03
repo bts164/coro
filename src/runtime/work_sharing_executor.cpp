@@ -1,6 +1,5 @@
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/detail/context.h>
 #include <cstdlib>
 #include <iostream>
@@ -23,6 +22,7 @@ WorkSharingExecutor::WorkSharingExecutor(Runtime* runtime, std::size_t num_threa
 }
 
 WorkSharingExecutor::~WorkSharingExecutor() {
+    bool unpark_driver;
     {
         std::lock_guard lock(m_mutex);
         // RACE CONDITION NOTE: m_stop must be set *inside* m_mutex before notify_all().
@@ -30,8 +30,13 @@ WorkSharingExecutor::~WorkSharingExecutor() {
         // then we set m_stop=true and call notify_all(), and the worker enters wait()
         // and sleeps forever (lost wakeup).
         m_stop = true;
+        // A worker takes the driver only under m_mutex after checking m_stop, so
+        // either it saw m_stop (and won't block), or we see it holding the driver.
+        unpark_driver = m_driver_held;
     }
     m_cv.notify_all();
+    // The Runtime destroys its executor before its driver, so this is safe.
+    if (unpark_driver) m_runtime->io_driver().unpark();
     for (auto& t : m_workers)
         t.join();
 }
@@ -54,11 +59,21 @@ void WorkSharingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
         m_local_queues[idx].push(std::move(task));
     } else {
         // Remote path: external or main thread — use shared injection queue.
+        bool unpark_driver;
         {
             std::lock_guard lock(m_mutex);
             m_injection_queue.push_back(std::move(task));
+            // m_driver_held is set under this lock before the holder leaves it to
+            // block, so either the holder's re-check sees the task or we unpark it.
+            unpark_driver = m_driver_held;
         }
         m_cv.notify_one();
+        // Both: the notified condvar waiter (if any) takes the task, and the holder
+        // only loses a turn. Unpark before the holder blocks is not lost: the
+        // driver's eventfd stays readable until its poll consumes it.
+        // Race (benign): the holder may leave turn() for another reason first; the
+        // unpark then makes its next turn return at once.
+        if (unpark_driver) m_runtime->io_driver().unpark();
     }
 }
 
@@ -70,6 +85,7 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     t_owning_executor = this;
     t_worker_index    = worker_index;
     set_current_runtime(m_runtime);
+    // I/O primitives not yet on the IoDriver still reach the uv loop through this.
     set_current_uv_executor(&m_runtime->uv_executor());
 
     while (true) {
@@ -79,16 +95,13 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
         if (auto local = m_local_queues[worker_index].pop()) {
             task = std::move(*local);
         } else {
-            // Local queue empty — wait for the injection queue or shutdown.
-            std::unique_lock lock(m_mutex);
-            m_cv.wait(lock, [&] {
-                return !m_injection_queue.empty() || m_stop;
-            });
-            if (!m_injection_queue.empty()) {
-                task = std::move(m_injection_queue.front());
-                m_injection_queue.pop_front();
+            // Local queue empty: wait for the injection queue or shutdown, turning the
+            // driver if no other worker is. Returns a task, or null on shutdown.
+            task = wait_for_task(worker_index);
+            if (task == nullptr && !m_local_queues[worker_index].empty()) {
+                // A driver turn woke tasks onto this worker's local queue.
+                continue;
             }
-            // lock released here
         }
 
         if (!task) {
@@ -164,6 +177,40 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     set_current_uv_executor(nullptr);
     t_owning_executor = nullptr;
     t_worker_index    = -1;
+}
+
+std::shared_ptr<detail::TaskBase> WorkSharingExecutor::wait_for_task(int worker_index) {
+    std::unique_lock lock(m_mutex);
+    for (;;) {
+        if (!m_injection_queue.empty()) {
+            auto task = std::move(m_injection_queue.front());
+            m_injection_queue.pop_front();
+            return task;
+        }
+        if (m_stop) return nullptr;
+        if (m_driver_held) {
+            // Another worker is in the driver; it notifies m_cv when it leaves.
+            m_cv.wait(lock);
+            continue;
+        }
+
+        m_driver_held = true;
+        lock.unlock();
+        // Wakes from I/O events and timers fire on this thread, so they land in this
+        // worker's local queue (enqueue()'s local path).
+        m_runtime->io_driver().turn(std::nullopt);
+        lock.lock();
+        m_driver_held = false;
+
+        if (!m_local_queues[worker_index].empty() || !m_injection_queue.empty() || m_stop) {
+            // Leaving the driver to run tasks (or exit): let a condvar waiter take it
+            // over. Otherwise loop and take it again ourselves.
+            // Race (benign): the notified worker may find the driver already re-taken
+            // by another, and go back to waiting.
+            m_cv.notify_one();
+            if (!m_local_queues[worker_index].empty()) return nullptr;
+        }
+    }
 }
 
 } // namespace coro

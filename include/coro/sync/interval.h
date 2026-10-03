@@ -1,12 +1,9 @@
 #pragma once
 
 #include <coro/coro.h>
+#include <coro/runtime/clock.h>
 #include <coro/sync/sleep.h>
 #include <chrono>
-
-#ifdef CORO_PICO
-#include <coro/runtime/runtime.h>
-#endif
 
 namespace coro {
 
@@ -30,51 +27,22 @@ namespace coro {
 class IntervalTimer {
 public:
     explicit IntervalTimer(std::chrono::nanoseconds period) noexcept
-        : m_period(period) {}
+        : m_period(std::chrono::ceil<Clock::duration>(period)),
+          m_next(Clock::now() + m_period) {}
 
     [[nodiscard]] Coro<void> tick() {
-#ifdef CORO_PICO
-        auto period_us = static_cast<uint64_t>(
-            std::max<int64_t>(0,
-                std::chrono::duration_cast<std::chrono::microseconds>(m_period).count()));
-        if (!m_initialized) {
-            m_next_us    = current_runtime().now_us() + period_us;
-            m_initialized = true;
-        }
-        uint64_t now = current_runtime().now_us();
-        if (now < m_next_us)
-            co_await sleep_for(std::chrono::microseconds(m_next_us - now));
-        m_next_us += period_us;
+        co_await sleep_until(m_next);
+        m_next += m_period;
         // Drift guard: if we've fallen more than one period behind, reset rather
         // than trying to catch up (which would result in a burst of immediate ticks).
-        now = current_runtime().now_us();
-        if (m_next_us < now)
-            m_next_us = now + period_us;
-#else
-        if (!m_initialized) {
-            m_next        = std::chrono::steady_clock::now() + m_period;
-            m_initialized = true;
-        }
-        auto now = std::chrono::steady_clock::now();
-        if (now < m_next)
-            co_await sleep_for(m_next - now);
-        m_next += m_period;
-        // Drift guard: same logic as the Pico branch.
-        now = std::chrono::steady_clock::now();
+        const Instant now = Clock::now();
         if (m_next < now)
             m_next = now + m_period;
-#endif
     }
 
 private:
-    std::chrono::nanoseconds m_period;
-    bool                     m_initialized = false;
-
-#ifdef CORO_PICO
-    uint64_t m_next_us = 0;
-#else
-    std::chrono::steady_clock::time_point m_next{};
-#endif
+    Clock::duration m_period;
+    Instant         m_next;
 };
 
 } // namespace coro

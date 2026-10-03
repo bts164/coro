@@ -1,11 +1,10 @@
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/detail/context.h>
+#include <algorithm>
 #include <bit>
 #include <cstdlib>
 #include <iostream>
-#include <stdexcept>
 
 namespace coro {
 
@@ -14,6 +13,23 @@ namespace coro {
 // intra-executor wakeups to the local queue without a lock.
 thread_local WorkStealingExecutor* t_wse_owning_executor = nullptr;
 thread_local int                   t_wse_worker_index    = -1;
+
+namespace {
+
+// True while this worker thread is inside IoDriver::try_turn(). Wakes the driver
+// dispatches then are local enqueues that skip notify_if_needed(): this worker runs
+// them itself as soon as the turn returns (after_turn() wakes a peer if it got more
+// than one). See doc/design/work_stealing_executor.md, "Parking and its races".
+thread_local bool t_wse_in_driver_turn = false;
+
+struct InDriverTurn {
+    InDriverTurn()  { t_wse_in_driver_turn = true; }
+    ~InDriverTurn() { t_wse_in_driver_turn = false; }
+    InDriverTurn(const InDriverTurn&)            = delete;
+    InDriverTurn& operator=(const InDriverTurn&) = delete;
+};
+
+} // namespace
 
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
 using TaskSP = detail::TaskBase*;
@@ -39,12 +55,16 @@ struct InjectionOverflow {
 
 WorkStealingExecutor::WorkStealingExecutor(Runtime* runtime, std::size_t num_threads) :
 #ifndef CORO_USE_LOCAL_RUN_QUEUE
-    m_local_queues(num_threads),
+    m_local_queues(std::min(num_threads, MAX_WORKERS)),
 #endif
-    m_runtime(runtime)
+    m_runtime(runtime),
+    m_driver(runtime->io_driver())
 {
-    if (num_threads > MAX_WORKERS)
-        throw std::invalid_argument("WorkStealingExecutor: num_threads exceeds MAX_WORKERS (64)");
+    // TODO: temporary cap. m_idle_mask is one uint64_t, so extra workers are dropped
+    // rather than failing construction on >64-core machines, where the default
+    // (hardware_concurrency) would otherwise throw. Lifting it means a multi-word
+    // idle bitmap; see doc/roadmap.md, "WorkStealingExecutor: more than 64 workers".
+    num_threads = std::min(num_threads, MAX_WORKERS);
 
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
     m_worker_queues.reserve(num_threads);
@@ -70,9 +90,11 @@ WorkStealingExecutor::~WorkStealingExecutor() {
         std::lock_guard lock(m_mutex);
         m_stop = true;
     }
-    // Wake every parked worker so they observe m_stop and exit.
-    for (auto& slot : m_workers)
-        slot->parker.release();
+    // Wake every parked worker so they observe m_stop and exit: a worker in the
+    // driver gets driver.unpark(), one on its condvar gets notified, and one that
+    // isn't parked yet banks a token so its next park returns at once.
+    for (int i = 0; i < static_cast<int>(m_workers.size()); ++i)
+        unpark_worker(i);
     for (auto& slot : m_workers)
         slot->thread.join();
 }
@@ -89,10 +111,11 @@ void WorkStealingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
 }
 
 void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
-    const int local_idx = t_wse_worker_index;
+    const int  local_idx = t_wse_worker_index;
+    const bool local     = local_idx >= 0 && t_wse_owning_executor == this;
 
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
-    if (local_idx >= 0 && t_wse_owning_executor == this) {
+    if (local) {
         // Fast path: push to own local queue; spill to injection queue if full.
         InjectionOverflow overflow{m_mutex, m_injection_queue};
         m_worker_queues[local_idx].local.push_or_overflow(task.get(), overflow);
@@ -103,7 +126,7 @@ void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
         m_injection_queue.push_back(task.get());
     }
 #else
-    if (local_idx >= 0 && t_wse_owning_executor == this) {
+    if (local) {
         // Fast path: called from a worker of this executor.
         m_local_queues[local_idx].push(task.get());
     } else {
@@ -118,6 +141,11 @@ void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
         }
     }
 #endif
+    // A wake dispatched by this worker's own driver turn: the worker runs the task
+    // itself when the turn returns, and after_turn() wakes a peer if needed. Waking
+    // one here would at best pick this very worker (its idle bit is still set) and
+    // at worst have a peer steal the task it is about to run.
+    if (local && t_wse_in_driver_turn) return;
     notify_if_needed();
 }
 
@@ -131,9 +159,79 @@ void WorkStealingExecutor::notify_if_needed() {
     // Otherwise wake one parked worker to begin searching.
     const uint64_t idle = m_idle_mask.load(std::memory_order_acquire);
     if (idle) {
+        // Race (benign): two enqueuers may both pick the same worker before it
+        // clears its idle bit. unpark_worker() is idempotent; the second call only
+        // re-banks the token, costing that worker one extra loop iteration.
         const int idx = std::countr_zero(idle);
-        m_workers[idx]->parker.release();
+        unpark_worker(idx);
     }
+}
+
+std::size_t WorkStealingExecutor::park_worker(int index) {
+    WorkerSlot& slot = *m_workers[index];
+
+    // ParkedDriver is published only while this worker already holds the driver.
+    // Publishing it first was a lost wake-up: unpark_worker()'s eventfd write could
+    // be consumed by ANOTHER worker's turn (a busy worker's try_turn(0), or the
+    // previous holder returning), after which this worker took the driver and blocked
+    // in epoll with Notified sitting unread. Only the holder resets the eventfd, so
+    // an unpark after before_poll() below always reaches this worker's poll().
+    //
+    // Race (benign): a stale eventfd write from an earlier unpark can make this turn
+    // return at once; the worker finds nothing and parks again.
+    std::optional<std::size_t> dispatched;
+    {
+        InDriverTurn in_turn;
+        dispatched = m_driver.try_turn(std::nullopt, [&slot] {
+            std::lock_guard lock(slot.park_mutex);
+            if (slot.park_state == ParkState::Notified) return false;   // token banked
+            slot.park_state = ParkState::ParkedDriver;
+            return true;
+        });
+    }
+
+    std::unique_lock lock(slot.park_mutex);
+    if (!dispatched && slot.park_state != ParkState::Notified) {
+        // Another worker holds the driver: wait on our own condvar instead.
+        slot.park_state = ParkState::ParkedCondvar;
+        slot.park_cv.wait(lock, [&] { return slot.park_state == ParkState::Notified; });
+    }
+    // Consumes any token, including one whose driver.unpark() hasn't been written
+    // yet. That late write then makes the next turn (by whichever worker) return
+    // at once: a stale unpark, costing one loop iteration.
+    slot.park_state = ParkState::Empty;
+    return dispatched.value_or(0);
+}
+
+void WorkStealingExecutor::unpark_worker(int index) {
+    WorkerSlot& slot = *m_workers[index];
+    ParkState prev;
+    {
+        std::lock_guard lock(slot.park_mutex);
+        prev = slot.park_state;
+        slot.park_state = ParkState::Notified;
+    }
+    // Outside the lock. Race (benign): the worker may already have woken for
+    // another reason; see the stale-unpark note in park_worker().
+    if (prev == ParkState::ParkedDriver)
+        m_driver.unpark();
+    else if (prev == ParkState::ParkedCondvar)
+        slot.park_cv.notify_one();
+    // Empty or Notified: the token is banked; the next park_worker() returns at once.
+}
+
+std::size_t WorkStealingExecutor::local_len(int index) const {
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+    return m_worker_queues[index].local.len();
+#else
+    return m_local_queues[index].size();
+#endif
+}
+
+void WorkStealingExecutor::after_turn(int index, std::size_t dispatched) {
+    // One woken task: run it here, no cross-thread wake. More: let a peer help.
+    if (dispatched > 0 && local_len(index) > 1)
+        notify_if_needed();
 }
 
 void WorkStealingExecutor::worker_loop(int worker_index) {
@@ -145,10 +243,13 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     t_wse_owning_executor = this;
     t_wse_worker_index    = worker_index;
     set_current_runtime(m_runtime);
+    // I/O primitives not yet on the IoDriver still reach the uv loop through this.
     set_current_uv_executor(&m_runtime->uv_executor());
 
     const int    n            = static_cast<int>(m_workers.size());
     const int    max_search   = std::max(1, n / 2);
+    // Task polls since this worker last tried a non-blocking driver turn.
+    unsigned     polls_since_turn = 0;
 
     while (true) {
         std::shared_ptr<detail::TaskBase> task;
@@ -244,10 +345,13 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 
             if (!task) {
                 // Truly nothing — park. If a token was banked by notify_if_needed()
-                // after we set the idle bit, acquire() returns immediately.
-                m_workers[worker_index]->parker.acquire();
+                // after we set the idle bit, park_worker() returns immediately.
+                // Otherwise we block in the driver, or on our condvar if another
+                // worker holds the driver.
+                const std::size_t dispatched = park_worker(worker_index);
                 m_idle_mask.fetch_and(~(1ull << worker_index),
                                       std::memory_order_relaxed);
+                after_turn(worker_index, dispatched);
 
                 // Check shutdown after waking.
                 {
@@ -327,6 +431,21 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                 }
                 enqueue(std::move(task));
             }
+        }
+
+        // --- Poll I/O while busy ---
+        // A worker that never runs out of work never parks, so without this I/O
+        // could starve while every worker is busy. Edge-triggered events wait in the
+        // kernel until then. If another worker holds the driver, try_turn() returns
+        // at once; that worker is handling events anyway.
+        if (++polls_since_turn >= kEventInterval) {
+            polls_since_turn = 0;
+            std::optional<std::size_t> dispatched;
+            {
+                InDriverTurn in_turn;
+                dispatched = m_driver.try_turn(std::chrono::nanoseconds{0});
+            }
+            if (dispatched) after_turn(worker_index, *dispatched);
         }
     }
 

@@ -1,8 +1,9 @@
 # Executor Design
 
-Design document covering the `Executor` interface, the two concrete implementations
-(`SingleThreadedExecutor` and `WorkSharingExecutor`), and the planned local-queue /
-injection-queue changes that enable safe wakeups from external threads.
+Design document covering the `Executor` interface, the task scheduling state machine,
+and two of the concrete implementations: `CurrentThreadExecutor` and
+`WorkSharingExecutor`. `WorkStealingExecutor`, the default multi-threaded executor, has
+its own document: [Work-Stealing Scheduler](work_stealing_executor.md).
 
 ---
 
@@ -12,30 +13,34 @@ injection-queue changes that enable safe wakeups from external threads.
 and decides when to poll them. It does not own threads or the I/O reactor — those belong
 to `Runtime`.
 
-Two concrete implementations exist:
+Three concrete implementations exist:
 
 | Executor | Threads | Use case |
 |---|---|---|
-| `SingleThreadedExecutor` | 1 (the calling thread) | Tests, deterministic debugging, single-threaded apps |
-| `WorkSharingExecutor` | N worker threads | Multi-threaded production use |
+| `CurrentThreadExecutor` | 1 (the calling thread) | Single-threaded apps, deterministic tests, Pico |
+| `WorkStealingExecutor` | N worker threads | Multi-threaded production use (the default) |
+| `WorkSharingExecutor` | N worker threads | Simpler reference scheduler, mainly a debugging aid |
 
 `Runtime` selects the implementation at construction time:
 
 ```cpp
 Runtime::Runtime(std::size_t num_threads) {
     if (num_threads <= 1)
-        m_executor = std::make_unique<SingleThreadedExecutor>();
+        m_executor = std::make_unique<CurrentThreadExecutor>(this);
     else
-        m_executor = std::make_unique<WorkSharingExecutor>(num_threads, this);
+        m_executor = std::make_unique<WorkStealingExecutor>(this, num_threads);
 }
 ```
+
+`Runtime(std::in_place_type<E>, args...)` builds any other executor, such as
+`WorkSharingExecutor`.
 
 ---
 
 ## Local Wake vs. Remote Wake
 
-When the `SingleThreadedUvExecutor` background thread calls `Waker::wake()` (e.g. from a
-libuv timer or I/O callback), it originates from a thread that is not the poll loop.
+When a blocking-pool thread, an lws service thread, or another executor's worker calls
+`Waker::wake()`, it originates from a thread that is not the poll loop.
 Every executor must therefore handle wakeups from threads it does not own.
 
 Tokio and similar runtimes distinguish two categories of wakeup:
@@ -310,9 +315,8 @@ void wait_for_completion(detail::TaskStateBase& state) {
 }
 ```
 
-`SingleThreadedExecutor` cannot use this directly since it *is* the poll thread — it
-must interleave polling with waiting. See the [SingleThreadedExecutor](#singlethreadedexecutor)
-section for the planned fix.
+`CurrentThreadExecutor` cannot use this directly since it *is* the poll thread — it
+must interleave polling with waiting. See [CurrentThreadExecutor](#currentthreadexecutor).
 
 `Runtime::block_on` passes `*state` directly to either implementation:
 
@@ -323,11 +327,29 @@ m_executor->wait_for_completion(*task_state_ptr);
 
 ---
 
-## SingleThreadedExecutor
+## CurrentThreadExecutor
+
+`CurrentThreadExecutor` runs every task on the thread that calls `block_on()`. It is the
+executor behind desktop `Runtime(1)` and the only executor on Pico. The scheduling loop is
+platform-neutral; how it waits for outside events is an injected `Parker`
+(see [I/O Driver](io_driver.md), "Parker"):
+
+| Parker | Wait | Used by |
+|---|---|---|
+| `IoDriverParker` | Blocks in `IoDriver::turn()`; I/O events and timers are dispatched on this thread | desktop `Runtime(1)` |
+| `PollingParker` | Calls `cyw43_arch_poll()` once and never blocks, so the loop busy-polls | Pico `Runtime` |
+
+It keeps a single mutex-protected ready queue for local and remote wakes alike. The local
+case is uncontended, and one queue is simpler to reason about than a lock-free local queue
+next to a remote one.
+
+!!! tip "PERF: no lock-free same-thread fast path"
+    Every enqueue takes `m_ready_mutex`, even from the executor's own thread. If profiling
+    ever shows that lock, add a thread-local fast path for local wakes then.
 
 ### Task states
 
-Each task is in exactly one state at any moment:
+The task state machine is the shared `SchedulingState` CAS machine described above:
 
 ```mermaid
 stateDiagram-v2
@@ -337,93 +359,85 @@ stateDiagram-v2
     Running --> RunningAndNotified : wake() — CAS Running→RunningAndNotified
     RunningAndNotified --> Notified : poll_ready_tasks() — CAS RunningAndNotified→Notified, re-enqueue
     Running --> Done : poll_ready_tasks() — poll() returns Ready/Error
-    Idle --> Notified : wake() — CAS Idle→Notified, pushed to m_ready / m_incoming_wakes
+    Idle --> Notified : wake() — CAS Idle→Notified, enqueue() pushes to m_ready
     Done --> [*]
 ```
 
-| Transition | Function |
-|---|---|
-| `[*] → Notified` | `schedule()` — stores `Notified` before first `enqueue()` call |
-| `Notified → Running` | `poll_ready_tasks()` — CAS before invoking `task->poll()` |
-| `Running → Idle` | `poll_ready_tasks()` — CAS after `poll()` returns `Pending`; succeeds when no concurrent wake |
-| `Running → RunningAndNotified` | `TaskBase::wake()` — second CAS when task is mid-poll |
-| `RunningAndNotified → Notified` | `poll_ready_tasks()` — CAS after `poll()` returns `Pending`; fires when first CAS failed; re-enqueues via `m_ready` |
-| `Running → Done` | `poll_ready_tasks()` — `poll()` returned `true`; task dropped in place |
-| `Idle → Notified` | `TaskBase::wake()` — first CAS; calls `enqueue()` which routes to `m_ready` (local) or `m_incoming_wakes` (remote) |
+### The loop
 
-### Data model
+All ready-queue state is under `m_ready_mutex`:
 
-```
-m_poll_thread_id : thread::id                         ← set when wait_for_completion is entered
-m_incoming_wakes : deque<shared_ptr<TaskBase>>        ← remote enqueue() calls deposit here
-m_remote_mutex   : mutex                              ← guards m_incoming_wakes
-m_remote_cv      : condition_variable                 ← signalled by remote enqueue(); waited on by wait_for_completion
-```
-
-The fields `m_suspended`, `m_running_task_key`, and `m_running_task_woken` that existed
-in earlier iterations have been replaced by the `SchedulingState` CAS machine — a task in
-`Idle` is kept alive solely by the `shared_ptr<Task>` inside its waker.
-
-### Enqueue routing
-
-`TaskBase::wake()` calls `executor->enqueue(task)` after the `Idle → Notified` CAS
-succeeds. `enqueue` routes based on thread identity:
-
-```
-enqueue(task):
-    if this_thread == m_poll_thread_id:
-        // Local path — push directly to ready queue, no lock
-        m_ready.push(task)
-    else:
-        // Remote path — hand off to poll thread via injection queue
-        lock(m_remote_mutex)
-        m_incoming_wakes.push_back(task)
-        unlock(m_remote_mutex)
-        m_remote_cv.notify_one()
-```
-
-The `Running → RunningAndNotified` self-wake CAS is handled entirely inside
-`TaskBase::wake()` — no executor involvement needed.
-
-### poll_ready_tasks — drain injection queue first
-
-```
-poll_ready_tasks():
-    lock(m_remote_mutex)
-    for task in m_incoming_wakes:
-        m_ready.push(task)
-    m_incoming_wakes.clear()
-    unlock(m_remote_mutex)
-
-    // Existing poll loop (unchanged)
-    ...
-```
-
-### wait_for_completion — block until done
-
-```
+```cpp
 wait_for_completion(state):
-    m_poll_thread_id = this_thread::get_id()
-    while true:
-        if state.terminated: return
-        if poll_ready_tasks(): continue
-        // Ready queue empty — block until a remote wake arrives.
-        // state.terminated cannot change while blocked here since tasks only
-        // complete during poll_ready_tasks(), which is not running.
-        lock(m_remote_mutex)
-        m_remote_cv.wait(lock, [this]{ return !m_incoming_wakes.empty(); })
-        unlock(m_remote_mutex)
-    m_poll_thread_id = {}
+    while (true) {
+        if (state.terminated) break;            // under state.mutex
+        poll_ready_tasks();
+        check_expired_timers();
+        if (state.terminated) break;            // the last poll may have finished the root task
+        park_once();
+    }
+
+park_once():
+    { lock(m_ready_mutex);
+      if (!m_ready.empty()) max_wait = 0;
+      else { max_wait = m_timers.begin_wait(nullopt); m_parked = true; } }
+    t_parked_executor = this;                   // thread-local
+    parker.park(max_wait);
+    t_parked_executor = nullptr;
+    m_timers.end_wait();
+    { lock(m_ready_mutex); m_parked = false; }
+
+enqueue(task):
+    { lock(m_ready_mutex); m_ready.push(task); unpark = m_parked && t_parked_executor != this; }
+    if (unpark) parker.unpark();
 ```
 
-!!! tip "PERF: add per-turn task budget"
-    If tasks continuously wake each other, `poll_ready_tasks()` always returns `true` and
-    the outer loop never yields. `m_incoming_wakes` is drained at the start of each
-    `poll_ready_tasks()` call so timer wakeups are still serviced, but remote wakes may be
-    delayed by an arbitrary number of local iterations. Tokio addresses this with a per-turn
-    task budget (default 61): after processing that many tasks the worker unconditionally
-    yields to drain the injection queue regardless of whether the local queue is empty. A
-    similar bound should be applied here.
+- **The executor picks the wait.** Zero when the ready queue isn't empty; otherwise the
+  time until the next deadline in its own timer queue, or no limit. On a desktop `Runtime`
+  its timers live in the driver's queue instead, and `turn()` bounds its own wait by them
+  (see [Timers](timers.md)).
+- **Busy executors poll I/O every N batches, not every batch.** While tasks stay ready, the
+  loop calls `park(0)` once per batch. `IoDriverParker` only turns the driver on every
+  `event_interval`-th such call (61, tokio's value), so a task that keeps re-waking itself
+  doesn't pay an `epoll_wait` syscall per poll. Edge-triggered events wait in the kernel
+  meanwhile. Any non-zero wait always turns. Keeping the counter in the parker leaves the
+  loop platform-neutral and Pico's per-iteration `cyw43_arch_poll()` unchanged.
+- **A remote enqueue unparks only a parked executor.**
+
+### Parking and its races
+
+- **A remote wake before the executor decides to park.** `enqueue()` pushes under the lock,
+  so the executor's empty check sees the task and parks with a zero wait. No unpark is
+  needed and none is sent.
+- **A remote wake while the executor is parked, or about to be.** The executor set
+  `m_parked` under the same lock as its empty check, so `enqueue()` sees it and unparks.
+  `unpark()` is sticky (an eventfd write), so it works even if it lands before the executor
+  actually blocks in `turn()`.
+- **A local wake while parked.** The driver fires wakers inside `turn()`, on the executor
+  thread, while `m_parked` is true. Unparking there would cost an eventfd write and make the
+  next `turn()` return at once for nothing. The thread-local `t_parked_executor` marks the
+  parking thread, so these wakes skip the unpark.
+- **A stale unpark (benign).** A remote `enqueue()` reads `m_parked == true`, releases the
+  lock, and the executor wakes for another reason before `unpark()` runs. The unpark then
+  makes the executor's next `park()` return early: one extra loop iteration.
+- **The root task finishes during `poll_ready_tasks()`.** The second `terminated` check
+  catches it. Without it, an empty queue would park with no limit and never return.
+- **A `spawn()` from another thread.** `schedule()` goes through `enqueue()`, not a bare
+  push onto `m_ready`, so that it unparks too.
+
+!!! danger "WARNING: every push onto `m_ready` from outside the loop must unpark"
+    A common pattern is a root task that awaits `spawn_blocking()`, so the executor parks
+    with no limit, while the blocking thread `spawn()`s a task. If `schedule()` pushed onto
+    `m_ready` without unparking, that task would never run.
+    `CurrentThreadRuntimeTest.SpawnFromBlockingThreadUnparksDriver` covers it.
+
+### Tests
+
+`test/runtime/test_current_thread_executor.cpp` covers the executor with a test `Parker`
+(remote enqueue unparks only while parked, local wakes during `park()` don't, the root task
+finishing mid-batch, its own timer queue) and on `Runtime(1)` (`CurrentThreadRuntimeTest`:
+I/O and timers through the driver, spawns from foreign threads). The typed `AllExecutors`
+suites run every executor-agnostic test on it as well.
 
 ---
 
@@ -439,12 +453,12 @@ classDiagram
         +enqueue(task: shared_ptr~TaskBase~) void
         +wait_for_completion(state) void
     }
-    class SingleThreadedExecutor {
-        -m_ready: queue~shared_ptr~TaskBase~~
-        -m_incoming_wakes: deque~shared_ptr~TaskBase~~
-        -m_remote_mutex: mutex
-        -m_remote_cv: condition_variable
-        -m_poll_thread_id: thread_id
+    class CurrentThreadExecutor {
+        -m_parker: unique_ptr~Parker~
+        -m_ready: queue~Rc~TaskBase~~
+        -m_ready_mutex: Mutex
+        -m_parked: bool
+        -m_timers: TimerQueue
         +poll_ready_tasks() bool
         +wait_for_completion(state) void
     }
@@ -458,7 +472,7 @@ classDiagram
         +wait_for_completion(state) void
         -worker_loop(index) void
     }
-    Executor <|-- SingleThreadedExecutor
+    Executor <|-- CurrentThreadExecutor
     Executor <|-- WorkSharingExecutor
 ```
 
@@ -514,17 +528,17 @@ CASes to `Notified` and re-enqueues.
 ```
 worker_loop():
     set_current_runtime(m_runtime)
-    set_current_uv_executor(&m_runtime->uv_executor())
 
     loop:
         // Try local queue first (no lock), then injection queue.
         task = m_local_queues[this_worker].pop()
         if not task:
-            lock(m_mutex)
-            wait on m_cv until: m_injection_queue non-empty OR m_stop
-            if m_stop and m_injection_queue empty → break
-            task = m_injection_queue.pop_front()
-            unlock(m_mutex)
+            // Waits on m_cv, or turns the I/O driver if no other worker is
+            // (see "I/O and timers: the driver handoff" below).
+            task = wait_for_task(this_worker)
+            if not task:
+                if m_stop → break
+                continue          // a driver turn woke tasks onto the local queue
 
         expected = Notified
         ASSERT CAS(expected → Running) succeeds
@@ -544,7 +558,6 @@ worker_loop():
                 enqueue(task)
 
     set_current_runtime(nullptr)
-    set_current_uv_executor(nullptr)
 ```
 
 **Key invariants:**
@@ -556,14 +569,63 @@ worker_loop():
 - `m_stop = true` is set **inside** `m_mutex` before `notify_all()` in the destructor,
   for the same reason.
 
+### I/O and timers: the driver handoff
+
+I/O readiness and timers fire only where some thread turns the runtime's `IoDriver`. The
+work-sharing port is the smallest handoff that works; its workers share one injection
+queue, one mutex and one condvar:
+
+```
+wait_for_task(i):                         // under m_mutex
+    loop:
+        if m_injection_queue non-empty: return its front
+        if m_stop: return null
+        if m_driver_held: wait on m_cv; continue
+        m_driver_held = true
+        unlock; driver.turn(nullopt); lock    // wakes land in local queue i
+        m_driver_held = false
+        if local queue i, the injection queue, or m_stop has something:
+            m_cv.notify_one()                 // let a waiter take the driver over
+            if local queue i non-empty: return null
+```
+
+- **An idle worker takes the driver** if no other worker holds it (`m_driver_held`, under
+  `m_mutex`), and turns it with no limit with the mutex released. Other idle workers wait
+  on the condvar as before.
+- **Wakes from I/O and timers run on the holder's thread,** so they land in its local
+  queue. When it leaves the driver with work, it notifies the condvar so another worker
+  can take the driver over; with none, it turns again.
+- **A remote enqueue** into the injection queue calls `driver.unpark()` if the driver is
+  held, as well as notifying the condvar. Shutdown does the same.
+
+The races:
+
+- **A remote enqueue while the holder is about to block.** `m_driver_held` is set under
+  `m_mutex` before the holder unlocks to turn, and the enqueuer reads it under the same
+  lock. Either the holder's check sees the task, or the enqueuer sees `m_driver_held` and
+  unparks. The unpark is sticky (the eventfd stays readable until a poll consumes it), so
+  it is not lost if it lands before the holder blocks.
+- **A stale unpark (benign).** The holder leaves `turn()` for another reason before the
+  enqueuer's `unpark()`; its next turn returns at once.
+- **A handoff to a worker that finds the driver re-taken (benign).** The notified worker
+  sees `m_driver_held` again and goes back to waiting.
+- **Shutdown.** A worker takes the driver only after checking `m_stop` under `m_mutex`, so
+  the destructor either stops it from turning or sees it holding the driver and unparks
+  it. The `Runtime` destroys its executor before its driver, so the unpark is safe.
+
+!!! note "NOTE: busy workers never turn the driver"
+    I/O and timers wait until some worker goes idle, and tasks woken by the driver run on
+    the holder: local queues are not stolen from, so a burst of I/O wakes is not spread
+    across workers. That is acceptable for a debugging executor; `WorkStealingExecutor`
+    is the one to use for throughput.
+
 ### Thread-local state
 
-Two thread-locals are set on each worker at startup:
+One thread-local is set on each worker at startup:
 
 | Thread-local | Set by | Used by |
 |---|---|---|
-| `t_current_runtime` | Worker thread startup | `coro::spawn()`, `JoinSet::spawn()`, `spawn_blocking()` |
-| `t_current_uv_executor` | Worker thread startup | `SleepFuture::poll()`, any future that touches the reactor via `SingleThreadedUvExecutor` |
+| `t_current_runtime` | Worker thread startup | `coro::spawn()`, `JoinSet::spawn()`, `spawn_blocking()`, `SleepFuture::poll()` and the I/O primitives (via `current_runtime().io_driver()`) |
 
 ### Shutdown
 
@@ -572,8 +634,8 @@ The destructor:
 2. Calls `m_cv.notify_all()` after releasing the lock
 3. Joins all worker threads
 
-Outstanding tasks in `m_queue` and `m_suspended` are dropped when their `shared_ptr`s
-destruct.
+It also unparks the driver if a worker holds it (see the driver handoff above).
+Outstanding tasks in the queues are dropped when their `shared_ptr`s destruct.
 
 ### Enqueue routing
 
@@ -609,153 +671,30 @@ enqueue(task):
 
 ## Summary
 
-| | `SingleThreadedExecutor` | `WorkSharingExecutor` |
+| | `CurrentThreadExecutor` | `WorkSharingExecutor` |
 |---|---|---|
-| **External wake safety** | `m_incoming_wakes` injection queue; `m_remote_cv` blocks when idle | `m_injection_queue` + `m_cv`; workers block when both local and injection queues empty |
-| **Suspended task storage** | `Idle` atomic state; waker holds the only `shared_ptr<Task>` ref | `Idle` atomic state; waker holds the only `shared_ptr<Task>` ref |
+| **External wake safety** | `m_ready` under `m_ready_mutex`; unparks the `Parker` if parked | `m_injection_queue` + `m_cv`; unparks the driver if a worker holds it |
+| **Suspended task storage** | `Idle` atomic state; the executor's owned-task set keeps it alive | `Idle` atomic state; waker holds the only `shared_ptr<Task>` ref |
 | **Self-wake detection** | `RunningAndNotified` CAS in `TaskBase::wake()` | `RunningAndNotified` CAS in `TaskBase::wake()` |
-| **Local enqueue path** | Direct to `m_ready`, no lock (poll thread only) | Direct to `m_local_queue[t_worker_index]`, no lock (owning worker only) |
-| **Remote enqueue path** | `m_incoming_wakes` + `m_remote_cv.notify_one()` | `m_injection_queue` + `m_cv.notify_one()` |
-| **wait_for_completion** | Drives poll loop; blocks on `m_remote_cv` when ready queue empty | Delegates entirely to `state.wait_until_done()` |
+| **Local enqueue path** | `m_ready` under `m_ready_mutex` (uncontended), no unpark | Direct to `m_local_queue[t_worker_index]`, no lock (owning worker only) |
+| **Remote enqueue path** | `m_ready` under `m_ready_mutex` + `parker.unpark()` if parked | `m_injection_queue` + `m_cv.notify_one()` (+ `driver.unpark()`) |
+| **Idle wait** | `Parker::park()`: blocks in the I/O driver (desktop) or busy-polls (Pico) | One worker turns the I/O driver; the others wait on `m_cv` |
+| **wait_for_completion** | Drives the poll loop on the calling thread | Delegates entirely to `state.wait_until_done()` |
 
 ---
 
-## Future Direction: Unified Current-Thread Poll Loop
+## Former direction: unified current-thread poll loop
 
-!!! tip "TODO: absorb UV reactor into SingleThreadedExecutor"
-    The current design treats the task executor and the I/O reactor as separate peers.
-    `Runtime::block_on()` sets both `t_current_runtime` and `t_current_uv_executor` as
-    independent thread-locals, and `SingleThreadedExecutor::wait_for_completion()` interleaves
-    task polling with UV ticks by blocking on `m_remote_cv` when the ready queue is empty and
-    relying on the UV thread to signal it when I/O events arrive.
-
-    The Pico port exposes a cleaner model: `PicoExecutor` is a **current-thread executor** with
-    no worker threads at all. The calling thread IS the scheduler. `wait_for_completion()` drives
-    both the coroutine ready queue and the hardware I/O event loop (`cyw43_arch_poll()`) in a
-    tight alternating loop with no blocking. Because there are no other threads, `Runtime::poll()`
-    — a single call to `poll_ready_tasks()` — is safe to expose to the caller for use in a
-    manually-driven firmware event loop.
-
-    `SingleThreadedExecutor` could adopt the same model for the standard build:
-
-    - Replace the `m_remote_cv` blocking wait with a `uv_run(UV_RUN_NOWAIT)` tick when the
-      ready queue is empty, giving libuv a turn without yielding the thread.
-    - This eliminates the need for a separate UV thread in single-threaded mode and the
-      `t_current_uv_executor` thread-local, since the UV loop is now owned by the executor
-      itself rather than `Runtime`.
-    - `poll_ready_tasks()` would become a meaningful virtual method on `Executor` (with a
-      default no-op), allowing `Runtime::poll()` to be exposed unconditionally rather than
-      only under `#ifdef CORO_PICO`.
-
-    **Key constraint:** libuv is thread-affine — `uv_run()` must be called from the thread
-    that owns the loop. This integration therefore only applies to `SingleThreadedExecutor`.
-    `WorkSharingExecutor` must keep UV on a dedicated thread as it does today, because tasks
-    migrate across worker threads and there is no single thread that can own the UV loop.
-
-    The practical consequence is a three-way executor taxonomy:
-
-    | Executor | UV ownership | `poll()` safe from caller? |
-    |---|---|---|
-    | `PicoExecutor` | `cyw43_arch_poll()` called by caller alongside `poll()` | Yes — current-thread model |
-    | `SingleThreadedExecutor` (future) | UV loop owned by executor, ticked inside `poll_ready_tasks()` | Yes — current-thread model |
-    | `WorkSharingExecutor` | Dedicated UV thread; no caller-visible poll | No — worker threads own scheduling |
-
-    This redesign is non-trivial: it requires `SingleThreadedExecutor` to own the UV loop
-    (currently owned by `SingleThreadedUvExecutor` as a separate `Runtime` member), restructure
-    `wait_for_completion()`, and add `poll_ready_tasks()` to the `Executor` base interface.
-    It should be tackled as a dedicated phase with its own design document.
-
-### Current ownership model
-
-```mermaid
-classDiagram
-    class Runtime {
-        -m_uv_executor: SingleThreadedUvExecutor
-        -m_executor: unique_ptr~Executor~
-        +block_on(F)
-        +spawn(F)
-        +poll()¹
-    }
-    class SingleThreadedUvExecutor {
-        -m_uv_loop: uv_loop_t
-        -m_uv_thread: thread
-    }
-    class Executor {
-        <<abstract>>
-        +schedule(task)*
-        +enqueue(task)*
-        +wait_for_completion(state)*
-    }
-    class SingleThreadedExecutor {
-        -m_ready: queue
-        -m_remote_cv: condition_variable
-        +poll_ready_tasks() bool
-    }
-    class WorkSharingExecutor {
-        -m_workers: vector~thread~
-        -m_injection_queue: deque
-    }
-    class PicoExecutor {
-        -m_ready: queue
-        +poll_ready_tasks() bool
-    }
-
-    Runtime *-- SingleThreadedUvExecutor : owns separately
-    Runtime *-- Executor : owns
-    Executor <|-- SingleThreadedExecutor
-    Executor <|-- WorkSharingExecutor
-    Executor <|-- PicoExecutor
-```
-
-¹ `Runtime::poll()` is `#ifdef CORO_PICO` only — delegates to `PicoExecutor::poll_ready_tasks()`.
-UV is a separate peer of the task executor; `block_on()` must set both as independent thread-locals.
-
-### Future ownership model
-
-```mermaid
-classDiagram
-    class Runtime {
-        -m_executor: unique_ptr~Executor~
-        +block_on(F)
-        +spawn(F)
-        +poll() bool
-    }
-    class Executor {
-        <<abstract>>
-        +schedule(task)*
-        +enqueue(task)*
-        +wait_for_completion(state)*
-        +poll_ready_tasks() bool
-    }
-    class SingleThreadedExecutor {
-        -m_uv_loop: uv_loop_t
-        -m_ready: queue
-        +poll_ready_tasks() bool
-        note: "ticks uv_run(NOWAIT) + drains task queue"
-    }
-    class WorkSharingExecutor {
-        -m_uv_thread: thread
-        -m_workers: vector~thread~
-        -m_injection_queue: deque
-        +poll_ready_tasks() bool
-        note: "returns false — UV on dedicated thread"
-    }
-    class PicoExecutor {
-        -m_ready: queue
-        +poll_ready_tasks() bool
-        note: "drains task queue only — caller drives cyw43_arch_poll()"
-    }
-
-    Runtime *-- Executor : owns
-    Executor <|-- SingleThreadedExecutor
-    Executor <|-- WorkSharingExecutor
-    Executor <|-- PicoExecutor
-```
-
-`SingleThreadedUvExecutor` is absorbed into `SingleThreadedExecutor`. `Runtime` owns a single
-executor pointer in all builds. `poll_ready_tasks()` is a virtual method with a default `return false`
-no-op, making `Runtime::poll()` unconditionally available — meaningful for single-threaded and
-Pico runtimes, a safe no-op for multi-threaded ones.
+!!! note "NOTE: superseded by the I/O driver"
+    This section used to propose absorbing the libuv loop into a single-threaded executor,
+    so the calling thread would drive both tasks and I/O, as the Pico executor does. The
+    I/O driver did this more generally: `CurrentThreadExecutor` replaced
+    `SingleThreadedExecutor`, an idle executor parks by turning the epoll `IoDriver`
+    (one worker at a time on the multi-threaded executors), the uv thread and the
+    `t_current_uv_executor` thread-local are gone, and libuv was removed. See
+    [I/O Driver](io_driver.md), "Who turns the driver". The `poll_ready_tasks()` /
+    unconditional `Runtime::poll()` part of the proposal was not adopted;
+    `Runtime::poll()` remains Pico-only.
 
 ---
 
@@ -768,7 +707,8 @@ Pico runtimes, a safe no-op for multi-threaded ones.
 | `include/coro/detail/work_stealing_deque.h` | Complete | `WorkStealingDeque<T>` — mutex-backed, Chase-Lev interface |
 | `include/coro/runtime/executor.h` | Complete | `schedule`/`enqueue(shared_ptr<TaskBase>)` pure virtual |
 | `src/task.cpp` | Complete | `TaskBase::wake()` / `TaskBase::clone()` — out-of-line to break circular include with `executor.h` |
-| `include/coro/runtime/single_threaded_executor.h` | Complete | Injection queue fields; `m_suspended` and self-wake fields removed |
-| `src/single_threaded_executor.cpp` | Complete | `enqueue` routing; CAS-based poll loop; fixed `wait_for_completion` |
+| `include/coro/runtime/current_thread_executor.h` | Complete | Single ready queue under `m_ready_mutex`; `Parker`; own `TimerQueue` |
+| `src/runtime/current_thread_executor.cpp` | Complete | CAS-based poll loop; `park_once()`; unpark-only-when-parked `enqueue` |
+| `include/coro/runtime/parker.h` | Complete | `Parker`, `IoDriverParker`, `PollingParker` |
 | `include/coro/runtime/work_sharing_executor.h` | Complete | Per-worker local queues; `m_suspended`, `m_self_woken` removed |
-| `src/work_sharing_executor.cpp` | Complete | Dual thread-locals; `enqueue` routing; CAS-based worker loop |
+| `src/runtime/work_sharing_executor.cpp` | Complete | Dual thread-locals; `enqueue` routing; CAS-based worker loop; driver handoff |

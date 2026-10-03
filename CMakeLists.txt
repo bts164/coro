@@ -74,7 +74,6 @@ if(CORO_PLATFORM STREQUAL "pico")
         PATTERN "poll_stream.hpp" EXCLUDE
         PATTERN "uv_future.h" EXCLUDE
         PATTERN "single_threaded_uv_executor.h" EXCLUDE
-        PATTERN "single_threaded_executor.h" EXCLUDE
         PATTERN "work_sharing_executor.h" EXCLUDE
         PATTERN "work_stealing_executor.h" EXCLUDE
         # epoll-based I/O driver (doc/design/io_driver.md) — desktop only; Pico
@@ -104,7 +103,6 @@ else()
         src/runtime/runtime.cpp
         src/runtime/executor.cpp
         src/runtime/single_threaded_uv_executor.cpp
-        src/runtime/single_threaded_executor.cpp
         src/runtime/current_thread_executor.cpp
         src/runtime/work_sharing_executor.cpp
         src/runtime/work_stealing_executor.cpp
@@ -121,6 +119,7 @@ else()
         src/detail/timer_queue.cpp
         # sync/
         src/sync/cancellation_token.cpp
+        src/sync/sleep.cpp
         # io/
         src/io/tcp_stream.cpp
         src/io/tcp_listener.cpp

@@ -4,7 +4,7 @@
 #include <co_assert.h>
 #include <coro/coro.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_executor.h>
+#include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/sync/join.h>
@@ -132,7 +132,7 @@ Coro<size_t> skynet_handles(size_t my_num, size_t remaining, size_t depth, ArgMa
     co_return sum;
 }
 TEST(SkynetHandlesTest, Single) {
-    Runtime rt(std::in_place_type<SingleThreadedExecutor>);
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
     std::atomic_size_t arg_marker{0};
 #ifdef SKYNET_BENCHMARK_ITERATIONS
     for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
@@ -188,7 +188,7 @@ Coro<size_t> skynet_join(size_t my_num, size_t remaining) {
 }
 
 TEST(SkynetJoinTest, SingleThreaded) {
-    Runtime rt(std::in_place_type<SingleThreadedExecutor>);
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
 #ifdef SKYNET_BENCHMARK_ITERATIONS
     for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
         rt.block_on(skynet_join(0, 1000000));
@@ -238,7 +238,7 @@ Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
 }
 
 TEST(SkynetJoinSetTest, SingleThreaded) {
-    Runtime rt(std::in_place_type<SingleThreadedExecutor>);
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
 #ifdef SKYNET_BENCHMARK_ITERATIONS
     for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
         rt.block_on(skynet_joinset(0, 1000000));
@@ -301,7 +301,7 @@ Coro<size_t> skynet_mixed0(size_t my_num, size_t remaining) {
 }
 
 TEST(SkynetMixedTest, SingleThreaded) {
-    Runtime rt(std::in_place_type<SingleThreadedExecutor>);
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
 #ifdef SKYNET_BENCHMARK_ITERATIONS
     for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
         rt.block_on(skynet_mixed0(0, 1000000));

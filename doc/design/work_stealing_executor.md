@@ -194,10 +194,14 @@ if (idle) {
 
 #### 64-worker cap
 
-`m_idle_mask` is a `uint64_t`, so the pool is capped at 64 workers. This covers all
-realistic use cases (machines with >64 hardware threads are uncommon and the scheduler
-design does not target NUMA at this stage). A `static_assert` in the constructor
-enforces the limit with a clear error message rather than silent bit truncation.
+`m_idle_mask` is a `uint64_t`, so the pool is capped at 64 workers. The constructor
+clamps `num_threads` to `MAX_WORKERS` rather than throwing: with a throw, the default
+`Runtime()` (sized by `hardware_concurrency()`) failed outright on >64-core machines.
+
+!!! tip "TODO: Lift the 64-worker cap"
+    Extra hardware threads beyond 64 go unused. See the roadmap entry
+    "WorkStealingExecutor: more than 64 workers" for the two candidate designs
+    (multi-word idle bitmap, or tokio-style counters plus a mutex-protected sleeper list).
 
 #### Park protocol: avoiding lost wakeups
 
@@ -226,16 +230,17 @@ worker loop (park sequence):
   7. resume worker loop
 ```
 
-`WorkStealingExecutor` uses per-worker `std::binary_semaphore` parking,
-replacing the shared `m_mutex` + `m_cv` used by `WorkSharingExecutor`. The semaphore
-approach was adopted because:
+`WorkStealingExecutor` first used per-worker `std::binary_semaphore` parking,
+replacing the shared `m_mutex` + `m_cv` used by `WorkSharingExecutor`. Once workers
+could also park in the I/O driver, the semaphore became a per-worker park slot (mutex,
+condvar and state); see [Parking in the I/O driver](#parking-in-the-io-driver). The
+per-worker approach was adopted because:
 
 - It is the natural C++ equivalent of Tokio's `park()`/`unpark()`.
 - It makes Q4 (notify on local enqueue) cheap enough to always do correctly: check
-  `m_searching` and `m_idle_mask` atomically, then call `parker.release()` on one
-  idle worker — no mutex round-trip.
-- Shutdown (`notify_all`) becomes: iterate `m_idle_mask`, call `release()` on each
-  parked worker.
+  `m_searching` and `m_idle_mask` atomically, then call `unpark_worker()` on one
+  idle worker — no shared-mutex round-trip.
+- Shutdown (`notify_all`) becomes: call `unpark_worker()` on each worker.
 
 The shared `m_mutex` is retained only for protecting the injection queue (remote
 enqueue path). It is no longer used for parking/wakeup.
@@ -250,6 +255,225 @@ running the consumer immediately after the producer yields, improving cache reus
 
 This optimization is not required for correctness and can be added after the baseline
 stealing path works.
+
+---
+
+## Parking in the I/O driver
+
+I/O readiness and timers fire only where some thread turns the runtime's `IoDriver`
+(see [I/O Driver](io_driver.md)). `WorkStealingExecutor` follows tokio's multi-thread
+scheduler, and its workers share one driver:
+
+- **Parking.** The first worker to run out of work takes the driver and parks in
+  `try_turn(nullopt)`. Other idle workers park on their own condition variable.
+- **Wakes during a turn.** Wakes fired inside the turn are local enqueues onto the
+  turning worker's own queue.
+- **Busy workers.** A busy worker does a non-blocking `try_turn(0)` every
+  `kEventInterval` (61) task polls, so I/O and timers aren't starved when no worker is
+  idle.
+
+The idle-mask and searching protocol above is unchanged. What parks is a per-worker park
+slot that knows whether the worker is blocked in the driver or on its condition variable.
+
+### Driver API
+
+A worker must not block on the driver's mutex while another worker holds it, so
+`IoDriver` has a try-variant:
+
+```cpp
+/// Like turn(), but returns std::nullopt at once if another thread is turning.
+std::optional<std::size_t> try_turn(std::optional<std::chrono::nanoseconds> timeout);
+
+/// Like try_turn(), but calls before_poll() once it holds the driver; false releases
+/// the driver without polling and returns 0.
+template<typename BeforePoll>
+std::optional<std::size_t> try_turn(std::optional<std::chrono::nanoseconds> timeout,
+                                    BeforePoll&& before_poll);
+```
+
+### Per-worker park state
+
+Each `WorkerSlot` holds `park_mutex`, `park_cv` and `park_state`, GUARDED BY
+`park_mutex`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty
+    Empty --> Notified: unpark_worker()
+    Empty --> ParkedDriver: park_worker() got the driver
+    Empty --> ParkedCondvar: park_worker(), driver busy
+    ParkedDriver --> Empty: try_turn() returned
+    ParkedDriver --> Notified: unpark_worker() → driver.unpark()
+    ParkedCondvar --> Notified: unpark_worker() → cv.notify_one()
+    Notified --> Empty: park_worker() consumes the token
+```
+
+```cpp
+// Returns the number of I/O events and timers dispatched (0 if this worker didn't turn).
+std::size_t park_worker(i):
+    std::optional<size_t> n;
+    { InDriverTurn guard;                 // thread-local: wakes in the turn are local, no notify
+      n = driver.try_turn(nullopt, [&] {  // runs only once this worker holds the driver
+          lock(slot.m);
+          if (slot.state == Notified) return false;   // token banked: don't poll
+          slot.state = ParkedDriver;
+          return true; }); }
+    lock(slot.m);
+    if (!n && slot.state != Notified) {   // driver busy: fall back to the condvar
+        slot.state = ParkedCondvar;
+        slot.cv.wait(lock, [&]{ return slot.state == Notified; });
+    }
+    slot.state = Empty;
+    return n.value_or(0);
+
+void unpark_worker(i):
+    { lock(slot.m); prev = slot.state; slot.state = Notified; }
+    if      (prev == ParkedDriver)  driver.unpark();       // sticky eventfd write
+    else if (prev == ParkedCondvar) slot.cv.notify_one();
+    // prev == Empty or Notified: the token is banked; the next park_worker() returns at once
+```
+
+`notify_if_needed()` calls `unpark_worker(idx)` for the lowest idle worker. The destructor
+sets `m_stop` and then calls `unpark_worker()` on every worker.
+
+### Worker loop
+
+- **Park** calls `park_worker(i)`, then clears its idle bit. If the turn dispatched
+  anything and the worker's local queue now holds more than one task, `after_turn()` calls
+  `notify_if_needed()` so another worker can help (tokio's `should_notify_others`). With
+  exactly one task the worker just runs it, so a single I/O wake never costs a
+  cross-thread wake.
+- **After each task poll,** a counter is bumped. Every `kEventInterval` polls, the worker
+  calls `try_turn(0)` inside an `InDriverTurn` guard and applies the same `after_turn()`
+  rule. If another worker holds the driver, the call returns at once and costs nothing.
+- **`enqueue()` on a worker of this executor** skips `notify_if_needed()` while the
+  thread-local `InDriverTurn` flag is set. The turning worker runs those tasks itself as
+  soon as the turn returns. Remote enqueues are unchanged.
+
+### Parking and its races
+
+- **A remote wake before the worker parks** (the lost-wakeup check). The enqueuer pushes,
+  then reads `m_searching` and `m_idle_mask`. The worker sets its idle bit, then re-checks
+  its queues. This is a store-then-load pattern on both sides. It is sound only because
+  every queue a parking worker re-checks is mutex-protected, or only ever pushed to by its
+  owner:
+    - the injection queue is mutex-protected;
+    - with `CORO_USE_LOCAL_RUN_QUEUE` (the default), only the owner pushes to its own
+      local queue;
+    - without it, `WorkStealingDeque` is mutex-protected.
+
+    The mutex orders the two sides: either the worker's re-check sees the task, or the
+    enqueuer's later load sees the idle bit.
+- **A remote wake while the worker is in the driver, or about to be.** The worker sets
+  `ParkedDriver` only once it holds the driver (inside `before_poll`). `unpark_worker()`
+  sees it and calls `driver.unpark()`. That write is sticky, and only the driver's holder
+  ever consumes it, so it reaches this worker's `epoll_wait` even if it lands first.
+
+    !!! danger "WARNING: publish ParkedDriver only while holding the driver"
+        If a worker set `ParkedDriver` and *then* called `try_turn()`, an unpark in that
+        gap could write the eventfd while another worker was in a turn (a busy worker's
+        `try_turn(0)`, or the previous holder on its way out). That worker would reset
+        the eventfd, and the parking worker would then win the driver and block in
+        `epoll_wait` with `Notified` unread: a lost wake-up, which shows up as a rare hang
+        (most likely at `Runtime` teardown, whose unparks have no other backstop).
+- **A remote wake while the worker is on the condvar.** `unpark_worker()` sees
+  `ParkedCondvar`, sets `Notified`, and notifies. The wait predicate makes a spurious or
+  early return harmless.
+- **An unpark after a failed `try_turn()`, before the condvar wait.** The slot is still
+  `Empty`, so `unpark_worker()` banks `Notified`; the worker checks it under the slot
+  mutex and returns without waiting.
+- **A stale driver unpark (benign).** The holder returns from `turn()` for an I/O event
+  just before an `unpark_worker()` sees `ParkedDriver` and writes the eventfd. The next
+  worker to turn returns at once, finds nothing, and parks again. Tokio has the same
+  property.
+- **Two enqueuers wake the same idle worker.** Both read its idle bit before the worker
+  clears it. `Notified` is idempotent, so the second unpark only re-banks the token, at
+  the cost of one extra loop iteration. (With a `binary_semaphore`, a second `release()`
+  while the count is already 1 is undefined behaviour.)
+- **Wakes dispatched inside a turn.** They fire on the turning worker, whose idle bit is
+  still set. Without the `InDriverTurn` skip, `notify_if_needed()` could pick the turning
+  worker itself (an eventfd write that makes its next turn return at once), or wake a
+  peer that steals a task the turning worker was about to run. Both are pure overhead
+  for the common "one event, one task" case.
+- **The driver goes unturned while the holder runs tasks.** After the holder leaves
+  `turn()`, nobody is in the driver until:
+    - it parks again,
+    - another worker parks and finds the driver free, or
+    - some busy worker reaches its `kEventInterval` turn.
+
+    Edge-triggered events wait in the kernel meanwhile, so nothing is lost. But a single
+    long-running task on the old holder delays I/O and timer delivery when every other
+    worker sits on its condvar. Tokio has the same property.
+- **Shutdown.** The destructor sets `m_stop` under `m_mutex`, then unparks every worker.
+  A worker in the driver gets `driver.unpark()`, and one on the condvar gets notified.
+  Each sees `m_stop` and exits. The driver outlives the executor (`Runtime` member
+  order), so the unparks are safe.
+
+!!! tip "PERF: hand the driver off when the holder leaves it with work"
+    To close the latency gap in the "driver goes unturned" case, a holder that returns
+    from `turn()` with tasks to run could wake one condvar-parked worker, which would then
+    take the driver. That costs a futex wake per driver wake-up whenever idle workers
+    exist, and at high event rates it could ping-pong the driver between two workers on
+    every event. Tokio doesn't do it either; decide from profiling.
+
+!!! tip "PERF: prefer condvar-parked workers in `notify_if_needed()`"
+    `notify_if_needed()` wakes the lowest idle bit, which may be the driver holder. Waking
+    it costs an eventfd write and leaves the driver unturned until it parks again. Waking
+    a condvar-parked worker first would avoid that, but needs a "driver holder" index next
+    to the idle mask. Measure before adding it.
+
+!!! tip "PERF: mutex + condvar park slot instead of a `binary_semaphore`"
+    A semaphore can only wake a worker that waits on it. Once workers can also park in the
+    driver, `unpark_worker()` has to know where the worker is parked: in `epoll_wait`,
+    which needs `driver.unpark()`, or on its own wait primitive. The worker changes that
+    state partway through parking (`ParkedDriver`, or `ParkedCondvar` after a failed
+    `try_turn()`). The waker's read-and-set of the state has to be atomic with respect to
+    that change, or the wake goes to the wrong place and is lost. A mutex keeps that
+    protocol obvious, as CLAUDE.md prefers, and `cv.wait(lock, pred)` makes the move to
+    `ParkedCondvar` and the sleep one step.
+
+    Tokio's multi-thread parker (`scheduler/multi_thread/park.rs`) has the same shape:
+    `EMPTY`/`PARKED_CONDVAR`/`PARKED_DRIVER`/`NOTIFIED`, with a mutex and a condvar.
+
+    Compared with the semaphore:
+
+    - **Sleep and wake:** the same futex wait, futex wake and context switch either way.
+      This is the dominant cost, several µs.
+    - **Extra work per park and unpark:** one uncontended lock and unlock, about 20–50 ns
+      with no syscall. `notify_one()` with no waiter does not make a syscall either.
+    - **Contention:** a waker can briefly contend on `park_mutex` with a worker that is
+      waking up. `unpark_worker()` notifies after unlocking to keep that window short.
+
+    Unparks happen only when the idle mask shows a sleeping worker, so a busy runtime
+    rarely reaches this path. If profiling shows a regression, add tokio's fast path:
+    make `park_state` an atomic that the waker `swap(Notified)`s, and take the lock and
+    notify only when the old state was `ParkedCondvar`. That falls under the
+    "scheduling-state atomics" exception in CLAUDE.md. Do not add it without numbers.
+
+!!! warning "FIXME: lost wakeup on the non-`CORO_USE_LOCAL_RUN_QUEUE` affinity path"
+    Without `CORO_USE_LOCAL_RUN_QUEUE`, a remote `enqueue()` pushes to the task's last
+    worker `k` (the affinity path). It then calls `notify_if_needed()`, which returns early
+    if any worker is searching. The searcher re-checks only its own queue and the injection
+    queue before parking, never `k`'s. If `k` is parked, the task strands until some later
+    wake. The default build doesn't take this path. Fix by unparking `k` directly when its
+    idle bit is set, or by dropping the affinity path.
+
+### Tests
+
+| Test | Proves |
+|---|---|
+| `IoDriver.TryTurnReturnsNulloptWhileAnotherThreadTurns` | `try_turn()` never blocks on a held driver. |
+| `IoDriver.TryTurnDispatchesWhenFree` | `try_turn()` behaves like `turn()` otherwise. |
+| `WorkStealingIoTest.IoEventWakesTaskOnIdleRuntime` | An idle worker parked in the driver receives I/O (socketpair, writer thread after 50 ms). |
+| `WorkStealingIoTest.BusyWorkersStillPollIo` | With every worker spinning on self-waking tasks (nobody parks), an I/O wait still completes through the `kEventInterval` turns. |
+| `WorkStealingIoTest.ManySocketsPingPong` | 16 socketpairs × 200 round trips on `Runtime(4)`. A lost wakeup anywhere in the handoff shows up as a hang. |
+| `WorkStealingIoTest.RemoteWakeUnparksDriverHolder` | A wake from a foreign thread reaches a runtime whose only idle worker is in the driver. |
+| `WorkStealingIoTest.ShutdownWithPendingIoWait` | Destroying the runtime with a spawned task still waiting on a socket neither hangs nor crashes. |
+
+These are in `test/runtime/test_io_driver.cpp` and `test/runtime/test_work_stealing_io.cpp`.
+`ReadByteFuture`, `AsyncByteReader` and `SocketPair` live in the shared
+`test/runtime/io_test_util.h`. Every idle worker parks through this path, so the
+`AllExecutors` and work-stealing suites exercise it heavily too.
 
 ---
 
@@ -319,7 +543,7 @@ void WorkStealingExecutor::notify_if_needed() {
     uint64_t idle = m_idle_mask.load(memory_order_acquire);
     if (idle) {
         int idx = std::countr_zero(idle);
-        m_workers[idx].parker.release();  // futex wake — no mutex
+        unpark_worker(idx);  // driver.unpark() or condvar notify, by park state
     }
 }
 ```
@@ -332,7 +556,9 @@ locally-enqueued task on its steal sweep without an explicit wake.
 ## Shutdown
 
 1. Destructor sets `m_stop = true` inside `m_mutex` (still guards the injection queue).
-2. Iterates `m_idle_mask` and calls `parker.release()` on every parked worker.
+2. Calls `unpark_worker()` on every worker: a worker in the driver gets
+   `driver.unpark()`, one on its condvar is notified, and one not yet parked banks a
+   token so its next park returns at once.
 3. Joins all worker threads.
 
 Workers exit their loop when `m_stop` is true and all queues are drained.
@@ -346,9 +572,9 @@ simpler concurrency). `WorkStealingExecutor` is added alongside it as a new clas
 
 Files:
 - `include/coro/runtime/work_stealing_executor.h`
-- `src/work_stealing_executor.cpp`
+- `src/runtime/work_stealing_executor.cpp`
 
-`Runtime` selects the implementation: `num_threads <= 1` → `SingleThreadedExecutor`,
+`Runtime` selects the implementation: `num_threads <= 1` → `CurrentThreadExecutor`,
 otherwise → `WorkStealingExecutor`.
 
 ---
@@ -364,7 +590,7 @@ will fail if two workers race to claim the same task (which should not happen si
 
 ## Tests
 
-Unit tests are in `test/test_work_stealing_executor.cpp`. Key cases covered:
+Unit tests are in `test/runtime/test_work_stealing_executor.cpp`. Key cases covered:
 
 - Workers complete tasks when work is uneven (one spawning coroutine fans out N tasks).
 - Tasks complete correctly with `N` workers and `M >> N` short-lived tasks.

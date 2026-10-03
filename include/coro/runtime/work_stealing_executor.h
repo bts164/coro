@@ -1,6 +1,7 @@
 #pragma once
 
 #include <coro/runtime/executor.h>
+#include <coro/runtime/io_driver.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/work_stealing_deque.h>
@@ -8,13 +9,13 @@
 #include <coro/detail/local_run_queue.h>
 #endif
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <latch>
 #include <memory>
 #include <mutex>
-#include <semaphore>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -33,14 +34,17 @@ class Runtime;
  * - **Stealing**: idle workers attempt `steal_half()` from peers before parking.
  * - **Bounded searching**: at most `num_workers / 2` workers search simultaneously,
  *   preventing thundering herd on the victim queues.
- * - **Per-worker parking**: each worker parks on its own `std::binary_semaphore`
- *   instead of a shared condition variable. An idle bitmask (`m_idle_mask`) lets
- *   enqueuers wake a specific worker without acquiring any lock.
+ * - **Per-worker parking**: the first idle worker parks in the Runtime's IoDriver
+ *   (blocking in epoll); other idle workers park on their own condition variable.
+ *   An idle bitmask (`m_idle_mask`) lets enqueuers pick a specific worker to wake.
+ *   See doc/design/work_stealing_executor.md, "Parking in the I/O driver".
  * - **Task affinity**: `Task::last_worker_index` routes re-enqueued tasks back to
  *   their last worker's local queue, improving cache locality.
  *
- * **Worker limit**: `m_idle_mask` is a `uint64_t`; pools larger than 64 workers are
- * rejected at construction time via `static_assert` / runtime check.
+ * **Worker limit**: `m_idle_mask` is a `uint64_t`, so the pool is capped at
+ * `MAX_WORKERS` (64): a larger `num_threads`, including the hardware_concurrency()
+ * default on a >64-core machine, is silently clamped to 64. Temporary; see
+ * doc/roadmap.md, "WorkStealingExecutor: more than 64 workers".
  *
  * @see WorkSharingExecutor for the simpler reference implementation.
  */
@@ -49,7 +53,8 @@ public:
     static constexpr std::size_t MAX_WORKERS = 64;
 
     /// @param runtime     Back-pointer to the owning Runtime.
-    /// @param num_threads Number of worker threads (default: hardware concurrency). Must be in [2, MAX_WORKERS].
+    /// @param num_threads Number of worker threads (default: hardware concurrency). Must be at least 2;
+    ///                    values above MAX_WORKERS are clamped to MAX_WORKERS.
     WorkStealingExecutor(Runtime* runtime, std::size_t num_threads = std::thread::hardware_concurrency());
     ~WorkStealingExecutor() override;
 
@@ -73,6 +78,9 @@ public:
     /// @brief Delegates to `state.wait_until_done()`.
     void wait_for_completion(detail::TaskStateBase& state) override;
 
+    /// Workers park in the driver and busy workers poll it; see park_worker().
+    bool turns_io_driver() const noexcept override { return true; }
+
 private:
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
     // shared_ptr<TaskBase> is stored by value directly in the ring buffer.
@@ -92,10 +100,20 @@ private:
     };
 #endif
 
-    /// @brief One slot per worker thread. Not movable due to binary_semaphore.
+    /// Where a worker is parked, or whether a wake token is banked for it.
+    enum class ParkState {
+        Empty,          ///< Not parked, no token.
+        Notified,       ///< Token banked: the next park_worker() returns at once.
+        ParkedDriver,   ///< Holds the driver; blocked (or about to block) in its poll().
+        ParkedCondvar,  ///< Blocked on park_cv.
+    };
+
+    /// @brief One slot per worker thread. Not movable (mutex, condition variable).
     struct WorkerSlot {
-        std::thread           thread;
-        std::binary_semaphore parker{0}; ///< 0 = no pending wake token.
+        std::thread             thread;
+        std::mutex              park_mutex;
+        std::condition_variable park_cv;
+        ParkState               park_state = ParkState::Empty; ///< GUARDED BY park_mutex.
 
         WorkerSlot() = default;
         WorkerSlot(const WorkerSlot&) = delete;
@@ -108,6 +126,23 @@ private:
 
     /// @brief Wake one parked worker if no workers are currently searching.
     void notify_if_needed();
+
+    /// @brief Parks worker `index` until unpark_worker(index), or until the driver
+    /// returns if this worker got it.
+    /// @return The number of I/O events dispatched (0 if this worker didn't turn).
+    std::size_t park_worker(int index);
+
+    /// @brief Wakes worker `index` wherever it is parked, or banks a token if it isn't.
+    /// Safe from any thread.
+    void unpark_worker(int index);
+
+    /// @brief Number of tasks in worker `index`'s local queue. Owner thread only.
+    std::size_t local_len(int index) const;
+
+    /// @brief Called by worker `index` after a turn that dispatched `dispatched` events:
+    /// wakes a peer if the turn left more than one task queued (tokio's
+    /// should_notify_others).
+    void after_turn(int index, std::size_t dispatched);
 
     // --- Per-worker state ---
 
@@ -139,10 +174,16 @@ private:
 
     /// Number of workers currently performing a steal sweep. Capped at num_workers/2.
     std::atomic<int>      m_searching{0};
-    /// Bitmask of parked workers: bit k is set while worker k is in parker.acquire().
+    /// Bitmask of parked workers: bit k is set while worker k is parking or parked (park_worker()).
     std::atomic<uint64_t> m_idle_mask{0};
 
-    Runtime* m_runtime;
+    Runtime*  m_runtime;
+    /// Shared by all workers; owned by the Runtime, which declares it before the
+    /// executor, so it outlives every worker.
+    IoDriver& m_driver;
+
+    /// Busy workers try a non-blocking turn every this many task polls.
+    static constexpr unsigned kEventInterval = IoDriverParker::kDefaultEventInterval;
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).

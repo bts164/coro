@@ -1,29 +1,27 @@
 #pragma once
 
-// Single-threaded polling executor that drives coroutine tasks on the calling
-// thread alongside a platform I/O poll function.
+// Single-threaded executor that drives coroutine tasks on the calling thread and
+// waits for outside events through a Parker.
 //
-// The scheduling loop is platform-agnostic; the two platform-specific pieces
-// are injected by the build:
-//   - Timer source:    time_us_64() on Pico; could be steady_clock on Linux
-//   - I/O poll:        cyw43_arch_poll() on Pico W; could be a libuv tick elsewhere
-//
-// Currently only the Pico SDK implementations are provided (CORO_PICO), which
-// was the original motivation for this executor. Future ports supply their own
-// timer and poll implementations without changing the scheduling logic.
-//
-// Dependencies: pico_cyw43_arch (provides cyw43_arch_poll()) must be linked.
+// The scheduling loop is platform-agnostic; the platform-specific piece is the
+// injected Parker: PollingParker(cyw43_arch_poll) on Pico W (never blocks), or
+// IoDriverParker on desktop (blocks in epoll when idle). Timers use coro::Clock.
+// See doc/design/executor_design.md, "CurrentThreadExecutor".
 
 #include <coro/runtime/executor.h>
+#include <coro/runtime/parker.h>
 #include <coro/detail/mutex.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/waker.h>
 #include <coro/detail/rc.h>
 #include <coro/detail/isr_flag.h>
-#include <functional>
+#include <coro/detail/timer_queue.h>
+#include <coro/runtime/clock.h>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <unordered_set>
 #include <vector>
@@ -34,46 +32,48 @@ namespace coro {
 class Runtime;
 
 /**
- * @brief Single-threaded polling executor that drives all coroutine tasks on
- * the calling thread.
+ * @brief Single-threaded executor that drives all coroutine tasks on the calling
+ * thread.
  *
- * Internal implementation class — the public entry point is @ref Runtime.
- * `wait_for_completion()` runs a tight loop: drain the ready queue, fire
- * expired timers, then call the platform I/O poll function:
+ * Internal implementation class — the public entry point is @ref Runtime
+ * (`Runtime(1)` on desktop; the only executor on Pico). `wait_for_completion()`
+ * loops:
  *
  * @code
  * loop:
  *   poll_ready_tasks()      // poll all runnable coroutines once
  *   check_expired_timers()  // fire sleep_for / timeout wakers
- *   platform_poll()         // drive I/O events (cyw43_arch_poll() on Pico W)
+ *   parker.park(max_wait)   // wait for outside events (see below)
  * @endcode
  *
- * This model is well suited to bare-metal and embedded targets where a
- * dedicated I/O thread is unavailable or undesirable. The Raspberry Pi Pico W
- * was the first supported platform; future ports replace only the timer source
- * and poll function, leaving the scheduling state machine unchanged.
+ * `max_wait` is zero while tasks are ready, otherwise the time until the next
+ * timer in this executor's own queue, otherwise unlimited. On desktop the parker
+ * is an @ref IoDriverParker, so an idle executor blocks in epoll and I/O events
+ * are dispatched on this thread. A desktop Runtime puts its timers in the
+ * driver's queue rather than this one, and `turn()` bounds its own wait by them;
+ * this executor's queue serves Pico and a standalone executor. On Pico it is a @ref PollingParker around `cyw43_arch_poll()`, which
+ * never blocks, so the loop busy-polls.
  *
- * Because everything runs on a single thread, `enqueue()` only needs to protect
- * `m_ready` against ISR preemption (not thread contention). See @ref detail::Mutex
- * for the IRQ-disabling critical section used there.
+ * `enqueue()` may be called from other threads (blocking pool, lws service threads) or
+ * from an ISR on Pico. It pushes under `m_ready_mutex`, and unparks the
+ * executor if it is parked. See doc/design/executor_design.md, "Parking and its races".
  */
 class CurrentThreadExecutor : public Executor {
 public:
-    /// Microsecond clock — returns time since an arbitrary epoch (e.g. boot).
-    /// On Pico W: time_us_64(). In tests: steady_clock offset.
-    using ClockFn = std::function<uint64_t()>;
+    /// @param parker How the loop waits for outside events; must not be null.
+    explicit CurrentThreadExecutor(std::unique_ptr<Parker> parker);
 
-    /// Platform I/O poll function called once per event loop iteration.
-    /// On Pico W: cyw43_arch_poll(). In tests: no-op.
-    using PollFn  = std::function<void()>;
-
-    explicit CurrentThreadExecutor(ClockFn clock, PollFn poll)
-        : m_clock(std::move(clock)), m_poll(std::move(poll)) {}
-
-    // Overload for Runtime(std::in_place_type<CurrentThreadExecutor>, clock, poll).
+    // Overload for Runtime(std::in_place_type<CurrentThreadExecutor>, parker).
     // The Runtime passes itself as the first argument; we ignore it.
-    explicit CurrentThreadExecutor(Runtime* /*rt*/, ClockFn clock, PollFn poll)
-        : CurrentThreadExecutor(std::move(clock), std::move(poll)) {}
+    CurrentThreadExecutor(Runtime* /*rt*/, std::unique_ptr<Parker> parker)
+        : CurrentThreadExecutor(std::move(parker)) {}
+
+#ifndef CORO_PICO
+    /// Desktop default, used by `Runtime(1)` and
+    /// `Runtime(std::in_place_type<CurrentThreadExecutor>)`: an IoDriverParker on
+    /// `rt->io_driver()`.
+    explicit CurrentThreadExecutor(Runtime* rt);
+#endif
 
     ~CurrentThreadExecutor() override = default;
 
@@ -82,9 +82,6 @@ public:
     CurrentThreadExecutor(CurrentThreadExecutor&&)                 = delete;
     CurrentThreadExecutor& operator=(CurrentThreadExecutor&&)      = delete;
 
-    /// Returns the current time in microseconds from the injected clock.
-    uint64_t now_us() const { return m_clock(); }
-
     /// Takes ownership of `task` and enqueues it for its first poll.
     void schedule(detail::Rc<detail::TaskBase> task) override;
 
@@ -92,23 +89,31 @@ public:
     /// executor thread — an IRQ handler on Pico (e.g. DMA completion ISR) or
     /// an external thread on multi-threaded platforms. m_ready_mutex serialises
     /// access appropriately for the current platform (see detail/mutex.h).
+    /// Unparks the executor if it is parked and the caller is another thread.
     void enqueue(detail::Rc<detail::TaskBase> task) override;
 
     /// @brief Runs the event loop until `state.terminated`.
     ///
     /// Alternates between draining the coroutine ready queue, firing expired
-    /// timers, and calling `cyw43_arch_poll()` to process WiFi and lwIP events.
-    /// Never blocks — idles by polling rather than sleeping. For battery-sensitive
-    /// applications, add a short `sleep_us(100)` when both queues are empty.
+    /// timers, and parking. Whether parking blocks depends on the Parker: on
+    /// Pico (PollingParker) it never does, so the loop busy-polls.
     void wait_for_completion(detail::TaskStateBase& state) override;
+
+    /// True only when built by `CurrentThreadExecutor(Runtime*)`, whose parker turns
+    /// the runtime's driver. A caller-supplied parker may not.
+    bool turns_io_driver() const noexcept override { return m_turns_io_driver; }
 
     /// @brief Drains the ready queue: polls each task once in FIFO order.
     /// @return `true` if at least one task was polled.
     bool poll_ready_tasks();
 
-    /// @brief Registers a one-shot timer that wakes `waker` at `deadline_us`
-    /// (microseconds since boot, as returned by time_us_64()).
-    void schedule_timer(uint64_t deadline_us, detail::Rc<detail::Waker> waker);
+    /// @brief Returns `true` if no task is waiting in the ready queue.
+    bool empty() const;
+
+    /// @brief Adds a timer to this executor's own queue: `slot`'s waker fires once
+    /// `deadline` has passed. Thread-safe; unparks the executor if it is parked
+    /// for a later deadline. Used by `Runtime::add_timer()` on Pico.
+    void add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot);
 
     /// @brief Fires wakers for any timers whose deadline has passed.
     /// Called from wait_for_completion() on every loop iteration.
@@ -131,30 +136,29 @@ public:
     /// peek returns true. Never removes entries itself -- nothing here resolves a
     /// wait, so there's nothing to react to by removing one; removal stays with the
     /// owning waiter's destructor. Called from wait_for_completion() on every loop
-    /// iteration, after m_poll().
+    /// iteration, after parking.
     void check_isr_events();
 #endif // CORO_PICO
 
 private:
-    ClockFn m_clock;
-    PollFn  m_poll;
+    /// Picks the wait (zero / until next timer / unlimited), marks the executor
+    /// parked, and parks once.
+    void park_once();
+
+    std::unique_ptr<Parker> m_parker;
+    bool                    m_turns_io_driver = false;  // set once in the constructor
 
     // m_ready_mutex serialises m_ready access against ISR preemption (Pico) or
     // concurrent thread wakers (multi-threaded platforms). See detail/mutex.h.
-    detail::Mutex m_ready_mutex;
+    mutable detail::Mutex m_ready_mutex;
     std::queue<detail::Rc<detail::TaskBase>> m_ready;
+    // True from park_once()'s empty-queue check until park() returns. Read by
+    // enqueue() to decide whether to unpark. GUARDED BY m_ready_mutex.
+    bool m_parked = false;
 
-    struct TimerEntry {
-        uint64_t deadline_us;
-        detail::Rc<detail::Waker> waker;
-    };
-    struct TimerCmp {
-        // min-heap: smallest deadline (next to expire) at the top
-        bool operator()(const TimerEntry& a, const TimerEntry& b) const {
-            return a.deadline_us > b.deadline_us;
-        }
-    };
-    std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerCmp> m_timers;
+    // Internally synchronized. Lock order: m_ready_mutex, then the queue's mutex
+    // (park_once() calls begin_wait() under m_ready_mutex).
+    detail::TimerQueue m_timers;
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
