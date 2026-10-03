@@ -1,6 +1,12 @@
+// WsStream / WsListener on the lws service threads (doc/design/websocket_stream.md).
+// Each test uses its own port in 30201-30299.
+
 #include <gtest/gtest.h>
+#include <coro/io/lookup_host.h>
 #include <coro/io/ws_listener.h>
 #include <coro/io/ws_stream.h>
+#include <coro/runtime/current_thread_executor.h>
+#include <coro/runtime/parker.h>
 #include <coro/runtime/runtime.h>
 #include <coro/sync/join.h>
 #include <coro/sync/sleep.h>
@@ -9,9 +15,11 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace coro;
@@ -40,7 +48,45 @@ Coro<WsStream::Message> receive(WsStream& ws) {
     co_return std::move(std::get<0>(result).value);
 }
 
+// Accepts one connection, failing the test instead of hanging if none arrives within 2 s.
+Coro<WsStream> accept(WsListener& listener) {
+    auto result = co_await timeout(2s, listener.accept());
+    if (result.index() != 0) throw std::runtime_error("accept timed out");
+    co_return std::move(std::get<0>(result).value);
+}
+
 std::string text(const WsStream::Message& msg) { return std::string(msg.as_text()); }
+
+std::string url(uint16_t port, const std::string& host = "127.0.0.1") {
+    return "ws://" + host + ":" + std::to_string(port) + "/";
+}
+
+// Awaits connect(url) and returns the error it threw (a default error_code if none).
+Coro<std::error_code> connect_error(std::string to) {
+    try {
+        auto result = co_await timeout(2s, WsStream::connect(std::move(to)));
+        if (result.index() != 0) throw std::runtime_error("connect timed out");
+    } catch (const std::system_error& e) {
+        co_return e.code();
+    }
+    co_return std::error_code{};
+}
+
+// Awaits bind(host, port), keeping the listener only until it returns, and returns
+// the error it threw (a default error_code if none).
+Coro<std::error_code> bind_error(std::string host, uint16_t port) {
+    try {
+        WsListener listener = co_await WsListener::bind(std::move(host), port);
+    } catch (const std::system_error& e) {
+        co_return e.code();
+    }
+    co_return std::error_code{};
+}
+
+// Waits on the server end forever; the Runtime destroys it at shutdown.
+Coro<void> hold(Connection c) {
+    (void)co_await c.server.receive();
+}
 
 }  // namespace
 
@@ -184,4 +230,166 @@ TEST(WsStreamTest, QueuedMessagesDeliveredBeforeCloseThrows) {
         }
         EXPECT_TRUE(threw);
     }());
+}
+
+// ---------------------------------------------------------------------------
+// Connect: names and errors
+// ---------------------------------------------------------------------------
+
+// "localhost" may resolve to ::1 first. This lws build has no IPv6, so that address
+// is skipped and connect() falls through to 127.0.0.1.
+TEST(WsStreamTest, ConnectByName) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        WsListener listener = co_await WsListener::bind("127.0.0.1", 30208);
+        auto [server, client] = co_await join(accept(listener),
+                                              WsStream::connect(url(30208, "localhost")));
+        co_await client.send("hi");
+        EXPECT_EQ(text(co_await receive(server)), "hi");
+    }());
+}
+
+TEST(WsStreamTest, ConnectRefusedThrowsSystemError) {
+    Runtime rt;
+    auto code = rt.block_on(connect_error(url(30209)));   // nothing listening
+    EXPECT_EQ(code, std::errc::connection_refused) << code.message();
+}
+
+TEST(WsStreamTest, ConnectToUnresolvableNameThrowsDnsError) {
+    Runtime rt;
+    auto code = rt.block_on(connect_error(url(80, "nonexistent.invalid")));
+    EXPECT_EQ(&code.category(), &dns_error_category()) << code.message();
+}
+
+TEST(WsStreamTest, MalformedUrlThrowsInvalidArgument) {
+    Runtime rt;
+    EXPECT_THROW(rt.block_on(WsStream::connect("http://127.0.0.1/")), std::invalid_argument);
+}
+
+// A connect dropped part way (here by a 1 ms timeout) may or may not have finished
+// its handshake. Either way it must not leave anything broken: a connection it did
+// make is closed, and the next connect works.
+TEST(WsStreamTest, DroppedConnectIsHarmless) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        WsListener listener = co_await WsListener::bind("127.0.0.1", 30212);
+        (void)co_await timeout(1ms, WsStream::connect(url(30212)));
+        co_await sleep_for(200ms);   // let a connection it made reach the accept queue
+
+        WsStream client = co_await WsStream::connect(url(30212));
+        co_await client.send("hello");
+        // The dropped connect's connection, if any, is queued first, already closed.
+        bool found = false;
+        for (int i = 0; i < 2 && !found; ++i) {
+            WsStream server = co_await accept(listener);
+            try {
+                found = text(co_await receive(server)) == "hello";
+            } catch (const std::runtime_error&) {
+                // "connection closed": the dropped connect's connection.
+            }
+        }
+        EXPECT_TRUE(found);
+    }());
+}
+
+// ---------------------------------------------------------------------------
+// Listener lifetime and bind errors
+// ---------------------------------------------------------------------------
+
+TEST(WsListenerTest, StreamsSurviveListenerDrop) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        Connection c = co_await connect_pair(30210);
+        { WsListener gone = std::move(c.listener); }
+
+        co_await c.client.send("still");
+        EXPECT_EQ(text(co_await receive(c.server)), "still");
+        co_await c.server.send("here");
+        EXPECT_EQ(text(co_await receive(c.client)), "here");
+    }());
+}
+
+// The accepted stream keeps the port bound, but the upgrade is refused.
+TEST(WsListenerTest, DroppedListenerRejectsNewConnections) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        Connection c = co_await connect_pair(30211);
+        { WsListener gone = std::move(c.listener); }
+
+        auto code = co_await connect_error(url(30211));
+        EXPECT_TRUE(code) << "connect to a dropped listener succeeded";
+    }());
+}
+
+// Once the listener and every stream it accepted are gone, so is the socket.
+TEST(WsListenerTest, PortReleasedWhenLastStreamDrops) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        {
+            Connection c = co_await connect_pair(30216);
+            (void)c;
+        }
+        WsListener again = co_await WsListener::bind("127.0.0.1", 30216);
+        (void)again;
+    }());
+}
+
+TEST(WsListenerTest, BindAddressInUseThrowsEaddrinuse) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        WsListener first = co_await WsListener::bind("127.0.0.1", 30215);
+        auto code = co_await bind_error("127.0.0.1", 30215);
+        EXPECT_EQ(code, std::errc::address_in_use) << code.message();
+    }());
+}
+
+TEST(WsListenerTest, BindUnresolvableNameThrowsDnsError) {
+    Runtime rt;
+    auto code = rt.block_on(bind_error("nonexistent.invalid", 30217));
+    EXPECT_EQ(&code.category(), &dns_error_category()) << code.message();
+}
+
+// An empty host listens on every interface, loopback included.
+TEST(WsListenerTest, EmptyHostBindsAllInterfaces) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        WsListener listener = co_await WsListener::bind("", 30218);
+        auto [server, client] = co_await join(accept(listener), WsStream::connect(url(30218)));
+        co_await client.send("any");
+        EXPECT_EQ(text(co_await receive(server)), "any");
+    }());
+}
+
+// ---------------------------------------------------------------------------
+// Runtime integration
+// ---------------------------------------------------------------------------
+
+// Shutdown with a listener, both streams and a pending receive still alive in a task
+// must neither hang nor wake into the destroyed executor.
+TEST(WsStreamTest, RuntimeShutdownWithOpenStreams) {
+    {
+        Runtime rt;
+        rt.block_on([]() -> Coro<void> {
+            Connection c = co_await connect_pair(30213);
+            (void)spawn(hold(std::move(c))).detach();
+            co_await sleep_for(50ms);   // let the task start its receive
+        }());
+    }
+    SUCCEED();
+}
+
+// lws runs on its own thread, so WS needs no IoDriver. No timeouts or sleeps here: timers
+// need the IoDriver.
+TEST(WsStreamTest, WorksWithoutDriver) {
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>,
+               std::make_unique<PollingParker>([] {}));
+    auto echoed = rt.block_on([]() -> Coro<std::string> {
+        WsListener listener = co_await WsListener::bind("127.0.0.1", 30214);
+        auto [server, client] = co_await join(listener.accept(),
+                                              WsStream::connect(url(30214)));
+        co_await client.send("no driver");
+        auto msg = co_await server.receive();
+        co_return std::string(msg.as_text());
+    }());
+    EXPECT_EQ(echoed, "no driver");
 }

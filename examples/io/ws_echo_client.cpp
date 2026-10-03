@@ -58,8 +58,8 @@ using namespace coro;
 // ---------------------------------------------------------------------------
 static Coro<void> run_client(int id, std::string message) {
     using namespace std::chrono_literals;
-    // connect() parses the URL, submits a WsConnectRequest to IoService, and
-    // suspends until lws fires LWS_CALLBACK_CLIENT_ESTABLISHED.
+    // connect() parses the URL, resolves the host, hands the connect to the shared
+    // lws client thread, and suspends until the handshake completes.
     struct Defer {
         Defer(int id) : id_(id) {}
         ~Defer() { LOG(id_, "Connection %d closed", id_); }

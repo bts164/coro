@@ -155,8 +155,10 @@ class CoroRecipe(ConanFile):
         self.requires("libuv/1.47.0",
             transitive_headers = True,
             transitive_libs = True)
+        # lws runs its own poll() loop on a dedicated thread (doc/design/websocket_stream.md,
+        # "Service threads"), so its libuv event-lib backend stays off.
         self.requires("libwebsockets/[>=4.3.5 <5]",
-            options={"with_libuv": True},
+            options={"with_libuv": False},
             transitive_headers = True,
             transitive_libs = True)
 

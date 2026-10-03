@@ -1,12 +1,13 @@
 #pragma once
 
+#include <coro/coro.h>
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
+#include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
 #include <coro/io/ws_stream.h>
-#include <coro/runtime/single_threaded_uv_executor.h>
 #include <libwebsockets.h>
-#include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -60,38 +61,25 @@ private:
 namespace coro::detail::ws {
 
 // ---------------------------------------------------------------------------
-// ListenerState — shared between WsListener (worker thread) and the I/O thread.
-//
-// server_protocol_cb recovers this via lws_context_user(lws_get_context(wsi))
-// when LWS_CALLBACK_ESTABLISHED fires for a new incoming connection.
-//
-// RACE: pending queue and accept_waker are accessed from both the I/O thread
-// (server_protocol_cb pushing new connections) and the worker thread (AcceptFuture
-// polling). Both accesses are protected by `mutex`.
+// ListenerState — shared by WsListener and its AcceptFutures (executor threads) and
+// server_protocol_cb (the listener's lws service thread), which finds it through
+// lws_context_user(). The listener's LwsService keeps it alive until its context is
+// destroyed.
 // ---------------------------------------------------------------------------
 struct ListenerState {
-    lws_context*                                      ctx = nullptr;  // owned here, destroyed in WsDestroyListenerRequest
-    // bind_mutex guards ready, bind_error, and bind_waker.
-    // Both WsBindRequest (I/O thread) and BindFuture::poll (worker thread) must hold
-    // it when reading or writing any of these fields to avoid race conditions.
-    std::mutex                                        bind_mutex;
-    bool                                              ready{false};   // set after bind succeeds
-    int                                               bind_error = 0; // set before ready=true on failure
-    std::shared_ptr<coro::detail::Waker>              bind_waker;     // woken when bind completes
-    // accept_mutex guards pending and accept_waker.
-    // Both server_protocol_cb (I/O thread) and AcceptFuture::poll (worker thread) must hold
-    // it when reading or writing any of these fields.
+    // accept_mutex guards pending, accept_waker and closed. server_protocol_cb and
+    // AcceptFuture::poll both hold it.
     std::mutex                                        accept_mutex;
-    std::deque<std::shared_ptr<ConnectionState>>      pending;        // accepted, awaiting take by AcceptFuture
-    std::shared_ptr<coro::detail::Waker>              accept_waker;   // woken when a connection arrives
-    std::atomic<bool>                                 closed{false};
+    std::deque<std::shared_ptr<ConnectionState>>      pending;        // accepted, awaiting accept()
+    detail::Weak<detail::Waker>                       accept_waker;   // woken when a connection arrives
+    bool                                              closed = false; // the WsListener was dropped
 
     // lws_context stores a raw pointer into the protocols array — it does NOT copy it.
-    // Both must outlive the context (i.e. stay alive until WsDestroyListenerRequest runs).
+    // Both must outlive the context, which the LwsService's keep-alive ensures.
     std::string         subprotocol_str;        // storage for the protocol name c_str()
     lws_protocols       protocols[2]{};         // [0] = real entry, [1] = null terminator
 
-    // Options copied from WsListener::Options at bind time.
+    // Options copied from WsListener::Options at bind time. Read-only afterwards.
     coro::WsStream::FrameMode frame_mode       = coro::WsStream::FrameMode::Full;
     std::size_t               max_frame_size   = 4096;
     std::size_t               max_message_size = 0;
@@ -110,10 +98,10 @@ struct ListenerState {
 // The `user` parameter in every callback points to this storage.
 //
 // Layout of per-session storage:
-//   void* slot  →  heap-allocated shared_ptr<ConnectionState>*
+//   void* slot  →  ConnectionState*, kept alive by its `self` member
 //
-// LWS_CALLBACK_CLOSED deletes the heap-allocated shared_ptr*, decrementing
-// the ref count.
+// CLOSED (or WSI_DESTROY) clears the slot and calls close_connection(), which drops
+// `self`.
 // ---------------------------------------------------------------------------
 int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
                        void* user, void* in, std::size_t len);
@@ -127,16 +115,18 @@ namespace coro {
  * @brief Async WebSocket server listener.
  *
  * Binds a TCP port and performs the WebSocket handshake for each incoming
- * connection. Built on libwebsockets using a dedicated server-side lws context
- * that shares the same libuv event loop as the uv executor.
+ * connection. Built on libwebsockets: each listener has its own lws context and lws
+ * service thread (see doc/design/websocket_stream.md, "Service threads"), shared by the
+ * streams it accepts.
  *
  * Obtain a `WsListener` via `co_await WsListener::bind(host, port)`.
  * Call `co_await listener.accept()` in a loop to receive connections as
  * @ref WsStream objects.
  *
- * Dropping the `WsListener` destroys the server lws context, closing any
- * connections still in the accept queue. Active `WsStream`s that were already
- * handed off are unaffected.
+ * Dropping the `WsListener` rejects new connections and closes those still in the
+ * accept queue. `WsStream`s already handed off are unaffected: they keep the context,
+ * and with it the listening socket, until the last of them is dropped. Until then
+ * the port stays bound, and new connections to it fail the upgrade.
  *
  * All lws handles and callbacks are private implementation details.
  */
@@ -179,35 +169,6 @@ public:
     // -----------------------------------------------------------------------
 
     /**
-     * @brief Future<WsListener> returned by @ref WsListener::bind().
-     *
-     * On first poll, submits a `WsBindRequest` to the uv executor, which creates
-     * a server-side lws context on the uv thread and registers it on the shared
-     * uv_loop. Woken when the context is ready (or fails).
-     */
-    class BindFuture {
-    public:
-        using OutputType = WsListener;
-
-        BindFuture(std::string host, uint16_t port,
-                   Options options, SingleThreadedUvExecutor* uv_exec);
-
-        BindFuture(BindFuture&&) noexcept            = default;
-        BindFuture& operator=(BindFuture&&) noexcept = default;
-        BindFuture(const BindFuture&)                = delete;
-        BindFuture& operator=(const BindFuture&)     = delete;
-
-        PollResult<WsListener> poll(detail::Context& ctx);
-
-    private:
-        std::string                                  m_host;
-        uint16_t                                     m_port;
-        Options                                      m_options;
-        SingleThreadedUvExecutor*                    m_uv_exec;
-        std::shared_ptr<detail::ws::ListenerState>   m_state;  // null until first poll
-    };
-
-    /**
      * @brief Future<WsStream> returned by @ref WsListener::accept().
      *
      * Suspends until a client completes the WebSocket handshake. The resulting
@@ -218,7 +179,7 @@ public:
         using OutputType = WsStream;
 
         AcceptFuture(std::shared_ptr<detail::ws::ListenerState> state,
-                     SingleThreadedUvExecutor*                                  uv_exec);
+                     std::shared_ptr<detail::ws::LwsService>    service);
 
         AcceptFuture(AcceptFuture&&) noexcept            = default;
         AcceptFuture& operator=(AcceptFuture&&) noexcept = default;
@@ -229,7 +190,7 @@ public:
 
     private:
         std::shared_ptr<detail::ws::ListenerState>   m_state;
-        SingleThreadedUvExecutor*                                   m_uv_exec;
+        std::shared_ptr<detail::ws::LwsService>      m_service;
     };
 
     // -----------------------------------------------------------------------
@@ -241,19 +202,24 @@ public:
     WsListener(const WsListener&)            = delete;
     WsListener& operator=(const WsListener&) = delete;
 
-    /// Destroys the server lws context on the uv executor. Does not block.
+    /// Stops accepting (see the class comment). Does not block, unless no accepted
+    /// stream is left: then it destroys the context and joins its service thread.
     ~WsListener();
 
     /**
      * @brief Binds a WebSocket server on `host:port`.
-     * @param subprotocols Optional list of subprotocols the server advertises in the
-     *        `Sec-WebSocket-Protocol` response header. When empty (the default), the server
-     *        accepts connections regardless of any subprotocol the client requests.
-     * @return A `BindFuture` that resolves to a bound `WsListener`.
-     * @throws std::system_error if the port cannot be bound.
+     *
+     * An empty `host` listens on every interface. Otherwise it's resolved with
+     * `lookup_host()` and the first address that binds is used. The context, and its
+     * listening socket, are created before this returns.
+     *
+     * @param options Frame mode and sizes, advertised subprotocols (none by default,
+     *        which accepts whatever the client requests) and upgrade hooks.
+     * @throws std::system_error with `dns_error_category()` if `host` doesn't resolve,
+     *         or the last address's bind error (e.g. `EADDRINUSE`) if none binds.
      */
-    [[nodiscard]] static BindFuture bind(std::string host, uint16_t port);
-    [[nodiscard]] static BindFuture bind(std::string host, uint16_t port, Options options);
+    [[nodiscard]] static Coro<WsListener> bind(std::string host, uint16_t port);
+    [[nodiscard]] static Coro<WsListener> bind(std::string host, uint16_t port, Options options);
 
     /**
      * @brief Accepts the next incoming WebSocket connection.
@@ -262,11 +228,15 @@ public:
     [[nodiscard]] AcceptFuture accept();
 
 private:
-    explicit WsListener(std::shared_ptr<detail::ws::ListenerState> state,
-                        SingleThreadedUvExecutor*                                  uv_exec);
+    WsListener(std::shared_ptr<detail::ws::ListenerState> state,
+               std::shared_ptr<detail::ws::LwsService>    service);
+
+    /// Marks the listener closed, fails pending accepts, and closes the connections
+    /// queued for accept(). Used by the destructor and move assignment.
+    void close() noexcept;
 
     std::shared_ptr<detail::ws::ListenerState>   m_state;
-    SingleThreadedUvExecutor*                                   m_uv_exec = nullptr;
+    std::shared_ptr<detail::ws::LwsService>      m_service;
 };
 
 } // namespace coro

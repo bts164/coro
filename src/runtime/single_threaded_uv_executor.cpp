@@ -1,15 +1,8 @@
 #include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/detail/context.h>
-#include <libwebsockets.h>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
-
-// Forward declaration — protocol_cb is defined in ws_stream.cpp.
-namespace coro::detail::ws {
-    int protocol_cb(lws* wsi, lws_callback_reasons reason,
-                    void* user, void* in, std::size_t len);
-}
 
 namespace coro {
 
@@ -86,51 +79,10 @@ void SingleThreadedUvExecutor::stop() {
     if (m_uv_thread.joinable())
         m_uv_thread.join();
 
-    // ---------------------------------------------------------------------------
-    // Phase 2 of lws + libuv shutdown (see io_async_cb for phase 1).
-    //
-    // The UV thread has exited — uv_run() returned because io_async_cb called
-    // uv_stop(). At this point lws has begun its teardown (phase 1 called
-    // lws_context_destroy once) but its async close callbacks may not have fired
-    // yet because uv_stop() cuts the loop short before they get a chance to run.
-    //
-    // lws_context_destroy must be called a second time from outside the loop to
-    // complete whatever teardown was interrupted. This is the documented usage
-    // for foreign libuv loops: the first call (inside the loop) schedules
-    // cleanup; the second call (after the loop exits) finalises it. lws is
-    // internally idempotent across these two calls — it checks its own state and
-    // continues from where it left off rather than double-freeing.
-    //
-    // After the second lws_context_destroy we walk and force-close any remaining
-    // handles. In normal operation this catches:
-    //   - m_async (our wakeup handle, still open since we used uv_stop not uv_close)
-    //   - any handles owned by user code that were not closed before the runtime
-    //     shut down (e.g. a TcpStream that went out of scope without co_await close)
-    //
-    // A final uv_run(UV_RUN_DEFAULT) drains the close callbacks for all of those
-    // handles (including any remaining lws close callbacks), after which
-    // uv_loop_close() should succeed.
-    // ---------------------------------------------------------------------------
-
-    if (m_lws_ctx) {
-        // Second call — finalises the teardown that was started in io_async_cb.
-        // uv_stop() cut the loop short before lws's async close callbacks could
-        // all fire; this second call completes whatever was left. lws is
-        // internally idempotent: it checks its own destruction state and resumes
-        // from where it left off rather than double-freeing anything.
-        lws_context_destroy(m_lws_ctx);
-        m_lws_ctx = nullptr;
-    }
-
-    // The same second call for contexts retired by their owners (WsListener), whose
-    // first call ran inside the loop. Their user data must outlive this call, since
-    // lws may still invoke protocol callbacks while finishing, hence on_destroyed.
-    for (auto& [ctx, on_destroyed] : m_retired_lws_ctxs) {
-        lws_context_destroy(ctx);
-        if (on_destroyed) on_destroyed();
-    }
-    m_retired_lws_ctxs.clear();
-
+    // The uv thread has exited: io_async_cb called uv_stop(), so uv_run() returned
+    // without closing anything. Close every remaining handle (m_async, plus any a user
+    // left open), run the loop once more to drain their close callbacks, then close
+    // the loop.
     uv_walk(&m_uv_loop, [](uv_handle_t* h, void*) {
         if (!uv_is_closing(h))
             uv_close(h, nullptr);
@@ -138,19 +90,6 @@ void SingleThreadedUvExecutor::stop() {
 
     uv_run(&m_uv_loop, UV_RUN_DEFAULT);
     uv_loop_close(&m_uv_loop);
-}
-
-void SingleThreadedUvExecutor::retire_lws_context(lws_context* ctx,
-                                                  std::function<void()> on_destroyed) {
-    // FIXME: retired contexts are only freed when the executor stops, so a process
-    // that keeps binding and dropping listeners holds one context per listener until then.
-    m_retired_lws_ctxs.emplace_back(ctx, std::move(on_destroyed));
-}
-
-lws_context* SingleThreadedUvExecutor::lws_ctx() {
-    std::unique_lock lk(m_lws_mutex);
-    m_lws_ready_cv.wait(lk, [this] { return m_lws_ready; });
-    return m_lws_ctx;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,47 +103,8 @@ void SingleThreadedUvExecutor::io_async_cb(uv_async_t* handle) {
     self->drain_ready_tasks();
 
     if (self->m_stopping.load()) {
-        // ---------------------------------------------------------------------------
-        // Phase 1 of lws + libuv shutdown.
-        //
-        // lws shutdown with a foreign libuv loop is a two-phase process and is
-        // poorly documented. Here is the full picture, derived from reading the lws
-        // source (lib/event-libs/libuv/libuv.c) and its minimal foreign-loop example
-        // (minimal-examples/http-server/minimal-http-server-eventlib-foreign/libuv.c):
-        //
-        // PHASE 1 — called from within the running loop (here, from io_async_cb):
-        //
-        //   lws_context_destroy() starts lws teardown:
-        //     - Calls uv_poll_stop() + uv_close() on every wsi's poll handle.
-        //     - Calls uv_idle_stop() + uv_close() and uv_timer_stop() + uv_close()
-        //       on its per-thread static handles (idle, sultimer).
-        //     - All of these uv_close() calls are synchronous in marking handles as
-        //       "closing" (uv_is_closing() returns true immediately), but their close
-        //       CALLBACKS fire asynchronously in later loop iterations.
-        //     - For a foreign loop, lws does NOT call uv_stop() — that is our job.
-        //     - For a foreign loop, lws does NOT free context memory yet; it defers
-        //       to a second lws_context_destroy() call after the loop exits.
-        //
-        //   uv_stop() tells uv_run() to return after the current iteration. We use
-        //   this instead of closing our handles (e.g. m_async) to unblock uv_run,
-        //   because closing handles here races with lws's own deferred close
-        //   callbacks. uv_stop() is clean: no handles are touched, the loop just
-        //   exits at the next safe point.
-        //
-        // PHASE 2 — after uv_run() returns (see stop()):
-        //   - lws_context_destroy() is called a second time to finalise cleanup that
-        //     was interrupted when uv_stop() cut the loop short.
-        //   - uv_walk() + uv_close() closes all remaining handles (m_async plus any
-        //     user-leaked handles).
-        //   - A final uv_run(UV_RUN_DEFAULT) drains all close callbacks.
-        //   - uv_loop_close() completes the teardown.
-        // ---------------------------------------------------------------------------
-        if (self->m_lws_ctx) {
-            // First call — starts teardown and marks all lws handles as closing.
-            // Do NOT clear m_lws_ctx here; stop() needs the pointer for the
-            // mandatory second call after uv_run() returns.
-            lws_context_destroy(self->m_lws_ctx);
-        }
+        // uv_stop() rather than closing m_async here: stop() closes every handle
+        // once uv_run() has returned.
         uv_stop(&self->m_uv_loop);
         return;
     }
@@ -218,29 +118,6 @@ void SingleThreadedUvExecutor::io_async_cb(uv_async_t* handle) {
 
 void SingleThreadedUvExecutor::io_thread_loop() {
     set_current_uv_executor(this);
-
-    lws_set_log_level(0, nullptr);
-
-    // Create the lws context on the uv thread so it registers its handles on
-    // m_uv_loop from the thread that will drive it.
-    static const lws_protocols protocols[] = {
-        { "coro-ws", coro::detail::ws::protocol_cb, 0, 4096, 0, nullptr, 0 },
-        { nullptr, nullptr, 0, 0, 0, nullptr, 0 }
-    };
-
-    lws_context_creation_info info{};
-    info.options        |= LWS_SERVER_OPTION_LIBUV;
-    void* loops          = &m_uv_loop;
-    info.foreign_loops   = &loops;
-    info.port            = CONTEXT_PORT_NO_LISTEN;
-    info.protocols       = protocols;
-    m_lws_ctx = lws_create_context(&info);
-
-    {
-        std::lock_guard lk(m_lws_mutex);
-        m_lws_ready = true;
-    }
-    m_lws_ready_cv.notify_all();
 
     uv_run(&m_uv_loop, UV_RUN_DEFAULT);
 }

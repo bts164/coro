@@ -138,6 +138,7 @@ else()
         src/io/tcp_listener.cpp
         src/io/ws_stream.cpp
         src/io/ws_listener.cpp
+        src/io/ws_service.cpp
         src/io/file.cpp
         src/io/lookup_host.cpp
         src/io/pipe.cpp

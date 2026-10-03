@@ -1,10 +1,19 @@
+// WsListener on libwebsockets, with its own lws context and service thread
+// (ws_service.h). See doc/design/websocket_stream.md.
+
 #include <coro/io/ws_listener.h>
-#include <coro/task/spawn_on.h>
-#include <coro/coro.h>
+#include <coro/io/lookup_host.h>
+#include <coro/io/socket_address.h>
+#include <coro/detail/sys/tcp.h>
+#include "ws_service.h"
 #include <cctype>
+#include <cerrno>
+#include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <variant>
 #include <vector>
 
 namespace coro {
@@ -76,215 +85,91 @@ std::vector<std::string> WsUpgradeRequest::offered_subprotocols() const {
 
 namespace detail::ws {
 
-#define LOGSTDOUT(...)
-    // do { \
-    //     std::printf("server_protocol_cb:%d -  ", __LINE__); \
-    //     std::printf(__VA_ARGS__); \
-    //     std::fflush(stdout); \
-    // } while (0)
+namespace {
+
+ListenerState& listener_of(lws* wsi) {
+    return *static_cast<ListenerState*>(lws_context_user(lws_get_context(wsi)));
+}
+
+bool listener_closed(ListenerState& listener) {
+    std::lock_guard lk(listener.accept_mutex);
+    return listener.closed;
+}
+
+} // namespace
 
 int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
-                        void* user, void* in, std::size_t len) {
-
-    // `user` points to sizeof(void*) bytes of lws-managed per-session storage.
-    // We use this slot to hold a heap-allocated shared_ptr<ConnectionState>*.
-    // On ESTABLISHED we write it; on CLOSED we delete it.
+                       void* user, void* in, std::size_t len) {
+    // `user` points to sizeof(void*) bytes of lws-managed per-session storage holding
+    // the connection's ConnectionState*, or null before ESTABLISHED and after CLOSED.
+    // Null for the context-level callbacks, which have no session.
     auto** slot = static_cast<void**>(user);
+    auto* state = slot ? static_cast<ConnectionState*>(*slot) : nullptr;
 
     switch (reason) {
 
-    // -----------------------------------------------------------------------
-    // Pre-upgrade filter — runs before the 101 response is sent.
-    // Return -1 to reject; 0 to accept.
-    // -----------------------------------------------------------------------
+    // Before the 101 response. Return -1 to reject, 0 to accept.
     case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION: {
-        auto* listener_sp = static_cast<std::shared_ptr<ListenerState>*>(
-                                lws_context_user(lws_get_context(wsi)));
-        if (!listener_sp) return -1;
-        auto& listener = **listener_sp;
+        auto& listener = listener_of(wsi);
+        if (listener_closed(listener)) return -1;
 
         if (listener.process_request) {
             coro::WsUpgradeRequest req(wsi);
-            auto rejection = listener.process_request(req);
-            if (rejection.has_value()) {
-                LOGSTDOUT("connection rejected by process_request hook\n");
-                return -1;
-            }
+            if (listener.process_request(req).has_value()) return -1;
         }
 
         if (listener.select_subprotocol) {
             coro::WsUpgradeRequest req(wsi);
             auto offered = req.offered_subprotocols();
-            std::vector<std::string_view> views;
-            views.reserve(offered.size());
-            for (auto& s : offered) views.emplace_back(s);
-            auto selected = listener.select_subprotocol(
-                std::span<const std::string_view>(views));
-            if (selected.empty() && !offered.empty()) {
-                LOGSTDOUT("connection rejected by select_subprotocol hook\n");
-                return -1;
-            }
+            std::vector<std::string_view> views(offered.begin(), offered.end());
+            auto selected = listener.select_subprotocol(std::span<const std::string_view>(views));
+            if (selected.empty() && !offered.empty()) return -1;
         }
         break;
     }
 
-    // -----------------------------------------------------------------------
-    // New client completed the WebSocket handshake.
-    // -----------------------------------------------------------------------
+    // A client completed the handshake: queue it for accept().
     case LWS_CALLBACK_ESTABLISHED: {
-        LOGSTDOUT("connection established\n");
-        // Recover the ListenerState from lws context user data.
-        auto* listener_sp = static_cast<std::shared_ptr<ListenerState>*>(
-                                lws_context_user(lws_get_context(wsi)));
-        if (!listener_sp) {
-            LOGSTDOUT("no listener state, rejecting\n");
-            return -1;
-        }
-        auto& listener = **listener_sp;
-
-        // Create a ConnectionState for this connection and store it in the
-        // per-session slot so subsequent callbacks can find it.
+        if (!slot) return -1;
+        auto& listener = listener_of(wsi);
         auto conn = std::make_shared<ConnectionState>();
         conn->wsi              = wsi;
         conn->frame_mode       = listener.frame_mode;
         conn->max_message_size = listener.max_message_size;
-        auto* conn_sp = new std::shared_ptr<ConnectionState>(conn);
-        *slot = conn_sp;  // write into lws-managed per-session storage
-
-        // Enqueue the connection for the next accept() call.
+        Weak<Waker> waker;
         {
             std::lock_guard lk(listener.accept_mutex);
+            // The WsListener was dropped after this connection passed the filter.
+            // Returning -1 closes it; the slot is still null, so CLOSED ignores it.
+            if (listener.closed) return -1;
+            conn->self = conn;
+            *slot = conn.get();
             listener.pending.push_back(conn);
-            if (listener.accept_waker)
-                listener.accept_waker->wake();
+            waker = listener.accept_waker;
         }
-        LOGSTDOUT("connection enqueued for accept()\n");
+        wake(waker);
         break;
     }
 
-    // -----------------------------------------------------------------------
-    // Incoming data — delegate to shared receive logic.
-    // -----------------------------------------------------------------------
-    case LWS_CALLBACK_RECEIVE: {
-        if (!slot || !*slot) break;
-        auto& state = **static_cast<std::shared_ptr<ConnectionState>*>(*slot);
-
-        // lws_is_final_fragment / lws_frame_is_binary query lws state only valid during this callback.
-        LOGSTDOUT("received %zu bytes\n", len);
-        on_receive(state, std::span(static_cast<const std::byte*>(in), len),
+    case LWS_CALLBACK_RECEIVE:
+        if (!state) break;
+        // lws_is_final_fragment / lws_frame_is_binary are only valid during this callback.
+        on_receive(*state, std::span(static_cast<const std::byte*>(in), len),
                    lws_frame_is_binary(wsi) == 0, lws_is_final_fragment(wsi));
         break;
-    }
 
-    // -----------------------------------------------------------------------
-    // Write-ready — pop and send the front of the send queue.
-    // -----------------------------------------------------------------------
-    case LWS_CALLBACK_SERVER_WRITEABLE: {
-        LOGSTDOUT("writeable\n");
-        if (!slot || !*slot) break;
-        auto& state = **static_cast<std::shared_ptr<ConnectionState>*>(*slot);
+    case LWS_CALLBACK_SERVER_WRITEABLE:
+        if (!state) break;
+        return on_writeable(*state, wsi);
 
-        // Close takes priority over pending sends.
-        if (state.closing.load(std::memory_order_acquire)) {
-            LOGSTDOUT("closing connection\n");
-            lws_close_reason(wsi, LWS_CLOSE_STATUS_NORMAL, nullptr, 0);
-            return -1;
-        }
-
-        std::shared_ptr<SendSubState> sub;
-        {
-            std::lock_guard lk(state.send_queue_mutex);
-            if (state.send_queue.empty()) {
-                LOGSTDOUT("writeable but send queue is empty\n");
-                break;
-            }
-            sub = state.send_queue.front();
-            state.send_queue.pop_front();
-        }
-
-        std::shared_ptr<detail::Waker> waker_to_wake;
-        {
-            std::lock_guard lk(sub->mutex);
-            if (!sub->cancelled) {
-                // Copy data under the lock before touching the span — the destructor
-                // sets cancelled and the caller may free their buffer concurrently.
-                std::vector<std::byte> buf(LWS_PRE + sub->data.size());
-                std::copy(sub->data.begin(), sub->data.end(), buf.begin() + LWS_PRE);
-                int flags = (sub->opcode == WsStream::OpCode::Binary)
-                                ? LWS_WRITE_BINARY : LWS_WRITE_TEXT;
-                int r = lws_write(wsi,
-                                  reinterpret_cast<unsigned char*>(buf.data() + LWS_PRE),
-                                  buf.size() - LWS_PRE,
-                                  static_cast<lws_write_protocol>(flags));
-                if (r < 0) {
-                    LOGSTDOUT("lws_write error %d\n", r);
-                } else {
-                    LOGSTDOUT("sent %zu bytes\n", buf.size() - LWS_PRE);
-                }
-                sub->error = (r < 0) ? r : 0;
-                sub->data  = {};
-            } else {
-                LOGSTDOUT("send cancelled, skipping\n");
-            }
-            sub->complete = true;
-            waker_to_wake = sub->waker.load();
-        }
-        if (waker_to_wake) {
-            LOGSTDOUT("send complete, waking sender\n");
-            waker_to_wake->wake();
-        } else {
-            LOGSTDOUT("no waker to wake\n");
-        }
-        {
-            std::lock_guard lk(state.send_queue_mutex);
-            if (!state.send_queue.empty()) {
-                LOGSTDOUT("more sends queued, requesting another writeable callback\n");
-                lws_callback_on_writable(wsi);
-            } else {
-                LOGSTDOUT("no more sends queued\n");
-            }
-        }
-        break;
-    }
-
-    // -----------------------------------------------------------------------
-    // Connection closed — wake pending futures and free the session state.
-    // -----------------------------------------------------------------------
-    case LWS_CALLBACK_CLOSED: {
-        LOGSTDOUT("connection closed\n");
-        if (!slot || !*slot) break;
-        auto* conn_sp = static_cast<std::shared_ptr<ConnectionState>*>(*slot);
-        auto& state   = **conn_sp;
-
-        state.wsi = nullptr;
-        state.closed.store(true, std::memory_order_release);
-
-        std::shared_ptr<detail::Waker> recv_waker;
-        {
-            std::lock_guard lk(state.receive.mutex);
-            recv_waker = state.receive.waker.load();
-        }
-        if (recv_waker) recv_waker->wake();
-        {
-            std::lock_guard lk(state.send_queue_mutex);
-            for (auto& sub : state.send_queue) {
-                std::shared_ptr<detail::Waker> send_waker;
-                {
-                    std::lock_guard slk(sub->mutex);
-                    sub->error    = -1;
-                    sub->complete = true;
-                    send_waker    = sub->waker.load();
-                }
-                if (send_waker) send_waker->wake();
-            }
-            state.send_queue.clear();
-        }
-
-        // Delete the heap-allocated shared_ptr wrapper; may free ConnectionState.
-        delete conn_sp;
+    // WSI_DESTROY covers a wsi that goes without CLOSED; for one that had CLOSED the
+    // slot is already null.
+    case LWS_CALLBACK_CLOSED:
+    case LWS_CALLBACK_WSI_DESTROY:
+        if (!state) break;
         *slot = nullptr;
+        close_connection(*state, ECONNABORTED);
         break;
-    }
 
     default:
         break;
@@ -294,149 +179,137 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
 
 } // namespace detail::ws
 
+namespace {
+
+// A fresh state per bind attempt: lws keeps pointers into it (the protocols array,
+// the context user data), so it belongs to that attempt's context alone.
+std::shared_ptr<detail::ws::ListenerState> make_listener_state(const WsListener::Options& options) {
+    auto state = std::make_shared<detail::ws::ListenerState>();
+    state->frame_mode         = options.frame_mode;
+    state->max_frame_size     = options.max_frame_size;
+    state->max_message_size   = options.max_message_size;
+    state->process_request    = options.process_request;
+    state->select_subprotocol = options.select_subprotocol;
+    for (const auto& p : options.subprotocols) {
+        if (!state->subprotocol_str.empty()) state->subprotocol_str += ',';
+        state->subprotocol_str += p;
+    }
+    const char* name = state->subprotocol_str.empty() ? "coro-ws" : state->subprotocol_str.c_str();
+    state->protocols[0] = {name, detail::ws::server_protocol_cb, sizeof(void*),
+                           static_cast<unsigned int>(state->max_frame_size), 0, nullptr, 0};
+    state->protocols[1] = {nullptr, nullptr, 0, 0, 0, nullptr, 0};
+    return state;
+}
+
+// lws reports a failed bind only as a null context: it neither returns nor keeps the
+// errno. So bind the address again ourselves, with the same SO_REUSEADDR, to learn
+// why. Race (benign): the port's state can change in between; the probe only picks
+// the error code, and a probe that succeeds reports EIO (lws failed for some reason
+// other than the bind).
+int bind_errno(const SocketAddress& local) {
+    try {
+        detail::sys::close_socket(detail::sys::tcp_listen(local, 1));
+    } catch (const std::system_error& e) {
+        return e.code().value();
+    }
+    return EIO;
+}
+
+} // namespace
+
 // =============================================================================
 // WsListener
 // =============================================================================
 
 WsListener::WsListener(std::shared_ptr<detail::ws::ListenerState> state,
-                        SingleThreadedUvExecutor* uv_exec)
+                       std::shared_ptr<detail::ws::LwsService>    service)
     : m_state(std::move(state))
-    , m_uv_exec(uv_exec) {}
+    , m_service(std::move(service)) {}
 
 WsListener::WsListener(WsListener&&) noexcept = default;
-WsListener& WsListener::operator=(WsListener&&) noexcept = default;
 
-WsListener::~WsListener() {
-    if (!m_state) return;
-    with_context(*m_uv_exec,
-        [](std::shared_ptr<detail::ws::ListenerState> state,
-           SingleThreadedUvExecutor* uv_exec) -> Coro<void> {
-            using namespace coro::detail::ws;
-            if (!state->ctx) co_return;
-            // The shared_ptr<ListenerState> wrapper stored as lws context user data.
-            auto* sp = static_cast<std::shared_ptr<ListenerState>*>(
-                           lws_context_user(state->ctx));
-            // First of the two lws_context_destroy() calls a foreign-loop context
-            // needs; the executor makes the second, which frees the context, once the
-            // loop has exited. lws may call server_protocol_cb until then, so the
-            // wrapper it reads is deleted only after that.
-            lws_context_destroy(state->ctx);
-            uv_exec->retire_lws_context(state->ctx, [sp] { delete sp; });
-            state->ctx = nullptr;
-            state->closed.store(true, std::memory_order_release);
-            std::lock_guard lk(state->accept_mutex);
-            if (state->accept_waker)
-                state->accept_waker->wake();
-        }(std::move(m_state), m_uv_exec)
-    ).detach();
+WsListener& WsListener::operator=(WsListener&& other) noexcept {
+    if (this != &other) {
+        close();
+        m_state   = std::move(other.m_state);
+        m_service = std::move(other.m_service);
+    }
+    return *this;
 }
 
-WsListener::BindFuture WsListener::bind(std::string host, uint16_t port) {
+WsListener::~WsListener() { close(); }
+
+void WsListener::close() noexcept {
+    if (!m_state) return;
+    std::deque<std::shared_ptr<detail::ws::ConnectionState>> pending;
+    detail::Weak<detail::Waker> waker;
+    {
+        std::lock_guard lk(m_state->accept_mutex);
+        // From here the callbacks reject new connections (FILTER and ESTABLISHED
+        // check this under the same mutex), so nothing more reaches `pending`.
+        m_state->closed = true;
+        pending.swap(m_state->pending);
+        waker = m_state->accept_waker;
+    }
+    // An AcceptFuture from this listener may still be pending in another task.
+    detail::ws::wake(waker);
+    for (auto& conn : pending) detail::ws::post_close(*m_service, std::move(conn));
+    m_state.reset();
+    // If no accepted stream holds the service, this destroys the context (closing the
+    // listening socket) and joins its thread, after the closes above have run.
+    m_service.reset();
+}
+
+Coro<WsListener> WsListener::bind(std::string host, uint16_t port) {
     return bind(std::move(host), port, Options{});
 }
 
-WsListener::BindFuture WsListener::bind(std::string host, uint16_t port, Options options) {
-    return BindFuture(std::move(host), port, std::move(options), &current_uv_executor());
+Coro<WsListener> WsListener::bind(std::string host, uint16_t port, Options options) {
+    // nullopt: every interface (lws's iface = nullptr).
+    std::vector<std::optional<SocketAddress>> candidates;
+    if (host.empty()) {
+        candidates.emplace_back(std::nullopt);
+    } else {
+        for (const SocketAddress& addr : co_await lookup_host(host, port))
+            candidates.emplace_back(addr);
+    }
+
+    std::exception_ptr last_error;
+    for (const auto& candidate : candidates) {
+#if !defined(LWS_WITH_IPV6)
+        if (candidate && std::holds_alternative<Ipv6Address>(candidate->address)) {
+            last_error = std::make_exception_ptr(std::system_error(
+                EAFNOSUPPORT, std::system_category(),
+                "WsListener::bind: libwebsockets was built without IPv6"));
+            continue;
+        }
+#endif
+        auto state = make_listener_state(options);
+        const std::string iface = candidate ? detail::ws::numeric_host(*candidate) : std::string();
+
+        lws_context_creation_info info{};
+        info.port      = port;
+        info.iface     = candidate ? iface.c_str() : nullptr;
+        info.protocols = state->protocols;
+        info.user      = state.get();
+        // Without this, an address lws can't bind yet is deferred instead of failing.
+        info.options   = LWS_SERVER_OPTION_FAIL_UPON_UNABLE_TO_BIND;
+
+        // Synchronous: the socket is bound and listening when this returns.
+        std::string lws_errors;
+        if (auto service = detail::ws::LwsService::create(info, state, &lws_errors))
+            co_return WsListener(std::move(state), std::move(service));
+
+        const SocketAddress local = candidate ? *candidate : SocketAddress{Ipv4Address{}, port};
+        last_error = std::make_exception_ptr(std::system_error(
+            bind_errno(local), std::system_category(), "WsListener::bind (" + lws_errors + ")"));
+    }
+    std::rethrow_exception(last_error);   // non-null: there is always a candidate
 }
 
 WsListener::AcceptFuture WsListener::accept() {
-    return AcceptFuture(m_state, m_uv_exec);
-}
-
-// =============================================================================
-// BindFuture
-// =============================================================================
-
-WsListener::BindFuture::BindFuture(std::string host, uint16_t port,
-                                     Options options,
-                                     SingleThreadedUvExecutor* uv_exec)
-    : m_host(std::move(host))
-    , m_port(port)
-    , m_options(std::move(options))
-    , m_uv_exec(uv_exec) {}
-
-PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
-    if (!m_state) {
-        // First poll: allocate state and submit the bind request.
-        m_state = std::make_shared<detail::ws::ListenerState>();
-
-        {
-            std::lock_guard lk(m_state->bind_mutex);
-            m_state->bind_waker = ctx.getWaker();
-        }
-
-        // Copy options into state (hooks must outlive the context).
-        m_state->frame_mode         = m_options.frame_mode;
-        m_state->max_frame_size     = m_options.max_frame_size;
-        m_state->max_message_size   = m_options.max_message_size;
-        m_state->process_request    = std::move(m_options.process_request);
-        m_state->select_subprotocol = std::move(m_options.select_subprotocol);
-
-        // Build comma-separated subprotocol string; empty = accept any.
-        std::string proto;
-        for (std::size_t i = 0; i < m_options.subprotocols.size(); ++i) {
-            if (i) proto += ',';
-            proto += m_options.subprotocols[i];
-        }
-
-        uv_loop_t* loop = m_uv_exec->loop();
-        with_context(*m_uv_exec,
-            [](std::shared_ptr<detail::ws::ListenerState> state,
-               std::string host, uint16_t port, std::string proto,
-               uv_loop_t* loop) -> Coro<void> {
-                using namespace coro::detail::ws;
-                // lws_context stores a raw pointer into the protocols array, so it
-                // must live in ListenerState (not on this frame).
-                state->subprotocol_str = std::move(proto);
-                const char* proto_name = state->subprotocol_str.empty()
-                                             ? "coro-ws" : state->subprotocol_str.c_str();
-                state->protocols[0] = { proto_name, server_protocol_cb,
-                                         sizeof(void*),
-                                         static_cast<unsigned int>(state->max_frame_size),
-                                         0, nullptr, 0 };
-                state->protocols[1] = { nullptr, nullptr, 0, 0, 0, nullptr, 0 };
-
-                auto* sp = new std::shared_ptr<ListenerState>(state);
-
-                lws_context_creation_info info{};
-                info.port         = port;
-                info.iface        = host.empty() ? nullptr : host.c_str();
-                info.protocols    = state->protocols;
-                info.options     |= LWS_SERVER_OPTION_LIBUV;
-                void* loop_ptr    = loop;
-                info.foreign_loops = &loop_ptr;
-                info.user         = sp;
-
-                state->ctx = lws_create_context(&info);
-                if (!state->ctx) delete sp;
-
-                std::shared_ptr<detail::Waker> w;
-                {
-                    std::lock_guard lk(state->bind_mutex);
-                    if (!state->ctx) state->bind_error = -1;
-                    state->ready = true;
-                    w = state->bind_waker;
-                }
-                if (w) w->wake();
-                co_return;
-            }(m_state, m_host, m_port, std::move(proto), loop)
-        ).detach();
-        return PollPending;
-    }
-
-    std::lock_guard lk(m_state->bind_mutex);
-
-    if (!m_state->ready) {
-        m_state->bind_waker = ctx.getWaker();
-        return PollPending;
-    }
-
-    if (m_state->bind_error != 0)
-        throw std::system_error(
-            std::error_code(-m_state->bind_error, std::system_category()),
-            "WsListener::bind");
-
-    return WsListener(std::move(m_state), m_uv_exec);
+    if (!m_state) throw std::logic_error("WsListener::accept: moved-from WsListener");
+    return AcceptFuture(m_state, m_service);
 }
 
 // =============================================================================
@@ -444,26 +317,25 @@ PollResult<WsListener> WsListener::BindFuture::poll(detail::Context& ctx) {
 // =============================================================================
 
 WsListener::AcceptFuture::AcceptFuture(std::shared_ptr<detail::ws::ListenerState> state,
-                                         SingleThreadedUvExecutor* uv_exec)
+                                       std::shared_ptr<detail::ws::LwsService>    service)
     : m_state(std::move(state))
-    , m_uv_exec(uv_exec) {}
+    , m_service(std::move(service)) {}
 
 PollResult<WsStream> WsListener::AcceptFuture::poll(detail::Context& ctx) {
-    if (m_state->closed.load(std::memory_order_acquire))
-        throw std::runtime_error("WsListener::accept: listener is closed");
-
     std::lock_guard lk(m_state->accept_mutex);
+
+    if (m_state->closed)
+        throw std::runtime_error("WsListener::accept: listener is closed");
 
     if (!m_state->pending.empty()) {
         auto conn = std::move(m_state->pending.front());
         m_state->pending.pop_front();
-        // Construct WsStream from the accepted ConnectionState.
-        // WsStream's private constructor is accessible here because AcceptFuture
-        // is a nested class of WsListener, and WsStream grants access via friend.
-        return WsStream(std::move(conn), m_uv_exec);
+        // WsStream's private constructor: WsStream befriends WsListener, and
+        // AcceptFuture, as its nested class, shares that access.
+        return WsStream(std::move(conn), m_service);
     }
 
-    m_state->accept_waker = ctx.getWaker();
+    m_state->accept_waker = ctx.get_weak_waker();
     return PollPending;
 }
 

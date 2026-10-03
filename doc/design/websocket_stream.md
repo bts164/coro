@@ -1,437 +1,315 @@
 # WebSocket Stream
 
-!!! danger "FIXME: Heavily out of date — describes a retired architecture"
-    This document still describes `WsStream`/`WsListener` operations as `IoRequest`
-    subclasses (`WsConnectRequest`, `WsWritableRequest`, `WsCloseRequest`,
-    `WsBindRequest`) submitted to an `IoService`. **Neither `IoService` nor
-    `IoRequest` exist in the codebase anymore.** The real implementation
-    (`src/io/ws_stream.cpp`, `src/io/ws_listener.cpp`) runs each operation as a
-    `with_context(*m_uv_exec, ...)` coroutine that calls the lws API directly,
-    following the pattern documented in `doc/design/libuv_integration.md`. The
-    `lws_context*` ownership section is also stale — it's owned by
-    `SingleThreadedUvExecutor`, not `IoService`. This doc needs a full rewrite, not
-    a patch — see `doc_inconsistency_audit.md` at the repo root for details.
+`WsStream` and `WsListener` are an async WebSocket client and server built on
+[libwebsockets](https://libwebsockets.org/) (lws). They are not on the
+[I/O Driver](io_driver.md). lws runs its own `poll()` loop, so each lws context gets a
+dedicated **service thread**, and every lws call is posted to it. Futures are woken from
+the lws callbacks on that thread.
 
-`WsStream` and `WsListener` — async WebSocket client and server built on
-[libwebsockets](https://libwebsockets.org/) using the shared libuv event loop as the backend.
+Desktop only. `ws_stream.h` and `ws_listener.h` are excluded from the Pico install.
 
 ---
 
-## Overview
+## Goals
 
-`WsStream` exposes the same coroutine-friendly API surface as `TcpStream`:
+- **Any executor.** WebSockets need neither the driver nor a particular executor; they
+  work on a `CurrentThreadExecutor` with a caller-supplied `Parker`.
+- **Same connect and bind behaviour as TCP.** Host names resolve through
+  [`lookup_host()`](file_io.md#lookup_host), each address is tried in turn, and errors
+  are `std::system_error` with a real errno.
+- **Errors at the call site.** `connect()` and `bind()` throw; a bind failure is
+  reported by `bind()` itself.
+- **Safe to drop.** Dropping a stream, a listener or any pending future, on any thread,
+  closes or abandons cleanly. A dropped `receive()` loses no message.
+
+## Non-goals
+
+- **Owned buffers for `send()`** (see the TODO under [API](#api)).
+- **Explicit ping/pong.** lws answers pings itself.
+- **TLS listeners.** `wss://` works for clients only.
+
+---
+
+## API
 
 ```cpp
-// Connect and perform the WebSocket handshake.
-WsStream ws = co_await WsStream::connect("ws://example.com/chat");
+#include <coro/io/ws_stream.h>
+#include <coro/io/ws_listener.h>
 
-// Send a text frame.
-co_await ws.send("hello", WsStream::OpCode::Text);
-
-// Receive the next complete message.
+// Client
+WsStream ws = co_await coro::WsStream::connect("ws://example.com/chat");
+co_await ws.send("hello");                                   // text frame
 WsStream::Message msg = co_await ws.receive();
-std::string_view text(reinterpret_cast<const char*>(msg.data.data()), msg.data.size());
-
-// Destructor sends a close frame and tears down gracefully.
-```
-
----
-
-## Event Loop Integration
-
-libwebsockets (lws) has first-class support for an external libuv event loop. Passing
-`LWS_SERVER_OPTION_LIBUV` and a pointer to the runtime's `uv_loop_t` causes lws to
-register all its internal handles on that loop:
-
-```cpp
-lws_context_creation_info info{};
-info.options        |= LWS_SERVER_OPTION_LIBUV;
-info.foreign_loops[0] = loop;  // the uv_loop_t* owned by IoService
-lws_context* ctx = lws_create_context(&info);
-```
-
-lws is then driven entirely by the existing I/O thread — no new threads, no polling, no
-separate event loop.
-
-### `lws_context` ownership
-
-The `lws_context` is owned by `IoService` directly — it is a second I/O backend alongside
-the libuv loop, not a separate service. `IoService` gains a `lws_context*` member
-initialised at the **start of `io_thread_loop()`** (not in the constructor), because
-`lws_context` creation must happen on the same thread that will drive the loop. It is
-destroyed in `stop()` before `uv_loop_close()`.
-
-```
-IoService members:
-  uv_loop_t    m_uv_loop;      // libuv event loop
-  lws_context* m_lws_ctx;      // lws context; created on I/O thread, destroyed in stop()
-  uv_async_t   m_async;        // cross-thread doorbell (unchanged)
-```
-
-WebSocket operation types (`WsConnectRequest`, `WsSendRequest`, etc.) remain entirely
-separate from `IoService`, following the same pattern as `SleepFuture`'s timer requests —
-`IoService` submits and dispatches `IoRequest`s without knowing their concrete types.
-
----
-
-## Key Differences from `TcpStream`
-
-### 1. lws owns the connection, not the caller
-
-With `TcpStream` the library allocates the `uv_tcp_t`, controls its lifetime, and closes
-it when the stream is destroyed. With lws, the `lws_wsi*` (WebSocket instance) is owned
-by the lws context. Callers receive a raw pointer in callbacks and must never free it
-themselves. `WsStream` must hold a raw `lws_wsi*` and null it out when lws delivers a
-`LWS_CALLBACK_CLIENT_CLOSED` or `LWS_CALLBACK_CLIENT_CONNECTION_ERROR` event.
-
-The `shared_ptr<Handle>` ownership pattern from `TcpStream` does not apply here. Lifetime
-is managed by lws.
-
-### 2. A single callback dispatches all events
-
-lws fires one protocol callback (a C function pointer registered at context creation) for
-every event on every connection. The `reason` argument is an enum with ~80 values covering
-connection establishment, data receipt, write-readiness, pings, closes, and more. The
-relevant subset for a client stream:
-
-| Reason | Meaning |
-|---|---|
-| `LWS_CALLBACK_CLIENT_ESTABLISHED` | Handshake complete — connection is ready |
-| `LWS_CALLBACK_CLIENT_RECEIVE` | A complete (or partial) message frame arrived |
-| `LWS_CALLBACK_CLIENT_WRITEABLE` | Safe to call `lws_write()` now |
-| `LWS_CALLBACK_CLIENT_CLOSED` | Connection closed by remote or after our close |
-| `LWS_CALLBACK_CLIENT_CONNECTION_ERROR` | Handshake or connection failed |
-
-This means a single `protocol_cb` function must dispatch to whichever sub-state is
-relevant for each event, rather than having separate `connect_cb`, `read_cb`, `write_cb`
-as in `TcpStream`.
-
-### 3. Writing is write-readiness based, not direct
-
-`uv_write()` can be called at any time from the I/O thread — lws forbids this. The correct
-pattern is:
-
-1. Caller's `SendFuture` stores the data and submits a `WsWritableRequest` which calls
-   `lws_callback_on_writable(wsi)` on the I/O thread.
-2. lws fires `LWS_CALLBACK_CLIENT_WRITEABLE` when the connection is ready.
-3. `protocol_cb` calls `lws_write()` from within that callback, records the result,
-   and wakes the `SendFuture`.
-
-This adds one extra suspension point compared to `TcpStream::write()` but is required by
-the lws API contract.
-
----
-
-## Public API Types
-
-### `WsStream::OpCode`
-
-```cpp
-enum class OpCode { Text, Binary };
-```
-
-### `WsStream::FrameMode`
-
-```cpp
-enum class FrameMode { Full, Partial };
-```
-
-`Full` (default): `receive()` returns only after the final fragment — the complete message
-is in `Message::data`.
-
-`Partial`: `receive()` returns for each fragment as it arrives; `Message::is_final`
-indicates whether this is the last one. Useful for large binary transfers.
-
-Selected at connect time:
-
-```cpp
-WsStream ws = co_await WsStream::connect(url);                        // Full
-WsStream ws = co_await WsStream::connect(url, FrameMode::Partial);   // Partial
-```
-
-### `WsStream::Message`
-
-```cpp
-struct Message {
-    std::vector<std::byte> data;      // payload bytes
-    bool                   is_text;   // true = UTF-8 text frame, false = binary
-    bool                   is_final;  // always true in Full mode; may be false in Partial mode
-};
-```
-
----
-
-## State and Ownership Model
-
-Because multiple futures (`ConnectFuture`, `ReceiveFuture`, `SendFuture`) share the same
-lws connection, all shared state lives in a single `coro::detail::ws::ConnectionState`
-struct. This follows the detail-namespace rule: when sibling futures share state, a
-dedicated `coro::detail::<op>` namespace is used rather than nesting in one sibling
-arbitrarily.
-
-`WsStream` holds a `shared_ptr<ConnectionState>`. Each future also holds one, so the
-state remains valid even if `WsStream` is destroyed while an operation is in flight.
-
-### Canonical struct definitions
-
-```cpp
-namespace coro::detail::ws {
-
-struct ConnectSubState {
-    std::atomic<std::shared_ptr<Waker>> waker;
-    std::atomic<bool>                   complete{false};
-    int                                 error = 0;   // 0 = success; set before complete=true
-};
-
-struct ReceivedMessage {
-    std::vector<std::byte> data;
-    bool                   is_text  = false;
-    bool                   is_final = false;
-    int                    error    = 0;   // e.g. EMSGSIZE; receive() throws it
-};
-
-struct ReceiveSubState {
-    std::mutex                          mutex;     // guards everything below except waker
-    std::atomic<std::shared_ptr<Waker>> waker;
-    std::vector<std::byte>              buffer;    // message being assembled on the I/O thread
-    std::size_t                         message_size = 0;   // for max_message_size
-    bool                                discarding = false; // dropping the rest of an oversized message
-    std::deque<ReceivedMessage>         ready;     // complete messages, drained in order by receive()
-};
-
-struct SendSubState {
-    std::atomic<std::shared_ptr<Waker>> waker;
-    std::atomic<bool>                   complete{false};
-    std::atomic<bool>                   cancelled{false};  // set by SendFuture destructor
-    std::span<const std::byte>          data;     // non-owning; caller's buffer must stay alive
-    WsStream::OpCode                    opcode  = WsStream::OpCode::Text;
-    int                                 error   = 0;   // set before complete=true
-};
-
-struct ConnectionState {
-    lws*                  wsi        = nullptr;  // owned by lws context — never freed by us
-    WsStream::FrameMode   frame_mode = WsStream::FrameMode::Full;  // read-only after connect
-    ConnectSubState       connect;
-    ReceiveSubState       receive;
-    SendSubState          send;
-    std::mutex            send_queue_mutex;
-    std::deque<SendSubState*> send_queue;        // see Send Queue section
-    std::atomic<bool>     closed{false};
-};
-
-int protocol_cb(lws* wsi, lws_callback_reasons reason,
-                void* user, void* in, std::size_t len);
-
-} // namespace coro::detail::ws
-```
-
----
-
-## `WsConnectRequest` — Bootstrapping per-session user data
-
-`lws_client_connect_via_info` requires the `ConnectionState*` to be available in
-`protocol_cb` from the very first callback. lws passes per-session user data via the
-`userdata` field of `lws_client_connect_info`. `WsConnectRequest::execute()` stores a
-heap-allocated `shared_ptr<ConnectionState>` there before calling connect, so
-`protocol_cb` can recover it from the first event onward:
-
-```cpp
-struct WsConnectRequest : IoRequest {
-    std::shared_ptr<ConnectionState> state;
-    std::string                      host;
-    std::string                      path;
-    uint16_t                         port;
-    bool                             tls;
-
-    void execute(uv_loop_t* /*loop*/) override {
-        // Heap-allocate a shared_ptr wrapper — protocol_cb recovers it via
-        // lws_get_opaque_user_data() and deletes it in LWS_CALLBACK_CLIENT_CLOSED.
-        auto* sp = new std::shared_ptr<ConnectionState>(state);
-
-        lws_client_connect_info ci{};
-        ci.context    = /* IoService::m_lws_ctx, passed in at construction */;
-        ci.address    = host.c_str();
-        ci.port       = port;
-        ci.path       = path.c_str();
-        ci.ssl_connection = tls ? LCCSCF_USE_SSL : 0;
-        ci.userdata   = sp;   // recovered by protocol_cb as shared_ptr<ConnectionState>*
-
-        state->wsi = lws_client_connect_via_info(&ci);
-        if (!state->wsi) {
-            delete sp;
-            state->connect.error = -1;
-            state->connect.complete.store(true, std::memory_order_release);
-            if (auto w = state->connect.waker.load()) w->wake();
-        }
-    }
-};
-```
-
-`WsConnectRequest` needs access to `IoService::m_lws_ctx`. The simplest approach is to
-pass the `lws_context*` into the request at construction time (obtained via a new
-`IoService::lws_context()` accessor).
-
----
-
-## `protocol_cb` Dispatch
-
-```cpp
-int protocol_cb(lws* wsi, lws_callback_reasons reason, void* /*user*/,
-                void* in, std::size_t len) {
-
-    auto* sp = static_cast<std::shared_ptr<ConnectionState>*>(
-                   lws_wsi_user(wsi));
-    if (!sp) return 0;
-    auto& state = **sp;
-
-    switch (reason) {
-
-    case LWS_CALLBACK_CLIENT_ESTABLISHED:
-        state.connect.complete.store(true, std::memory_order_release);
-        if (auto w = state.connect.waker.load()) w->wake();
-        break;
-
-    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-        state.connect.error = -1;  // TODO: surface lws error string
-        state.connect.complete.store(true, std::memory_order_release);
-        if (auto w = state.connect.waker.load()) w->wake();
-        break;
-
-    case LWS_CALLBACK_CLIENT_RECEIVE: {
-        // Shared with the server's LWS_CALLBACK_RECEIVE. Appends the fragment to
-        // receive.buffer; on the final fragment (or every fragment in Partial mode)
-        // moves it onto receive.ready and wakes the ReceiveFuture, if any.
-        on_receive(state, std::span(static_cast<const std::byte*>(in), len),
-                   lws_frame_is_binary(wsi) == 0, lws_is_final_fragment(wsi));
-        lws_rx_flow_control(wsi, 1);
-        break;
-    }
-
-    case LWS_CALLBACK_CLIENT_WRITEABLE: {
-        std::lock_guard lk(state.send_queue_mutex);
-        if (state.send_queue.empty()) break;
-        auto* sub = state.send_queue.front();
-        state.send_queue.pop_front();
-
-        if (!sub->cancelled.load(std::memory_order_acquire)) {
-            // lws_write requires LWS_PRE bytes of padding before the payload.
-            std::vector<std::byte> buf(LWS_PRE + sub->data.size());
-            std::copy(sub->data.begin(), sub->data.end(), buf.begin() + LWS_PRE);
-            int flags = (sub->opcode == WsStream::OpCode::Binary)
-                            ? LWS_WRITE_BINARY : LWS_WRITE_TEXT;
-            int r = lws_write(wsi,
-                              reinterpret_cast<unsigned char*>(buf.data() + LWS_PRE),
-                              sub->data.size(),
-                              static_cast<lws_write_protocol>(flags));
-            sub->error = (r < 0) ? r : 0;
-            sub->data  = {};
-            sub->complete.store(true, std::memory_order_release);
-            if (auto w = sub->waker.load()) w->wake();
-        }
-
-        // If more sends are queued, request another WRITEABLE callback.
-        if (!state.send_queue.empty())
-            lws_callback_on_writable(wsi);
-        break;
-    }
-
-    case LWS_CALLBACK_CLIENT_CLOSED:
-        state.wsi = nullptr;
-        state.closed.store(true, std::memory_order_release);
-        // Wake any futures blocked on receive or send so they can return an error.
-        if (auto w = state.receive.waker.load()) w->wake();
-        {
-            std::lock_guard lk(state.send_queue_mutex);
-            for (auto* sub : state.send_queue) {
-                sub->error = -1;
-                sub->complete.store(true, std::memory_order_release);
-                if (auto w = sub->waker.load()) w->wake();
-            }
-            state.send_queue.clear();
-        }
-        // Delete the heap-allocated shared_ptr wrapper — last ref may free ConnectionState.
-        delete sp;
-        break;
-
-    default:
-        break;
-    }
-    return 0;
+std::string_view text = msg.as_text();
+
+// Server
+WsListener listener = co_await coro::WsListener::bind("", 9001);   // all interfaces
+while (true) {
+    WsStream peer = co_await listener.accept();
+    spawn(serve(std::move(peer))).detach();
 }
 ```
 
----
+### `WsStream`
 
-## Send Future — Extra Suspension Point
+| Method | Returns | Output |
+|---|---|---|
+| `static connect(url)`, `connect(url, options)` | `Coro<WsStream>` | the stream, once the opening handshake completes |
+| `receive()` | `ReceiveFuture` | the oldest queued `Message` |
+| `send(span, opcode = Binary)`, `send(string_view)` | `SendFuture` | `void`, once `lws_write()` has taken the frame |
 
-Unlike `TcpStream::WriteFuture`, `SendFuture::poll()` cannot issue the write directly.
-It must enqueue the send and request write-readiness:
+- **URL:** `ws://host[:port]/path` or `wss://host[:port]/path`; default ports 80 and
+  443. Anything else throws `std::invalid_argument`.
+- **`WsStream::Options`:** `frame_mode` (`Full` assembles whole messages; `Partial`
+  returns each fragment, with `Message::is_final` on the last), `subprotocols` to
+  advertise (none by default, which accepts any server), and `max_message_size`
+  (0 = unlimited).
+- **`Message`:** `data` (bytes), `is_text`, `is_final`; `as_text()` throws
+  `std::logic_error` on a binary frame.
+- **Errors**, all `std::system_error` at `co_await`:
+    - `connect`: `dns_error_category()` if the host doesn't resolve; otherwise the last
+      address's failure (see the FIXME below).
+    - `receive`: `EMSGSIZE` for a message over `max_message_size` (the connection stays
+      usable); a closed connection throws once the queued messages are drained.
+    - `send`: `ENOTCONN` if the connection closed first, `EIO` if `lws_write` failed.
+- **Moved-from streams:** `receive()` and `send()` throw `std::logic_error`.
+- **Concurrency:** only one `receive()` may be in flight. Sends go through a queue and
+  are written in the order they were first polled. A stream must not be shared across
+  tasks.
+- **Drop and move-assign** post a graceful close (Close frame, then the peer's echo).
 
-```
-SendFuture::poll() #1:
-    push SendSubState* onto state.send_queue (under mutex)
-    submit WsWritableRequest → calls lws_callback_on_writable(wsi) on I/O thread
-    store waker, return PollPending
+!!! tip "TODO: `send()` still borrows a span"
+    `send` takes a `std::span`/`std::string_view` that must outlive the await, unlike the
+    owned-buffer API of `TcpStream` and `File`. Move it to a `ByteBuffer` parameter
+    (moved in, returned with the result) when the WebSocket API is next touched.
 
-LWS_CALLBACK_CLIENT_WRITEABLE fires:
-    protocol_cb pops SendSubState* from queue
-    calls lws_write(), sets complete=true, wakes future
+### `WsListener`
 
-SendFuture::poll() #2:
-    complete == true → check error → return PollReady or PollError
-```
+| Method | Returns | Output |
+|---|---|---|
+| `static bind(host, port)`, `bind(host, port, options)` | `Coro<WsListener>` | the listener; its socket is bound before this returns |
+| `accept()` | `AcceptFuture` | the next `WsStream` whose handshake completed |
 
----
+- **Host:** empty listens on every interface. Otherwise it's resolved with
+  `lookup_host()`, and the first address that binds is used. Errors: `dns_error_category()`,
+  or the last address's bind errno (`EADDRINUSE`, `EADDRNOTAVAIL`, ...).
+- **`WsListener::Options`:** `frame_mode`, `max_frame_size` (lws's per-connection rx
+  buffer), `max_message_size`, `subprotocols` to advertise, and two upgrade hooks:
+    - `process_request(const WsUpgradeRequest&)`: inspect the path, headers and offered
+      subprotocols; return a `WsUpgradeRejection` to refuse. lws closes the TCP
+      connection; the status code is not sent.
+    - `select_subprotocol(offered)`: return the chosen name, or empty to refuse.
+- **Drop and move-assign** reject new upgrades and close connections still queued for
+  `accept()`. Streams already accepted keep working (see
+  [Lifetimes](#lifetimes)).
 
-## Send Cancellation
-
-Dropping a `SendFuture` before it completes sets `cancelled = true` on its `SendSubState`.
-`protocol_cb` checks this flag in `LWS_CALLBACK_CLIENT_WRITEABLE` before calling
-`lws_write()`, skipping the write if the future is gone. The data span is never read after
-`cancelled` is set, so there is no dangling-pointer hazard.
-
-```cpp
-// SendFuture destructor — worker thread.
-~SendFuture() {
-    if (!m_sub_state->complete.load(std::memory_order_acquire))
-        m_sub_state->cancelled.store(true, std::memory_order_release);
-}
-```
-
-Because `cancelled` and `complete` are both atomics, the destructor and `protocol_cb`
-cannot both act on the data simultaneously.
-
----
-
-## ConnectFuture Cancellation
-
-Dropping a `ConnectFuture` mid-handshake is handled the same way: a `cancelled` flag on
-`ConnectSubState`. `LWS_CALLBACK_CLIENT_ESTABLISHED` checks it and, if set, immediately
-submits a `WsCloseRequest` rather than waking a future that no longer exists. The `wsi`
-remains valid until `LWS_CALLBACK_CLIENT_CLOSED` fires and nulls it.
-
-```cpp
-struct ConnectSubState {
-    std::atomic<std::shared_ptr<Waker>> waker;
-    std::atomic<bool>                   complete{false};
-    std::atomic<bool>                   cancelled{false};  // set by ConnectFuture destructor
-    int                                 error = 0;
-};
-```
+`connect` and `bind` each have two overloads rather than a defaulted `Options options = {}`
+argument: GCC rejects that default because `Options` is a nested class with member
+initializers.
 
 ---
 
-## Receive Queue and Cancellation
+## Service threads
 
-Incoming messages are queued on `ReceiveSubState::ready` as they arrive, whether or not a
-`receive()` is pending, and each `receive()` pops the oldest. So messages that arrive back to
-back stay separate, and dropping a `ReceiveFuture` (e.g. the losing branch of a `select()` or
-`timeout()`) is cancel-safe: nothing is discarded, and the next `receive()` gets whatever
-arrived meanwhile.
+```mermaid
+flowchart TB
+    subgraph Executor["Any executor thread"]
+        WsStream
+        WsListener
+        Futures["ReceiveFuture / SendFuture / AcceptFuture / ConnectAttempt"]
+    end
+    subgraph ClientSvc["Client LwsService thread (one per process)"]
+        ClientCtx["lws_context (no listen port)"]
+    end
+    subgraph ServerSvc["LwsService thread (one per WsListener)"]
+        ServerCtx["lws_context (listening)"]
+    end
+    WsStream -- "post(command)" --> ClientSvc
+    WsStream -- "post(command)" --> ServerSvc
+    WsListener -- "LwsService::create()" --> ServerSvc
+    ClientCtx -- "callbacks fill ConnectionState, wake()" --> Futures
+    ServerCtx -- "callbacks fill ConnectionState / ListenerState, wake()" --> Futures
+```
+
+- `detail::ws::LwsService` (`src/io/ws_service.{h,cpp}`, private) owns one
+  `lws_context` and the thread that services it. The loop is one `lws_service()` pass,
+  then every command posted since, then repeat.
+- `post()` is the only way in from other threads. It queues a command and calls
+  `lws_cancel_service()`, the one lws call that is safe from any thread, to wake the
+  poll. Commands run in posting order.
+- **Client:** every `WsStream::connect()` shares one process-wide client service,
+  created on first use and kept until static destruction (see the FIXME below). If
+  creating it fails, the next `connect()` tries again.
+- **Server:** each `WsListener::bind()` creates its own service with a listening
+  context. `lws_create_context()` runs on the calling thread, so a bind failure is
+  reported by `bind()` itself.
+- lws is built without its libuv event-lib backend (`with_libuv=False` in
+  `conanfile.py`); the service thread uses lws's built-in `poll()` loop.
+
+!!! note "NOTE: one fd table per context"
+    lws sizes each context's fd table from the process's fd limit, so each listener,
+    plus the shared client context, costs that much memory. Negligible for a handful of
+    listeners; revisit if a program binds many.
+
+### Lifetimes
+
+```mermaid
+classDiagram
+    class WsStream {
+        shared_ptr~ConnectionState~ m_state
+        shared_ptr~LwsService~ m_service
+    }
+    class WsListener {
+        shared_ptr~ListenerState~ m_state
+        shared_ptr~LwsService~ m_service
+    }
+    class LwsService {
+        lws_context* m_ctx
+        shared_ptr~void~ m_keep_alive
+        thread m_thread
+    }
+    class ConnectionState {
+        lws* wsi
+        shared_ptr~ConnectionState~ self
+    }
+    WsStream --> ConnectionState
+    WsStream --> LwsService
+    WsListener --> LwsService
+    LwsService --> ListenerState : keep_alive
+```
+
+- **`shared_ptr<LwsService>` is held only by `WsStream`, `WsListener` and their
+  futures.** Callback state (`ConnectionState`, `ListenerState`) and posted commands
+  never hold it. So the last reference always drops on a non-service thread, and
+  `~LwsService()` can stop and join the thread. Destroying the context closes every
+  connection still on it.
+- **Accepted streams hold their listener's service.** So the listening context, and its
+  bound port, live until the listener and the last stream it accepted are gone. Until
+  then new connections fail the upgrade: the server callback checks
+  `ListenerState::closed` in `FILTER_PROTOCOL_CONNECTION` and `ESTABLISHED`.
+- **`self`.** While lws holds a raw pointer to a `ConnectionState` (the client wsi's user
+  pointer, or the server's per-session slot), the state keeps itself alive through its
+  `self` member. `close_connection()` clears it last, when lws reports the connection
+  gone (`CLOSED`, a connect error, or `WSI_DESTROY`); it is idempotent.
+- **`keep_alive`** holds what `lws_context_creation_info` points into (the protocols
+  table and `ListenerState`) until after the context is destroyed.
+
+!!! warning "FIXME: a client context can't be recreated"
+    Freeing the client service when its last stream drops, and making a new one on the
+    next `connect()`, fails under ASan in an Ubuntu 24.04 container: every client
+    context after the first fails in `lws_context_init_client_ssl()`. lws logs nothing
+    more specific; the silent failure points in
+    `lws_tls_client_create_vhost_context()` are the SHA-256 hash of the TLS config
+    (`EVP_MD_CTX_create`/`EVP_DigestInit_ex`). Server contexts, which don't do the SSL
+    global init, are unaffected. The root cause wasn't found.
+
+    The client service therefore lives for the rest of the process. A static's
+    initializer creates it, so its destructor runs before OpenSSL's atexit cleanup. The
+    cost is one idle thread blocked in `poll()` after the first `connect()`. Find the
+    root cause before giving listeners TLS, since each listener has its own context and
+    would hit the same path.
+
+---
+
+## Connection state
+
+All per-connection state is one `detail::ws::ConnectionState`, shared by the futures (on
+executor threads) and the lws callbacks (on the service thread). Each operation has its
+own sub-state and mutex:
+
+| Sub-state | Guards | Shared with |
+|---|---|---|
+| `ConnectSubState` | `waker`, `complete`, `cancelled`, `error`, lws's `reason` text | `ConnectAttempt` |
+| `ReceiveSubState` | the message being assembled, `ready` queue, `waker` | `ReceiveFuture` |
+| `SendSubState` (one per send) | `data`, `opcode`, `complete`, `cancelled`, `error`, `waker` | `SendFuture` |
+| `send_queue` (own mutex) | `shared_ptr<SendSubState>`s waiting for WRITEABLE | `SendFuture`, close path |
+
+`wsi`, `self` and `closing` are touched only on the service thread. `closed` is an atomic
+that only goes false to true; each reader re-checks it under the sub-state mutex that
+`close_connection()` takes before waking.
+
+Wakers are stored as `Weak<Waker>`, as the driver stores them: the executor's task list
+owns a waiting task, and a task that has gone is simply not woken. They are fired with
+`detail::ws::wake()` outside the mutex.
+
+lws fires one protocol callback for every event on every connection. The client
+(`protocol_cb`) and server (`server_protocol_cb`) callbacks share the logic that matters:
+
+| Event | Client / server reason | Does |
+|---|---|---|
+| Handshake done | `CLIENT_ESTABLISHED` / `ESTABLISHED` | completes the connect; the server queues the stream for `accept()` |
+| Data | `CLIENT_RECEIVE` / `RECEIVE` | `on_receive()` |
+| Writable | `CLIENT_WRITEABLE` / `SERVER_WRITEABLE` | `on_writeable()` |
+| Gone | `CLIENT_CONNECTION_ERROR`, `CLIENT_CLOSED` / `CLOSED`, and `WSI_DESTROY` | `close_connection()` |
+
+---
+
+## Connect
 
 ```mermaid
 sequenceDiagram
-    participant IO as I/O thread (on_receive)
+    participant T as connect() (task)
+    participant P as blocking pool
+    participant S as client service thread
+    participant L as lws
+    T->>P: lookup_host(host, port)
+    P-->>T: addresses
+    loop each address, until one connects
+        T->>S: post(connect command)
+        S->>L: lws_client_connect_via_info(numeric address, Host = name)
+        L-->>S: CLIENT_ESTABLISHED (or CONNECTION_ERROR)
+        S-->>T: complete, wake
+    end
+```
+
+`connect()` is a `Coro`. It parses the URL, resolves the host, then awaits a private
+leaf future, `WsStream::ConnectAttempt`, per address. The attempt connects to the numeric
+address, but the Host header and TLS SNI carry the name from the URL. The last error is
+rethrown if no address connects, as in `TcpStream::connect`.
+
+- **Cancellation.** Dropping a `ConnectAttempt` sets `cancelled`. The posted connect
+  command checks it first. If the handshake still completes, ESTABLISHED sees
+  `cancelled` and closes the connection. If the attempt is dropped after the connection
+  was established but before it was taken, its destructor posts the close.
+- **lws's reason in errors.** lws reports why a context or a connection failed only
+  as text. A connect failure's text, and the error and warning lines lws logs on the
+  calling thread during `lws_create_context()`, are appended to the exception's
+  `what()`. Lines logged anywhere else are dropped.
+
+!!! warning "FIXME: connect errors are a stand-in `ECONNREFUSED`"
+    lws reports a client connection failure as `LWS_CALLBACK_CLIENT_CONNECTION_ERROR`
+    with only a text reason, not an errno. Every failed connect is reported as
+    `ECONNREFUSED`, with lws's text in `what()`. A timeout, an unreachable host and a
+    failed handshake all look like a refusal.
+
+!!! tip "TODO: no IPv6 in this lws build"
+    The Conan lws package is built without `LWS_WITH_IPV6`. `connect()` skips IPv6
+    addresses, recording `EAFNOSUPPORT`, and `bind()` skips IPv6 candidates. Enable the
+    option, then drop the skips.
+
+## Bind
+
+`bind()` resolves the host, then calls `LwsService::create()` for each candidate address
+with `LWS_SERVER_OPTION_FAIL_UPON_UNABLE_TO_BIND`, so a missing interface fails at once
+instead of being retried later.
+
+lws doesn't keep `errno` when its bind fails. After a failed `lws_create_context()`,
+`bind()` probes the same address with a plain `sys::tcp_listen` and reports that errno,
+or `EIO` if the probe succeeds. Race (benign): the port can change hands between the two
+binds, which changes only the error reported.
+
+---
+
+## Receive
+
+Incoming messages are queued on `ReceiveSubState::ready` as they arrive, whether or not a
+`receive()` is pending, and each `receive()` pops the oldest. So messages that arrive back
+to back stay separate, and dropping a `ReceiveFuture` (the losing branch of a `select()`
+or `timeout()`) loses nothing.
+
+```mermaid
+sequenceDiagram
+    participant IO as service thread (on_receive)
     participant Q as receive.ready
     participant App as ReceiveFuture::poll
     IO->>Q: push "A" (final fragment), wake
@@ -441,158 +319,118 @@ sequenceDiagram
     App->>Q: empty and not closed -> store waker, Pending
 ```
 
-A message larger than `max_message_size` is queued as a single `EMSGSIZE` entry, which
-`receive()` throws. The rest of that message is dropped and the connection stays usable.
-When the connection closes, `receive()` still returns the queued messages first, then
-throws.
+- In `Full` mode fragments are assembled in `buffer` and queued once the final one
+  arrives. In `Partial` mode each fragment is queued as its own entry.
+- A message larger than `max_message_size` is queued as a single `EMSGSIZE` entry, which
+  `receive()` throws. The rest of that message is discarded; the connection stays usable.
+- When the connection closes, `receive()` still returns the queued messages first, then
+  throws.
 
-!!! warning "FIXME: The receive queue is unbounded"
+!!! warning "FIXME: the receive queue is unbounded"
     rx flow control isn't applied, so a peer that sends faster than the application
     receives grows `ready` without limit.
 
----
+## Send
 
-## Frame Mode — Full vs. Partial
+lws only allows `lws_write()` from inside a WRITEABLE callback, so a send takes one extra
+hop compared to `TcpStream::write()`:
 
-`receive()` behaviour is controlled by `FrameMode` stored in `ConnectionState`
-(set at connect time, read-only thereafter). `protocol_cb` reads it from `ConnectionState`
-— not from a member variable, since `protocol_cb` is a plain C function with no `this`.
+1. The first `SendFuture::poll` stores the waker under its sub-state mutex, releases it,
+   then, under `send_queue_mutex`, checks `closed` and pushes the sub-state. It posts
+   `lws_callback_on_writable()` to the service thread.
+2. WRITEABLE (`on_writeable`) pops the front entry. Under its mutex, unless `cancelled`,
+   it copies the data into an `LWS_PRE`-padded buffer, calls `lws_write()`, and
+   completes the send. If more entries remain it asks for another WRITEABLE.
+3. The next poll sees `complete` and returns, or throws its errno.
 
-In `Partial` mode, each fragment is queued on `ReceiveSubState::ready` as its own entry,
-with `is_final` set on the last one of a message.
+Dropping a `SendFuture` sets `cancelled` under the sub-state mutex. WRITEABLE checks it
+and reads `data` under that same lock, so it can't read a span whose buffer the caller
+has just freed.
 
----
+!!! tip "PERF: one copy per send"
+    `lws_write()` needs `LWS_PRE` bytes of headroom before the payload, so every send
+    copies its data. An owned-buffer `send()` could reserve the headroom itself.
 
-## Send Queue (Backpressure)
+## Close
 
-`ConnectionState::send_queue` holds raw pointers to `SendSubState` objects owned by their
-respective `SendFuture`s. Each `SendFuture` pushes its `SendSubState*` onto the queue
-(under `send_queue_mutex`) and submits a `WsWritableRequest`. `LWS_CALLBACK_CLIENT_WRITEABLE`
-pops and processes one entry per callback, then calls `lws_callback_on_writable()` again
-if more remain.
+`~WsStream` and move assignment post a close. The command sets `closing` and asks for
+WRITEABLE; `on_writeable` sees `closing`, calls `lws_close_reason()` and returns -1, since
+lws only starts a close from inside a protocol callback. When lws reports the connection
+gone, `close_connection()`:
 
-This allows multiple concurrent `send()` calls without waiting for each to complete.
-If the send queue interaction with cancellation proves complex during implementation,
-fall back to a single-in-flight constraint enforced by an assertion and defer the queue
-to a future version.
+1. fails a pending connect,
+2. sets `closed` and wakes the receiver,
+3. fails every queued send with `ENOTCONN` (under `send_queue_mutex`, then each
+   sub-state's mutex),
+4. clears the lws pointer to the state and drops `self`.
 
----
-
-## LWS_PRE Buffer Padding
-
-lws requires `LWS_PRE` bytes of free space before the payload pointer passed to
-`lws_write()`. `protocol_cb` copies the payload into a `LWS_PRE`-padded local buffer for
-each write. A future optimisation could expose a `send_with_padding()` API letting callers
-pre-allocate padded buffers to avoid the copy.
-
----
-
-## TLS (`wss://`)
-
-lws handles TLS internally when the `tls` flag is set in `WsConnectRequest`. The caller
-may pass a CA certificate path in `lws_context_creation_info` or use the system store. No
-changes to the callback model or future types are needed — TLS is transparent at the API
-level.
+If the stream held the last reference to a listener's service, the destructor also
+joins that service's thread, which closes the remaining connections abruptly.
 
 ---
 
-## URL Parsing
+## Races
 
-`connect(url)` accepts a full URL string. A small internal helper in `coro::detail::ws`
-parses it into the fields `lws_client_connect_via_info` requires:
-
-```cpp
-struct ParsedUrl {
-    std::string host;
-    std::string path;
-    uint16_t    port;
-    bool        tls;
-};
-ParsedUrl parse_ws_url(std::string_view url);  // throws std::invalid_argument on bad input
-```
-
-Handles four forms: `ws://host/path`, `ws://host:port/path`, and their `wss://`
-equivalents. Default ports: 80 for `ws://`, 443 for `wss://`.
-
----
-
-## Shutdown
-
-`WsStream`'s destructor submits a `WsCloseRequest` to the I/O thread, which calls
-`lws_close_reason()` to initiate a clean WebSocket close (sends a Close frame and waits
-for the echo). `LWS_CALLBACK_CLIENT_CLOSED` then nulls `state->wsi`, wakes any pending
-futures with an error, and deletes the `shared_ptr<ConnectionState>` wrapper.
-
-Forceful teardown (e.g. runtime shutdown before the close handshake completes) is handled
-by `lws_context_destroy()`, called from `IoService::stop()` on the I/O thread before
-`uv_loop_close()`. This closes all open connections synchronously.
+- **Wake after executor teardown (known).** A callback can `lock()` a waker just as the
+  task's executor is being destroyed. The executor drops its tasks first, so the window
+  is a few instructions, and only on `Runtime` shutdown with a connection still active.
+  The blocking pool has the same window. Wakes are skipped entirely while a service
+  thread runs `lws_context_destroy()` (`LwsService::tearing_down()`): that destroy fires
+  CLOSED for every connection, and by then no future can be waiting.
+- **Cancel vs. destroy.** `lws_cancel_service()` must not overlap
+  `lws_context_destroy()`. `post()` and `~LwsService()` call cancel with the service
+  mutex held. The thread only destroys after it has seen `m_stopping` under that same
+  mutex, and once `m_stopping` is set no one cancels again. If `lws_service()` fails,
+  the thread sets `m_stopping` itself, so later posts are dropped instead of touching a
+  dead context.
+- **Send lock order.** `SendFuture::poll` never holds its sub-state mutex while taking
+  `send_queue_mutex`; the close path takes `send_queue_mutex`, then each sub-state
+  mutex. Checking `closed` and pushing under `send_queue_mutex`, which the close path
+  also holds while setting `closed`, means a send can't be queued after the queue was
+  failed.
+- **Connect cancelled mid-handshake.** See [Connect](#connect).
+- **Bind errno probe.** See [Bind](#bind).
+- **Listener dropped during a handshake.** A connection already past
+  `FILTER_PROTOCOL_CONNECTION` is refused at ESTABLISHED, which also checks `closed`.
 
 ---
 
-## Protocol Negotiation (`Sec-WebSocket-Protocol`)
+## Tests
 
-The WebSocket opening handshake optionally includes a `Sec-WebSocket-Protocol` header that
-lets clients advertise one or more application-level subprotocols they understand, and
-servers echo back the one they selected.
+`test/io/test_ws_stream.cpp` (`test_ws_stream`). Each test uses its own port in
+30201–30299, and accepts are bounded by a timeout so a lost connection fails instead of
+hanging.
 
-### Default behaviour — no subprotocol
-
-By default, `WsStream` and `WsListener` omit `Sec-WebSocket-Protocol` entirely:
-
-```cpp
-// Client — no Sec-WebSocket-Protocol header sent.
-WsStream ws = co_await WsStream::connect("ws://localhost:9001/");
-
-// Server — accepts connections regardless of any subprotocol the client requests.
-WsListener listener = co_await WsListener::bind("127.0.0.1", 9001);
-```
-
-This makes both classes behave like a general-purpose WebSocket transport (similar to
-Python's `websockets` library), compatible with any peer without additional configuration.
-
-On the lws side, `nullptr` is passed as the protocol name in `lws_protocols`:
-
-```cpp
-const lws_protocols protocols[] = {
-    { nullptr, server_protocol_cb, sizeof(void*), 4096, 0, nullptr, 0 },
-    { nullptr, nullptr, 0, 0, 0, nullptr, 0 }  // terminator
-};
-```
-
-For the client, `ci.protocol = nullptr` omits the header from the HTTP upgrade request.
-
-### Opting in to a specific subprotocol
-
-Pass an optional `subprotocols` vector to advertise or restrict to named protocols:
-
-```cpp
-// Client advertises support for "chat.v1" and "chat.v2".
-WsStream ws = co_await WsStream::connect(
-    "wss://example.com/chat", WsStream::FrameMode::Full, {"chat.v1", "chat.v2"});
-
-// Server only accepts clients requesting "chat.v1".
-WsListener listener = co_await WsListener::bind(
-    "0.0.0.0", 9001, {"chat.v1"});
-```
-
-Multiple names are joined with commas and passed directly to lws:
-
-```cpp
-// "chat.v1,chat.v2" → Sec-WebSocket-Protocol: chat.v1, chat.v2
-ci.protocol = subprotocol_str.empty() ? nullptr : subprotocol_str.c_str();
-```
-
-The subprotocol string only needs to be alive for the duration of
-`lws_client_connect_via_info()` / `lws_create_context()`, so it is stored in the
-`WsConnectRequest` / `WsBindRequest` struct and freed after `execute()` returns.
+| Test | Checks |
+|---|---|
+| `WsStreamTest.TextRoundTripsBothWays` | Text both ways. |
+| `WsStreamTest.BinaryMessageIsNotText` | `is_text` false; `as_text()` throws. |
+| `WsStreamTest.BackToBackMessagesStaySeparate`, `...OnClient` | Two quick sends arrive as two messages, on either end. |
+| `WsStreamTest.DroppedReceiveLosesNothing` | A `receive()` dropped by a timeout; the next one gets the message. |
+| `WsStreamTest.OversizedMessageThrowsAndConnectionRecovers` | `EMSGSIZE`, then the next message arrives. |
+| `WsStreamTest.QueuedMessagesDeliveredBeforeCloseThrows` | Messages queued before a close are received first. |
+| `WsStreamTest.ConnectByName` | `ws://localhost:…` reaches a listener on 127.0.0.1, even if `::1` is tried first. |
+| `WsStreamTest.ConnectRefusedThrowsSystemError` | Nothing listening: `connection_refused`. |
+| `WsStreamTest.ConnectToUnresolvableNameThrowsDnsError` | `nonexistent.invalid` fails in `dns_error_category()`. |
+| `WsStreamTest.MalformedUrlThrowsInvalidArgument` | `http://` URL. |
+| `WsStreamTest.DroppedConnectIsHarmless` | A connect dropped by a 1 ms timeout; the next connect round-trips. |
+| `WsStreamTest.RuntimeShutdownWithOpenStreams` | A detached task blocked in `receive()` at `Runtime` destruction: no hang, no crash. |
+| `WsStreamTest.WorksWithoutDriver` | `CurrentThreadExecutor` + `PollingParker`, no timers. |
+| `WsListenerTest.StreamsSurviveListenerDrop` | Both directions still work after the listener drops. |
+| `WsListenerTest.DroppedListenerRejectsNewConnections` | A new connect fails while an accepted stream keeps the port. |
+| `WsListenerTest.PortReleasedWhenLastStreamDrops` | Rebinding the port succeeds once everything is dropped. |
+| `WsListenerTest.BindAddressInUseThrowsEaddrinuse` | The probed errno. |
+| `WsListenerTest.BindUnresolvableNameThrowsDnsError` | DNS errors propagate from `bind`. |
+| `WsListenerTest.EmptyHostBindsAllInterfaces` | `bind("", port)` accepts on loopback. |
 
 ---
 
-## Future Enhancements (Out of Scope for v1)
+## Files
 
-- **DNS resolution timeout:** lws resolves DNS internally via `getaddrinfo`. Exposing a
-  configurable timeout requires hooking into lws's async DNS path.
-- **Ping / Pong:** lws responds to unsolicited pings automatically. Exposing an explicit
-  `ping()` future for application-level heartbeats is straightforward but not required for v1.
-- **Zero-copy sends:** expose `send_with_padding()` so callers can pre-allocate
-  `LWS_PRE`-padded buffers and avoid the copy in `protocol_cb`.
+| File | Contents |
+|---|---|
+| `include/coro/io/ws_stream.h`, `src/io/ws_stream.cpp` | `WsStream`, `ConnectionState` and sub-states, the client callback, `on_receive`, `on_writeable`, `close_connection` |
+| `include/coro/io/ws_listener.h`, `src/io/ws_listener.cpp` | `WsListener`, `WsUpgradeRequest`, `ListenerState`, the server callback |
+| `src/io/ws_service.h`, `src/io/ws_service.cpp` | `LwsService` (private) |
+| `test/io/test_ws_stream.cpp` | Tests |
+| `examples/io/ws_echo_client.cpp`, `ws_echo_server.cpp` | Examples |

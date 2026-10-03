@@ -89,7 +89,8 @@ static Coro<void> handle_connection(WsStream ws, int id) {
 // ---------------------------------------------------------------------------
 static Coro<void> run_server() {
     LOG(-1, "Starting WebSocket echo server...");
-    // WsListener::bind() registers a listening socket with lws via IoService.
+    // WsListener::bind() creates an lws context listening on the port, serviced by
+    // its own thread.
     WsListener listener = co_await WsListener::bind("127.0.0.1", 9001);
     LOG(-1, "WebSocket echo server listening on ws://127.0.0.1:9001");
 
