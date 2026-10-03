@@ -20,7 +20,7 @@ public:
 
 // Stub: always returns Pending and stores the waker for inspection.
 template<typename T>
-class NeverFuture {
+class WakerStoringFuture {
 public:
     using OutputType = T;
     PollResult<T> poll(detail::Context& ctx) {
@@ -47,8 +47,8 @@ private:
 
 // --- Concept checks (compile-time) ---
 
-static_assert(Future<NeverFuture<int>>);
-static_assert(Future<NeverFuture<std::string>>);
+static_assert(Future<WakerStoringFuture<int>>);
+static_assert(Future<WakerStoringFuture<std::string>>);
 static_assert(Future<ImmediateFuture<int>>);
 
 struct NoOutputType {
@@ -64,17 +64,17 @@ static_assert(!Future<WrongReturnType>);
 
 // --- Runtime tests ---
 
-TEST(NeverFutureTest, PollReturnsPending) {
+TEST(WakerStoringFutureTest, PollReturnsPending) {
     auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
-    NeverFuture<int> f;
+    WakerStoringFuture<int> f;
     EXPECT_TRUE(f.poll(ctx).isPending());
 }
 
-TEST(NeverFutureTest, StoresWakerAfterPoll) {
+TEST(WakerStoringFutureTest, StoresWakerAfterPoll) {
     auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);
-    NeverFuture<int> f;
+    WakerStoringFuture<int> f;
     f.poll(ctx);
     EXPECT_EQ(f.storedWaker(), waker);
 }
@@ -91,9 +91,7 @@ TEST(ImmediateFutureTest, PollReturnsReady) {
 
 // --- coro::never<T>() / coro::NeverFuture<T> ---
 //
-// Qualified as coro::NeverFuture below: this file's own NeverFuture<T> stub (above) is
-// declared directly in this (global) scope, which hides the `using namespace coro;`-imported
-// coro::NeverFuture for unqualified lookup here.
+// Qualified as coro::NeverFuture for clarity next to this file's WakerStoringFuture stub.
 
 static_assert(Future<coro::NeverFuture<int>>);
 static_assert(Future<coro::NeverFuture<void>>);

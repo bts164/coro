@@ -29,7 +29,7 @@ static_assert(!std::is_default_constructible_v<NoDefaultFuture>);
 static_assert(Future<NoDefaultFuture>);
 static_assert(std::is_default_constructible_v<WhenFuture<NoDefaultFuture>>);
 
-struct NeverFuture {
+struct NeverReadyFuture {
     using OutputType = void;
     PollResult<void> poll(detail::Context&) { return PollPending; }
 };
@@ -139,7 +139,7 @@ TYPED_TEST(WhenSelectTest, EnabledBranchCanWin) {
     this->traits.rt.block_on([](std::optional<int>& got) -> Coro<void> {
         auto sel = co_await select(
             when(true, [] { return NoDefaultFuture(7); }),
-            NeverFuture{});
+            NeverReadyFuture{});
         if (std::holds_alternative<SelectBranch<0, int>>(sel))
             got = std::get<SelectBranch<0, int>>(sel).value;
     }(got));

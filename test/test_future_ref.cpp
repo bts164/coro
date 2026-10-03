@@ -27,12 +27,6 @@ struct ReadyFuture {
     PollResult<T> poll(detail::Context&) { return std::move(value); }
 };
 
-template<typename T>
-struct NeverFuture {
-    using OutputType = T;
-    PollResult<T> poll(detail::Context&) { return PollPending; }
-};
-
 struct CancellableFuture {
     using OutputType = int;
     bool cancelled = false;

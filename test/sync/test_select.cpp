@@ -29,7 +29,7 @@ struct ImmediateVoid {
     PollResult<void> poll(detail::Context&) { return PollReady; }
 };
 
-struct NeverFuture {
+struct NeverReadyFuture {
     using OutputType = void;
     PollResult<void> poll(detail::Context&) { return PollPending; }
 };
@@ -86,13 +86,13 @@ protected:
 TYPED_TEST_SUITE(SelectTest, AllExecutors);
 
 TYPED_TEST(SelectTest, FirstBranchWinsImmediately) {
-    auto result = this->traits.rt.block_on(select(ImmediateInt{7}, NeverFuture{}));
+    auto result = this->traits.rt.block_on(select(ImmediateInt{7}, NeverReadyFuture{}));
     EXPECT_TRUE((std::holds_alternative<SelectBranch<0, int>>(result)));
     EXPECT_EQ((std::get<SelectBranch<0, int>>(result).value), 7);
 }
 
 TYPED_TEST(SelectTest, SecondBranchWinsWhenFirstNeverReady) {
-    auto result = this->traits.rt.block_on(select(NeverFuture{}, ImmediateVoid{}));
+    auto result = this->traits.rt.block_on(select(NeverReadyFuture{}, ImmediateVoid{}));
     EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(result)));
 }
 
@@ -104,7 +104,7 @@ TYPED_TEST(SelectTest, ThreeBranchesFirstWins) {
 
 TYPED_TEST(SelectTest, ErrorFromWinningBranchPropagates) {
     EXPECT_THROW(
-        this->traits.rt.block_on(select(ThrowingFuture{}, NeverFuture{})),
+        this->traits.rt.block_on(select(ThrowingFuture{}, NeverReadyFuture{})),
         std::runtime_error);
 }
 
@@ -170,7 +170,7 @@ TEST(TimeoutTest, FutureCompletesBeforeTimeout) {
 TEST(TimeoutTest, TimeoutFiresWhenFutureNeverCompletes) {
     Runtime rt(1);
     using namespace std::chrono_literals;
-    auto result = rt.block_on(timeout(0ns, NeverFuture{}));
+    auto result = rt.block_on(timeout(0ns, NeverReadyFuture{}));
     EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(result)));
 }
 

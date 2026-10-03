@@ -24,7 +24,7 @@ struct ImmediateFuture {
     PollResult<int> poll(Context&) { return m_value; }
 };
 
-struct NeverFuture {
+struct NeverReadyFuture {
     using OutputType = int;
     PollResult<int> poll(Context&) { return PollPending; }
 };
@@ -61,7 +61,7 @@ TEST(TaskTest, CompletedTaskPollReturnsTrue) {
 TEST(TaskTest, PendingTaskPollReturnsFalse) {
     auto waker = make_rc<MockWaker>();
     Context ctx(waker);
-    TaskImpl<NeverFuture> t(NeverFuture{});
+    TaskImpl<NeverReadyFuture> t(NeverReadyFuture{});
     EXPECT_FALSE(t.poll(ctx));
 }
 
@@ -124,7 +124,7 @@ TEST(SingleThreadedExecutorTest, ScheduleAndPollTask) {
 
 TEST(SingleThreadedExecutorTest, PendingTaskBecomesIdle) {
     SingleThreadedExecutor ex;
-    auto impl = std::make_shared<TaskImpl<NeverFuture>>(NeverFuture{});
+    auto impl = std::make_shared<TaskImpl<NeverReadyFuture>>(NeverReadyFuture{});
     ex.schedule(std::shared_ptr<TaskBase>(std::move(impl)));
     ex.poll_ready_tasks();
     // Task returned Pending without storing a waker — transitions to Idle and
@@ -261,7 +261,7 @@ TEST(SchedulingStateTest, InitialStateIsIdle) {
 TEST(SchedulingStateTest, ScheduleSetsNotified) {
     SingleThreadedExecutor ex;
     // Keep a shared_ptr alive so we can inspect scheduling_state after schedule().
-    auto impl = std::make_shared<TaskImpl<NeverFuture>>(NeverFuture{});
+    auto impl = std::make_shared<TaskImpl<NeverReadyFuture>>(NeverReadyFuture{});
     TaskBase* raw = impl.get();
     ex.schedule(std::shared_ptr<TaskBase>(impl));  // shares ownership; impl still valid
     EXPECT_EQ(raw->scheduling_state.load(), SchedulingState::Notified);

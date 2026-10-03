@@ -12,13 +12,8 @@
 using namespace coro;
 using namespace coro::detail;
 
-// Minimal futures used in unit tests. NeverFuture<T> stays pending forever;
-// it is used to create a TaskImpl that looks pending from the scope's perspective.
-template<typename T>
-struct NeverFuture {
-    using OutputType = T;
-    PollResult<T> poll(Context&) { return PollPending; }
-};
+// coro::NeverFuture<T> (future.h) stays pending forever; it is used to create a
+// TaskImpl that looks pending from the scope's perspective.
 
 // A stream that never yields an item — used to create a StreamTaskImpl that looks
 // pending from the scope's perspective.
