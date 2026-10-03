@@ -309,21 +309,25 @@ WsListener& WsListener::operator=(WsListener&&) noexcept = default;
 WsListener::~WsListener() {
     if (!m_state) return;
     with_context(*m_uv_exec,
-        [](std::shared_ptr<detail::ws::ListenerState> state) -> Coro<void> {
+        [](std::shared_ptr<detail::ws::ListenerState> state,
+           SingleThreadedUvExecutor* uv_exec) -> Coro<void> {
             using namespace coro::detail::ws;
             if (!state->ctx) co_return;
-            // Recover and delete the shared_ptr<ListenerState> wrapper stored as
-            // lws context user data, then destroy the context.
+            // The shared_ptr<ListenerState> wrapper stored as lws context user data.
             auto* sp = static_cast<std::shared_ptr<ListenerState>*>(
                            lws_context_user(state->ctx));
+            // First of the two lws_context_destroy() calls a foreign-loop context
+            // needs; the executor makes the second, which frees the context, once the
+            // loop has exited. lws may call server_protocol_cb until then, so the
+            // wrapper it reads is deleted only after that.
             lws_context_destroy(state->ctx);
+            uv_exec->retire_lws_context(state->ctx, [sp] { delete sp; });
             state->ctx = nullptr;
             state->closed.store(true, std::memory_order_release);
-            delete sp;
             std::lock_guard lk(state->accept_mutex);
             if (state->accept_waker)
                 state->accept_waker->wake();
-        }(std::move(m_state))
+        }(std::move(m_state), m_uv_exec)
     ).detach();
 }
 

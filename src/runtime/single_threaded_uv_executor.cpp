@@ -122,6 +122,15 @@ void SingleThreadedUvExecutor::stop() {
         m_lws_ctx = nullptr;
     }
 
+    // The same second call for contexts retired by their owners (WsListener), whose
+    // first call ran inside the loop. Their user data must outlive this call, since
+    // lws may still invoke protocol callbacks while finishing, hence on_destroyed.
+    for (auto& [ctx, on_destroyed] : m_retired_lws_ctxs) {
+        lws_context_destroy(ctx);
+        if (on_destroyed) on_destroyed();
+    }
+    m_retired_lws_ctxs.clear();
+
     uv_walk(&m_uv_loop, [](uv_handle_t* h, void*) {
         if (!uv_is_closing(h))
             uv_close(h, nullptr);
@@ -129,6 +138,13 @@ void SingleThreadedUvExecutor::stop() {
 
     uv_run(&m_uv_loop, UV_RUN_DEFAULT);
     uv_loop_close(&m_uv_loop);
+}
+
+void SingleThreadedUvExecutor::retire_lws_context(lws_context* ctx,
+                                                  std::function<void()> on_destroyed) {
+    // FIXME: retired contexts are only freed when the executor stops, so a process
+    // that keeps binding and dropping listeners holds one context per listener until then.
+    m_retired_lws_ctxs.emplace_back(ctx, std::move(on_destroyed));
 }
 
 lws_context* SingleThreadedUvExecutor::lws_ctx() {

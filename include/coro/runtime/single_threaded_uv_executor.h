@@ -7,11 +7,14 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 // Forward declaration — full type in <libwebsockets.h>, included only by translation
 // units that use lws directly.
@@ -90,6 +93,11 @@ public:
     /// (or during initialisation) — libuv is not thread-safe.
     uv_loop_t* loop() noexcept { return &m_uv_loop; }
 
+    /// Takes a foreign-loop lws context (e.g. a WsListener's) on which the first
+    /// lws_context_destroy() has already been called. stop() makes the second call,
+    /// which frees it, after the loop exits; on_destroyed runs after that. UV thread only.
+    void retire_lws_context(lws_context* ctx, std::function<void()> on_destroyed);
+
 private:
     static void io_async_cb(uv_async_t* handle);
     void io_thread_loop();
@@ -113,6 +121,10 @@ private:
     std::mutex              m_lws_mutex;
     std::condition_variable m_lws_ready_cv;
     bool                    m_lws_ready = false;
+
+    // Contexts handed to retire_lws_context(). uv thread only; stop() reads it after
+    // joining the uv thread, which orders it after every push.
+    std::vector<std::pair<lws_context*, std::function<void()>>> m_retired_lws_ctxs;
 
     // -----------------------------------------------------------------------
     // Coroutine task queues

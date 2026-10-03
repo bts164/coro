@@ -168,6 +168,10 @@ int protocol_cb(lws* wsi, lws_callback_reasons reason,
             state.send_queue.clear();
         }
         // Delete the heap-allocated shared_ptr wrapper — may free ConnectionState.
+        // lws keeps calling protocol_cb for this wsi after CLOSED (WSI_DESTROY from
+        // __lws_close_free_wsi_final), so clear the user pointer first or those calls
+        // read the freed wrapper.
+        lws_set_wsi_user(wsi, nullptr);
         delete sp;
         break;
     }
