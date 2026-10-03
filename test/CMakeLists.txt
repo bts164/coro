@@ -64,7 +64,7 @@ set(TEST_NAMES
     # io/
     test_file
     test_lookup_host
-    # test_pipe  # disabled — see io/test_pipe.cpp
+    test_pipe
     test_circular_byte_buffer
     test_poll_stream
     test_signal
@@ -125,7 +125,7 @@ set(TEST_SRCS
     # io/
     io/test_file.cpp
     io/test_lookup_host.cpp
-    # io/test_pipe.cpp  # disabled
+    io/test_pipe.cpp
     io/test_circular_byte_buffer.cpp
     io/test_poll_stream.cpp
     io/test_signal.cpp

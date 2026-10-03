@@ -1,17 +1,15 @@
 #pragma once
 
-#include <coro/detail/context.h>
-#include <coro/detail/poll_result.h>
-#include <coro/detail/waker.h>
+// Desktop only: named pipes (FIFOs) on the IoDriver. See doc/design/pipe_streaming.md.
+
+#include <coro/coro.h>
+#include <coro/detail/socket_state.h>
+#include <coro/detail/stream_io.h>
+#include <coro/detail/sys/pipe.h>
 #include <coro/io/byte_buffer.h>
-#include <coro/task/join_handle.h>
-#include <any>
 #include <cstddef>
 #include <memory>
-#include <mutex>
-#include <ranges>
 #include <string>
-#include <system_error>
 #include <utility>
 
 namespace coro {
@@ -21,194 +19,137 @@ namespace coro {
 // ---------------------------------------------------------------------------
 
 enum class PipeMode : unsigned {
-    Read      = 0x01,  // O_RDONLY — blocks until a writer opens the other end
-    Write     = 0x02,  // O_WRONLY — blocks until a reader opens the other end
-    ReadWrite = 0x03,  // O_RDWR  — never blocks
+    Read      = 0x01,  // waits until a writer has written or come and gone
+    Write     = 0x02,  // waits until a reader has the FIFO open
+    ReadWrite = 0x03,  // never waits, and never reads EOF
 };
-
-// ---------------------------------------------------------------------------
-// Internal request types
-// ---------------------------------------------------------------------------
 
 namespace detail {
-
-// WriteRequest — owns the write buffer and tracks per-request completion.
-struct WriteRequest {
-    std::any               buf_owner;
-    const char*            base      = nullptr;
-    std::size_t            size      = 0;
-    bool                   completed = false;  // GUARDED BY mutex
-    std::error_code        error;              // GUARDED BY mutex
-    std::mutex             mutex;
-    std::shared_ptr<Waker> waker;              // GUARDED BY mutex
+/// Pipe's syscalls for the shared byte-stream futures (detail/stream_io.h).
+struct PipeIo {
+    static sys::IoResult try_read(sys::RawFd fd, std::byte* data, std::size_t size) noexcept {
+        return sys::pipe_try_read(fd, data, size);
+    }
+    static sys::IoResult try_write(sys::RawFd fd, const std::byte* data,
+                                   std::size_t size) noexcept {
+        return sys::pipe_try_write(fd, data, size);
+    }
+    static constexpr const char* read_name       = "Pipe::read";
+    static constexpr const char* read_exact_name = "Pipe::read_exact";
+    static constexpr const char* write_name      = "Pipe::write";
 };
-
-// ReadRequest — owns the read buffer and tracks per-request completion.
-struct ReadRequest {
-    std::any               buf_owner;
-    char*                  base     = nullptr;
-    std::size_t            capacity = 0;
-    std::size_t            filled    = 0;      // GUARDED BY mutex
-    bool                   completed = false;  // GUARDED BY mutex
-    std::error_code        error;              // GUARDED BY mutex
-    std::mutex             mutex;
-    std::shared_ptr<Waker> waker;              // GUARDED BY mutex
-};
-
-// Request factories — move buf into std::any and extract a stable raw pointer.
-// Requests are heap-allocated (shared_ptr), so the std::any address is stable
-// regardless of SBO; the extracted char* remains valid for the I/O lifetime.
-template<ByteBuffer Buf>
-std::shared_ptr<WriteRequest> make_write_request(Buf buf) {
-    auto req       = std::make_shared<WriteRequest>();
-    req->buf_owner = std::move(buf);
-    auto& stored   = std::any_cast<Buf&>(req->buf_owner);
-    req->base      = reinterpret_cast<const char*>(std::ranges::data(stored));
-    req->size      = std::ranges::size(stored);
-    return req;
-}
-
-template<ByteBuffer Buf>
-std::shared_ptr<ReadRequest> make_read_request(Buf buf) {
-    auto req       = std::make_shared<ReadRequest>();
-    req->buf_owner = std::move(buf);
-    auto& stored   = std::any_cast<Buf&>(req->buf_owner);
-    req->base      = reinterpret_cast<char*>(std::ranges::data(stored));
-    req->capacity  = std::ranges::size(stored);
-    return req;
-}
-
-struct PipeState;  // fully defined in pipe.cpp
-
-// Push helpers called from the Pipe::write / Pipe::read templates in pipe.hpp.
-// PipeState is incomplete here; the definitions in pipe.cpp see the full type.
-void push_write_request(PipeState& state, std::shared_ptr<WriteRequest> req);
-void push_read_request (PipeState& state, std::shared_ptr<ReadRequest>  req);
-
 } // namespace detail
 
-// ---------------------------------------------------------------------------
-// WriteHandle — Future<void> that resolves when a queued write completes.
-// ---------------------------------------------------------------------------
+/// Future returned by `Pipe::read()` (`Exact = false`) and `read_exact()`
+/// (`Exact = true`). Yields `{bytes_read, buf}`.
+template<ByteBuffer Buf, bool Exact>
+using PipeReadFuture = detail::FdReadFuture<detail::PipeIo, Buf, Exact>;
 
-class [[nodiscard]] WriteHandle {
-public:
-    using OutputType = void;
-
-    explicit WriteHandle(std::shared_ptr<detail::WriteRequest> req)
-        : m_req(std::move(req)) {}
-    WriteHandle(WriteHandle&&)            noexcept = default;
-    WriteHandle& operator=(WriteHandle&&) noexcept = default;
-    WriteHandle(const WriteHandle&)                = delete;
-    WriteHandle& operator=(const WriteHandle&)     = delete;
-
-    PollResult<void> poll(detail::Context& ctx);
-
-private:
-    std::shared_ptr<detail::WriteRequest> m_req;
-};
-
-// ---------------------------------------------------------------------------
-// ReadHandle<Buf> — Future<pair<size_t,Buf>> that resolves when a read completes.
-// ---------------------------------------------------------------------------
-
+/// Future returned by `Pipe::write()`. Yields `buf` once every byte is written.
 template<ByteBuffer Buf>
-class [[nodiscard]] ReadHandle {
-public:
-    using OutputType = std::pair<std::size_t, Buf>;
-
-    explicit ReadHandle(std::shared_ptr<detail::ReadRequest> req)
-        : m_req(std::move(req)) {}
-    ReadHandle(ReadHandle&&)            noexcept = default;
-    ReadHandle& operator=(ReadHandle&&) noexcept = default;
-    ReadHandle(const ReadHandle&)                = delete;
-    ReadHandle& operator=(const ReadHandle&)     = delete;
-
-    PollResult<std::pair<std::size_t, Buf>> poll(detail::Context& ctx) {
-        std::lock_guard lock(m_req->mutex);
-        if (!m_req->completed) {
-            m_req->waker = ctx.getWaker();
-            return PollPending;
-        }
-        if (m_req->error)
-            return PollError(std::make_exception_ptr(
-                std::system_error(m_req->error, "Pipe::read")));
-        Buf buf = std::any_cast<Buf>(std::move(m_req->buf_owner));
-        return std::pair<std::size_t, Buf>{m_req->filled, std::move(buf)};
-    }
-
-private:
-    std::shared_ptr<detail::ReadRequest> m_req;
-};
+using PipeWriteFuture = detail::FdWriteFuture<detail::PipeIo, Buf>;
 
 // ---------------------------------------------------------------------------
 // Pipe
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Async named-pipe (FIFO) handle backed by libuv stream I/O.
+ * @brief Async named-pipe (FIFO) handle. Move-only; obtain via
+ * `co_await Pipe::open(path, mode)` after creating the FIFO with
+ * `co_await Pipe::create(path)`.
  *
- * Obtain a `Pipe` via `co_await Pipe::open(path, mode)`. Create the FIFO on
- * disk first with `co_await Pipe::create(path)`.
+ * Same shape as `TcpStream`: every operation is a non-blocking syscall on the calling
+ * thread, and one that would block waits for readiness from the Runtime's IoDriver.
+ * Requires an executor that turns the IoDriver (`Runtime(n)` for any n); `open()`
+ * throws `std::logic_error` otherwise.
  *
- * `write(buf)` and `read(buf)` are regular (non-coroutine) functions that
- * queue the operation and return a handle immediately without suspending.
- * `co_await`-ing the handle waits for completion. Multiple requests can be
- * in-flight simultaneously; write requests are batched into a single
- * `uv_write` call per driver wake cycle, amortising cross-thread scheduling.
+ * **Concurrency:** only one read (`read()`/`read_exact()`) and only one `write()` may
+ * be in flight at a time (a read and a write at once only makes sense in
+ * `PipeMode::ReadWrite`).
  *
- * **Concurrency:** a `Pipe` must not be shared across tasks without external
- * synchronisation.
+ * **Cancellation:** dropping a pending `open()` or `read()` is always safe and loses
+ * nothing. Dropping a pending `read_exact()` loses the bytes it already read, and
+ * dropping a pending `write()` may leave part of the buffer written: after either,
+ * the byte stream is out of step.
+ *
+ * **Closing:** the fd is closed synchronously when the last owner drops it: the Pipe
+ * or a still-pending future.
+ *
+ * @warning A write after the reader has closed raises SIGPIPE, which kills the process
+ *          unless it is ignored or handled (`signal(SIGPIPE, SIG_IGN)`); the write then
+ *          throws EPIPE. Unlike `TcpStream`, a FIFO write has no per-call way to
+ *          suppress it.
  */
 class Pipe {
 public:
-    using OpenFuture   = JoinHandle<Pipe>;
-    using CreateFuture = JoinHandle<void>;
-
     Pipe(Pipe&&) noexcept;
     Pipe& operator=(Pipe&&) noexcept;
     Pipe(const Pipe&)            = delete;
     Pipe& operator=(const Pipe&) = delete;
 
-    /// Signals background drivers to stop and closes the pipe asynchronously.
+    /// Releases this handle. The fd is deregistered and closed synchronously once no
+    /// in-flight future still uses it.
     ~Pipe();
 
     /**
-     * @brief Opens an existing FIFO at `path`. Suspends until both ends are open.
-     * @throws std::system_error on failure.
+     * @brief Opens an existing FIFO at `path`.
+     *
+     * - `PipeMode::Write` waits until a reader has the FIFO open. The kernel gives no
+     *   event for a reader arriving, so this retries the open on a timer (1 ms, backing
+     *   off to 50 ms).
+     * - `PipeMode::Read` waits until a writer has written data, or has opened and closed
+     *   again (the first read then returns 0). Before any writer arrives a FIFO read
+     *   would return 0 as if at EOF; waiting here keeps EOF meaning "the writers are
+     *   gone". A writer that opens and writes nothing yet keeps this waiting.
+     * - `PipeMode::ReadWrite` never waits.
+     *
+     * @throws std::system_error (at co_await) on failure, e.g. ENOENT.
+     * @throws std::logic_error if the current Runtime's executor doesn't turn the
+     *         IoDriver.
      */
-    [[nodiscard]] static OpenFuture open(std::string path, PipeMode mode);
+    [[nodiscard]] static Coro<Pipe> open(std::string path, PipeMode mode);
 
     /**
-     * @brief Creates a FIFO at `path` via mkfifo(3). EEXIST is silently ignored.
+     * @brief Creates a FIFO at `path` via mkfifo(3). An existing file at `path` is
+     * silently accepted, whatever its type.
      * @param permission Unix permission bits (default 0666, subject to umask).
-     * @throws std::system_error on failure.
+     * @throws std::system_error (at co_await) on failure.
      */
-    [[nodiscard]] static CreateFuture create(std::string path, int permission = 0666);
+    [[nodiscard]] static Coro<void> create(std::string path, int permission = 0666);
 
     /**
-     * @brief Queues a write and returns a handle immediately (no suspension).
-     *
-     * The buffer is moved into the request. `co_await` the returned handle to
-     * wait for completion. Multiple in-flight writes are batched into a single
-     * `uv_write` call.
+     * @brief Reads up to `buf.size()` bytes into `buf` and returns `{bytes_read, buf}`;
+     * 0 bytes once every writer has closed.
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
     template<ByteBuffer Buf>
-    [[nodiscard]] WriteHandle write(Buf buf);
+    [[nodiscard]] PipeReadFuture<Buf, false> read(Buf buf);
 
     /**
-     * @brief Queues a read and returns a handle immediately (no suspension).
-     *
-     * The buffer is moved into the request. `co_await` the returned handle to
-     * get `{bytes_read, buf}`. Multiple reads can be pre-queued; the driver
-     * fills them in order as data arrives.
+     * @brief Reads exactly `buf.size()` bytes. Returns `{bytes_read, buf}`;
+     * `bytes_read < buf.size()` indicates EOF before the buffer was filled.
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
      */
     template<ByteBuffer Buf>
-    [[nodiscard]] ReadHandle<Buf> read(Buf buf);
+    [[nodiscard]] PipeReadFuture<Buf, true> read_exact(Buf buf);
+
+    /**
+     * @brief Writes all of `buf` and returns `buf` once the kernel has accepted every
+     * byte. Writes of at most `PIPE_BUF` bytes (4096 on Linux) are atomic with respect
+     * to other writers of the same FIFO; larger ones may interleave.
+     * @tparam Buf Any type satisfying @ref ByteBuffer.
+     * @throws std::system_error (at co_await) on failure, e.g. EPIPE (see the SIGPIPE
+     *         warning above).
+     */
+    template<ByteBuffer Buf>
+    [[nodiscard]] PipeWriteFuture<Buf> write(Buf buf);
 
 private:
-    explicit Pipe(std::shared_ptr<detail::PipeState> state);
-    std::shared_ptr<detail::PipeState> m_state;
+    using State = detail::SocketState;
+
+    explicit Pipe(std::shared_ptr<State> state);
+
+    std::shared_ptr<State> m_state;
 };
 
 } // namespace coro

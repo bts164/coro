@@ -1,24 +1,28 @@
 #pragma once
 
-// Template implementations for Pipe::write / Pipe::read.
-// Included at the bottom of pipe.h — not meant to be included directly.
+// Template method bodies for Pipe. Included at the bottom of pipe.h; never include
+// this file directly.
+//
+// The futures themselves are the shared byte-stream futures in
+// coro/detail/stream_io.h. See doc/design/tcp_stream.md, "Byte-stream futures".
 
-#include <coro/io/pipe.h>
+#include <utility>
 
 namespace coro {
 
 template<ByteBuffer Buf>
-WriteHandle Pipe::write(Buf buf) {
-    auto req = detail::make_write_request(std::move(buf));
-    detail::push_write_request(*m_state, req);  // req shared between queue and handle
-    return WriteHandle(std::move(req));
+PipeReadFuture<Buf, false> Pipe::read(Buf buf) {
+    return PipeReadFuture<Buf, false>(m_state, std::move(buf));
 }
 
 template<ByteBuffer Buf>
-ReadHandle<Buf> Pipe::read(Buf buf) {
-    auto req = detail::make_read_request<Buf>(std::move(buf));
-    detail::push_read_request(*m_state, req);   // req shared between queue and handle
-    return ReadHandle<Buf>(std::move(req));
+PipeReadFuture<Buf, true> Pipe::read_exact(Buf buf) {
+    return PipeReadFuture<Buf, true>(m_state, std::move(buf));
+}
+
+template<ByteBuffer Buf>
+PipeWriteFuture<Buf> Pipe::write(Buf buf) {
+    return PipeWriteFuture<Buf>(m_state, std::move(buf));
 }
 
 } // namespace coro

@@ -108,7 +108,7 @@ nav:
       - UDP Socket: design/udp_socket.md
       - WebSocket Stream: design/websocket_stream.md
       - Poll Streams: design/poll_streams.md
-      - Pipelined I/O: design/pipe_streaming.md
+      - Pipe (FIFOs): design/pipe_streaming.md
       - Signal Handling: design/signal_handling.md
     - Synchronization & Combinators:
       - Channels: design/channels.md

@@ -82,6 +82,8 @@ if(CORO_PLATFORM STREQUAL "pico")
         PATTERN "io_driver.h" EXCLUDE
         PATTERN "socket_state.h" EXCLUDE
         PATTERN "stream_io.h" EXCLUDE
+        PATTERN "pipe.h" EXCLUDE
+        PATTERN "pipe.hpp" EXCLUDE
         PATTERN "sys" EXCLUDE
         # spawn_blocking.h declares BlockingPool unconditionally (no CORO_PICO guard)
         # and calls Runtime::blocking_pool(), which only exists in the non-CORO_PICO
@@ -120,6 +122,7 @@ else()
         src/detail/fiber_context_posix.cpp
         src/detail/sys/dns_posix.cpp
         src/detail/sys/file_posix.cpp
+        src/detail/sys/pipe_posix.cpp
         src/detail/sys/poller_epoll.cpp
         src/detail/sys/socket_posix.cpp
         src/detail/sys/tcp_posix.cpp
@@ -136,7 +139,7 @@ else()
         src/io/ws_listener.cpp
         src/io/file.cpp
         src/io/lookup_host.cpp
-        #src/io/pipe.cpp
+        src/io/pipe.cpp
         src/io/circular_byte_buffer.cpp
         src/io/signal.cpp
         src/io/socket_address.cpp
