@@ -56,7 +56,7 @@ struct DecoderCoroPromise : CoroStream<T>::promise_type {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Coroutine return type for PollStream decoders.
+ * @brief Coroutine return type for ByteSource-driven decoders.
  *
  * Identical to `CoroStream<T>` but its promise type (@ref DecoderCoroPromise)
  * restricts `co_await` to `ByteSource`-produced futures only. Any attempt to
@@ -78,7 +78,6 @@ struct DecoderCoroPromise : CoroStream<T>::promise_type {
  *         co_yield std::move(pkt);
  *     }
  * }
- * auto stream = coro::PollStream<PciePacket>::open(fd, pcie_decoder);
  * @endcode
  *
  * @tparam T The item type yielded by the decoder.

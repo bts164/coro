@@ -35,11 +35,12 @@ concept ByteSourceFuture =
 /**
  * @brief Byte delivery interface for DecoderStream coroutines.
  *
- * Owned by PollStream::State and lives entirely on the libuv I/O thread.
- * poll_cb writes raw bytes from the fd into the accumulation ring buffer;
- * the decoder coroutine reads them via memcpy() and read().
+ * Owned by whatever feeds the decoder. The producer writes raw bytes into the
+ * accumulation ring buffer; the decoder coroutine reads them via memcpy() and
+ * read().
  *
- * All methods are libuv-thread-only. No synchronisation is needed.
+ * Not thread-safe: the producer and the decoder must run on the same thread, or
+ * the owner must serialize them.
  *
  * @see MemcpyFuture  For fixed-size struct reads (headers, footers).
  * @see ReadFuture    For variable-length or large reads where the caller
@@ -75,7 +76,7 @@ public:
     void consume(std::size_t n) { m_buffer.consume(n); }
 
     // ------------------------------------------------------------------
-    // poll_cb-facing API (libuv thread only)
+    // Producer-facing API
     // ------------------------------------------------------------------
 
     std::span<std::byte> writable_span()        { return m_buffer.writable_span(); }

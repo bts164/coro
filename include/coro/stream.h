@@ -88,8 +88,8 @@ NextFuture<S> next(S& stream) {
  * available. Equivalent to `blocking_wait(next(stream))`.
  *
  * Same runtime-context requirement as @ref blocking_wait: a future that touches the
- * reactor requires an active `current_runtime()`/`current_uv_executor()` on the calling
- * thread (ambient on a `spawn_blocking` thread). See doc/design/blocking_wait.md.
+ * runtime requires an active `current_runtime()` on the calling thread (ambient on a
+ * `spawn_blocking` thread). See doc/design/blocking_wait.md.
  *
  * @return `nullopt`/`false` once the stream is exhausted (matching `next()`'s return type
  * for the stream's `ItemType` — `bool` for `void` streams, `optional<T>` otherwise).

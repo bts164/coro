@@ -164,11 +164,11 @@ template<typename T>
  *
  * Unlike `Runtime::block_on()`, this does not create an executor or a reactor — it builds
  * a minimal condvar-backed `Waker` and loop-polls `future` directly, reusing whatever
- * `current_runtime()`/`current_uv_executor()` context is already active on the calling
- * thread (ambient on a `spawn_blocking` thread; see `coro::spawn_blocking()`). A future
- * that touches the reactor (a timer, a socket, a child task) requires that context to be
- * active — `current_uv_executor()` throws `std::runtime_error` otherwise, the same as it
- * would from any other thread with no active runtime.
+ * `current_runtime()` context is already active on the calling thread (ambient on a
+ * `spawn_blocking` thread; see `coro::spawn_blocking()`). A future that touches the
+ * runtime (a timer, a socket, a child task) requires that context to be active —
+ * `current_runtime()` throws `std::runtime_error` otherwise, the same as it would from
+ * any other thread with no active runtime.
  *
  * See doc/design/blocking_wait.md for the full design and rationale.
  *

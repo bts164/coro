@@ -20,5 +20,5 @@ target_link_libraries(ws_echo_server PRIVATE coro::coro)
 add_executable(fibonacci fibonacci.cpp)
 target_link_libraries(fibonacci PRIVATE coro::coro)
 
-add_executable(length_prefixed_stream length_prefixed_stream.cpp)
-target_link_libraries(length_prefixed_stream PRIVATE coro::coro)
+# length_prefixed_stream.cpp is kept for reference but not built: it uses PollStream,
+# which was removed with libuv. Kept until it is ported to the IoDriver.

@@ -1,3 +1,5 @@
+// NOT BUILT: this example uses PollStream, which was removed along with libuv. Kept
+// for reference until it is ported to the IoDriver.
 #include <sstream>
 #include <random>
 #include <fcntl.h>

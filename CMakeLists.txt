@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 # CORO_PLATFORM selects which target this build produces:
-#   desktop (default) — the libuv-based "coro" library
+#   desktop (default) — the epoll-based "coro" library
 #   pico               — coro_pico/coro_pico_hal[/coro_pico_mqtt] for RP2040/RP2350
 # Set via -DCORO_PLATFORM=pico, or automatically by conanfile.py when
 # settings.os == "baremetal". See doc/design/lwip_config.md and
@@ -56,10 +56,10 @@ if(CORO_PLATFORM STREQUAL "pico")
     if(CORO_PICO_WITH_MQTT)
         install(TARGETS coro_pico_mqtt)
     endif()
-    # The following are libuv/libwebsockets-only, or are desktop-only Executor
+    # The following are POSIX/libwebsockets-only, or are desktop-only Executor
     # implementations other than CurrentThreadExecutor (the only Executor pico uses)
     # — none have a CORO_PICO backend-flag fallback, unlike tcp_stream.h/tcp_listener.h
-    # which are whole-file #ifdef CORO_TCP_BACKEND_LWIP/libuv. Excluded so they can't
+    # which are whole-file #ifdef CORO_TCP_BACKEND_LWIP/IoDriver. Excluded so they can't
     # be included at all on the pico package, rather than relying on a header guard
     # to produce a clean error if a user includes one by mistake.
     install(DIRECTORY include/coro
@@ -71,10 +71,6 @@ if(CORO_PLATFORM STREQUAL "pico")
         PATTERN "file.h" EXCLUDE
         PATTERN "file.hpp" EXCLUDE
         PATTERN "lookup_host.h" EXCLUDE
-        PATTERN "poll_stream.h" EXCLUDE
-        PATTERN "poll_stream.hpp" EXCLUDE
-        PATTERN "uv_future.h" EXCLUDE
-        PATTERN "single_threaded_uv_executor.h" EXCLUDE
         PATTERN "work_sharing_executor.h" EXCLUDE
         PATTERN "work_stealing_executor.h" EXCLUDE
         # epoll-based I/O driver (doc/design/io_driver.md) — desktop only; Pico
@@ -98,7 +94,6 @@ else()
     if(WITH_GPERFTOOLS)
         find_package(gperftools REQUIRED)
     endif()
-    find_package(libuv REQUIRED)
     find_package(Libwebsockets REQUIRED)
 
     file(GLOB_RECURSE CORO_PUBLIC_HEADERS "include/coro/*.h" "include/coro/*.hpp")
@@ -107,7 +102,6 @@ else()
         # runtime/
         src/runtime/runtime.cpp
         src/runtime/executor.cpp
-        src/runtime/single_threaded_uv_executor.cpp
         src/runtime/current_thread_executor.cpp
         src/runtime/work_sharing_executor.cpp
         src/runtime/work_stealing_executor.cpp
@@ -152,7 +146,6 @@ else()
     endif()
     target_include_directories(coro PUBLIC include ${CORO_GENERATED_INCLUDE_DIR})
     target_link_libraries(coro PUBLIC
-        libuv::uv_a
         $<$<BOOL:${WITH_GPERFTOOLS}>:gperftools::gperftools>
         websockets)
 
@@ -168,7 +161,7 @@ else()
     # include/coro/io/lwip/ is excluded for the same reason, just not caught by the
     # "pico" pattern above since it lives directly under io/ rather than under pico/.
     # lwip_callback_result.h backs the lwIP TCP backend (tcp_stream_lwip.cpp) and
-    # pico/mqtt.cpp — the desktop build always uses the libuv backend instead (see
+    # pico/mqtt.cpp — the desktop build always uses the IoDriver backend instead (see
     # tcp_stream.h's CORO_TCP_BACKEND_LWIP #ifdef), so it has no use here either.
     install(DIRECTORY include/coro
         DESTINATION include

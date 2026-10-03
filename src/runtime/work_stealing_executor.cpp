@@ -243,8 +243,6 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     t_wse_owning_executor = this;
     t_wse_worker_index    = worker_index;
     set_current_runtime(m_runtime);
-    // I/O primitives not yet on the IoDriver still reach the uv loop through this.
-    set_current_uv_executor(&m_runtime->uv_executor());
 
     const int    n            = static_cast<int>(m_workers.size());
     const int    max_search   = std::max(1, n / 2);
@@ -450,7 +448,6 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     }
 
     set_current_runtime(nullptr);
-    set_current_uv_executor(nullptr);
     t_wse_owning_executor = nullptr;
     t_wse_worker_index    = -1;
 }

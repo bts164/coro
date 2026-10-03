@@ -38,17 +38,11 @@ void BlockingPool::submit(std::move_only_function<void()> work_item) {
 }
 
 void BlockingPool::worker_loop() {
-    // Set the thread-local runtime so recursive spawn_blocking calls and
-    // blocking_get() work correctly from within this blocking thread.
+    // Set the thread-local runtime so recursive spawn_blocking calls, blocking_get(),
+    // and futures that reach the runtime (sleep_for's timer, sockets on the driver)
+    // work from within this blocking thread. Not reset before the thread exits
+    // below: the OS thread terminates right after, so nothing can read it stale.
     set_current_runtime(m_runtime);
-    // Also set the thread-local uv executor -- without this, any future polled
-    // from a blocking-pool thread (e.g. a nested block_on(), or the planned
-    // blocking_wait()) that touches the reactor (sleep_for, file IO,
-    // poll_stream) would hit current_uv_executor()'s "no uv executor active on
-    // this thread" throw, even though the owning Runtime has one. Neither
-    // thread-local is reset before the thread exits below: the OS thread
-    // terminates right after, so there's nothing left to read a stale value.
-    set_current_uv_executor(&m_runtime->uv_executor());
 
     while (true) {
         std::move_only_function<void()> work;

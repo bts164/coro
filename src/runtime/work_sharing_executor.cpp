@@ -85,8 +85,6 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     t_owning_executor = this;
     t_worker_index    = worker_index;
     set_current_runtime(m_runtime);
-    // I/O primitives not yet on the IoDriver still reach the uv loop through this.
-    set_current_uv_executor(&m_runtime->uv_executor());
 
     while (true) {
         std::shared_ptr<detail::TaskBase> task;
@@ -174,7 +172,6 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     }
 
     set_current_runtime(nullptr);
-    set_current_uv_executor(nullptr);
     t_owning_executor = nullptr;
     t_worker_index    = -1;
 }

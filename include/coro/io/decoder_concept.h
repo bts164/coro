@@ -8,7 +8,7 @@
 namespace coro {
 
 /**
- * @brief Concept for frame decoders used with PollStream.
+ * @brief Concept for frame decoders that extract frames from a raw byte stream.
  *
  * A Decoder extracts structured frames from a raw byte stream. It maintains
  * internal state across multiple decode() calls to handle frames that span
@@ -24,7 +24,7 @@ namespace coro {
  * IMPORTANT: The buffer passed to decode() contains ONLY unconsumed bytes, not the
  * entire packet from the beginning. The decoder must track its own state and consume
  * bytes incrementally. The 'consumed' parameter indicates bytes consumed from THIS
- * buffer (not cumulative). PollStream will consume these bytes immediately, even if
+ * buffer (not cumulative). The caller consumes these bytes immediately, even if
  * the packet is incomplete. This design correctly handles wrap-around in circular buffers.
  *
  * Zero-copy support (optional):

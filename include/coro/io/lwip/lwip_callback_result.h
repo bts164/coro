@@ -2,9 +2,8 @@
 
 // One-shot bridge between an lwIP callback and an awaiting coroutine.
 //
-// Analogous to UvCallbackResult / UvFuture in the libuv backend. Designed for
-// lwIP NO_SYS mode where all callbacks fire synchronously on the executor thread
-// during cyw43_arch_poll() / sys_check_timeouts(). No mutex is required.
+// Designed for lwIP NO_SYS mode where all callbacks fire synchronously on the executor
+// thread during cyw43_arch_poll() / sys_check_timeouts(). No mutex is required.
 //
 // CAUTION: if using CYW43_ARCH_THREADSAFE_BACKGROUND, lwIP callbacks can arrive
 // from an IRQ or second core. In that case protect waker and value with a

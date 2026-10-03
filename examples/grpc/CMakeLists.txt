@@ -28,17 +28,5 @@ add_executable(gendata src/gendata.cpp)
 target_link_libraries(gendata PRIVATE coro::coro absl::log absl::log_initialize xtensor)
 target_include_directories(gendata PRIVATE include)
 
-add_executable(signal_server src/signalserver.cpp src/plotsignal.proto)
-target_link_libraries(signal_server PRIVATE coro::coro gRPC::grpc++ absl::log absl::log_initialize xtensor)
-target_include_directories(signal_server PRIVATE include ${CMAKE_CURRENT_BINARY_DIR})
-protobuf_generate(TARGET signal_server
-    LANGUAGE cpp
-    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
-    PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
-protobuf_generate(
-    TARGET signal_server
-    LANGUAGE grpc
-    GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
-    PLUGIN "protoc-gen-grpc=${grpc_cpp_plugin_location}"
-    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src
-    PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR})
+# src/signalserver.cpp (the signal_server target) is kept for reference but not built:
+# it uses PollStream, which was removed with libuv. Kept until it is ported to the IoDriver.

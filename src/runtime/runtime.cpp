@@ -70,7 +70,6 @@ Runtime::~Runtime() {
     //      Its tasks' IoRegistrations deregister from m_io_driver here.
     //   2. m_blocking_pool — joins blocking pool threads.
     //   3. m_io_driver — closes the epoll and eventfd.
-    //   4. m_uv_executor — stops the uv thread and closes the loop last.
     // No explicit action needed here; member destructors fire in the right order.
 }
 

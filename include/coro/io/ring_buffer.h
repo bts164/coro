@@ -9,8 +9,8 @@ namespace coro {
 /**
  * @brief Fixed-capacity ring buffer for decoded packets.
  *
- * Provides a FIFO queue with fixed capacity. Used by PollStream to buffer
- * decoded packets between poll_cb (producer) and poll_next (consumer).
+ * Provides a FIFO queue with fixed capacity. Suitable for buffering
+ * decoded packets between a producer and a consumer.
  *
  * Thread safety: Not thread-safe. Caller must ensure exclusive access.
  *

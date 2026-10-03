@@ -5,8 +5,6 @@
 #include <coro/detail/timer_queue.h>
 #ifndef CORO_PICO
 #include <coro/runtime/io_driver.h>
-#include <coro/runtime/single_threaded_uv_executor.h>
-#include <coro/runtime/uv_future.h>
 #include <coro/task/spawn_on.h>
 #include <coro/task/spawn_blocking.h>
 #include <mutex>
@@ -42,9 +40,8 @@ Runtime& current_runtime();
 /**
  * @brief Top-level runtime object. Entry point for all async execution.
  *
- * Owns the @ref Executor and, in the standard build, the epoll I/O driver, the
- * blocking pool and the libuv event loop that the I/O primitives not yet on the
- * driver still use. Construct one `Runtime` per application and call `block_on()` to
+ * Owns the @ref Executor and, in the standard build, the epoll I/O driver and the
+ * blocking pool. Construct one `Runtime` per application and call `block_on()` to
  * drive async work from a synchronous context (e.g. `main()`).
  *
  * `Runtime` is not copyable or movable.
@@ -131,10 +128,6 @@ public:
 
     ~Runtime();
 
-    /// @brief Returns the runtime's SingleThreadedUvExecutor, which runs the I/O
-    /// primitives that are not on the IoDriver yet.
-    SingleThreadedUvExecutor& uv_executor() { return m_uv_executor; }
-
     /// @brief Returns the runtime's epoll I/O driver. See doc/design/io_driver.md.
     IoDriver& io_driver() { return m_io_driver; }
 
@@ -169,9 +162,6 @@ public:
     template<Future F>
     typename F::OutputType block_on(F future) {
         set_current_runtime(this);
-#ifndef CORO_PICO
-        set_current_uv_executor(&m_uv_executor);
-#endif
         auto impl = detail::make_rc<detail::TaskImpl<F>>(std::move(future));
         // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same
         // TaskImpl allocation. Provides typed access to the result and waker slot.
@@ -187,9 +177,6 @@ public:
         m_executor->wait_for_completion(*state);
 
         set_current_runtime(nullptr);
-#ifndef CORO_PICO
-        set_current_uv_executor(nullptr);
-#endif
         if (state->exception)
             std::rethrow_exception(state->exception);
         if constexpr (!std::is_void_v<typename F::OutputType>)
@@ -230,8 +217,6 @@ private:
     std::unique_ptr<Executor> m_executor;
 #else
     // Declaration order matters for destruction (members destroyed in reverse order):
-    //   m_uv_executor — owns the uv thread and loop; must outlive everything else,
-    //                   since worker threads may wake tasks through it.
     //   m_io_driver   — must outlive m_executor: tasks own futures that own
     //                   IoRegistrations, which deregister on destruction, and the
     //                   executor's IoDriverParker unparks it. Only executor threads
@@ -242,7 +227,6 @@ private:
     //                     call current_runtime() during their final work item.
     //   m_executor    — destroyed first: joins its worker threads, so no task runs
     //                   once the members above start going away.
-    SingleThreadedUvExecutor  m_uv_executor;
     IoDriver                  m_io_driver;
     BlockingPool              m_blocking_pool;
     std::unique_ptr<Executor> m_executor;

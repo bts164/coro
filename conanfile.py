@@ -115,7 +115,7 @@ class CoroRecipe(ConanFile):
 
         # baremetal (Pico) targets: always static (no "shared" option to
         # decide otherwise), no PIC, and the desktop I/O stack
-        # (libuv/gperftools/libwebsockets) doesn't exist for them.
+        # (gperftools/libwebsockets) doesn't exist for them.
         if self.settings.os == "baremetal":
             self.package_type = "static-library"
             self.options.rm_safe("shared")
@@ -152,11 +152,8 @@ class CoroRecipe(ConanFile):
             self.requires("gperftools/2.17.2",
                 transitive_headers = True,
                 transitive_libs = True)
-        self.requires("libuv/1.47.0",
-            transitive_headers = True,
-            transitive_libs = True)
         # lws runs its own poll() loop on a dedicated thread (doc/design/websocket_stream.md,
-        # "Service threads"), so its libuv event-lib backend stays off.
+        # "Service threads"), so its libuv event-lib backend stays off; coro doesn't use libuv.
         self.requires("libwebsockets/[>=4.3.5 <5]",
             options={"with_libuv": False},
             transitive_headers = True,
@@ -295,7 +292,6 @@ class CoroRecipe(ConanFile):
             self.cpp_info.requires.append("gperftools::gperftools")
         if self.options.with_local_run_queue:
             self.cpp_info.defines.append("CORO_USE_LOCAL_RUN_QUEUE")
-        self.cpp_info.requires.append("libuv::libuv")
         self.cpp_info.requires.append("libwebsockets::libwebsockets")
 
         self.cpp_info.set_property("cmake_find_package", "coro")

@@ -1,7 +1,6 @@
 #include <coro/coro.h>
 #include <coro/co_invoke.h>
 #include <coro/runtime/runtime.h>
-#include <coro/runtime/single_threaded_uv_executor.h>
 #include <coro/sync/sleep.h>
 #include <coro/task/join_set.h>
 #include <coro/task/spawn_blocking.h>
@@ -196,42 +195,42 @@ TEST(SpawnBlocking, BlockingGetVoid) {
 }
 
 // ---------------------------------------------------------------------------
-// current_uv_executor() must be reachable from a blocking-pool thread --
-// worker_loop() sets it alongside current_runtime() (see blocking_pool.cpp)
-// so futures that touch the reactor (sleep_for, file IO, poll_stream) can be
-// polled synchronously from inside spawn_blocking work, not just from the
-// Runtime's own block_on() thread.
+// current_runtime() must be reachable from a blocking-pool thread --
+// worker_loop() sets it (see blocking_pool.cpp) so futures that touch the
+// runtime (sleep_for's timer, sockets on the IoDriver) can be polled
+// synchronously from inside spawn_blocking work, not just from the Runtime's
+// own block_on() thread.
 // ---------------------------------------------------------------------------
 
-TEST(SpawnBlocking, UvExecutorAvailableOnBlockingThread) {
+TEST(SpawnBlocking, RuntimeAvailableOnBlockingThread) {
     coro::Runtime rt(1);
-    coro::SingleThreadedUvExecutor* seen = nullptr;
+    coro::Runtime* seen = nullptr;
 
-    rt.block_on([&]() -> coro::Coro<void> {
-        co_await coro::spawn_blocking([&] {
-            // Throws std::runtime_error if no uv executor is active on this thread.
-            seen = &coro::current_uv_executor();
+    rt.block_on([](coro::Runtime*& s) -> coro::Coro<void> {
+        co_await coro::spawn_blocking([&s] {
+            // Throws std::runtime_error if no runtime is active on this thread.
+            s = &coro::current_runtime();
         });
-    }());
+    }(seen));
 
-    EXPECT_EQ(seen, &rt.uv_executor());
+    EXPECT_EQ(seen, &rt);
 }
 
-TEST(SpawnBlocking, UvExecutorAvailableOnRecursiveBlockingThread) {
+TEST(SpawnBlocking, RuntimeAvailableOnRecursiveBlockingThread) {
     coro::Runtime rt(1);
-    coro::SingleThreadedUvExecutor* seen = nullptr;
+    coro::Runtime* seen = nullptr;
 
-    rt.block_on([&]() -> coro::Coro<void> {
-        co_await coro::spawn_blocking([&] {
+    rt.block_on([](coro::Runtime*& s) -> coro::Coro<void> {
+        co_await coro::spawn_blocking([&s] {
             // A nested spawn_blocking() call runs its work on another
             // blocking-pool thread -- confirm that thread also has the
-            // uv executor set, not just the first one.
-            auto h = coro::spawn_blocking([&] { seen = &coro::current_uv_executor(); });
+            // runtime set, not just the first one.
+            auto h = coro::spawn_blocking([&s] { s = &coro::current_runtime(); });
             h.blocking_get();
         });
-    }());
+    }(seen));
 
-    EXPECT_EQ(seen, &rt.uv_executor());
+    EXPECT_EQ(seen, &rt);
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@
 //
 //   Multi-threaded platforms (non-CORO_PICO):
 //     Wakers may be held and called from any thread — a spawn_blocking worker,
-//     a libuv I/O callback, or any external thread that receives a waker.
+//     an lws service thread, or any external thread that receives a waker.
 //     std::mutex provides the necessary cross-thread serialisation.
 //
 //   CORO_PICO (RP2040 bare-metal):

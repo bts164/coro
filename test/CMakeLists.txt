@@ -12,11 +12,6 @@ enable_testing()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# PCIe character device PollStream example — decoder, tests, and usage example
-add_library(pcie_decoder misc/pcie_decoder.cpp)
-target_include_directories(pcie_decoder PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/misc)
-target_link_libraries(pcie_decoder PUBLIC coro::coro)
-
 set(TEST_NAMES
     # detail/
     test_poll_result
@@ -40,8 +35,6 @@ set(TEST_NAMES
     test_work_sharing_executor
     test_work_stealing_executor
     test_work_stealing_io
-    test_single_threaded_uv_executor
-    test_uv_future
     test_spawn_on
     test_local_run_queue
     test_io_driver
@@ -66,16 +59,12 @@ set(TEST_NAMES
     test_lookup_host
     test_pipe
     test_circular_byte_buffer
-    test_poll_stream
     test_signal
     test_tcp_stream
     test_udp_socket
     test_ws_stream
     # stress/
     test_skynet
-    # misc/
-    test_pcie_decoder
-    test_pcie_stream_integration
 )
 
 set(TEST_SRCS
@@ -101,8 +90,6 @@ set(TEST_SRCS
     runtime/test_work_sharing_executor.cpp
     runtime/test_work_stealing_executor.cpp
     runtime/test_work_stealing_io.cpp
-    runtime/test_single_threaded_uv_executor.cpp
-    runtime/test_uv_future.cpp
     runtime/test_spawn_on.cpp
     runtime/test_local_run_queue.cpp
     runtime/test_io_driver.cpp
@@ -127,16 +114,12 @@ set(TEST_SRCS
     io/test_lookup_host.cpp
     io/test_pipe.cpp
     io/test_circular_byte_buffer.cpp
-    io/test_poll_stream.cpp
     io/test_signal.cpp
     io/test_tcp_stream.cpp
     io/test_udp_socket.cpp
     io/test_ws_stream.cpp
     # stress/
     stress/test_skynet.cpp
-    # misc/
-    misc/test_pcie_decoder.cpp
-    misc/test_pcie_stream_integration.cpp
 )
 
 foreach(t src IN ZIP_LISTS TEST_NAMES TEST_SRCS)
@@ -152,9 +135,6 @@ endforeach()
 if(WITH_SANITIZE STREQUAL "tsan")
     set_tests_properties(test_skynet PROPERTIES DISABLED TRUE)
 endif()
-
-target_link_libraries(test_pcie_decoder PRIVATE pcie_decoder)
-target_link_libraries(test_pcie_stream_integration PRIVATE pcie_decoder)
 
 # ---------------------------------------------------------------------------
 # Unicorn test of the real ARMv6-M switch_context()/init_fiber_entry()/
@@ -198,7 +178,7 @@ target_compile_definitions(test_switch_context_pico PRIVATE
 add_test(NAME test_switch_context_pico COMMAND test_switch_context_pico)
 
 # ---------------------------------------------------------------------------
-# CurrentThreadExecutor tests — no hardware, no libuv, no lwIP.
+# CurrentThreadExecutor tests — no hardware, no epoll driver, no lwIP.
 #
 # Compiles the portable coro core from source with CORO_PICO defined (selects
 # CurrentThreadExecutor in runtime.cpp) and CORO_TCP_BACKEND_LWIP (selects
@@ -208,7 +188,7 @@ add_test(NAME test_switch_context_pico COMMAND test_switch_context_pico)
 # break the Pico port.
 # ---------------------------------------------------------------------------
 # coro_pico_core — portable coro core + current_thread_executor.
-# Cannot use the installed coro::coro package (links libuv, wrong flags) and
+# Cannot use the installed coro::coro package (desktop backends, wrong flags) and
 # OBJECT libraries don't cross Conan package boundaries, so core sources are
 # compiled directly from the source tree.
 set(CORO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)

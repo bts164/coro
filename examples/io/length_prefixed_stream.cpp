@@ -1,3 +1,5 @@
+// NOT BUILT: this example uses PollStream, which was removed along with libuv. Kept
+// for reference until it is ported to the IoDriver.
 /**
  * @file length_prefixed_stream.cpp
  * @brief Example: Reading length-prefixed messages from a pipe/socket using PollStream.

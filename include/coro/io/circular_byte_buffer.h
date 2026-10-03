@@ -9,7 +9,7 @@ namespace coro {
 /**
  * @brief Circular byte buffer for streaming I/O.
  *
- * Provides a fixed-capacity circular buffer for raw bytes. Used by PollStream
+ * Provides a fixed-capacity circular buffer for raw bytes. Used by ByteSource
  * to buffer data between read() syscalls and frame decoding.
  *
  * Thread safety: Not thread-safe. Caller must ensure exclusive access.
