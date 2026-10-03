@@ -100,6 +100,7 @@ nav:
       - Blocking Thread Pool: design/spawn_blocking.md
       - blocking_wait / blocking_next: design/blocking_wait.md
     - I/O Subsystem:
+      - I/O Driver (epoll reactor): design/io_driver.md
       - libuv Integration: design/libuv_integration.md
       - I/O Coroutines: design/io_coroutine.md
       - File I/O: design/file_io.md

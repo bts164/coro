@@ -77,6 +77,10 @@ if(CORO_PLATFORM STREQUAL "pico")
         PATTERN "single_threaded_executor.h" EXCLUDE
         PATTERN "work_sharing_executor.h" EXCLUDE
         PATTERN "work_stealing_executor.h" EXCLUDE
+        # epoll-based I/O driver (doc/design/io_driver.md) — desktop only; Pico
+        # drives lwIP through CurrentThreadExecutor's PollFn instead.
+        PATTERN "io_driver.h" EXCLUDE
+        PATTERN "sys" EXCLUDE
         # spawn_blocking.h declares BlockingPool unconditionally (no CORO_PICO guard)
         # and calls Runtime::blocking_pool(), which only exists in the non-CORO_PICO
         # Runtime — desktop-only, would fail to compile on pico.
@@ -104,6 +108,7 @@ else()
         src/runtime/current_thread_executor.cpp
         src/runtime/work_sharing_executor.cpp
         src/runtime/work_stealing_executor.cpp
+        src/runtime/io_driver.cpp
         # task/
         src/task/task.cpp
         src/task/waker.cpp
@@ -112,6 +117,8 @@ else()
         src/task/fiber.cpp
         # detail/
         src/detail/fiber_context_posix.cpp
+        src/detail/sys/poller_epoll.cpp
+        src/detail/timer_queue.cpp
         # sync/
         src/sync/cancellation_token.cpp
         # io/

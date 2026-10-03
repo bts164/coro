@@ -24,6 +24,8 @@ set(TEST_NAMES
     test_intrusive_list
     test_rc
     test_frame_pool
+    test_poller
+    test_timer_queue
     # flat (foundational types — coro.h, future.h, stream.h, co_invoke.h)
     test_future
     test_future_ref
@@ -40,6 +42,7 @@ set(TEST_NAMES
     test_uv_future
     test_spawn_on
     test_local_run_queue
+    test_io_driver
     # task/
     test_join_handle
     test_join_set
@@ -78,6 +81,8 @@ set(TEST_SRCS
     detail/test_intrusive_list.cpp
     detail/test_rc.cpp
     detail/test_frame_pool.cpp
+    detail/test_poller.cpp
+    detail/test_timer_queue.cpp
     # flat
     test_future.cpp
     test_future_ref.cpp
@@ -94,6 +99,7 @@ set(TEST_SRCS
     runtime/test_uv_future.cpp
     runtime/test_spawn_on.cpp
     runtime/test_local_run_queue.cpp
+    runtime/test_io_driver.cpp
     # task/
     task/test_join_handle.cpp
     task/test_join_set.cpp
