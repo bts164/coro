@@ -1,9 +1,12 @@
-// lookup_host() (doc/design/file_io.md, "lookup_host"). Names that need resolving use
-// "localhost", which /etc/hosts answers without the network, or the RFC 6761 ".invalid"
-// TLD, which never resolves.
+// lookup_host() (doc/design/file_io.md, "lookup_host") and hostnames in connect() and
+// bind(). Names that need resolving use "localhost", which /etc/hosts answers without
+// the network, or the RFC 6761 ".invalid" TLD, which never resolves.
 
 #include <gtest/gtest.h>
 #include <coro/io/lookup_host.h>
+#include <coro/io/tcp_listener.h>
+#include <coro/io/tcp_stream.h>
+#include <coro/io/udp_socket.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/parker.h>
@@ -87,4 +90,63 @@ TEST(LookupHostTest, WorksWithoutDriver) {
         co_return co_await lookup_host("localhost", 53);
     }());
     EXPECT_FALSE(addrs.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Hostnames in connect() / bind()
+// ---------------------------------------------------------------------------
+
+// "localhost" may resolve to ::1 before 127.0.0.1. Nothing listens on ::1 here, so
+// that attempt is refused and connect() must fall through to the IPv4 address.
+TEST(LookupHostTest, ConnectByNameTriesEachAddress) {
+    Runtime rt;
+    auto echoed = rt.block_on([]() -> Coro<std::string> {
+        auto listener = co_await TcpListener::bind("127.0.0.1", 31100);
+        auto client   = co_await TcpStream::connect("localhost", 31100);
+        auto server   = co_await listener.accept();
+        co_await client.write(std::string("hi"));
+        auto [n, buf] = co_await server.read_exact(std::string(2, '\0'));
+        buf.resize(n);
+        co_return buf;
+    }());
+    EXPECT_EQ(echoed, "hi");
+}
+
+TEST(LookupHostTest, BindByName) {
+    Runtime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto listener = co_await TcpListener::bind("localhost", 0);
+        auto socket   = co_await UdpSocket::bind("localhost", 0);
+        (void)listener;
+        (void)socket;
+    }());
+}
+
+// Every address failing rethrows the last failure, not a generic error.
+TEST(LookupHostTest, ConnectByNameRethrowsLastError) {
+    Runtime rt;
+    auto code = rt.block_on([]() -> Coro<std::error_code> {
+        try {
+            auto s = co_await TcpStream::connect("localhost", 31101);   // nothing listening
+            (void)s;
+        } catch (const std::system_error& e) {
+            co_return e.code();
+        }
+        co_return std::error_code{};
+    }());
+    EXPECT_EQ(code, std::errc::connection_refused);
+}
+
+TEST(LookupHostTest, ConnectToUnresolvableNameThrowsDnsError) {
+    Runtime rt;
+    auto code = rt.block_on([]() -> Coro<std::error_code> {
+        try {
+            auto s = co_await TcpStream::connect("nonexistent.invalid", 80);
+            (void)s;
+        } catch (const std::system_error& e) {
+            co_return e.code();
+        }
+        co_return std::error_code{};
+    }());
+    EXPECT_EQ(&code.category(), &dns_error_category()) << code.message();
 }

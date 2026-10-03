@@ -600,12 +600,12 @@ never early: `SleepFuture` checks the clock itself.
 | Primitive | How it uses the driver | Design |
 |---|---|---|
 | `UdpSocket` | `IoRegistration` per socket; non-blocking ops in `detail/sys/udp.h` | [UDP Socket](udp_socket.md) |
-| `TcpStream`, `TcpListener` | `IoRegistration` per socket; non-blocking ops in `detail/sys/tcp.h` | [TCP & WebSocket](websocket_stream.md) |
+| `TcpStream`, `TcpListener` | `IoRegistration` per socket; non-blocking ops in `detail/sys/tcp.h` | [TCP Stream](tcp_stream.md) |
 | `Pipe` | `IoRegistration` per FIFO end; `detail/sys/pipe.h` | [Pipelined I/O](pipe_streaming.md) |
 | `signal()`, `signal_stream()` | A self-pipe written by the signal handler; each watcher reads it through the driver | [Signal Handling](signal_handling.md) |
 | `sleep_for`, `sleep_until`, `timeout`, `IntervalTimer` | The driver's timer queue | [Timers](timers.md) |
 | `File`, `lookup_host()` | Not on the driver: regular files are always "ready", and `getaddrinfo()` blocks, so both run on the blocking pool | [File I/O](file_io.md) |
-| `WsStream`, `WsListener` | Not on the driver: libwebsockets runs its own poll loop on a service thread | [TCP & WebSocket](websocket_stream.md) |
+| `WsStream`, `WsListener` | Not on the driver: libwebsockets runs its own poll loop on a service thread | [WebSocket Stream](websocket_stream.md) |
 
 ---
 

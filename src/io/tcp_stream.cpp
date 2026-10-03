@@ -1,77 +1,67 @@
+// Desktop TcpStream on the IoDriver. Every syscall goes through the backend seam in
+// include/coro/detail/sys/tcp.h. See doc/design/tcp_stream.md.
+
 #include <coro/io/tcp_stream.h>
-#include <coro/runtime/uv_future.h>
-#include <coro/task/spawn_on.h>
-#include <coro/coro.h>
+#include <coro/detail/sys/tcp.h>
+#include <coro/io/lookup_host.h>
+#include <coro/io/socket_address.h>
+#include <exception>
 #include <system_error>
 
 namespace coro {
 
 namespace {
-[[noreturn]] void throw_uv_error(int status, const char* what) {
-    throw std::system_error(
-        std::error_code(-status, std::system_category()), what);
-}
+
+/// Waits for a connect started by tcp_connect_start() to finish: write readiness,
+/// then SO_ERROR. A leaf future, so dropping the connect mid-handshake just drops the
+/// state, which closes the socket.
+class ConnectFuture {
+public:
+    using OutputType = void;
+
+    explicit ConnectFuture(std::shared_ptr<detail::SocketState> state)
+        : m_state(std::move(state)) {}
+
+    PollResult<void> poll(detail::Context& ctx) {
+        auto result = m_state->reg.poll_io(IoDirection::Write, ctx, [this] {
+            return detail::sys::tcp_try_finish_connect(m_state->fd);
+        });
+        if (!result) return PollPending;
+        if (!*result) return PollError(detail::socket_error(result->error(), "TcpStream::connect"));
+        return PollReady;
+    }
+
+private:
+    std::shared_ptr<detail::SocketState> m_state;
+};
+
 } // namespace
 
-TcpStream::TcpStream(std::shared_ptr<Handle> handle, SingleThreadedUvExecutor* uv_exec)
-    : m_handle(std::move(handle)), m_uv_exec(uv_exec) {}
+TcpStream::TcpStream(std::shared_ptr<State> state) : m_state(std::move(state)) {}
 
 TcpStream::TcpStream(TcpStream&&) noexcept = default;
 TcpStream& TcpStream::operator=(TcpStream&&) noexcept = default;
+TcpStream::~TcpStream() = default;
 
-TcpStream::~TcpStream() {
-    if (!m_handle) return;
-    with_context(*m_uv_exec,
-        [](std::shared_ptr<Handle> handle) -> Coro<void> {
-            UvCallbackResult<int> result;
-            handle->handle.data = &result;
-            uv_close(reinterpret_cast<uv_handle_t*>(&handle->handle),
-                [](uv_handle_t* h) {
-                    static_cast<UvCallbackResult<int>*>(h->data)->complete(0);
-                });
-            auto [ignored] = co_await wait(result);
-            (void)ignored;
-        }(std::move(m_handle))
-    ).detach();
+Coro<TcpStream> TcpStream::connect(std::string host, uint16_t port) {
+    IoDriver& driver = detail::socket_io_driver("TcpStream::connect");
+    // Each address the name has, in the resolver's order: the first that connects
+    // wins; if none does, the last one's error is thrown (as tokio does). A numeric
+    // host resolves to itself without leaving this thread.
+    const std::vector<SocketAddress> peers = co_await lookup_host(host, port);
+    std::exception_ptr last_error;
+    for (const SocketAddress& peer : peers) {
+        try {
+            // Registered after connect() starts. A handshake that finishes in between
+            // is still seen: readiness starts set, so the first poll tries to finish.
+            auto state = std::make_shared<State>(driver, detail::sys::tcp_connect_start(peer));
+            co_await ConnectFuture(state);
+            co_return TcpStream(std::move(state));
+        } catch (const std::system_error&) {
+            last_error = std::current_exception();
+        }
+    }
+    std::rethrow_exception(last_error);   // non-null: lookup_host never returns empty
 }
-
-// ---------------------------------------------------------------------------
-// connect
-// ---------------------------------------------------------------------------
-
-TcpStream::ConnectFuture TcpStream::connect(std::string host, uint16_t port) {
-    auto& exec = current_uv_executor();
-    return with_context(exec,
-        [](SingleThreadedUvExecutor& exec,
-           std::string host, uint16_t port) -> Coro<TcpStream> {
-
-            auto handle = std::make_shared<Handle>();
-            uv_tcp_init(exec.loop(), &handle->handle);
-
-            struct sockaddr_in addr;
-            if (int r = uv_ip4_addr(host.c_str(), port, &addr); r != 0)
-                throw_uv_error(r, "TcpStream::connect");
-
-            UvCallbackResult<int> result;
-            uv_connect_t req;
-            req.data = &result;
-
-            int r = uv_tcp_connect(&req, &handle->handle,
-                reinterpret_cast<const struct sockaddr*>(&addr),
-                [](uv_connect_t* r, int status) {
-                    static_cast<UvCallbackResult<int>*>(r->data)->complete(status);
-                });
-            if (r != 0)
-                throw_uv_error(r, "TcpStream::connect");
-
-            auto [status] = co_await wait(result);
-            if (status != 0)
-                throw_uv_error(status, "TcpStream::connect");
-
-            co_return TcpStream(std::move(handle), &exec);
-        }(exec, std::move(host), port)
-    );
-}
-
 
 } // namespace coro

@@ -68,6 +68,7 @@ set(TEST_NAMES
     test_circular_byte_buffer
     test_poll_stream
     test_signal
+    test_tcp_stream
     test_udp_socket
     test_ws_stream
     # stress/
@@ -128,6 +129,7 @@ set(TEST_SRCS
     io/test_circular_byte_buffer.cpp
     io/test_poll_stream.cpp
     io/test_signal.cpp
+    io/test_tcp_stream.cpp
     io/test_udp_socket.cpp
     io/test_ws_stream.cpp
     # stress/

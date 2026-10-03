@@ -81,6 +81,7 @@ if(CORO_PLATFORM STREQUAL "pico")
         # drives lwIP through CurrentThreadExecutor's PollFn instead.
         PATTERN "io_driver.h" EXCLUDE
         PATTERN "socket_state.h" EXCLUDE
+        PATTERN "stream_io.h" EXCLUDE
         PATTERN "sys" EXCLUDE
         # spawn_blocking.h declares BlockingPool unconditionally (no CORO_PICO guard)
         # and calls Runtime::blocking_pool(), which only exists in the non-CORO_PICO
@@ -121,6 +122,7 @@ else()
         src/detail/sys/file_posix.cpp
         src/detail/sys/poller_epoll.cpp
         src/detail/sys/socket_posix.cpp
+        src/detail/sys/tcp_posix.cpp
         src/detail/sys/udp_posix.cpp
         src/detail/socket_state.cpp
         src/detail/timer_queue.cpp

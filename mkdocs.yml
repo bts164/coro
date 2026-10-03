@@ -104,8 +104,9 @@ nav:
       - libuv Integration: design/libuv_integration.md
       - I/O Coroutines: design/io_coroutine.md
       - File I/O: design/file_io.md
-      - TCP & WebSocket: design/websocket_stream.md
+      - TCP Stream: design/tcp_stream.md
       - UDP Socket: design/udp_socket.md
+      - WebSocket Stream: design/websocket_stream.md
       - Poll Streams: design/poll_streams.md
       - Pipelined I/O: design/pipe_streaming.md
       - Signal Handling: design/signal_handling.md
