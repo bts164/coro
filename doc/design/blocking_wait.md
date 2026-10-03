@@ -7,15 +7,14 @@
 
 ## Motivation
 
-Any OS thread that already has `current_runtime()`/`current_uv_executor()` set — today,
-that means a [`spawn_blocking`](spawn_blocking.md) pool thread, and in the future any
-thread that has called the proposed `Runtime::enter()` (see
-[task_and_executor.md](task_and_executor.md)'s "Runtime" section) — is a valid place to
-synchronously drive a `Future` or `Stream` to completion. There is currently no generic
-way to do this. The nested-`Runtime` pattern (see
+Any OS thread that already has `current_runtime()` set — today, that means a
+[`spawn_blocking`](spawn_blocking.md) pool thread, and in the future any thread that has
+called the proposed `Runtime::enter()` (see [task_and_executor.md](task_and_executor.md)'s
+"Runtime" section) — is a valid place to synchronously drive a `Future` or `Stream` to
+completion. There is currently no generic way to do this. The nested-`Runtime` pattern (see
 [spawn_blocking.md](spawn_blocking.md)'s "Running a Future on a blocking thread") gives a
 blocking-pool callable a fully independent async environment — its own executor, its own
-`uv_loop_t`, complete isolation. That isolation is the *point* when it's needed, but it is
+`IoDriver`, complete isolation. That isolation is the *point* when it's needed, but it is
 also unavoidable overhead when it is not: a compute loop that just wants to drain a
 `Stream<T>` (an `MpscReceiver<T>`, or a `CoroStream<T>` async generator) one item at a time
 has no need for a second reactor — it already has one available via the ambient thread-local
@@ -94,10 +93,10 @@ This needs nothing from `Executor` or `Runtime` — `Context`/`Waker` are alread
 abstract notification interface (see
 [waker_and_context_propagation.md](waker_and_context_propagation.md)), so a condvar-backed
 `Waker` is a complete, correct implementation on its own. `blocking_wait` never touches the
-ready queue, the owned-task list, or libuv directly. This is the design's central property:
-it has no dependency on where it's called from, which is what makes it usable beyond
-`spawn_blocking` threads specifically — anywhere `current_runtime()`/`current_uv_executor()`
-are valid works, present or future call sites alike.
+ready queue, the owned-task list, or the I/O driver directly. This is the design's central
+property: it has no dependency on where it's called from, which is what makes it usable
+beyond `spawn_blocking` threads specifically — anywhere `current_runtime()` is valid works,
+present or future call sites alike.
 
 ## Excluded on `CORO_PICO` — for now
 
@@ -123,21 +122,21 @@ deferred as its own design discussion rather than folded into this exclusion sil
 
 ## Contract: an active `Runtime` is required for reactor-touching futures
 
-`blocking_wait`/`blocking_next` do not set up `current_runtime()`/`current_uv_executor()`
-themselves — they inherit whatever the calling thread already has. Concretely:
+`blocking_wait`/`blocking_next` do not set up `current_runtime()` themselves — they inherit
+whatever the calling thread already has. Concretely:
 
-- On a `spawn_blocking` thread: both are already set (see
+- On a `spawn_blocking` thread: it is already set (see
   [spawn_blocking.md](spawn_blocking.md)'s "Thread-local runtime context"), so any future —
   including one that awaits a timer, a socket, or spawns child tasks — can be driven with
   `blocking_wait` with no extra setup.
 - On a thread with no active `Runtime` at all (a thread the application created itself, not
-  via `spawn_blocking`): `current_runtime()`/`current_uv_executor()` throw
-  `std::runtime_error` when called, so a future that never touches them (pure in-memory
-  work — draining an `MpscReceiver`, awaiting a `oneshot`, a hand-written `CoroStream` that
-  only ever `co_await`s channel `recv()`s) still works, but one that does throws through
-  `blocking_wait` exactly as it would through `co_await` anywhere else without a `Runtime`.
-  Use the proposed `Runtime::enter()` (see [task_and_executor.md](task_and_executor.md)'s
-  "Runtime" section) to give such a thread valid context first.
+  via `spawn_blocking`): `current_runtime()` throws `std::runtime_error` when called, so a
+  future that never touches it (pure in-memory work — draining an `MpscReceiver`, awaiting
+  a `oneshot`, a hand-written `CoroStream` that only ever `co_await`s channel `recv()`s)
+  still works, but one that does throws through `blocking_wait` exactly as it would through
+  `co_await` anywhere else without a `Runtime`. Use the proposed `Runtime::enter()` (see
+  [task_and_executor.md](task_and_executor.md)'s "Runtime" section) to give such a thread
+  valid context first.
 
 `blocking_wait` deliberately does not paper over this by silently constructing a throwaway
 `Runtime`/reactor on first use — that would hide a real cost (a second event loop) behind an
@@ -150,7 +149,7 @@ site.
 | Approach | Pros | Cons |
 |---|---|---|
 | `blocking_wait`/`blocking_next` (this doc) | No second reactor/executor allocation; works with any `Future`/`Stream`; usable from any thread with an active runtime context | Requires an already-active `Runtime` context (ambient on `spawn_blocking` threads, or via the proposed `Runtime::enter()`) for futures that touch the reactor |
-| Nested `Runtime` + `block_on` (see [spawn_blocking.md](spawn_blocking.md)) | Fully isolated reactor; no ambient-context requirement | Full second executor + `uv_loop_t` allocated per call |
+| Nested `Runtime` + `block_on` (see [spawn_blocking.md](spawn_blocking.md)) | Fully isolated reactor; no ambient-context requirement | Full second executor + `IoDriver` (epoll fd, eventfd) allocated per call |
 | `MpscReceiver::blocking_recv()` | Already implemented, purpose-built | Bespoke to one channel type — `blocking_next` is the generic version of the same idea |
 
 ## Placement

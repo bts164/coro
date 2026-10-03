@@ -33,7 +33,7 @@ The following examples are planned but the files do not exist yet:
 | Example | File | Description |
 |---|---|---|
 | Hello coroutine | `examples/hello_coro.cpp` | `block_on` a single coroutine that returns a value. Shows `Coro<T>`, `Runtime`, and `co_return`. |
-| Sleep and wake | `examples/sleep_and_wake.cpp` | `co_await sleep_for(500ms)` then print elapsed time. Exercises the libuv timer path end-to-end. |
+| Sleep and wake | `examples/sleep_and_wake.cpp` | `co_await sleep_for(500ms)` then print elapsed time. Exercises the I/O driver's timer path end-to-end. |
 | Spawn tasks | `examples/spawn_tasks.cpp` | Spawn several tasks with `spawn()`, collect `JoinHandle`s, and `co_await` each result. |
 | JoinSet fan-out | `examples/join_set.cpp` | Use `JoinSet` to spawn a dynamic number of tasks and collect results as they complete. |
 | Timeout | `examples/timeout.cpp` | Wrap a slow task with `co_await timeout(200ms, slow_op())`. |

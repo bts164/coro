@@ -49,7 +49,7 @@ nav:
       - Runtime & Executors:
         - Runtime: coro/classcoro_1_1Runtime.md
         - CurrentThreadExecutor: coro/classcoro_1_1CurrentThreadExecutor.md
-        - SingleThreadedUvExecutor: coro/classcoro_1_1SingleThreadedUvExecutor.md
+        - IoDriver: coro/classcoro_1_1IoDriver.md
         - WorkStealingExecutor: coro/classcoro_1_1WorkStealingExecutor.md
         - WorkSharingExecutor: coro/classcoro_1_1WorkSharingExecutor.md
       - Coroutine Types:
@@ -101,13 +101,10 @@ nav:
       - blocking_wait / blocking_next: design/blocking_wait.md
     - I/O Subsystem:
       - I/O Driver (epoll reactor): design/io_driver.md
-      - libuv Integration: design/libuv_integration.md
-      - I/O Coroutines: design/io_coroutine.md
       - File I/O: design/file_io.md
       - TCP Stream: design/tcp_stream.md
       - UDP Socket: design/udp_socket.md
       - WebSocket Stream: design/websocket_stream.md
-      - Poll Streams: design/poll_streams.md
       - Pipe (FIFOs): design/pipe_streaming.md
       - Signal Handling: design/signal_handling.md
     - Synchronization & Combinators:

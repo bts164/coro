@@ -22,13 +22,11 @@ include/coro/
 ├── runtime/            tokio::runtime — executor and event loop
 │   ├── runtime.h
 │   ├── executor.h
-│   ├── single_threaded_uv_executor.h   libuv I/O reactor + task queue (dedicated thread)
 │   ├── current_thread_executor.h       single-thread executor — runs on calling thread; parks in the I/O driver
 │   ├── parker.h                        Parker — how an executor waits for outside events
 │   ├── io_driver.h                     IoDriver — epoll readiness reactor
 │   ├── work_sharing_executor.h
-│   ├── work_stealing_executor.h
-│   └── uv_future.h         UvCallbackResult / UvFuture — libuv callback bridges
+│   └── work_stealing_executor.h
 │
 ├── task/               tokio::task — task spawning and handles
 │   ├── join_handle.h
@@ -57,7 +55,7 @@ include/coro/
 │   ├── lookup_host.h       lookup_host() — DNS resolution on the blocking pool
 │   ├── ws_stream.h         WsStream — async WebSocket client connection
 │   ├── ws_listener.h       WsListener — async WebSocket server acceptor
-│   └── signal.h            signal() / signal_stream() — async OS signal delivery (uv_signal_t)
+│   └── signal.h            signal() / signal_stream() — async OS signal delivery (self-pipe)
 │
 └── detail/             Internal plumbing — not intended for direct user inclusion
     ├── poll_result.h       stable API for custom Future/Stream implementors
@@ -74,7 +72,6 @@ src/
 ├── runtime/
 │   ├── runtime.cpp
 │   ├── executor.cpp
-│   ├── single_threaded_uv_executor.cpp
 │   ├── current_thread_executor.cpp
 │   ├── work_sharing_executor.cpp
 │   └── work_stealing_executor.cpp
@@ -118,8 +115,7 @@ Anything that drives tasks to completion or owns I/O infrastructure goes here. T
 - The abstract `Executor` interface
 - Concrete executor implementations: `CurrentThreadExecutor`, `WorkSharingExecutor`, `WorkStealingExecutor`
 - `IoDriver` — the epoll readiness reactor that executors turn when they park
-- `SingleThreadedUvExecutor` — libuv event loop + task queue on a dedicated thread
-- `uv_future.h` — `UvCallbackResult` / `UvFuture` bridge libuv callbacks to coroutines
+- `CurrentThreadExecutor` — polling executor for MCU targets; runs on the calling thread
 
 ### `task/` — task spawning and handles
 
@@ -143,13 +139,14 @@ Types that coordinate between concurrently running tasks. This includes:
 ### `io/` — async I/O
 
 Types that provide async access to network resources. I/O types are built on top of
-`SingleThreadedUvExecutor` (the libuv reactor in `runtime/`) and satisfy `Future` or `Stream`.
+the `IoDriver` (the epoll reactor in `runtime/`) or the blocking pool, and satisfy
+`Future` or `Stream`.
 
 - `TcpStream` — async TCP connection
 - `WsStream` — async WebSocket client connection
 - `WsListener` — async WebSocket server acceptor
-- `signal()` / `signal_stream()` — async OS signal delivery via libuv's `uv_signal_t`;
-  see `doc/design/signal_handling.md`
+- `signal()` / `signal_stream()` — async OS signal delivery via a self-pipe on the
+  IoDriver; see `doc/design/signal_handling.md`
 
 ### `detail/` — internal plumbing and low-level extension points
 

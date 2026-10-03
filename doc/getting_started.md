@@ -81,7 +81,6 @@ Common headers:
 #include <coro/io/tcp_listener.h>         // TcpListener — TCP accept loop
 #include <coro/io/ws_stream.h>            // WsStream — async WebSocket client
 #include <coro/io/ws_listener.h>          // WsListener — WebSocket server
-#include <coro/io/poll_stream.h>          // PollStream — character-device / fd streaming
 #include <coro/io/signal.h>               // signal(), signal_stream() — OS signal delivery
 ```
 
@@ -1635,18 +1634,18 @@ SG.1](guidelines.md#sg1) for the full rule.
 !!! note "NOTE: bare-metal ports face the same problem from ISRs, not signals"
     On the MCU port, `IsrEvent` and `IsrChannel` (`include/coro/sync/isr_event.h`) exist
     to solve this exact mutex-safety problem, but for hardware interrupts instead of OS
-    signals. They are not available on desktop builds — there is no libuv event loop and
-    no self-pipe to write to on bare metal with no OS underneath, so a hardware-specific,
+    signals. They are not available on desktop builds. On bare metal, with no OS
+    underneath, there is no I/O driver or self-pipe to write to, so a hardware-specific,
     interrupt-safe primitive is the only option for signaling out of an ISR in that
     environment.
 
 `coro::signal()` and `coro::signal_stream()` (`#include <coro/io/signal.h>`) exist so
-user code never has to write a raw handler at all. They're built on libuv's
-`uv_signal_t`, which solves the signal-safety problem internally with a self-pipe: the
-real OS-level handler libuv installs only writes one byte to a pipe — the one operation
-POSIX guarantees is async-signal-safe — and all actual dispatch (coalescing repeat
-deliveries, waking the waiting coroutine) happens afterward on the uv loop thread, in
-ordinary non-handler context. See `doc/design/signal_handling.md` for the full design.
+user code never has to write a raw handler at all. They solve the signal-safety problem
+with a self-pipe: the real OS-level handler coro installs only bumps an atomic counter
+and writes one byte to a pipe — both async-signal-safe — and all actual dispatch
+(coalescing repeat deliveries, waking the waiting coroutine) happens afterward, when the
+pipe wakes the Runtime's I/O driver, in ordinary non-handler context. See
+`doc/design/signal_handling.md` for the full design.
 
 `coro::signal(signum)` returns a one-shot `Future<void>` that resolves on the next
 delivery of that signal — `select` it (section 9) alongside the running server task so

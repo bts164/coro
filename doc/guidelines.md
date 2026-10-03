@@ -1058,13 +1058,12 @@ or a mutex — none of which are guaranteed reentrant or signal-safe, and a hand
 interrupts the program mid-allocation or mid-lock can deadlock or corrupt state.
 
 `coro::signal(signum)` and `coro::signal_stream(signums)` (`include/coro/io/signal.h`)
-exist specifically so user code never needs to write a raw handler at all. They are
-built on libuv's `uv_signal_t`, which already solves the signal-safety problem
-internally via a self-pipe: the actual OS-level handler libuv installs only writes one
-byte to a pipe (the one operation POSIX guarantees is async-signal-safe), and all real
-dispatch — coalescing repeat deliveries, waking the waiting coroutine — happens
-afterward on the uv loop thread, in ordinary (non-handler) context. See
-`doc/design/signal_handling.md` for the full design.
+exist specifically so user code never needs to write a raw handler at all. They solve
+the signal-safety problem with a self-pipe: the actual OS-level handler coro installs
+only bumps an atomic counter and writes one byte to a pipe (both async-signal-safe), and
+all real dispatch — coalescing repeat deliveries, waking the waiting coroutine —
+happens afterward, when the pipe wakes the Runtime's I/O driver, in ordinary
+(non-handler) context. See `doc/design/signal_handling.md` for the full design.
 
 ```cpp
 // BAD — touches coro primitives directly from a signal handler; UB in general,
@@ -1085,9 +1084,9 @@ coro::Coro<void> run() {
 }
 ```
 
-This rule is specific to desktop builds (`coro::signal` is built on libuv, which is not
-available under `CORO_PICO`). The MCU analogue of this rule — for hardware interrupts
-rather than OS signals — is **IS.1** below.
+This rule is specific to desktop builds (`coro::signal` is built on a self-pipe read
+through the epoll IoDriver, which is not available under `CORO_PICO`). The MCU analogue of
+this rule — for hardware interrupts rather than OS signals — is **IS.1** below.
 
 ---
 

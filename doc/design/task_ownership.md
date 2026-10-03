@@ -290,7 +290,7 @@ All wakers stored for later notification are `weak_ptr<Waker>`:
 - `TaskState::waker` — a single slot shared between `JoinHandle::poll()` (while the
   caller awaits the result) and `CoroutineScope` (while the scope waits for a dropped
   child to drain).
-- Leaf futures (uv_future, sleep, channels, etc.) — store the waker from `ctx.get_weak_waker()`
+- Leaf futures (I/O readiness, sleep, channels, etc.) — store the waker from `ctx.get_weak_waker()`
 
 A `weak_ptr<Waker>` does not contribute to the reference count of the task it points
 at. Firing is `if (auto w = stored_waker.lock()) w->wake()`. If the task has already

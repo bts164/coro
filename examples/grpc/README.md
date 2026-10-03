@@ -52,6 +52,11 @@ A server-streaming example that pushes signal frames to a live vispy plot. The s
 sends an initial `SignalInfo` message describing the x-axis, then streams `DataFrame`
 messages at the requested frame rate.
 
+!!! note "NOTE: server not currently built"
+    The server, `src/signalserver.cpp`, reads its pipe through PollStream, which was
+    removed along with libuv. Its target is left out of `CMakeLists.txt` until it is
+    ported to the IoDriver.
+
 ### Running the server
 
 ```bash

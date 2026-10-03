@@ -230,29 +230,6 @@ concept). The work is the bridge task, the wrapper type, and cancellation edge-c
 testing — particularly ensuring the producer exits promptly when the consumer is
 dropped while the buffer is full.
 
-## `PollStream` — coroutine-based decoder
-
-`PollStream` currently requires a decoder class implementing an explicit state machine
-— it receives available bytes, parses as much as it can, and signals whether more data
-is needed. This interface is expressive but requires the author to manage parser state
-manually.
-
-A coroutine is a compiler-generated state machine, so there is a natural
-correspondence: a coroutine-based decoder that suspends at a `co_await need_bytes(N)`
-point when it needs more data and resumes when they arrive would express the same logic
-as sequential code. The key design constraint is that the decoder coroutine must resume
-on the I/O (libuv) thread directly — bypassing the executor scheduler — to preserve
-the low-overhead property that motivates `PollStream` in the first place. The libuv
-thread would act as the executor for the decoder coroutine.
-
-This requires working out:
-- How the decoder coroutine suspends and signals "I need N more bytes"
-- How the libuv callback resumes it without going through the task queue
-- Whether this replaces the existing decoder class interface or sits alongside it
-
-No implementation until the design is resolved. See the buffered protocol reading
-entry in `doc/patterns.md` for user-facing context.
-
 ## Stream combinators
 
 The `Stream` concept and `next()` are implemented but there are no combinators. Without
@@ -338,6 +315,6 @@ Suggested events to instrument once logging exists:
 - Task created / scheduled / polled / completed / cancelled
 - `SchedulingState` transitions (at `TRACE` level)
 - CAS failures that indicate bugs (`FATAL`)
-- `SingleThreadedUvExecutor` timer wakeup firing
+- `IoDriver` turns and timer wakeups
 - Worker thread start / stop
 - Injection queue drain counts (task budget enforcement)

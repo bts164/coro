@@ -28,21 +28,21 @@ portable C++20/23 with no platform dependencies and compiles as-is.
 
 | Flag | Effect |
 |---|---|
-| `CORO_PICO` | Selects `CurrentThreadExecutor`, no-op mutex stubs, `SleepFuture` timer queue, no libuv |
+| `CORO_PICO` | Selects `CurrentThreadExecutor`, no-op mutex stubs, `SleepFuture` timer queue, no epoll `IoDriver` |
 | `CORO_TCP_BACKEND_LWIP` | Selects lwIP TCP backend for `TcpStream` / `TcpListener` |
 
 Both flags are set automatically by `cmake/platforms/pico.cmake`.
 
 ### How the existing library maps to the Pico SDK
 
-| libuv backend | Pico SDK equivalent |
+| Desktop | Pico SDK equivalent |
 |---|---|
-| `uv_run(UV_RUN_ONCE)` | `cyw43_arch_poll()` |
-| `uv_tcp_t` | lwIP `tcp_pcb*` |
-| `uv_timer_t` | `CurrentThreadExecutor` timer queue (min-heap + `time_us_64()`) |
-| `uv_async_send()` doorbell | Not needed — single-threaded cooperative scheduling; ISR path uses `IsrEvent` volatile flags |
-| `UvCallbackResult` | `LwipCallbackResult` (no mutex; see below) |
-| `SingleThreadedUvExecutor` (dedicated I/O thread) | `CurrentThreadExecutor` (runs on calling thread) |
+| `IoDriver::turn()` (`epoll_wait`) | `cyw43_arch_poll()` |
+| Non-blocking socket fd registered with the `IoDriver` | lwIP `tcp_pcb*` |
+| `IoDriver` timer queue (`detail::TimerQueue`) | `CurrentThreadExecutor` timer queue (`detail::TimerQueue` + `time_us_64()`) |
+| `IoDriver` eventfd unpark | Not needed — single-threaded cooperative scheduling; ISR path uses `IsrEvent` volatile flags |
+| Readiness futures woken by the `IoDriver` | `LwipCallbackResult` (no mutex; see below) |
+| Executor threads that turn the `IoDriver` | `CurrentThreadExecutor` (runs on calling thread) |
 
 ### Event loop
 
@@ -490,7 +490,7 @@ include/coro/
                                 scheduling makes locking unnecessary), std::mutex elsewhere
   sync/
     isr_event.h                 IsrEvent / IsrChannel<T> — ISR-to-coroutine primitives
-    sleep.h                     SleepFuture — timer-queue based on Pico, libuv on desktop
+    sleep.h                     SleepFuture — timer-queue based on Pico, IoDriver timers on desktop
   pico/
     pico_executor.h             CurrentThreadExecutor class (timer queue, ready queue)
     pico_callback_result.h      PicoCallbackResult / PicoFuture — legacy; used by
@@ -499,8 +499,8 @@ include/coro/
       dma.h                     AsyncDmaTransfer — RAII async DMA channel (coro_pico_hal)
     mqtt.h                       MqttClient — coroutine wrapper over lwIP apps/mqtt (coro_pico_mqtt)
   io/
-    tcp_stream.h                TcpStream — dispatches to lwIP or libuv backend
-    tcp_listener.h              TcpListener — dispatches to lwIP or libuv backend
+    tcp_stream.h                TcpStream — dispatches to lwIP or epoll backend
+    tcp_listener.h              TcpListener — dispatches to lwIP or epoll backend
     lwip/
       lwip_callback_result.h    LwipCallbackResult<Args...> + lwip_wait() helper
 
@@ -774,7 +774,7 @@ int main() {
 `LwipTcpCtx` stores one `rx_waker` and one `tx_waker`. Calling `read()` from two
 concurrent tasks on the same stream would silently overwrite the waker and lose
 wakeups. Document and enforce single-consumer usage per direction; the same restriction
-exists in the libuv `TcpStream`.
+exists in the desktop `TcpStream`.
 
 ### `rx_buf` memory pressure
 
@@ -831,7 +831,7 @@ if (ready_queue_empty() && no_timers_near() && no_isr_events_pending()) {
 core 0's "queue is empty" check and the `__wfi()` instruction. The RP2040 fix is the
 **SIO inter-processor FIFO** — writing to `sio_hw->fifo_wr` raises `SIO_IRQ_PROC0` on
 core 0, waking it from WFI. `CurrentThreadExecutor::enqueue()` would write the doorbell
-after pushing to the ready queue, mirroring what `uv_async_send()` does in libuv.
+after pushing to the ready queue, mirroring the eventfd unpark the desktop `IoDriver` uses.
 
 !!! tip "TODO: Implement WFI idle in CurrentThreadExecutor"
     Implementing this would materially reduce power consumption on battery-powered

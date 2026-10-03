@@ -48,8 +48,8 @@ flowchart TD
     E["<b>Executor</b><br/>creates Context(waker)<br/>calls poll(ctx)"]
     C1["<b>main_coro</b><br/>resumes, forwards poll(ctx) downward"]
     C2["<b>compute_coro</b><br/>resumes, forwards poll(ctx) downward"]
-    IO["<b>read_packet</b> — leaf future<br/>calls ctx.getWaker(), stores it<br/>registers waker with libuv<br/>returns Pending"]
-    UV[("libuv")]
+    IO["<b>read_packet</b> — leaf future<br/>calls ctx.getWaker(), stores it<br/>registers waker with the I/O driver<br/>returns Pending"]
+    UV[("IoDriver")]
 
     E -->|"poll(ctx)"| C1
     C1 -->|"poll(ctx)"| C2
@@ -71,7 +71,7 @@ sequenceDiagram
     participant C1 as main_coro
     participant C2 as compute_coro
     participant IO as read_packet
-    participant UV as libuv
+    participant UV as IoDriver
 
     Note over E,UV: First poll — nothing ready yet
     E->>C1: poll(ctx)
@@ -82,7 +82,7 @@ sequenceDiagram
     C2-->>C1: Pending
     C1-->>E: Pending
 
-    Note over E,UV: libuv fires — data is available
+    Note over E,UV: epoll reports the fd readable
     UV->>E: waker.wake()
 
     Note over E,UV: Second poll — result bubbles back up
@@ -96,7 +96,7 @@ sequenceDiagram
 
 Key observations:
 - `main_coro` and `compute_coro` never store the waker — they just forward `ctx`
-- `read_packet` is the only future that interacts with libuv
+- `read_packet` is the only future that interacts with the I/O driver
 - On the second poll, each coroutine resumes instantly from where it was — the intermediate
   coroutines are not doing work, they are just passing the call through to find the ready leaf
 
@@ -150,7 +150,7 @@ task. The `SelectFuture` does not need to know in advance which one will fire fi
 ## Timeout — Two Competing Wakers
 
 `timeout(f, 10s)` registers the waker with two sources: the inner future's resource and a
-libuv timer. Whichever fires first wakes the task. On re-poll, `TimeoutFuture` checks
+driver timer. Whichever fires first wakes the task. On re-poll, `TimeoutFuture` checks
 whether the timer has elapsed to decide how to interpret the result.
 
 ```mermaid
@@ -158,8 +158,8 @@ sequenceDiagram
     participant E as Executor
     participant TF as TimeoutFuture
     participant F as inner_future
-    participant IO as libuv I/O
-    participant TM as libuv timer
+    participant IO as IoDriver (fd)
+    participant TM as IoDriver (timer)
 
     E->>TF: poll(ctx)
     TF->>F: poll(ctx)

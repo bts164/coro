@@ -399,8 +399,8 @@ int main(int argc, char *argv[]) {
 ```
 
 Never install a raw `sigaction` handler to do this — see guidelines.md SG.1. `coro::signal`
-already handles the async-signal-safety concerns internally (libuv's self-pipe trick) and
-delivers the result as an ordinary pollable `Future`.
+already handles the async-signal-safety concerns internally (a self-pipe read through the
+I/O driver) and delivers the result as an ordinary pollable `Future`.
 
 ---
 
@@ -579,23 +579,8 @@ coro::Coro<void> handle_connection(coro::TcpStream stream) {
 TCP is used here as a concrete example but the pattern applies to any byte stream:
 serial ports, pipes, Unix domain sockets, shared-memory rings.
 
-**High-throughput variant — `PollStream`**
+**High-throughput reads**
 
-The loop above suspends on `co_await stream.read(...)` and wakes through the executor
-on every chunk, which adds scheduling overhead. For high data-rate streams where that
-overhead is measurable, `PollStream` lets the decoder run directly on the I/O thread
-without going through the task scheduler for each read.
-
-The decoder passed to `PollStream` is a state machine — it receives available bytes,
-returns as much as it parsed, and signals whether it needs more data. This maps
-naturally to the same accumulate-and-try-parse structure above; `PollStream` just
-drives it at a lower level to eliminate the per-read wakeup cost. See
-[Poll Streams](../design/poll_streams.md) for the full interface.
-
-> **Future direction:** the decoder interface of `PollStream` is a state machine
-> expressed as a class. A coroutine is a compiler-generated state machine, so there is
-> a natural correspondence: a coroutine-based decoder that suspends when it needs more
-> bytes and resumes when they arrive would express the same logic in sequential code
-> rather than an explicit state machine. Making the decoder a coroutine that executes
-> on the I/O thread — bypassing the executor scheduler entirely — is an open design
-> question on the roadmap.
+`co_await stream.read(...)` makes the `read()` syscall directly on the polling thread and
+only suspends on `EAGAIN`, so a busy stream is read without a scheduler round trip per
+chunk. Read larger chunks to amortize the per-call cost further.

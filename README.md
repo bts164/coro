@@ -30,7 +30,7 @@ cd build/Release && make
 - [Tasks, Wakers, and Context](doc/waker_and_context_propagation.md)
 - [Tasks, Executors, and Runtime](doc/task_and_executor.md)
 - [Executor Design](doc/executor_design.md) · [Work-Stealing Scheduler](doc/work_stealing_executor.md)
-- I/O: [I/O Coroutines](doc/io_coroutine.md) · [libuv Integration](doc/libuv_integration.md) · [WebSocket Stream](doc/websocket_stream.md) · [PollStreams](doc/poll_streams.md)
+- I/O: [I/O Driver](doc/design/io_driver.md) · [TCP Stream](doc/design/tcp_stream.md) · [UDP Socket](doc/design/udp_socket.md) · [WebSocket Stream](doc/design/websocket_stream.md)
 - Synchronization: [Coroutine Scope](doc/coroutine_scope.md) · [JoinSet](doc/join_set.md) · [Channels](doc/channels.md) · [Select](doc/select.md)
 - [Module Structure](doc/module_structure.md)
 

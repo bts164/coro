@@ -16,8 +16,8 @@ distinct user-facing types:
 (`TaskBase`) and the result/cancellation state (`TaskState<T>`) into one allocation.
 Users never construct a `Task` directly.
 
-The `Executor` drives tasks by polling them. The `Runtime` bundles the executor, thread pool,
-and libuv I/O reactor into a single user-facing object.
+The `Executor` drives tasks by polling them. The `Runtime` bundles the executor, blocking
+pool, and epoll I/O driver into a single user-facing object.
 
 ## Design
 
@@ -25,7 +25,7 @@ and libuv I/O reactor into a single user-facing object.
 
 - **`Executor`** — abstract base responsible only for scheduling: accepts type-erased tasks
   and decides when to poll them. Does not own threads or I/O.
-- **`Runtime`** — user-facing object that owns the thread pool, libuv event loop, and a
+- **`Runtime`** — user-facing object that owns the blocking pool, the I/O driver, and a
   concrete `Executor`. Provides `spawn()` and `block_on()`.
 
 ```cpp
@@ -406,7 +406,7 @@ debugging (deterministic scheduling, no data races).
 
 - Single task queue (a simple FIFO)
 - Tasks are polled one at a time on the calling thread
-- libuv event loop is driven on the same thread between polls
+- The I/O driver is turned on the same thread when no task is ready
 - `spawn()` pushes to the queue; waking a task re-enqueues it
 
 Each task moves through four states:
@@ -449,7 +449,7 @@ class Runtime {
 public:
     explicit Runtime(std::size_t num_threads = std::thread::hardware_concurrency());
 
-    // Runs future on the calling thread, blocking until it completes. Drives the libuv loop.
+    // Runs future on the calling thread, blocking until it completes.
     // Intended for use in main() to launch the top-level coroutine.
     template<Future F>
     typename F::OutputType block_on(F future);
@@ -464,17 +464,17 @@ public:
 };
 ```
 
-`Runtime` owns the executor, the libuv reactor (`SingleThreadedUvExecutor`), and the
-blocking thread pool (`BlockingPool`) directly, as plain members — not behind a `pimpl`.
-Every place that needs to reach one of these from off the `Runtime` object itself (the
-free `spawn()`/`current_runtime()` thread-locals, `BlockingPool::worker_loop`'s
-`set_current_runtime`/`set_current_uv_executor` calls) stores a raw `Runtime*` and relies
-on a *structural* lifetime guarantee rather than shared ownership: `block_on()` runs on a
-call stack that has `Runtime` alive by construction, and `BlockingPool`'s worker threads
-are joined by `~BlockingPool()` before the rest of `~Runtime()` runs, so the pointer is
-never read after the `Runtime` it points to is gone. This is cheaper than an extra
-allocation and indirection level — worthwhile as long as every consumer of the pointer is
-one the library itself controls the lifetime of.
+`Runtime` owns the executor, the I/O driver (`IoDriver`), and the blocking thread pool
+(`BlockingPool`) directly, as plain members — not behind a `pimpl`. Every place that needs
+to reach one of these from off the `Runtime` object itself (the free
+`spawn()`/`current_runtime()` thread-locals, `BlockingPool::worker_loop`'s
+`set_current_runtime` call) stores a raw `Runtime*` and relies on a *structural* lifetime
+guarantee rather than shared ownership: `block_on()` runs on a call stack that has
+`Runtime` alive by construction, and `BlockingPool`'s worker threads are joined by
+`~BlockingPool()` before the rest of `~Runtime()` runs, so the pointer is never read after
+the `Runtime` it points to is gone. This is cheaper than an extra allocation and
+indirection level — worthwhile as long as every consumer of the pointer is one the library
+itself controls the lifetime of.
 
 #### Proposed: `Handle` and `Runtime::enter()` (not yet implemented)
 
@@ -498,7 +498,7 @@ The C++ equivalent is `shared_ptr`-based `pimpl`:
 ```cpp
 // Everything Runtime currently owns directly moves into Impl.
 struct Runtime::Impl {
-    SingleThreadedUvExecutor  uv_executor;
+    IoDriver                  io_driver;
     BlockingPool              blocking_pool;
     std::unique_ptr<Executor> executor;
 };
@@ -524,7 +524,7 @@ public:
     template<Future F>
     [[nodiscard]] JoinHandle<typename F::OutputType> spawn(F future) const;
 
-    // Makes this runtime's context (current-runtime + current-uv-executor thread-locals)
+    // Makes this runtime's context (the current-runtime thread-local)
     // active on the calling thread for the guard's lifetime. Restores whatever was active
     // before on drop, so nested enter() calls are safe.
     [[nodiscard]] EnterGuard enter() const;
@@ -537,7 +537,7 @@ private:
 
 class [[nodiscard]] EnterGuard {
 public:
-    ~EnterGuard();  // restores the previous thread-local Handle + uv executor (if any)
+    ~EnterGuard();  // restores the previous thread-local Handle (if any)
 
     EnterGuard(const EnterGuard&)            = delete;
     EnterGuard& operator=(const EnterGuard&) = delete;
@@ -561,13 +561,12 @@ is the freely-copyable reference type everything else works through, mirroring T
 member — `Impl` contains `BlockingPool`, so that would be a reference cycle and `Impl`
 would never be destroyed. It stores a `std::weak_ptr<Impl>` instead, and each worker
 thread `lock()`s it into a strong `Handle` once at the top of its loop, exactly where
-`set_current_runtime`/`set_current_uv_executor` are called today. This generalizes the
-same structural guarantee `spawn_blocking.md` describes for the current flat design (the
-worker thread's own reference keeps what it needs alive for as long as it's running) into
-one that also covers `enter()`: an `EnterGuard` on a foreign thread holds its own strong
-`shared_ptr<Impl>` clone, so `Impl` — and everything reachable through it — stays alive for
-the guard's lifetime regardless of what happens to the original `Runtime` value or any
-other `Handle`.
+`set_current_runtime` is called today. This generalizes the same structural guarantee
+`spawn_blocking.md` describes for the current flat design (the worker thread's own
+reference keeps what it needs alive for as long as it's running) into one that also covers
+`enter()`: an `EnterGuard` on a foreign thread holds its own strong `shared_ptr<Impl>`
+clone, so `Impl` — and everything reachable through it — stays alive for the guard's
+lifetime regardless of what happens to the original `Runtime` value or any other `Handle`.
 
 This is a change to `Runtime`'s public shape, not just its internals: `set_current_runtime`
 and `current_runtime()` change from storing/returning `Runtime*` to storing/returning
@@ -645,12 +644,13 @@ cleanest approach is to store a `Context*` in the `promise_type` on each `poll()
 `FutureAwaitable::await_ready()` and `await_resume()` retrieve it via
 `coroutine_handle.promise()`.
 
-### libuv integration point
+### I/O integration point
 
-libuv callbacks run on the `SingleThreadedUvExecutor` thread. When a callback fires (e.g. a
-timer or read completes), it calls `waker->wake()`, which posts the task back to the
-executor via the injection queue. `SingleThreadedUvExecutor` runs on a dedicated thread
-inside `Runtime` and communicates with worker threads via `uv_async_t` notifications.
+The I/O driver has no thread of its own: an executor thread with nothing ready turns it.
+When epoll reports an fd ready or a timer comes due, the driver calls `waker->wake()` on
+that turning thread, which reschedules the task on its executor. A wake from any other
+thread unparks the turning thread through the driver's eventfd. See
+[I/O Driver](io_driver.md).
 
 ### spawn() ownership
 
@@ -662,8 +662,8 @@ configure a name or buffer size before spawning.
 ### block_on threading
 
 `block_on` runs the future on the calling thread and blocks until completion. This is the
-intended entry point from `main()`. It also drives the libuv event loop on that thread for
-the duration of the call.
+intended entry point from `main()`. With a `CurrentThreadExecutor`, it also turns the I/O
+driver on that thread whenever no task is ready.
 
 ### co_await inside Coro — await_transform
 
@@ -725,7 +725,7 @@ struct MyFuture {
     // It kicks off async cleanup work and sets a flag so poll() knows to drain.
     void cancel() {
         m_cancelling = true;
-        submit_async_cleanup();  // e.g. uv_close, flush buffer, etc.
+        submit_async_cleanup();  // e.g. a close posted to another thread, flush buffer, etc.
     }
 
     PollResult<void> poll(Context& ctx) {
@@ -749,11 +749,12 @@ other means — but any alternative requires careful reasoning, as the case stud
 
 !!! note "NOTE: Executor shutdown ordering"
     A non-trivially drainable future whose `cancel()` submits work to an external subsystem
-    (such as a libuv `uv_close` request) is only as good as the guarantee that the subsystem
-    remains operational during the drain phase. If the executor stops the event loop before
-    draining such a future, the completion callback never fires, `poll()` returns `PollPending`
-    forever, and the drain deadlocks. The executor's shutdown sequence must therefore keep the
-    event loop live for the entire duration of the drain.
+    (such as a close request posted to an lws service thread) is only as good as the
+    guarantee that the subsystem remains operational during the drain phase. If the
+    executor stops the event loop before draining such a future, the completion callback
+    never fires, `poll()` returns `PollPending` forever, and the drain deadlocks. The
+    executor's shutdown sequence must therefore keep the event loop live for the entire
+    duration of the drain.
 
 #### Shutdown and detached tasks
 

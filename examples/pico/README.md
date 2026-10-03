@@ -163,7 +163,7 @@ Note the IP address assigned by your router — you need it for the next step. I
 
 ## Step 6 — Test with the host client
 
-Build and run `tcp_echo_client` from the main coro build (it uses the libuv-based executor on Linux — no lwIP needed on the host side):
+Build and run `tcp_echo_client` from the main coro build (it uses the desktop epoll-based runtime on Linux — no lwIP needed on the host side):
 
 ```bash
 # From the coro repo root, inside your regular build directory:

@@ -37,7 +37,7 @@ Requires C++20. Dependencies are managed with Conan; install them before configu
 | `Waker` | Notifies the executor that a `Future` is ready to make progress |
 | `Executor` / `Runtime` | Drives `Task`s to completion; manages the thread pool and I/O reactor |
 
-The underlying I/O reactor is implemented using **libuv** unless there is a compelling reason to use another library.
+The underlying I/O reactor is coro's own epoll-based **IoDriver** (see `doc/design/io_driver.md`). Don't add a third-party event-loop library without a compelling reason.
 
 The `Executor` should be designed around a pluggable scheduling model. The interface should not assume any particular scheduler. The first implementation is a **single-threaded executor** (simple, deterministic, useful for testing). The second is a **multi-threaded work-stealing scheduler** (similar to Tokio's).
 
