@@ -2,12 +2,25 @@
 #include "executor_traits.h"
 #include <coro/io/signal.h>
 #include <coro/runtime/runtime.h>
-#include <coro/task/spawn_on.h>
+#include <coro/runtime/current_thread_executor.h>
+#include <coro/runtime/parker.h>
 #include <coro/coro.h>
 #include <coro/stream.h>
+#include <coro/sync/timeout.h>
+#include <signal.h>
+#include <unistd.h>
+#include <chrono>
 #include <csignal>
+#include <latch>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <system_error>
+#include <thread>
+#include <utility>
 
 using namespace coro;
+using namespace std::chrono_literals;
 
 // ---------------------------------------------------------------------------
 // Concept checks
@@ -16,46 +29,12 @@ using namespace coro;
 static_assert(Future<SignalFuture>);
 static_assert(Stream<SignalStream>);
 
-// NOTE: every test below raises its signal from the same OS thread that runs the uv
-// loop — but the *coroutine* awaiting the result may run on a different OS thread,
-// since AllExecutors parameterizes the task scheduler (WorkStealingTraits,
-// WorkSharingTraits, etc.) independently of the dedicated uv-loop thread every Runtime
-// owns. That's exactly the race SignalState::mutex exists to guard: signal_cb always
-// fires on the uv thread, while poll()/poll_next() may be invoked concurrently on a
-// worker thread. We deliberately do NOT additionally test raising from a separate OS
-// thread via std::thread + kill(getpid(), signum) or pthread_kill(). Reasoning: libuv
-// installs one process-wide sigaction per signum whose handler just writes a byte to a
-// self-pipe (async-signal-safe) — it does not matter which thread the kernel chooses to
-// run that handler on, since the coalescing logic in signal_cb only ever runs
-// afterward on the uv loop thread, when uv_run() reads that pipe. So the dispatch path
-// this library owns is single-threaded by construction regardless of which thread the
-// OS delivered to. We're relying on libuv's self-pipe trick to be correct here rather
-// than independently verifying it. If that assumption is ever found to be wrong, come
-// back here, update this note, and add a real cross-thread-raise test.
-namespace {
-
-// Raises `signum` on the uv thread. Routing the raise through with_context() on the
-// same SingleThreadedUvExecutor that signal()/signal_stream() registered the
-// uv_signal_t handle on guarantees FIFO ordering relative to that registration: both
-// the registration coroutine and this one are enqueued on the same single-threaded
-// ready queue, so awaiting this completes only after registration has already run.
-// Without this, raising immediately after signal() would race uv_signal_start().
-Coro<void> raise_on_uv_thread(SingleThreadedUvExecutor& exec, int signum) {
-    co_await with_context(exec, [](int signum) -> Coro<void> {
-        ::raise(signum);
-        co_return;
-    }(signum));
-}
-
-// Yields to the uv thread and back without touching any signal — used after dropping
-// a SignalFuture/SignalStream to give its detached, asynchronous teardown coroutine a
-// chance to actually run before the test exits (rather than testing nothing because
-// the process exits before the uv thread ever gets scheduled).
-Coro<void> yield_to_uv_thread(SingleThreadedUvExecutor& exec) {
-    co_await with_context(exec, []() -> Coro<void> { co_return; }());
-}
-
-} // namespace
+// NOTE: ::raise() runs the handler on the calling thread before it returns, so the
+// delivery is counted and its byte is in the self-pipe by the time the next line runs:
+// no extra synchronisation is needed. Watching starts at signal()/signal_stream(), so raising
+// between creation and the first co_await is the normal case under test. Every await is
+// bounded by a timeout so a lost wake-up fails the test instead of hanging the suite.
+// Tests run one at a time, so SIGUSR1/SIGUSR2 have no watchers outside the test body.
 
 // ---------------------------------------------------------------------------
 // SignalFuture (coro::signal)
@@ -69,36 +48,74 @@ protected:
 TYPED_TEST_SUITE(SignalFutureTest, AllExecutors);
 
 TYPED_TEST(SignalFutureTest, ResolvesOnDelivery) {
-    bool delivered = false;
-    this->traits.rt.block_on([](bool& delivered) -> Coro<void> {
+    bool delivered = this->traits.rt.block_on([]() -> Coro<bool> {
         auto sig = coro::signal(SIGUSR1);
-        co_await raise_on_uv_thread(current_uv_executor(), SIGUSR1);
-        co_await sig;
-        delivered = true;
-    }(delivered));
+        ::raise(SIGUSR1);
+        auto got = co_await coro::timeout(5s, std::move(sig));
+        co_return got.index() == 0;
+    }());
     EXPECT_TRUE(delivered);
+}
+
+TYPED_TEST(SignalFutureTest, PendingUntilDelivered) {
+    std::size_t index = this->traits.rt.block_on([]() -> Coro<std::size_t> {
+        auto got = co_await coro::timeout(20ms, coro::signal(SIGUSR1));
+        co_return got.index();
+    }());
+    EXPECT_EQ(index, 1u);   // timed out
+}
+
+// The kernel may run the handler on any thread that doesn't block the signal; the
+// dispatch must not care which.
+TYPED_TEST(SignalFutureTest, ResolvesOnDeliveryFromAnotherThread) {
+    bool delivered = this->traits.rt.block_on([]() -> Coro<bool> {
+        auto sig = coro::signal(SIGUSR1);
+        std::thread([] { ::kill(::getpid(), SIGUSR1); }).join();
+        auto got = co_await coro::timeout(5s, std::move(sig));
+        co_return got.index() == 0;
+    }());
+    EXPECT_TRUE(delivered);
+}
+
+// A delivery counted before a watcher existed belongs to the watchers that existed then.
+TYPED_TEST(SignalFutureTest, IgnoresDeliveriesBeforeCreation) {
+    std::size_t index = this->traits.rt.block_on([]() -> Coro<std::size_t> {
+        auto earlier = coro::signal(SIGUSR1);   // keeps the handler installed
+        ::raise(SIGUSR1);
+        auto got = co_await coro::timeout(20ms, coro::signal(SIGUSR1));
+        co_return got.index();
+    }());
+    EXPECT_EQ(index, 1u);   // timed out
 }
 
 TYPED_TEST(SignalFutureTest, DroppingBeforeDeliveryDoesNotHang) {
     this->traits.rt.block_on([]() -> Coro<void> {
         { auto sig = coro::signal(SIGUSR1); }
-        co_await yield_to_uv_thread(current_uv_executor());
+        co_return;
     }());
 }
 
 TYPED_TEST(SignalFutureTest, MultipleIndependentWatchersOfSameSignal) {
-    bool a_delivered = false, b_delivered = false;
-    this->traits.rt.block_on([](bool& a, bool& b) -> Coro<void> {
+    bool both = this->traits.rt.block_on([]() -> Coro<bool> {
         auto sig_a = coro::signal(SIGUSR1);
         auto sig_b = coro::signal(SIGUSR1);
-        co_await raise_on_uv_thread(current_uv_executor(), SIGUSR1);
-        co_await sig_a;
-        a = true;
-        co_await sig_b;
-        b = true;
-    }(a_delivered, b_delivered));
-    EXPECT_TRUE(a_delivered);
-    EXPECT_TRUE(b_delivered);
+        ::raise(SIGUSR1);
+        auto a = co_await coro::timeout(5s, std::move(sig_a));
+        auto b = co_await coro::timeout(5s, std::move(sig_b));
+        co_return a.index() == 0 && b.index() == 0;
+    }());
+    EXPECT_TRUE(both);
+}
+
+TYPED_TEST(SignalFutureTest, InvalidSignalThrows) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        EXPECT_THROW((void)coro::signal(SIGKILL), std::system_error);
+        EXPECT_THROW((void)coro::signal(SIGSTOP), std::system_error);
+        EXPECT_THROW((void)coro::signal(0), std::system_error);
+        EXPECT_THROW((void)coro::signal(-1), std::system_error);
+        EXPECT_THROW((void)coro::signal_stream({SIGUSR1, SIGKILL}), std::system_error);
+        co_return;
+    }());
 }
 
 // ---------------------------------------------------------------------------
@@ -113,61 +130,158 @@ protected:
 TYPED_TEST_SUITE(SignalStreamTest, AllExecutors);
 
 TYPED_TEST(SignalStreamTest, ResolvesOnDelivery) {
-    std::optional<SignalEvent> got;
-    this->traits.rt.block_on([](std::optional<SignalEvent>& got) -> Coro<void> {
-        auto sigs = coro::signal_stream({SIGUSR1});
-        co_await raise_on_uv_thread(current_uv_executor(), SIGUSR1);
-        got = co_await next(sigs);
-    }(got));
+    std::optional<SignalEvent> got = this->traits.rt.block_on(
+        []() -> Coro<std::optional<SignalEvent>> {
+            auto sigs = coro::signal_stream({SIGUSR1});
+            ::raise(SIGUSR1);
+            auto r = co_await coro::timeout(5s, next(sigs));
+            if (r.index() != 0) co_return std::nullopt;
+            co_return std::get<0>(r).value;
+        }());
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->signum, SIGUSR1);
-    EXPECT_GE(got->count, 1u);
+    EXPECT_EQ(got->count, 1u);
 }
 
-// A burst of same-signum raises before the consumer polls coalesces into a single
-// item with count == the number of raises, per the deliberate layer-2 coalescing
-// described in doc/design/signal_handling.md. (count is a lower bound in general —
-// see that doc — but a same-thread, handler-returns-immediately burst like this one
-// is not expected to suffer layer-1 kernel coalescing in practice.)
+// A burst raised before the consumer polls coalesces into one item. Each ::raise()
+// runs the handler to completion before returning, so none of the three is merged by
+// the kernel and the count is exact here; in general it is a lower bound.
 TYPED_TEST(SignalStreamTest, CoalescesBurstIntoOneEventWithCount) {
-    std::optional<SignalEvent> got;
-    this->traits.rt.block_on([](std::optional<SignalEvent>& got) -> Coro<void> {
-        auto sigs = coro::signal_stream({SIGUSR1});
-        co_await with_context(current_uv_executor(), []() -> Coro<void> {
+    std::optional<SignalEvent> got = this->traits.rt.block_on(
+        []() -> Coro<std::optional<SignalEvent>> {
+            auto sigs = coro::signal_stream({SIGUSR1});
             ::raise(SIGUSR1);
             ::raise(SIGUSR1);
             ::raise(SIGUSR1);
-            co_return;
+            auto r = co_await coro::timeout(5s, next(sigs));
+            if (r.index() != 0) co_return std::nullopt;
+            co_return std::get<0>(r).value;
         }());
-        got = co_await next(sigs);
-    }(got));
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->signum, SIGUSR1);
-    EXPECT_GE(got->count, 1u);
+    EXPECT_EQ(got->count, 3u);
 }
 
 TYPED_TEST(SignalStreamTest, DistinctSignalsYieldSeparateEvents) {
-    std::optional<SignalEvent> first, second;
-    this->traits.rt.block_on([](std::optional<SignalEvent>& first, std::optional<SignalEvent>& second) -> Coro<void> {
-        auto sigs = coro::signal_stream({SIGUSR1, SIGUSR2});
-        co_await with_context(current_uv_executor(), []() -> Coro<void> {
+    std::pair<std::optional<SignalEvent>, std::optional<SignalEvent>> got =
+        this->traits.rt.block_on(
+            []() -> Coro<std::pair<std::optional<SignalEvent>, std::optional<SignalEvent>>> {
+                auto sigs = coro::signal_stream({SIGUSR1, SIGUSR2});
+                ::raise(SIGUSR1);
+                ::raise(SIGUSR2);
+                std::pair<std::optional<SignalEvent>, std::optional<SignalEvent>> out;
+                auto first = co_await coro::timeout(5s, next(sigs));
+                if (first.index() == 0) out.first = std::get<0>(first).value;
+                auto second = co_await coro::timeout(5s, next(sigs));
+                if (second.index() == 0) out.second = std::get<0>(second).value;
+                co_return out;
+            }());
+    ASSERT_TRUE(got.first.has_value());
+    ASSERT_TRUE(got.second.has_value());
+    EXPECT_NE(got.first->signum, got.second->signum);
+    EXPECT_TRUE((got.first->signum == SIGUSR1 && got.second->signum == SIGUSR2) ||
+                (got.first->signum == SIGUSR2 && got.second->signum == SIGUSR1));
+}
+
+// Items after the first only carry deliveries since the previous item.
+TYPED_TEST(SignalStreamTest, CountsResetBetweenItems) {
+    std::pair<uint64_t, uint64_t> counts = this->traits.rt.block_on(
+        []() -> Coro<std::pair<uint64_t, uint64_t>> {
+            auto sigs = coro::signal_stream({SIGUSR1});
+            std::pair<uint64_t, uint64_t> out{0, 0};
             ::raise(SIGUSR1);
-            ::raise(SIGUSR2);
-            co_return;
+            ::raise(SIGUSR1);
+            auto first = co_await coro::timeout(5s, next(sigs));
+            if (first.index() == 0 && std::get<0>(first).value)
+                out.first = std::get<0>(first).value->count;
+            ::raise(SIGUSR1);
+            auto second = co_await coro::timeout(5s, next(sigs));
+            if (second.index() == 0 && std::get<0>(second).value)
+                out.second = std::get<0>(second).value->count;
+            co_return out;
         }());
-        first = co_await next(sigs);
-        second = co_await next(sigs);
-    }(first, second));
-    ASSERT_TRUE(first.has_value());
-    ASSERT_TRUE(second.has_value());
-    EXPECT_NE(first->signum, second->signum);
-    EXPECT_TRUE((first->signum == SIGUSR1 && second->signum == SIGUSR2) ||
-                (first->signum == SIGUSR2 && second->signum == SIGUSR1));
+    EXPECT_EQ(counts.first, 2u);
+    EXPECT_EQ(counts.second, 1u);
 }
 
 TYPED_TEST(SignalStreamTest, DroppingBeforeDeliveryDoesNotHang) {
     this->traits.rt.block_on([]() -> Coro<void> {
         { auto sigs = coro::signal_stream({SIGUSR1}); }
-        co_await yield_to_uv_thread(current_uv_executor());
+        co_return;
     }());
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide behaviour
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool handler_is_default(int signum) {
+    struct sigaction current {};
+    ::sigaction(signum, nullptr, &current);
+    return !(current.sa_flags & SA_SIGINFO) && current.sa_handler == SIG_DFL;
+}
+
+// Creates a watcher of SIGUSR2 on this Runtime, signals `registered`, then waits.
+Coro<bool> wait_for_sigusr2(std::latch& registered) {
+    auto sig = coro::signal(SIGUSR2);
+    registered.count_down();
+    auto got = co_await coro::timeout(5s, std::move(sig));
+    co_return got.index() == 0;
+}
+
+} // namespace
+
+// The last watcher to go restores the action that was in place before the first.
+TEST(SignalTest, RestoresPreviousActionWhenLastWatcherDrops) {
+    ASSERT_TRUE(handler_is_default(SIGUSR2));
+    Runtime rt(std::size_t{1});
+    rt.block_on([]() -> Coro<void> {
+        auto a = coro::signal(SIGUSR2);
+        EXPECT_FALSE(handler_is_default(SIGUSR2));
+        {
+            auto b = coro::signal_stream({SIGUSR2});
+        }
+        EXPECT_FALSE(handler_is_default(SIGUSR2));   // `a` still watches
+        co_return;
+    }());
+    EXPECT_TRUE(handler_is_default(SIGUSR2));
+}
+
+// One delivery reaches watchers on two Runtimes, each woken through its own driver
+// or by the other's broadcast, whichever drains the self-pipe first.
+TEST(SignalTest, WatchersOnSeparateRuntimesBothResolve) {
+    std::latch registered(1);
+    bool other_delivered = false;
+    std::thread other([&] {
+        Runtime rt(std::size_t{1});
+        other_delivered = rt.block_on(wait_for_sigusr2(registered));
+    });
+
+    Runtime rt(std::size_t{4});
+    bool delivered = rt.block_on([](std::latch& registered) -> Coro<bool> {
+        auto sig = coro::signal(SIGUSR2);
+        registered.wait();   // briefly blocks this worker; the other Runtime is unaffected
+        ::raise(SIGUSR2);
+        auto got = co_await coro::timeout(5s, std::move(sig));
+        co_return got.index() == 0;
+    }(registered));
+    other.join();
+
+    EXPECT_TRUE(delivered);
+    EXPECT_TRUE(other_delivered);
+}
+
+// A CurrentThreadExecutor with a caller-supplied parker never turns the IoDriver, so a
+// watcher there could never be woken: signal() refuses instead of hanging later.
+TEST(SignalTest, ThrowsWithoutDriver) {
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>,
+               std::make_unique<PollingParker>([] {}));
+    rt.block_on([]() -> Coro<void> {
+        EXPECT_THROW((void)coro::signal(SIGUSR1), std::logic_error);
+        EXPECT_THROW((void)coro::signal_stream({SIGUSR1}), std::logic_error);
+        co_return;
+    }());
+    EXPECT_TRUE(handler_is_default(SIGUSR1));   // nothing was installed
 }

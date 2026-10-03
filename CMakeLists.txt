@@ -123,6 +123,7 @@ else()
         src/detail/sys/dns_posix.cpp
         src/detail/sys/file_posix.cpp
         src/detail/sys/pipe_posix.cpp
+        src/detail/sys/signal_posix.cpp
         src/detail/sys/poller_epoll.cpp
         src/detail/sys/socket_posix.cpp
         src/detail/sys/tcp_posix.cpp
