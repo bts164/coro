@@ -193,7 +193,7 @@ co_await ev.wait();    // suspends until set(); returns immediately if already s
 // OneshotSender<int>, OneshotReceiver<int>
 auto [tx, rx] = coro::oneshot_channel<int>();
 tx.send(42);                        // synchronous, any thread
-std::expected<int, ChannelError> r = co_await rx;
+std::expected<int, ChannelError> r = co_await rx.recv();
 ```
 
 ## mpsc — bounded queue, multiple producers, one consumer

@@ -688,8 +688,7 @@ enqueue(task):
 !!! note "NOTE: superseded by the I/O driver"
     This section used to propose absorbing the libuv loop into a single-threaded executor,
     so the calling thread would drive both tasks and I/O, as the Pico executor does. The
-    I/O driver did this more generally: `CurrentThreadExecutor` replaced
-    `SingleThreadedExecutor`, an idle executor parks by turning the epoll `IoDriver`
+    I/O driver did this more generally: an idle executor parks by turning the epoll `IoDriver`
     (one worker at a time on the multi-threaded executors), the uv thread and the
     `t_current_uv_executor` thread-local are gone, and libuv was removed. See
     [I/O Driver](io_driver.md), "Who turns the driver". The `poll_ready_tasks()` /

@@ -839,6 +839,57 @@ after pushing to the ready queue, mirroring the eventfd unpark the desktop `IoDr
     Dual-core additionally requires a SIO FIFO doorbell write in `CurrentThreadExecutor::enqueue()`.
     No changes to coroutine user code are needed in either case.
 
+    The same doorbell would also back a `CORO_PICO` `Waker` for
+    [`blocking_wait`/`blocking_next`](blocking_wait.md#excluded-on-coro_pico--for-now),
+    letting a compute loop on core 1 park until core 0 (or an ISR) wakes it — currently
+    excluded on `CORO_PICO` for lack of this backend, deferred as its own design
+    discussion.
+
+### Sharing more code with the desktop build
+
+The executor, timers and clock are already shared: Pico and desktop run the same
+`CurrentThreadExecutor`, `detail::TimerQueue`, `SleepFuture` and `coro::Clock`, and differ
+only in the `Parker` (`PollingParker` around `cyw43_arch_poll()` here, the `IoDriver` on
+desktop). What still diverges is the socket layer: `tcp_stream.h`, `tcp_listener.h` and
+`udp_socket.h` are each two whole-file `#ifdef` halves, with the lwIP backend in
+`src/io/lwip/`.
+
+!!! note "NOTE: an lwIP `IoDriver` is not the goal"
+    The desktop [`IoDriver`](io_driver.md) is readiness-based: a future makes the
+    non-blocking syscall itself and registers an fd only on `EAGAIN`. The lwIP raw API is
+    callback-based: there are no fds, received data arrives as pbufs in a `recv` callback,
+    and sends are acknowledged through a `sent` callback. An `IoDriver` implementation for
+    lwIP would have to fake fds and readiness on top of those callbacks, adding a layer
+    without removing any lwIP-specific code. The seam to share is one level up, at the
+    socket classes.
+
+None of the following is needed for correctness.
+
+!!! tip "TODO: Share the socket class declarations between backends"
+    Keep one `TcpStream` / `TcpListener` / `UdpSocket` declaration and move the backend
+    difference into the state object each one holds, in the way the desktop classes
+    already sit on `detail/sys/*.h`. The two `#ifdef` halves could then no longer drift
+    apart in signatures or documentation.
+
+!!! tip "TODO: Give Pico a blocking Parker"
+    Implement the WFI idle described in
+    [Busy-poll loop](#busy-poll-loop-no-cpu-idle-wfi) as a `Parker`, replacing
+    `PollingParker`. The `Parker` interface already has the `park(max_wait)` / `unpark()`
+    shape it needs; the nearest timer deadline bounds the wait as it does on desktop.
+
+!!! tip "TODO: Move the Pico timer queue and ISR polls into a Pico driver object"
+    On Pico the timer queue and the ISR poll list live in `CurrentThreadExecutor`, and
+    `Runtime` reaches them through `#ifdef CORO_PICO` branches. Putting them behind a small
+    driver object owned by `Runtime`, alongside the parker, would give `Runtime` the same
+    shape on both platforms.
+
+!!! warning "FIXME: Not verified on hardware since the desktop I/O rewrite"
+    After the desktop build moved to the `IoDriver`, the Pico libraries (`coro_pico`,
+    `coro_pico_hal`) cross-compile cleanly for `pico_w` and the host-side Pico tests pass,
+    but nothing has been flashed and run. The compile and the host tests don't exercise
+    real lwIP or the CYW43 driver; run one of the `examples/pico` targets on a board
+    before relying on the port.
+
 ### Timer resolution
 
 `sleep_for` / `timeout` resolution is bounded by poll loop iteration time rather than

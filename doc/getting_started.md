@@ -5,21 +5,68 @@ from the ground up. Each section introduces a feature as the server needs it —
 have a concrete reason for every abstraction you encounter. Sections 1–13 introduce all the
 features; sections 14 and 15 are complete, self-contained examples that bring them together.
 
+The route, in the order the server runs into each problem:
+
+- **Sections 1–5: one client.** What a coroutine is, `co_await`, async I/O and the runtime
+  that drives it all. (Section 3, generators, is a short side trip the server does not use.)
+- **Sections 6–9: many clients.** One task per connection, what happens to a task that is
+  cancelled and the lifetime rules that follow from it, a `JoinSet` to hold any number of
+  tasks, and cleanup that runs however a session ends.
+- **Section 10: doing two things at once inside one task.** Accepting new clients while
+  collecting finished sessions, and evicting a client that has stalled.
+- **Section 11: tasks working together.** Passing data between tasks through channels
+  instead of sharing it.
+- **Sections 12–13: living in a real process.** Shutting down cleanly on Ctrl-C, and
+  running blocking code without stalling everything else.
+- **Sections 14–15: complete programs.** The finished echo server and client, then a
+  second example that feeds a CPU-bound compute loop.
+
+Boxes titled "Deep dive" are folded and can be skipped on a first read; the guide reads
+correctly without them. The boxes that are open are the ones not to skip.
+
 ## Setup
 
-The library requires C++20 and uses CMake. The recommended and supported
-method for managing dependencies is with [Conan](https://conan.io). Other
-package managers or manual installs should also work.
+coro is built, packaged and consumed with [Conan](https://conan.io) and CMake.
 
-CMake locates dependencies through `find_package()`, which searches standard platform
-locations automatically for common packages (e.g. GTest ships its own CMake config). For
-less common packages you can point CMake at a manually installed prefix via
-`CMAKE_PREFIX_PATH`, or write a
-[CMake package config file](https://cmake.org/cmake/help/latest/command/find_package.html).
-Conan is simply the most convenient way to generate these config files consistently across
-platforms.
+| | Supported and tested | Not supported today |
+|---|---|---|
+| Platform and compiler | GCC on Linux; Raspberry Pi Pico (RP2040), bare metal | Windows / MSVC — the I/O driver is built on `epoll`, so it is known not to work |
+| C++ standard | C++23 | C++20 should be possible with compatibility adapters for the few C++23 library types the API uses, such as `std::expected`, but is not regularly tested |
+| Build | Conan | Plain CMake with the dependencies installed by hand. The CMake files are kept free of Conan specifics so this may be supported later, but it has never been confirmed to work |
 
-### Building with Conan
+### Using coro in your project
+
+Add coro as a requirement in your project's `conanfile.py`:
+
+```python
+def requirements(self):
+    self.requires("coro/[0.1.0]")
+```
+
+then find the package and link its target in your `CMakeLists.txt`:
+
+```cmake
+find_package(coro CONFIG REQUIRED)
+
+add_executable(my_server main.cpp)
+target_link_libraries(my_server PRIVATE coro::coro)
+```
+
+Conan has to be able to find the coro package. From a checkout of this repository,
+`conan create .` builds it and places it in your local Conan cache;
+[Versioning](versioning.md) covers version numbers and the alternative of pointing
+Conan at a live checkout with `conan editable add`.
+
+[examples/io](../examples/io) is a complete consumer project laid out exactly this way —
+its own `conanfile.py` and `CMakeLists.txt`, building the echo server and client that
+this guide develops. It is the quickest starting point to copy from. The Pico port is
+consumed the same way but links different targets; see
+[the Pico port design notes](design/pico_port.md).
+
+### Building coro itself
+
+The rest of this section is only needed if you are building the library from source, for
+example to run its tests or work on it.
 
 ```bash
 conan install . --build=missing -s:h build_type=Release
@@ -41,7 +88,8 @@ preset and build directory must match:
 | `Debug` | `conan-debug` | `build/Debug` |
 | `RelWithDebInfo` | `conan-relwithdebinfo` | `build/RelWithDebInfo` |
 
-Common headers:
+Public headers — everything under `coro/detail/` is internal and should not be included
+directly:
 
 ```cpp
 // Core coroutine types
@@ -50,38 +98,65 @@ Common headers:
 #include <coro/future.h>                  // Future/Cancellable concepts, FutureRef, coro::ref(), coro::never()
 #include <coro/stream.h>                  // Stream concept, coro::next()
 #include <coro/co_invoke.h>               // co_invoke() — safe capturing-lambda coroutines
+#include <coro/version.h>                 // CORO_VERSION (generated at build time)
 
 // Runtime
 #include <coro/runtime/runtime.h>         // Runtime, spawn(), build_task()
+#include <coro/runtime/executor.h>        // Executor — abstract interface, taken by spawn_on()
+#include <coro/runtime/work_stealing_executor.h>   // WorkStealingExecutor — multi-threaded default
+#include <coro/runtime/work_sharing_executor.h>    // WorkSharingExecutor
+#include <coro/runtime/current_thread_executor.h>  // CurrentThreadExecutor — single thread, MCU
+#include <coro/runtime/clock.h>           // Clock, Instant — deadlines for sleep_until()/timeout_at()
 
 // Tasks
 #include <coro/task/join_handle.h>        // JoinHandle<T>
+#include <coro/task/stream_handle.h>      // StreamHandle<T>
 #include <coro/task/join_set.h>           // JoinSet<T>
+#include <coro/task/spawn_builder.h>      // SpawnBuilder — returned by build_task()
 #include <coro/task/spawn_blocking.h>     // spawn_blocking()
 #include <coro/task/spawn_on.h>           // spawn_on(), with_context()
+#include <coro/task/fiber.h>              // spawn_fiber(), fiber_yield(), FiberHandle<T>
 
 // Sync primitives
 #include <coro/sync/select.h>             // select()
 #include <coro/sync/when.h>               // when() — conditional select() branch
 #include <coro/sync/join.h>               // join()
-#include <coro/sync/sleep.h>              // sleep_for()
-#include <coro/sync/timeout.h>            // timeout()
+#include <coro/sync/sleep.h>              // sleep_for(), sleep_until()
+#include <coro/sync/timeout.h>            // timeout(), timeout_at()
+#include <coro/sync/interval.h>           // IntervalTimer — drift-compensating periodic timer
 #include <coro/sync/event.h>              // Event — single-waiter set/wait primitive
-#include <coro/sync/mutex.h>              // Mutex — async mutex
-#include <coro/task/stream_handle.h>      // StreamHandle<T>
+#include <coro/sync/mutex.h>              // Mutex<T> — async mutex
 
 // Channels
 #include <coro/sync/oneshot.h>            // oneshot_channel<T>
 #include <coro/sync/mpsc.h>               // mpsc_channel<T>
 #include <coro/sync/watch.h>              // watch_channel<T>
+#include <coro/sync/broadcast.h>          // broadcast_channel<T>
+#include <coro/sync/channel_error.h>      // ChannelError, TrySendError, BroadcastRecvError
 
 // I/O
 #include <coro/io/file.h>                 // File — async file I/O
 #include <coro/io/tcp_stream.h>           // TcpStream — async TCP
 #include <coro/io/tcp_listener.h>         // TcpListener — TCP accept loop
+#include <coro/io/udp_socket.h>           // UdpSocket — async UDP
+#include <coro/io/pipe.h>                 // Pipe — async named pipe (FIFO)
+#include <coro/io/lookup_host.h>          // lookup_host() — async DNS
+#include <coro/io/socket_address.h>       // SocketAddress, Ipv4Address, Ipv6Address
 #include <coro/io/ws_stream.h>            // WsStream — async WebSocket client
 #include <coro/io/ws_listener.h>          // WsListener — WebSocket server
 #include <coro/io/signal.h>               // signal(), signal_stream() — OS signal delivery
+#include <coro/io/byte_buffer.h>          // ByteBuffer — concept for buffers passed to read/write
+
+// Framing — decoding a byte stream into messages
+#include <coro/io/decoder_stream.h>       // DecoderStream<T> — coroutine return type for decoders
+#include <coro/io/byte_source.h>          // ByteSource — the byte supply a decoder awaits on
+#include <coro/io/decoder_concept.h>      // Decoder, ZeroCopyDecoder concepts
+
+// Microcontroller builds only
+#include <coro/sync/isr_event.h>          // IsrEvent, IsrChannel<T>, IsrSemaphore — ISR-to-task signalling
+#include <coro/pico/hal/gpio.h>           // GpioPin — async edge/level waits (Pico)
+#include <coro/pico/hal/dma.h>            // AsyncDmaTransfer (Pico)
+#include <coro/pico/mqtt.h>               // MqttClient (Pico, optional)
 ```
 
 ---
@@ -133,7 +208,7 @@ coro::Coro<int> run_server() {
 
 // Regular function — no co_* keywords, so not a coroutine.
 // It calls run_server(), which constructs and returns an idle Coro<int> object,
-// then returns that object to the spawner. Nothing inside run_server() has run yet.
+// then returns that object to its caller. Nothing inside run_server() has run yet.
 coro::Coro<int> make_server() {
     return run_server();
 }
@@ -192,7 +267,12 @@ Recall from section 1 that calling a coroutine function produces an idle object 
 has run. `co_await` is how a running coroutine starts a child: the child begins executing
 immediately on the current thread, and if it reaches a point where it needs to wait (I/O,
 a channel, a sleep), *that* suspension propagates up and the executor picks up something
-else. When the child eventually completes, the parent resumes with the result.
+else. When the child eventually completes, the parent resumes with the result. In effect,
+awaiting a coroutine is the async form of calling a function: the child's frame plays the
+part of a stack frame, and the chain of coroutines awaiting one another plays the part of
+the call stack.
+`co_await` can only appear inside a coroutine; ordinary code such as `main` gets in
+through `block_on`.
 
 To see the mechanics with a simpler example:
 
@@ -210,8 +290,27 @@ coro::Coro<void> run() {
 }
 ```
 
-??? info "`co_await` works on anything the implements the `coro::Future<T>` concept"
-    `co_await` works on anything that produces a value asynchronously by implementing the `coro::Future<T>`— not just `Coro<T>`.
+Errors need no new machinery either. An exception thrown inside a coroutine unwinds and
+propagates exactly as it does through ordinary function calls: locals are destroyed in
+reverse order, and the exception passes up through each `co_await` to the coroutine that
+is awaiting, until a `catch` handles it. An exception nothing catches comes out of
+`Runtime::block_on()` in `main`.
+
+```cpp
+coro::Coro<int> run_server() {
+    try {
+        coro::TcpListener listener = co_await coro::TcpListener::bind("127.0.0.1", 8080);
+        std::printf("listening on 127.0.0.1:8080\n");
+        co_return 0;
+    } catch (const std::system_error& e) {  // for example, the port is already in use
+        std::printf("bind failed: %s\n", e.what());
+        co_return 1;
+    }
+}
+```
+
+??? info "`co_await` works on anything that implements the `coro::Future<T>` concept"
+    `co_await` works on anything that produces a value asynchronously by implementing the `coro::Future<T>` concept — not just `Coro<T>`.
     As we go we will introduce many other primitives such as channel receives, I/O operations, timers,
     and combinators like `select` and `join` that are all awaitable the same way. These types satisfy
     the [`Future` concept](design/future_and_stream.md), which the reference docs cover in detail, but you rarely
@@ -332,6 +431,17 @@ int main() {
 }
 ```
 
+Follow the buffer through the loop. `read` takes it by value: `std::string(4096, '\0')`
+is a 4096-byte buffer moved into the operation, which owns it for as long as the read is
+in progress. When the read completes, the buffer comes back alongside `n`, the number of
+bytes actually received. The string is still 4096 bytes long, so `buf.resize(n)` trims it
+to the data before it is moved into `write` the same way.
+
+I/O failures are reported as exceptions: a failed `bind`, `accept`, `read` or `write`
+throws `std::system_error` carrying the operating system's error code. A client closing
+its connection is not a failure — `read` returns `n == 0`, which is what ends the loop
+above.
+
 The server as is handles only one connection before it exits — section 6 extends it to handle many concurrently.
 
 To test it, a client connects with `TcpStream::connect` — the same read/write interface from the other end:
@@ -390,8 +500,10 @@ in `coro::dns_error_category()`.
 
 `WsStream` and `WsListener` are the WebSocket equivalents of `TcpStream` and `TcpListener`.
 `WsStream::connect()` handles the handshake and returns a stream with `send()` and
-`receive()` methods; `WsListener::bind()` accepts incoming connections and hands out a
-`WsStream` per client.
+`receive()` methods; `WsListener::bind(host, port)` starts a server, and each
+`co_await listener.accept()` hands out a `WsStream` for the next client. `receive()`
+throws once the connection has closed, so a per-client loop ends by exception rather
+than by a sentinel value.
 
 ```cpp
 #include <coro/io/ws_stream.h>
@@ -414,7 +526,8 @@ a configurable **executor** — the component that schedules and runs coroutine 
 
 `Runtime::block_on()` is the bridge between synchronous and async code. It takes a
 single root coroutine, drives it to completion on the executor, and returns its result
-to the caller. Everything else — spawning tasks, awaiting I/O, sleeping — happens from
+to the caller. The root coroutine plays the part `main` plays in an ordinary program: it
+is the bottom of the call chain, and the run ends when it returns. Everything else — spawning tasks, awaiting I/O, sleeping — happens from
 inside that root coroutine.
 
 ```cpp
@@ -430,8 +543,8 @@ The executor determines how tasks are scheduled across threads. Three are availa
 
 | Executor | Task threads | I/O | Use case |
 |---|---|---|---|
-| `WorkStealingExecutor` | N (default: `hardware_concurrency()`) | Turned by whichever worker parks first | Production default — tasks distributed across threads automatically |
-| `WorkSharingExecutor` | N | Turned by whichever worker parks first | Rarely needed — see below |
+| `WorkStealingExecutor` | N (default: `hardware_concurrency()`) | Handled by whichever worker thread is idle | Production default — tasks distributed across threads automatically |
+| `WorkSharingExecutor` | N | Handled by whichever worker thread is idle | Rarely needed — see below |
 | `CurrentThreadExecutor` | 1 (caller's thread) | Polled on the same thread: the executor waits in the I/O driver when idle | Deterministic, unsynchronized task ordering; tests; MCU/no-RTOS targets; nested `Runtime`s |
 
 The `Runtime` constructor selects the executor based on the thread count argument:
@@ -454,23 +567,27 @@ coro::Runtime rt(std::in_place_type<coro::WorkSharingExecutor>, 4);
 coro::Runtime rt(std::in_place_type<coro::CurrentThreadExecutor>);
 ```
 
-- **Work-stealing** is the right default for most applications. Tasks are distributed
-across worker threads; when a thread exhausts its local queue it steals tasks from
-other threads, keeping all cores busy without manual load balancing.
-- **Work-sharing** predates work-stealing in this library and exists because it was
-simpler to implement initially. It uses a single global FIFO queue protected by a mutex, which
-becomes a contention bottleneck under any significant task load. It is occasionally
-useful when debugging to help isolate whether a bug is specific to the work-stealing
-scheduler, but work-stealing should be preferred in virtually every other situation.
-Only reach for this if you understand the trade-offs and have a concrete reason to.
-- **Current-thread** is ideal for tests and deterministic environments. All coroutines
-run on the one calling thread — no synchronization is needed for shared state between
-coroutines, and execution order is reproducible. When no task is ready, the thread waits
-in the I/O driver (epoll on Linux) until a socket becomes ready, a timer expires, or
-another thread wakes a task, so an idle runtime uses no CPU. It never creates task
-threads of its own, which also makes it the right choice for a nested `Runtime` (e.g.
-inside `spawn_blocking`) and the only executor on MCU targets, where it busy-polls the
-network stack instead of blocking. `Runtime(1)` selects it.
+If in doubt, use the default. The details of each executor are below for when you need
+to choose.
+
+??? note "Deep dive: how the three executors differ"
+    - **Work-stealing** is the right default for most applications. Tasks are distributed
+    across worker threads; when a thread exhausts its local queue it steals tasks from
+    other threads, keeping all cores busy without manual load balancing.
+    - **Work-sharing** predates work-stealing in this library and exists because it was
+    simpler to implement initially. It uses a single global FIFO queue protected by a mutex, which
+    becomes a contention bottleneck under any significant task load. It is occasionally
+    useful when debugging to help isolate whether a bug is specific to the work-stealing
+    scheduler, but work-stealing should be preferred in virtually every other situation.
+    Only reach for this if you understand the trade-offs and have a concrete reason to.
+    - **Current-thread** is ideal for tests and deterministic environments. All coroutines
+    run on the one calling thread — no synchronization is needed for shared state between
+    coroutines, and execution order is reproducible. When no task is ready, the thread waits
+    in the I/O driver (epoll on Linux) until a socket becomes ready, a timer expires, or
+    another thread wakes a task, so an idle runtime uses no CPU. It never creates task
+    threads of its own, which also makes it the right choice for a nested `Runtime` (e.g.
+    inside `spawn_blocking`) and the only executor on MCU targets, where it busy-polls the
+    network stack instead of blocking. `Runtime(1)` selects it.
 
 The server code itself is unchanged regardless of which executor you use — the runtime
 is a pure deployment knob. Because the choice is just a constructor argument, it can
@@ -522,29 +639,9 @@ static coro::Coro<void> handle_connection(coro::TcpStream stream, int id) {
 frame so each connection owns its socket independently, with no shared state between them.
 
 To launch a separate instance of `handle_connection` per connection we use `coro::spawn()`,
-which schedules a coroutine as an independent parallel task. A useful mental model is
-launching an OS thread — the task executes concurrently with the spawner, but no new thread
-is actually created; spawning is lightweight and the task runs on the existing executor
-threads. This also means the executor's thread count doesn't limit how many tasks you can
-have — a single-threaded executor can run thousands of tasks, interleaving them
-cooperatively rather than truly simultaneously. `spawn()` returns a `JoinHandle` that can
-be `co_await`ed just like any other coroutine to retrieve the result or wait for
-completion.
-
-??? info "Tasks and OS threads"
-    A task is the coroutine analogue of an OS thread. A thread takes a function as its
-    entry point; everything it calls runs sequentially on that thread — no two callees on
-    the same thread overlap. A task works the same way: it takes a coroutine as its entry
-    point, that coroutine `co_await`s other coroutines instead of calling functions, and
-    everything in the resulting *"stack"* (a chain of suspended awaiters — not a true call
-    stack, but the closest analogue) runs sequentially. Only coroutines in *different* tasks
-    can execute simultaneously.
-
-    The difference is cost. `std::thread` requires a kernel stack (8 MiB by default on
-    Linux) and an OS scheduler registration — a round-trip into the kernel. A task allocates
-    only a coroutine frame (typically a few hundred bytes) and a small scheduler entry, with
-    no system call. The work-stealing executor is designed to support hundreds of thousands
-    of concurrent tasks, in the same ballpark as Tokio, on which the scheduler is modelled.
+which schedules a coroutine as an independent parallel **task**. `spawn()` returns a
+`JoinHandle` that can be `co_await`ed just like any other coroutine to retrieve the result
+or wait for completion.
 
 ```cpp
 coro::Coro<int> run_server() {
@@ -565,228 +662,163 @@ coro::Coro<int> run_server() {
 }
 ```
 
+Connect two clients — for example `nc 127.0.0.1 8080` in two terminals — and close the
+second one first:
+
+```
+listening on 127.0.0.1:8080
+[0] connected
+[1] connected
+[1] EOF
+[0] EOF
+```
+
+Client 1 was accepted, served and finished while client 0 was still connected: both
+sessions were in progress at once, each advancing whenever its own socket had data.
+
 To demonstrate joining here, the server accepts a fixed number of connections and runs them
 all in parallel while we wait in the accept loop. Each `co_await h` waits for that session to
-finish and join before the server exits. The limitation is that we have to know the count
-upfront and we wait for sessions in spawn order rather than completion order — a client that
-disconnects first still waits behind a slower one. Section 7 will cover how to extend this to
-handle a dynamic number of connections and deliver results in completion order.
+finish and join before the server exits. The limitation is that a `JoinHandle` is awaited
+one at a time, so we have to pick an order: we wait for sessions in spawn order rather than
+completion order, and a client that disconnects first still waits behind a slower one.
+Section 8 covers how to wait for whichever session finishes next.
+
+### A task is like a thread
+
+The mental model for a task, here and for the rest of the guide, is an OS thread. Section 2
+compared a coroutine to a stack frame and `co_await` to a function call; a task is the
+whole stack. A thread takes a function as its entry point, and everything that function
+calls runs on that thread, one call at a time. A task takes a coroutine as its entry point,
+and everything that coroutine awaits runs in that task, one coroutine at a time. `spawn()`
+does for tasks what constructing a `std::thread` does for threads: it starts a second,
+independent stack. Until now the whole program has been a single task, the one
+`block_on()` started.
+
+Two properties carry over from threads unchanged, and between them they settle most
+questions of thread safety:
+
+- **Within one task, nothing overlaps.** Like the function calls on one thread's stack,
+  the coroutines of a single task run one at a time, so code in the same task never races
+  with itself.
+- **Different tasks can run at the same instant.** Anything two tasks both touch needs the
+  same protection it would need between two threads. Our server sidesteps the question by
+  giving each task its own `TcpStream`; section 11 shows how to pass data between tasks
+  without sharing it.
+
+The analogy also extends one level down. Threads run on CPU cores, placed there by the OS
+scheduler; tasks run on the executor's worker threads, placed there by the executor. A
+worker thread is to a task what a core is to a thread. `spawn()` creates no thread, any
+more than starting a thread adds a core, so the thread count does not limit the number of
+tasks. `CurrentThreadExecutor` is a single-core machine: it can run thousands of tasks,
+but never two at the same instant, so no data race between them is possible. They still
+interleave at every `co_await`, though, so state shared between tasks can change while one
+of them is suspended.
+
+The analogy is a starting point, and it breaks down in three places:
+
+- **Tasks are scheduled cooperatively, not preemptively.** The OS can take a core away
+  from a thread at any moment, so a thread that blocks holds up only itself. Nothing can
+  take a worker thread away from a task: it keeps the thread until it suspends at a
+  `co_await`. A task that blocks therefore holds up its worker thread and every other task
+  that thread would have run. Section 13 covers work that has no choice but to block.
+- **A task can tell when it has moved.** A thread runs on one core at a time and may be on
+  a different one after a context switch; a task runs on one worker thread at a time and
+  may be on a different one after any `co_await`. The OS carries everything a thread owns
+  from core to core, so the thread never notices. Nothing carries per-thread state from
+  one worker thread to the next, because that state belongs to the worker thread and not
+  to the task. So do not rely on thread identity across a suspension: a `thread_local`
+  variable or `std::this_thread::get_id()` may give a different answer before and after,
+  and a `std::mutex` locked before a `co_await` may end up unlocked from another thread,
+  which is undefined behaviour.
+- **A task can be a tree, not only a stack.** A function can call only one function at a
+  time. A coroutine can await several at once with the combinators of section 10, so one
+  task can keep several branches in progress, which no thread's stack can do. Even then
+  the branches take turns: still only one coroutine of the task runs at any instant.
+
+Code that respects these points runs correctly on any executor, which is what keeps the
+executor a deployment choice (section 5).
+
+??? info "Deep dive: what a task costs compared with a thread"
+    `std::thread` requires a kernel stack (8 MiB by default on Linux) and an OS scheduler
+    registration — a round-trip into the kernel. A task allocates only a coroutine frame
+    (typically a few hundred bytes) and a small scheduler entry, with no system call. The
+    work-stealing executor is designed to support hundreds of thousands of concurrent
+    tasks, in the same ballpark as Tokio, on which the scheduler is modelled.
+
+### Exceptions stop at the task boundary
+
+The analogy holds for errors as well: a task is an exception boundary, as a thread is. An
+exception that escapes `handle_connection` cannot unwind into `run_server` at the moment
+it is thrown, because the two are running independently, each on its own stack. It is
+stored in the task and rethrown from `co_await h`, the point where the task's result is
+collected, and from there it propagates like any other exception.
+
+!!! warning "Dropping a handle discards the result — value or exception alike"
+    A `JoinHandle` is the only way to retrieve a task's result. If it is *dropped* —
+    destroyed without being awaited, for example by going out of scope — or detached,
+    whatever the task produces is discarded, and that includes an exception: it is not
+    rethrown anywhere and nothing is logged. This is the same rule as `std::future`, where
+    an exception stored by `std::async` is lost if `get()` is never called. Await the
+    handle — or use a `JoinSet` (section 8) — for any task whose failure you need to hear
+    about.
+
+Every handle so far has been awaited. What happens to a task whose handle is *not* awaited
+is the subject of the next section; section 8 then returns to the server.
+
+---
+
+## 7. Cancellation and the coroutine scope
+
+Section 6 awaited every `JoinHandle` it created. This section is about the handles that
+are not awaited — dropped at the end of a scope, by an early return, or by an exception.
+It takes four questions in turn: what happens to such a task, what a cancelled task still
+gets to do, who exactly does the cancelling and the waiting, and what all of that means
+for data the task refers to.
 
 !!! warning "Key takeaways"
-    The rest of this section covers cancellation, task lifetimes, and reference hazards.
-    The behaviour is deliberate and the rules are few, but they may not be obvious to first
-    time users and getting them wrong can lead to subtle bugs. It is worth reading this
-    section in full before writing code that spawns tasks, but if you do decide to skip
-    ahead for now at minimum keep these points in mind:
+    The behaviour described here is deliberate and the rules are few, but they may not be
+    obvious to first time users and getting them wrong can lead to subtle bugs. It is
+    worth reading this section in full before writing code that spawns tasks, but if you
+    do decide to skip ahead for now at minimum keep these points in mind:
 
-    - **Coroutine scope:** every `Coro<T>` has a scope that automatically tracks dropped
-      `JoinHandle`s. Before a coroutine's result can be observed by the caller, it suspends to let any
-      child tasks, which may have been passed references into its own frame, finish first.
-    - Dropping a `JoinHandle` **cancels** the child task and the enclosing coroutine parent waits for it to drain — no dangling tasks.
-    - `handle.detach()` — fire and forget; parent never waits. Consumes the handle without
-      cancelling the task, losing the ability to join with it or receive the result. This
-      creates a dangling task, but that is not the default behavior, requiring explicit
-      action instead.
-    - `handle.cancelOnDestroy(false)` — no cancel signal; parent waits for natural completion. Use this when a task needs to keep running during error cleanup — for example, a collector that must finish draining a channel even after sibling tasks have been cancelled.
-    - After cancellation, **no user code runs again** — only destructors, in order.
-    - **Reference hazard:** do not let a spawned task hold a reference to a local in the spawning scope. Use `co_invoke` to create an inner scope instead (see below).
-
-### The coroutine scope mechanism
-
-To understand the problem the coroutine scope mechanism is intended to solve, let's consider
-a `worker` coroutine that holds a raw pointer to a local in its `spawner`'s frame; `spawner`
-spawns `worker` and returns right away:
-
-```cpp
-coro::Coro<void> worker(int* ptr) {
-    // blocking, not co_await — no suspend point for cancel-on-drop to catch,
-    // so worker is guaranteed to still dereference ptr ten milliseconds from now
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    std::printf("%d\n", *ptr);
-    co_return;
-}
-
-coro::Coro<void> spawner() {
-    int local_data = 42;
-    coro::JoinHandle<void> h = coro::spawn(worker(&local_data));
-    co_return;
-}
-```
-
-`spawner()` returns immediately, ten milliseconds before `worker` ever touches `*ptr`.
-Nothing about the call above stops `spawner` from finishing and destroying its locals while
-`worker` still needs `local_data` to stay alive. Threads avoid this problem by blocking in the
-destructor of `std::jthread` (or the `std::future` returned by `std::async`) until the
-child thread is done. `~JoinHandle()` can't close the gap the same way, though. Blocking
-would stall the executor thread it runs on, but it also can't `co_await` either because
-destructors in C++ cannot be coroutines. This leaves no direct mechanism in `~JoinHandle` to
-safely await for `worker` to finish.
-
-The solution is to still await, but to defer it to the next await point after `~JoinHandle`
-runs. `spawner` has no `co_await` of its own, so the next await point is whoever is awaiting
-`spawner`'s result:
-
-```cpp
-coro::Coro<void> awaiter() {
-    // ...
-    co_await spawner();
-    // spawner's body has finished and its return value is ready,
-    // but we do not want this line to execute until worker also completes
-    // ...
-}
-```
-
-This gives us a suspend point to await on, but that only solves half the problem. The
-use-after-free error is still there: `h` and `local_data` are both locals in `spawner`'s frame,
-so `local_data` is destroyed at the same time as `h` right after `~JoinHandle` runs — before the deferred
-await begins. We can try to solve that by deferring the destruction of `spawner`'s frame and its
-locals until after `worker` completes to keep `local_data` alive, but doing so would also
-defer destruction of `h`, creating a chicken-and-egg scenario. `spawner` will only know it needs
-to await for `worker` if `spawner`'s frame is destroyed and `~JoinHandle` registers the pending
-await — but destroying `spawner`'s frame also destroys `local_data` along with it which is what
-creates the memory error to begin with.
-
-It may be possible to devise some other clever way for `spawner` to detect that it needs to await
-on `worker` before destructing its frame, or to use something like boost.context, libucontext, etc.,
-to context switch from within `~JoinHandle`, essentially manually implementing the await from a destructor
-that standard C++ coroutines do not support. Every option explored, however, comes with its own
-set of complications and drawbacks. C++ also has no compile-time check to catch this
-automatically — there's no borrow checker to reject a spawn that captures a reference to a local.
-So instead of trying to solve this problem generally, it is simply
-left as a pattern that the user must recognize and avoid by following this simple rule
-
-!!! danger "CORE RULE: Data for references passed to a spawned task must never live in the same frame as the `JoinHandle` for that task"
-    Notice that this problem only occurs because `local_data` and `h`, whose task holds references to
-    `local_data`, share the same coroutine frame. The chicken-and-egg problem exists because `~JoinHandle`
-    registers a deferred await on `worker` to protect the references, but the next await point is not until
-    after `local_data` is destroyed and the references are invalidated. Both events have to happen either at
-    the same time or not at all, and cannot be separated. Moving `local_data` up one level to live in the outer
-    `awaiter` coroutine frame above the inner `spawner` coroutine frame where `h` lives provides that separation.
-    Now returning from `spawner` becomes that await point separating the destruction of `h` and the destruction
-    of `local_data` so they can occur at different times. First `spawner` runs and completes normally, destroying
-    `h` and registering the deferred await on `worker` as it unwinds and cleans up its frame. After that cleanup
-    is finished, `spawner` awaits one last time before it returns its result — now on `worker`, which was just
-    registered with `h`, to complete. `awaiter` remains idle in the background, keeping `local_data` alive
-    until `worker` completes. It's not until `worker` completes and `awaiter` resumes that it can destroy `local_data`,
-    but by that point the references are no longer in use and the memory error has been successfully avoided. See
-    [CS.1–CS.4 in the guidelines](guidelines.md#coroutine-scope) for all the safe patterns and more detailed
-    explanations.
-
-```cpp
-coro::Coro<void> awaiter() {
-    int local_data = 42;  // lives in awaiter: the outer frame
-    auto spawner = [](int *ptr) -> coro::Coro<void> {
-        coro::JoinHandle<void> h = coro::spawn(worker(ptr)); // h lives in spawner: the inner frame
-        co_return;
-        // ~JoinHandle fires here and registers a deferred await on worker before spawner
-        // makes its result available and resumes the co_await in awaiter below. local_data is
-        // alive in awaiter's outer frame for the entire lifetime of spawner who also awaits
-        // for worker to complete
-    };
-    co_await spawner(&local_data);
-    // resumes only after spawner completes, which is observed to complete only after
-    // worker also completes — local_data is alive the entire time
-    co_return;
-    // local_data destroyed here, after worker is done
-}
-```
-
-This is the entire **Coroutine Scope Mechanism**. Every `coro::Coro` has a built-in implicit "scope"
-object that tracks any `JoinHandle`s destructed during the coroutine's execution. Internally, it is implemented
-as a `thread_local` variable in the executor's worker thread that gets set by every coroutine prior to
-each time it's resumed, and reset every time the coroutine suspends. The `~JoinHandle` destructor then uses that
-`thread_local` variable to register itself with the scope for the currently executing coroutine on the
-worker thread. When a coroutine completes, it first destroys its frame, including all local variables,
-which may include more `JoinHandle`s that register themselves with the current scope. Finally, before
-returning its result the coroutine checks its scope object and joins with any `JoinHandle`s registered
-either during execution or frame destruction. Only after all pending handles have been joined does the
-coroutine resume its awaiter and allow its result to be observed.
-
-The coroutine scope mechanism, combined with the rule that a spawned task's references must point to
-data living in an outer frame relative to the one holding its `JoinHandle`, guarantees those references
-stay valid for the task's entire lifetime. It's still best, when possible, for a spawned task to own its
-data outright rather than take references — no references, no use-after-free risk. However, C++ has a very
-common way to accidentally introduce reference arguments that is easily overlooked: non-static member
-function coroutines. Non-static member functions implicitly capture the `this` pointer as an argument,
-and `this` carries all the same hazards as any other explicit reference argument. Without the coroutine scope
-mechanism it would simply be impossible to safely use member coroutines for the same object from multiple
-tasks. While the coroutine scope mechanism is not perfect and if not carefully used does still leave a
-small window of opportunity for errors to slip through, it does dramatically close the gap leaving minimal
-surface area for unsafe code patterns.
-
-```cpp
-struct Foo {
-    static coro::Coro<void> static_bar(std::shared_ptr<Foo> self);
-    coro::Coro<void> bar();
-    // ...
-};
-
-coro::Coro<void> bad_spawner() {
-    Foo foo;
-    coro::JoinHandle<void> h = coro::spawn(foo.bar());
-    co_return;
-}
-
-coro::Coro<void> good_spawner1() {
-    Foo foo;
-    co_await co_invoke([&]() -> coro::Coro<void> {
-        coro::JoinHandle<void> h = coro::spawn(foo.bar());
-        co_return;
-    });
-    co_return;
-}
-
-coro::Coro<void> good_spawner2() {
-    auto foo = std::make_shared<Foo>();
-    coro::JoinHandle<void> h = coro::spawn(Foo::static_bar(foo));
-    co_return;
-}
-```
-
-??? note "`co_invoke` is the only safe way to use capturing lambda coroutines, even ones only capturing by value"
-    `co_invoke` is the one safe exception to the [no-capturing-lambda-coroutine
-    rule](guidelines.md#cs3--never-invoke-a-capturing-lambda-coroutine-directly-use-co_invoke).
-    It heap-allocates the lambda and the coroutine together so that captured references
-    remain valid across suspension points — which is exactly why `[&]` is safe here but
-    would be undefined behaviour if the lambda were invoked directly.
-
-In `bad_spawner`, the spawned call to `foo.bar()` implicitly passes `&foo` as `this`, and `bad_spawner`
-then immediately destroys `foo`. Any access to a member of `foo` inside `Foo::bar()`'s body — even
-implicitly through `this` — happens after `foo` is already gone, a use-after-free exactly like the
-`worker`/`local_data` case above. `good_spawner1` fixes that using the coroutine scope as explained above:
-`co_invoke` gives the spawn its own inner frame, nested inside the frame that owns `foo`. The alternative
-shown in `good_spawner2` avoids the reference hazard entirely by giving `static_bar` its own ownership of the
-object instead of relying on the caller's frame: `foo` becomes a reference-counted `std::shared_ptr<Foo>`,
-passed by value into the static `static_bar`. So even though `good_spawner2` destroys its copy of the `foo`
-pointer right away, `static_bar` itself owns its own copy and keeps it alive for its entire lifetime.
-Member functions in C++ are really just syntax sugar for a static or free function of the form `bar(Foo *this)`
-anyway, so this trick of making it `static` lets us capture a reference-counted `self` pointer explicitly
-instead of being forced into using a raw `this` pointer captured implicitly.
-
-See the [Coroutine Scope design document](design/coroutine_scope.md) for a full explanation of
-the implicit scope mechanism, its limits, and how it compares to Rust's `'static` bound.
+    - **Dropping a `JoinHandle` cancels its task.** A cancelled task runs none of your code
+      again — not even a `catch` block. It stops at the `co_await` it is suspended on and
+      only its destructors run, in order, so every resource must be released by a
+      destructor (RAII).
+    - **No dangling tasks.** A coroutine that drops a handle is not seen to finish until
+      that task has finished too. `co_await parent()` returns only once everything
+      `parent` spawned is gone.
+    - **Two opt-outs, both explicit:**
+        - `handle.cancelOnDestroy(false)` — no cancel signal; the parent waits for the task
+          to finish naturally. Use this when a task needs to keep running during error
+          cleanup — for example, a collector that must finish draining a channel even after
+          sibling tasks have been cancelled.
+        - `handle.detach()` — fire and forget; the parent never waits and the result is
+          lost.
+    - **Reference hazard:** never give a spawned task a pointer or reference — including
+      an implicit `this` — to a local of the coroutine that holds its `JoinHandle`. The
+      parent does wait for the task, but only *after* its own locals have been destroyed.
+      Have the task own its data, or spawn it from an inner `co_invoke` coroutine (shown
+      below).
+    - **Wrap every capturing lambda coroutine in `co_invoke`.** Called directly, its
+      captures dangle before the coroutine first runs — even captures by value.
 
 ### Cancellation
 
-The coroutine scope mechanism only guarantees that the parent waits for a dropped `JoinHandle`'s
-task to finish — it says nothing about what that task does while the parent waits. Left alone,
-a dropped task would just keep running to completion on its own schedule, however long that
-takes. Whether that's acceptable, or whether the parent should actively signal the task to stop
-early, is a question of policy, and cancellation is the default answer.
+The server so far awaits every handle before it returns. Suppose instead that `run_server`
+ends early — an error, or an operator shutting it down — while sessions are still in
+progress. Something has to happen to those tasks. Left to themselves they would carry on
+with nobody able to reach them, and possibly outlive the things they depend on.
 
-**Dropping a handle without awaiting cancels the task.** If you drop a `JoinHandle`
-without awaiting it, the task receives a cancellation signal and the scope waits for it
-to drain before completing — so there are never dangling tasks. Once a task is cancelled,
-**none of the user's coroutine code ever runs again** — no `co_await` expression resumes,
-no code after a suspension point executes; only destructors run, through draining.
+coro's answer is that a coroutine takes its tasks with it. **When a coroutine ends, every
+task it spawned and has not awaited is cancelled, and the coroutine waits for those tasks
+to finish cleaning up before its own result becomes visible.** The rule applies
+recursively at every level: a cancelled task cancels and waits for the tasks *it* spawned
+as it unwinds, so stopping the coroutine at the top takes down everything beneath it,
+innermost first, and there are never dangling tasks.
 
-Draining is how the library works around the fact that C++ destructors cannot suspend. To
-drain a frame, the library walks its call tree and runs each frame's destructors in order,
-suspending if a destructor itself needs to wait (for example, because a local `JoinHandle`
-triggers a nested drain), until every frame in the tree has been cleaned up. The result is
-that completion, however a child gets there, is safe to use with RAII: local resources are
-always destroyed in order, at the right time, even when the destruction path itself
-involves asynchronous steps.
+Here is the rule at work. `run_server` spawns one session and returns after a second,
+while the session is still waiting on a read that would take ten:
 
 ```cpp
 std::atomic_bool handler_frame_destroyed = false;
@@ -809,7 +841,7 @@ coro::Coro<void> run_server() {
     co_return;
     // ③ handle goes out of scope — cancellation signal sent to handle_connection, interrupting ②.
     // ④ drain: handle_connection's frame is destroyed; ~OnDestroy fires.
-    // ⑤ run_server() only completes after ④ — no dangling connections.
+    // ⑤ run_server() waits to notify parent until after ④ and handle_connection exits.
 }
 
 coro::Coro<void> parent() {
@@ -819,76 +851,370 @@ coro::Coro<void> parent() {
 }
 ```
 
-Step ③ is the same frame-into-scope hand-off from the previous section's `worker`/`spawner`
-example, just with `handle_connection` standing in for `worker` and `handle` for `h`: dropping
-`handle` moves the only reference to `handle_connection`'s task out of `run_server`'s
-frame and into its scope. The one thing that example didn't show is that this drop also
-sends a signal — by default, a cancellation signal — which is why `handle_connection` is
-interrupted at step ② instead of running its `sleep_for(10s)` to completion.
+Follow the numbers. `run_server` returns at ③ without ever awaiting `handle`, so
+`handle_connection` is cancelled where it is suspended, at ②. Its frame is destroyed (④),
+and only then does `run_server`'s completion reach `parent` (⑤, ⑥). `parent` resumes after
+about one second, not ten, and by then nothing of `handle_connection` is left.
 
-To opt out of cancellation, two options are available. `detach()` fully severs the task
-from the scope: unlike the default drop behaviour above, the reference never transfers
-from the frame to the `CoroutineScope` at all, so there's nothing for the scope to hold
-once the frame is destroyed. With the scope empty, `parent`'s own `Coro<void>::poll()` can
-report a terminal result as soon as `parent`'s frame finishes, without waiting on the
-child — the parent returns immediately and the child keeps running on its own.
+### A cancelled task runs only its destructors
 
-`cancelOnDestroy(false)` takes the opposite approach: it keeps the task in the scope —
-the reference still transfers on drop, exactly as before — but removes the
-cancellation signal, so the child keeps running normally instead of being torn down. The
-parent still waits for it, just for natural completion rather than for a cancelled drain.
+Look at what `handle_connection` got to do once it was cancelled: the destructor of `probe`
+ran, and the `std::cout` line did not. That is everything cancellation allows.
+
+Cleaning up a cancelled task is called **draining**. A task that is actively running when
+it is cancelled continues to its next suspension point; a task that is already suspended
+stays where it is. Either way it is never resumed again. From that point **none of the
+user's coroutine code ever runs again** — no `co_await` expression resumes, no code after
+a suspension point executes; only destructors run. Draining walks the task's call tree and
+runs each frame's destructors in order, suspending wherever a frame has to wait for child
+tasks of its own, until every frame in the tree has been cleaned up. Locals are therefore
+always destroyed in order and at the right time, even when the destruction path itself
+involves asynchronous steps.
+
+"No user code runs again" is stricter than it first sounds. In ordinary code it is common
+to pair a manual release with a `try`/`catch`, so that every way out of the function
+releases the resource:
+
+```cpp
+coro::Coro<void> handle_connection(coro::TcpStream stream) {
+    char* scratch = static_cast<char*>(std::malloc(4096));
+    try {
+        co_await serve(stream, scratch);  // any coroutine that suspends
+    } catch (...) {
+        std::free(scratch);  // error path
+        throw;
+    }
+    std::free(scratch);      // normal path
+}
+```
+
+In a function those are the only two ways out. A coroutine has a third: it is cancelled
+while suspended at the `co_await` and simply never resumes. Cancellation is not an
+exception, so the `catch` does not run, and neither does the line after it. `scratch` is
+leaked.
+
+Destructors are the one thing that does run on all three paths, which makes RAII the only
+safe way to manage a resource in a coroutine:
+
+```cpp
+coro::Coro<void> handle_connection(coro::TcpStream stream) {
+    auto scratch = std::make_unique<char[]>(4096);
+    co_await serve(stream, scratch.get());
+}   // freed on normal return, on an exception, and on cancellation
+```
+
+The same goes for anything else a `catch` or a trailing statement would normally undo:
+unlocking, closing, decrementing a counter, sending a final message. Put it in a
+destructor. Section 9 shows how to do that when the cleanup itself needs to `co_await`.
+
+### The `JoinHandle` decides who cancels and who waits
+
+Up to here this section has spoken of a coroutine cancelling and waiting for "the tasks it
+spawned". That was deliberately loose, to get the behaviour across first, and in most code
+it is also what happens. Strictly, though, `spawn()` creates no relationship at all between
+`run_server` and `handle_connection`. What makes one the child of the other is the
+`JoinHandle` — more precisely, where the handle is destroyed.
+
+It is the destructor because that is the moment the task would otherwise be left dangling.
+While the handle exists, someone can still await the task or cancel it. Once the handle is
+gone, nobody can do either, so that is the point at which the library has to step in. It
+does two separate things. Go back to step ③ of the example, where `handle` is destroyed:
+
+- **The task is sent a cancellation signal.** This is why `handle_connection` is
+  interrupted at ② instead of running its `sleep_for(10s)` to completion.
+- **The coroutine that dropped the handle takes on the job of waiting for the task.**
+  This is why `run_server` does not report its own result to `parent` until the task is
+  gone (⑤).
+
+In thread terms this is a `std::jthread`, whose destructor requests a stop and then joins.
+There are two differences. A thread has to check for the stop request and may ignore it,
+while a task is stopped at its next suspension point whether it checks or not. And
+`~jthread()` blocks until the join is done, whereas `~JoinHandle()` returns at once and
+leaves the waiting to the coroutine that dropped it — a detail that looks minor here and
+turns out to be the source of the hazard below.
+
+Each of the two effects can be switched off. `cancelOnDestroy(false)` removes the signal
+and keeps the wait: the child runs on normally and the parent waits for it to finish.
+`detach()` removes both: the child keeps running on its own and the parent returns without
+waiting for it.
 
 ```cpp
 coro::Coro<void> parent() {
-    coro::spawn(child()).detach();               // fire and forget — parent never waits for child
-
     coro::spawn(child()).cancelOnDestroy(false); // no cancel — parent waits for child to finish normally
+
+    coro::spawn(child()).detach();               // fire and forget — parent never waits for child
 
     co_return;
 }
 ```
 
-Cancel-on-drop being the default, rather than `detach()` or `cancelOnDestroy(false)`, is a
-deliberate design choice. `std::async` and
-`std::jthread` block in their destructors — they wait for the thread to finish. That
-behaviour is safe for threads because there is no reliable way to cancel an arbitrary
-running thread: a thread may be blocked in a syscall, spinning in a tight loop, or holding
-a lock, and forcibly killing it leaves resources in an undefined state. Blocking until it
-finishes naturally is the only safe option. It's also what closes off the reference hazard
-described above: by the time `~jthread()` returns, the child is guaranteed to be done, so
-there's no window left for it to touch a parent's already-destroyed locals.
+Cancel-on-drop is the default because, for coroutines, cancelling is always safe, and it
+is the fail-safe outcome when a handle is dropped by accident — an unexpected exception,
+say. The two alternatives are opt-in and cannot happen by mistake.
 
-`~JoinHandle()` doesn't have that option. Blocking would stall the executor thread it runs
-on — there's no separate OS thread to wait on the way `~jthread()` waits on one — so it
-can't reuse `std::jthread`'s strategy of blocking until the child is provably finished.
-That single constraint is the root cause of the reference hazard covered in the previous
-section: unable to block or suspend its way to a guarantee, the destructor can only signal
-and defer, which reopens the window blocking would otherwise have closed.
+??? note "Deep dive: why cancel-on-drop is the default"
+    Cancel-on-drop being the default, rather than `detach()` or `cancelOnDestroy(false)`, is a
+    deliberate design choice. `std::async` and
+    `std::jthread` block in their destructors — they wait for the thread to finish. That
+    behaviour is safe for threads because there is no reliable way to cancel an arbitrary
+    running thread: a thread may be blocked in a syscall, spinning in a tight loop, or holding
+    a lock, and forcibly killing it leaves resources in an undefined state. Blocking until it
+    finishes naturally is the only safe option. `~JoinHandle()` does not have that option —
+    it can neither block nor suspend, for the reasons given under the coroutine scope below.
 
-Coroutines do not have this problem. Structured cancellation always unwinds cleanly: the
-cancellation signal is delivered at the next `co_await` point, every destructor runs in
-order, and child tasks are recursively drained before the parent completes. Cancellation is
-always safe, so it can be the default.
+    Coroutines do not need it. Structured cancellation always unwinds cleanly: the
+    cancellation signal is delivered at the next `co_await` point, every destructor runs in
+    order, and child tasks are recursively drained before the parent completes. Cancellation is
+    always safe, so it can be the default.
 
-Making it the default is also the fail-safe choice. If an exception propagates unexpectedly
-and destroys a `JoinHandle` before it is awaited — a situation that is easy to stumble into
-— cancel-on-drop ensures the spawned task is stopped and drained immediately rather than
-silently continuing to run, racing against now-destroyed state, or causing a deadlock when
-the runtime tries to shut down. The non-cancelling behaviours (`detach()` and
-`cancelOnDestroy(false)`) are available but intentionally opt-in: both require an explicit call and
-cannot happen by accident.
+    Making it the default is also the fail-safe choice. If an exception propagates unexpectedly
+    and destroys a `JoinHandle` before it is awaited — a situation that is easy to stumble into
+    — cancel-on-drop ensures the spawned task is stopped and drained immediately rather than
+    silently continuing to run, racing against now-destroyed state, or causing a deadlock when
+    the runtime tries to shut down. The non-cancelling behaviours (`detach()` and
+    `cancelOnDestroy(false)`) are available but intentionally opt-in: both require an explicit call and
+    cannot happen by accident.
+
+Because the relationship lives in the handle, it travels with the handle. A `JoinHandle`
+is an ordinary movable object, so the parent need not be the coroutine that called
+`spawn()`. Pass the handle to another coroutine or return it to the caller, and whichever
+coroutine finally destroys it is the one that cancels the task and waits for it.
+
+So the place a task is started and the place it is cancelled and waited for are two
+different points in the program, sometimes far apart, sometimes only a few lines. Anything
+the task holds a reference to has to stay alive across that whole gap, and the rest of
+this section is about what that takes.
+
+### The coroutine scope and the reference hazard
+
+Of the two things a dropped handle does, the wait is the one that matters for references,
+and it has a name: the **coroutine scope**. Every `Coro` has one. It keeps track of the
+handles dropped while the coroutine ran, and joins all of those tasks before the
+coroutine's result can be observed.
+
+That makes it tempting to hand a task a pointer to one of the spawning coroutine's locals.
+After all, the spawner waits for the task:
+
+```cpp
+coro::Coro<void> worker(int* ptr) {
+    co_await coro::sleep_for(10ms);
+    std::printf("%d\n", *ptr);
+}
+
+coro::Coro<void> spawner() {
+    int local_data = 42;
+    coro::JoinHandle<void> h = coro::spawn(worker(&local_data))
+        .cancelOnDestroy(false);  // let worker run to completion
+    co_return;
+}
+```
+
+This is a use-after-free. `spawner` does wait for `worker`, but too late.
+
+This is the second `std::jthread` difference coming due: the wait cannot happen inside
+`~JoinHandle()`. A thread's destructor closes the gap by blocking until the child is done,
+but blocking here would stall the executor thread, and a destructor cannot `co_await`
+because destructors in C++ cannot be coroutines. So `~JoinHandle()` only
+registers the task with the scope, and the wait is deferred to the next point where
+`spawner` is able to suspend: after its body has finished and its locals have been
+destroyed.
+
+`h` and `local_data` are locals of the same frame, so they are destroyed together. By the
+time `spawner` starts waiting for `worker`, `local_data` is already gone. Keeping the frame
+alive a little longer does not help either: it is the destruction of `h` that registers the
+wait, so the locals have to be destroyed before `spawner` knows there is anything to wait
+for.
+
+C++ has no borrow checker to reject a spawn that takes a reference to a local, so this is
+a pattern you have to recognise and avoid:
+
+!!! danger "CORE RULE: Data a spawned task refers to must never live in the same frame as the `JoinHandle` for that task"
+    Put the data in an outer frame and the handle in an inner one. The inner coroutine
+    drops the handle and waits for the task as it finishes, and the outer frame — with the
+    data in it — is alive the whole time. Better still, have the task own its data, so
+    there is no reference to go stale. See
+    [CS.1–CS.4 in the guidelines](guidelines.md#coroutine-scope) for all the safe patterns.
+
+```cpp
+coro::Coro<void> awaiter() {
+    int local_data = 42;  // lives in awaiter: the outer frame
+
+    co_await co_invoke([&]() -> coro::Coro<void> {
+        coro::JoinHandle<void> h = coro::spawn(worker(&local_data))  // h lives in the inner frame
+            .cancelOnDestroy(false);
+        co_return;
+        // ~JoinHandle fires here. The inner coroutine waits for worker before it
+        // completes, and local_data is untouched: it is not in this frame.
+    });
+
+    // resumes only after the inner coroutine completes, which is only after worker
+    // completes — local_data was alive the entire time
+    co_return;
+    // local_data destroyed here, after worker is done
+}
+```
+
+Returning from the inner coroutine is now the await point that separates the two events:
+`h` is destroyed first, the wait for `worker` happens, and only when `awaiter` resumes and
+finishes is `local_data` destroyed.
+
+!!! note "`co_invoke` is the only safe way to use capturing lambda coroutines, even ones only capturing by value"
+    `co_invoke` is the one safe exception to the [no-capturing-lambda-coroutine
+    rule](guidelines.md#cs3-never-invoke-a-capturing-lambda-coroutine-directly-use-co_invoke).
+    It heap-allocates the lambda and the coroutine together so that captured references
+    remain valid across suspension points — which is exactly why `[&]` is safe here but
+    would be undefined behaviour if the lambda were invoked directly.
+    You will see `co_invoke` in most of the examples from here on;
+    [the end of this section](#capturing-lambdas-and-co_invoke) explains the pitfall it
+    avoids in full.
+
+??? note "Deep dive: how the scope works, and why the library does not close this gap for you"
+    Internally the scope is a `thread_local` variable in the executor's worker thread, set
+    by every coroutine each time it is resumed and reset each time it suspends.
+    `~JoinHandle()` uses it to register itself with the scope of whichever coroutine is
+    currently executing on that thread. When a coroutine's body finishes, its locals are
+    destroyed — which may register more `JoinHandle`s — and before returning its result the
+    coroutine joins every handle registered during execution or during that destruction.
+    Only then does it resume its awaiter.
+
+    A cancelled coroutine follows the same order, except that its entire frame —
+    parameters as well as locals — is destroyed before the join begins, so nothing in a
+    coroutine's own frame can be relied on to outlive that join.
+
+    It may be possible to devise some other way for `spawner` to detect that it needs to
+    wait for `worker` before destroying its frame, or to use something like boost.context
+    or libucontext to context switch from within `~JoinHandle()`, in effect implementing
+    the await-in-a-destructor that standard C++ coroutines do not support. Every option
+    explored comes with its own complications and drawbacks, so instead of solving the
+    problem generally it is left as a pattern to recognise and avoid.
+
+    See the [Coroutine Scope design document](design/coroutine_scope.md) for a full
+    explanation of the implicit scope mechanism, its limits, and how it compares to Rust's
+    `'static` bound.
+
+#### Member functions pass `this`
+
+The `worker` example passed its pointer in plain sight. C++ also has a very common way to
+hand a task a reference without noticing: non-static member function coroutines. They take
+`this` implicitly, and `this` carries the same hazard as any explicit pointer argument.
+
+```cpp
+struct Foo {
+    static coro::Coro<void> static_bar(std::shared_ptr<Foo> self);
+    coro::Coro<void> bar();
+    // ...
+};
+
+coro::Coro<void> bad_spawner() {
+    Foo foo;
+    coro::JoinHandle<void> h = coro::spawn(foo.bar())  // bar() holds this → &foo
+        .cancelOnDestroy(false);                       // let bar() run to completion
+    co_return;
+    // ① h destroyed (last declared, first destroyed) — bar() keeps running
+    // ② foo destroyed (first declared, last destroyed)
+    // ③ bad_spawner waits for bar() here, after ② — bar() runs the rest of its
+    //    body with a `this` that points at nothing
+}
+
+coro::Coro<void> good_spawner1() {
+    Foo foo;
+    co_await co_invoke([&]() -> coro::Coro<void> {
+        coro::JoinHandle<void> h = coro::spawn(foo.bar())
+            .cancelOnDestroy(false);
+        co_return;
+    });
+    co_return;
+}
+
+coro::Coro<void> good_spawner2() {
+    auto foo = std::make_shared<Foo>();
+    coro::JoinHandle<void> h = coro::spawn(Foo::static_bar(foo))
+        .cancelOnDestroy(false);
+    co_return;
+}
+```
+
+`bad_spawner` is the `worker`/`local_data` case again, with `&foo` passed as `this`.
+`good_spawner1` applies the core rule: `co_invoke` gives the spawn its own inner frame,
+nested inside the frame that owns `foo`. `good_spawner2` avoids the reference altogether:
+`foo` becomes a `std::shared_ptr<Foo>` passed by value into the static `static_bar`, so
+the task owns its own copy and keeps the object alive for as long as it runs, even though
+`good_spawner2` destroys its copy right away.
+
+Awaiting a member coroutine directly — `co_await foo.bar()` — is always fine: the awaiting
+coroutine is suspended, with `foo` alive, until `bar()` is done. The hazard is only in
+spawning one.
+
+### Capturing lambdas and `co_invoke`
+
+Both inner-frame fixes above spawned from a lambda wrapped in `co_invoke`, and the wrapper
+is not optional. A capturing lambda that returns `Coro<T>` has the member-function problem
+in its sharpest form, and it has it even when nothing is spawned. The compiler lowers a
+lambda to an anonymous struct whose `operator()` is a member function, so the coroutine
+frame holds `this` — a pointer to the lambda object — and reaches every capture through
+it. The captures are not copied into the frame. The lambda object is usually a
+temporary, destroyed at the end of the full expression, before the coroutine has run at
+all:
+
+```cpp
+// DANGEROUS — lambda struct destroyed at ';', before first resumption
+auto coro = [x]() -> Coro<void> {
+    co_await something();
+    use(x);          // accesses this->x — 'this' is dangling
+}();
+co_await coro;       // use-after-free
+```
+
+Note that `x` is captured by value and it makes no difference: the copy lives in the
+lambda object, not in the coroutine frame. The C++ Core Guidelines recommend never using
+capturing lambda coroutines for exactly this reason. `co_invoke` is the pattern this
+library provides instead. It moves the lambda onto the heap inside a wrapper that keeps it
+alive for the coroutine's entire lifetime:
+
+```cpp
+#include <coro/co_invoke.h>
+
+// SAFE — lambda kept alive by co_invoke
+co_await co_invoke([x]() -> Coro<void> {
+    co_await something();
+    use(x);    // safe
+});
+
+// Also works with spawn:
+auto handle = spawn(co_invoke([x]() -> Coro<void> { ... }));
+```
+
+`co_invoke` also works with `CoroStream<T>` lambdas. A lambda with an empty capture list
+`[]` has nothing to dangle and needs no wrapper. See
+[guideline CS.3](guidelines.md#cs3-never-invoke-a-capturing-lambda-coroutine-directly-use-co_invoke)
+for the full treatment.
+
+That is everything a dropped handle does. The server, meanwhile, still awaits every handle
+it creates, one at a time and in spawn order; section 8 removes that limit, and relies on
+the rules above to shut its sessions down.
 
 ---
 
-## 7. Fan-out with `JoinSet`
+## 8. Fan-out with `JoinSet`
 
 Back to the server. In section 6 we spawned a `handle_connection` task per connection and
-collected the `JoinHandle`s in a vector, but that required knowing the connection count
-upfront. `JoinSet` removes that constraint: it accepts tasks as they arrive and tracks them
-internally without a fixed size. We can `co_await coro::next(sessions)` at any point to
-receive the next completed result or propagate an error. `sessions.empty()` reports
-whether any task is currently pending or awaiting consumption — useful for guarding
-`next(sessions)` when racing it against another branch (section 9).
+collected the `JoinHandle`s in a vector, then awaited them one at a time in spawn order.
+That order is the constraint. We have to choose which session to wait for, and the one
+that finishes first is rarely the one we chose, so a finished session sits uncollected and
+an error in it goes unnoticed until its turn comes.
+
+`JoinSet` is a collection of tasks that is awaited as a whole. `co_await
+coro::next(sessions)` resolves with the next task to finish, whichever one that is,
+delivering its result or rethrowing its exception. The rest keep running. Tasks can be
+added at any time, so the set grows and shrinks as sessions come and go.
+
+One behaviour to know up front: `next()` on an **empty** `JoinSet` does not wait for a
+task to be added. It resolves immediately with "nothing left" — `false` for a
+`JoinSet<void>`, `std::nullopt` otherwise — the same way any exhausted stream ends, which
+is what lets `while (co_await coro::next(sessions))` terminate. `sessions.empty()` reports
+whether any task is currently pending or awaiting consumption, so you can check before
+asking. That matters as soon as `next(sessions)` is raced against another branch, which
+is where section 10 picks this up.
 
 ```cpp
 #include <coro/task/join_set.h>
@@ -914,21 +1240,27 @@ Dropping `sessions` at any point — whether `run_server` returns normally, thro
 cancelled — cancels every in-flight connection simultaneously and drains them before the
 frame is freed.
 
+When the opposite is wanted — let every task run to completion — `co_await
+sessions.drain()` waits for all of them. Results are discarded; if any task threw, the
+first exception is rethrown once they have all finished. It is the `JoinSet` counterpart
+of awaiting each `JoinHandle` in a loop, and reappears in section 14.
+
 The same coroutine scope rules that govern individually spawned tasks and their `JoinHandle`s
 apply here too — a task spawned into a `JoinSet` still needs any referenced data to outlive
 the frame holding the `JoinSet`, and `co_invoke` is still the tool for enforcing that when the
 two would otherwise share a frame.
 
 The loop still alternates sequentially: accept a connection, spawn it, wait for it to
-finish, then accept the next. If we could instead react to whichever of those two operations
-completes first — a new connection arriving or an existing session finishing — `sessions`
-would grow and shrink dynamically, results and errors would surface in the order sessions
-complete, and no client would ever block another from being accepted. Section 9 shows how
-to achieve exactly that.
+finish, then accept the next. `JoinSet` waits for the first of any number of tasks, but
+they all have to be tasks of the same type. The loop needs the same thing for two
+operations of different kinds: a new connection arriving or an existing session finishing,
+whichever comes first. With that, results and errors would surface in the order sessions
+complete, and no client would ever block another from being accepted. That is `select`,
+which section 10 introduces.
 
 ---
 
-## 8. Running async cleanup during drain
+## 9. Running async cleanup during drain
 
 Suppose every session needs to send the client one last goodbye frame as part of its
 teardown — not just when `handle_connection` returns normally, but also if `sessions`
@@ -955,7 +1287,7 @@ because a destructor has no `co_await` machinery to suspend with in the first pl
 needs a way to stop the current coroutine from being considered finished until that other
 coroutine completes.
 
-Section 6 already gives us exactly that tool. Dropping a `JoinHandle` transfers its task into
+Section 7 already gives us exactly that tool. Dropping a `JoinHandle` transfers its task into
 the current coroutine's scope, and the coroutine won't report a terminal result until every
 task in its scope has drained — that's true no matter where the drop happens, including inside
 a destructor. So a destructor that needs to run async work doesn't need `co_await` at all: it
@@ -965,6 +1297,16 @@ receive the same cancellation signal tearing down everything else around it, and
 having never actually run `send_goodbye`.
 
 ```cpp
+// Takes the stream by value — the goodbye task owns it.
+coro::Coro<void> send_goodbye(coro::TcpStream stream) {
+    try {
+        // Bounded: a stalled client must not be able to hold up shutdown.
+        co_await coro::timeout(1s, stream.write(std::string("goodbye\n")));
+    } catch (const std::exception&) {
+        // The peer is already gone — there is nobody left to say goodbye to.
+    }
+}
+
 class FinalNotice {
 public:
     explicit FinalNotice(coro::TcpStream& stream) : m_stream(stream) {}
@@ -973,7 +1315,8 @@ public:
         // spawn + drop with cancelOnDestroy(false): attaches send_goodbye() to the
         // enclosing coroutine's scope as a task that must complete, rather than one
         // that gets cancelled alongside everything else currently unwinding.
-        coro::spawn(send_goodbye(m_stream)).cancelOnDestroy(false);
+        // std::move hands the stream itself to the task, not a reference to it.
+        coro::spawn(send_goodbye(std::move(m_stream))).cancelOnDestroy(false);
     }
 
 private:
@@ -990,22 +1333,36 @@ coro::Coro<void> handle_connection(coro::TcpStream stream) {
 }
 ```
 
+Note the `std::move`. `send_goodbye` takes the `TcpStream` by value, so the spawned task
+owns the stream outright instead of holding a reference to it. That is what keeps this
+within section 7's core rule: the `JoinHandle` is dropped inside `handle_connection`'s
+frame, so the task must not reference anything living in that frame — and when
+`handle_connection` is cancelled, its frame, `stream` included, is destroyed before
+`send_goodbye` gets to run. Passing `m_stream` by reference would leave the task writing
+to a stream that no longer exists.
+
+`send_goodbye` itself shows two rules that apply to any cleanup task. First, **bound it**:
+the enclosing coroutine cannot finish until the cleanup does, so a goodbye written to a
+stalled client would hold up everything waiting on this session, including shutdown.
+Wrapping the write in `timeout()` (section 10) caps that wait at one second. Second,
+**expect it to fail**: cleanup often runs precisely because the connection broke, so a
+write error here is normal and is caught and ignored.
+
 That's the whole pattern: **spawn the async work, then drop its `JoinHandle` with
 `cancelOnDestroy(false)`**, anywhere a destructor needs to kick off something asynchronous.
 It works because a destructor never needs to *wait* on the task it starts — it only needs the
 enclosing coroutine to wait on it, and the scope mechanism already provides that for free.
 
-One consequence worth internalizing: this delays *observation* of completion, not completion
-itself. By the time `~FinalNotice` runs, `handle_connection` genuinely has finished — every
-other local is already destroyed. What `send_goodbye` sitting in the scope delays is purely
-when a caller `co_await`ing `handle_connection` (or, per section 7, a `JoinSet` polling it)
-gets to see that result. The trigger for the destructor running doesn't matter either — normal
-return, a timeout (section 9), a losing `select` branch (also section 9), or shutdown on an OS
-signal (section 12) all end up draining through this exact same path.
+Note that this delays *observation* of completion, not completion itself. By the time
+`~FinalNotice` runs, `handle_connection` has finished — none of its code will run again.
+What the pending `send_goodbye` delays is when a caller awaiting `handle_connection` (or,
+per section 8, a `JoinSet` waiting on it) sees the result. The trigger doesn't matter either:
+normal return, a timeout or a losing `select` branch (section 10), or shutdown on an OS
+signal (section 12) all drain through this same path.
 
 ---
 
-## 9. Concurrent combinators
+## 10. Concurrent combinators
 
 **Concurrent** means multiple operations can make progress without waiting for each other
 to complete — no ordering guarantees on when each starts or finishes. **Parallel** extends
@@ -1026,7 +1383,8 @@ handler task forever. Both are solved with combinators.
     like a call stack. Combinators fan a single task out into multiple live branches at
     once — the task's execution structure becomes a tree, not a stack. All branches in
     that tree are interleaved cooperatively on a single thread at a time; none of them
-    run truly simultaneously. A second *task* (spawned with `spawn()`) is a second
+    run truly simultaneously. This is where the thread analogy of section 6 runs out: a
+    thread's call stack has no equivalent. A second *task* (spawned with `spawn()`) is a second
     independent tree, and those two trees are what the executor runs in parallel across
     threads. Combinators are concurrent; `spawn()` is parallel.
 
@@ -1043,8 +1401,10 @@ graph TD
 `select()` races two or more futures and returns as soon as one completes.
 The result is a `std::variant` of `SelectBranch<N, T>` values identifying which
 branch won and carrying its result. All other branches are cancelled and drained.
+If a branch throws, the others are cancelled the same way and the exception is rethrown
+from the `co_await`.
 
-This is exactly what the section 7 loop was missing. Instead of awaiting `accept()` then
+This is exactly what the section 8 loop was missing. Instead of awaiting `accept()` then
 `next(sessions)` sequentially, we race them — whichever fires first is handled and the loop
 continues immediately, keeping new connections and completed sessions serviced without
 either starving the other:
@@ -1079,42 +1439,93 @@ coro::Coro<int> run_server() {
 }
 ```
 
-#### Keeping a future alive across a losing branch — `coro::ref()`
+#### What happens to the branch that loses
 
-By default `select()` takes its futures by value and cancels any branch that loses. Sometimes
-you want to re-enter the same future across multiple `select()` rounds — for example,
-polling a long-running task while checking back periodically.
+That loop cancels `listener.accept()` every time a session finishes first. Can a
+connection be lost that way? No, and the reason is worth spelling out.
 
-`coro::ref(f)` wraps an lvalue future in a non-owning reference. When that branch loses,
-only the wrapper is discarded; the underlying future is untouched and can be passed to
-`select()` again:
+Each call such as `listener.accept()` creates a *future*: a one-shot placeholder for a
+single operation and its eventual result. Creating it does nothing; the operation only
+starts when the future is awaited. Once it has delivered its result it is finished, and
+the next connection needs a new call and a new future.
+
+Cancelling a future therefore cancels that one operation and nothing else. Think of it as
+abandoning a function call, not destroying the object the function was called on. When a
+session finishes first, the pending `accept()` is abandoned: no `TcpStream` is produced,
+and the listener is untouched. A client that connects in the meantime stays queued in the
+listener. The next iteration creates a fresh `accept()` future, and whichever future is
+the first to resolve receives that connection, as if the abandoned ones had never existed.
+The same is true of `next(sessions)`: the `JoinSet` is the long-lived object, and
+abandoning a future for its next result takes nothing out of the set.
+
+So it is tempting to conclude that losing a `select()` is always harmless. Here is a loop
+that sends a large reply and prints a progress line every second until it is done:
 
 ```cpp
 using namespace std::chrono_literals;
 
-coro::Coro<int> slow_task() {
-    co_await coro::sleep_for(5s);
-    co_return 42;
-}
-
-coro::Coro<void> run() {
-    auto task = slow_task();  // lvalue — coro::ref() requires this
-
-    // Check every second whether the task has finished.
-    while (true) {
-        auto sel = co_await coro::select(coro::ref(task), coro::sleep_for(1s));
-        if (sel.index() == 0) {
-            std::printf("done: %d\n", std::get<0>(sel).value);
-            break;
-        }
-        std::printf("still waiting...\n");  // timer fired, loop and check again
+coro::Coro<void> send_reply(coro::TcpStream& stream, std::string reply) {
+    for (;;) {
+        auto sel = co_await coro::select(
+            stream.write(std::move(reply)),  // branch 0: the whole reply has been sent
+            coro::sleep_for(1s));            // branch 1: a second has passed
+        if (sel.index() == 0) co_return;
+        std::printf("still sending...\n");
     }
 }
 ```
 
+It looks like the accept loop, and it is broken. `write()` is not a single step: it keeps
+sending until the whole buffer has gone out. If the timer wins first, the write future is
+abandoned partway through, and two things go wrong:
+
+- **The peer has received part of the reply and will never get the rest.** The bytes
+  already sent stay sent; the future that knew how far it had got is gone.
+- **The reply itself is gone.** The buffer was moved into the write future when the
+  future was created, and was destroyed with it. The second time round the loop,
+  `reply` is an empty moved-from string.
+
+`accept()` was safe to abandon because it either produces a connection or does nothing.
+An operation that makes progress in steps is not:
+
+| Operation | If it loses a `select()` |
+|---|---|
+| `accept()`, `read()`, `next()`, a channel `recv()` | Nothing is lost; the next call carries on as if this one never happened |
+| `read_exact()` | The bytes it had already read are lost |
+| `write()` | The buffer is lost, and part of it may already have been sent |
+| `sleep_for()` | The time already waited; a new call starts the timer from zero |
+
+After an abandoned `read_exact()` or `write()` the byte stream is out of step, and the
+only safe thing left to do with the connection is close it.
+
+#### Keeping a future alive across a losing branch — `coro::ref()`
+
+The fix is to stop handing `select()` the future itself. By default `select()` takes its
+futures by value and destroys any branch that loses. `coro::ref(f)` instead wraps a future
+held in a local variable in a non-owning reference. When that branch loses, only the
+wrapper is discarded; the underlying future is untouched, keeps its buffer and its
+progress, and can be passed to `select()` again:
+
+```cpp
+coro::Coro<void> send_reply(coro::TcpStream& stream, std::string reply) {
+    auto write = stream.write(std::move(reply));  // created once, outside the loop
+
+    for (;;) {
+        auto sel = co_await coro::select(
+            coro::ref(write),      // branch 0: resumes the same write each time round
+            coro::sleep_for(1s));  // branch 1: a second has passed
+        if (sel.index() == 0) co_return;
+        std::printf("still sending...\n");
+    }
+}
+```
+
+The timer is deliberately *not* held this way: a fresh `sleep_for(1s)` each time round is
+exactly what a once-a-second progress line needs.
+
 !!! warning "Key points"
     - `coro::ref()` only accepts lvalues — store the future in a named variable first.
-      `coro::ref(slow_task())` is a compile error.
+      `coro::ref(stream.write(...))` is a compile error.
     - If the `coro::ref(f)` branch wins and delivers a result, the result is moved out of `f`.
       Do not await `f` again — it is logically consumed even though it was not moved.
 
@@ -1122,19 +1533,26 @@ coro::Coro<void> run() {
 
 `select()` needs the same set of branches, with the same types, on every round —
 but sometimes a branch is only meaningful *some* of the time. The recurring example is
-`coro::next(a_join_set)`: an **empty** `JoinSet`'s `next()` resolves immediately
-(`Ready`, end-of-stream — see section 7), so racing it unconditionally means that branch
-wins on every single poll while the set is empty. Since a synchronously-Ready branch
-never suspends the awaiting coroutine, `co_await select(..., coro::next(sessions))`
+`coro::next(a_join_set)`: an **empty** `JoinSet`'s `next()` resolves immediately with
+"nothing left" (section 8), so racing it unconditionally means that branch wins every
+time while the set is empty. Since a branch that is ready immediately never suspends the
+awaiting coroutine, `co_await select(..., coro::next(sessions))`
 does not give control back to the executor at all in that state — the calling coroutine
 busy-loops instead of waiting for real work.
 
 `coro::when(cond, make_future)` fixes this: it evaluates `cond` once and, only if
 true, calls `make_future()` to build the branch. While disengaged (`cond` was false),
-it behaves exactly like `coro::never<T>()` — always `Pending`, so it simply never wins.
+the branch never completes, so it simply never wins.
 Crucially, `make_future` is not called at all when disengaged, so the branch's future
 is never constructed — this matters when construction has side effects, is expensive,
-or (as with some futures) isn't even valid to attempt in the disabled case:
+or (as with some futures) isn't even valid to attempt in the disabled case.
+
+This case is the reason `when()` exists. Without it, skipping the `JoinSet` branch while
+the set is empty means writing two different `select()` calls — one with the branch and
+one without — whose result variants have different types and different branch indices,
+and duplicating the handling code for each. With `when()` the `select()` is written once:
+the arguments, the result type and the index of every branch are the same whether the
+gated branch is live or not.
 
 ```cpp
 coro::JoinSet<void> sessions;
@@ -1148,16 +1566,17 @@ auto sel = co_await coro::select(
 `JoinSet<T>::empty()` is the query used to gate this: true when there are no pending or
 completed-but-unconsumed tasks.
 
-!!! warning "Key points"
-    - `make_future` runs at most once per `when()` call, only when `cond` is true.
-    - A disengaged `WhenFuture` polls `Pending` forever on its own — it only makes sense
-      as a `select()` branch racing against something that can actually complete.
-    - If `make_future` would be expensive to re-invoke every loop iteration, build the
-      inner future once outside the loop and hold it with `coro::ref()` instead.
+??? note "Deep dive: `when()` fine print and `coro::never<T>()`"
+    !!! warning "Key points"
+        - `make_future` runs at most once per `when()` call, only when `cond` is true.
+        - A disengaged `when()` never completes on its own — it only makes sense
+          as a `select()` branch racing against something that can actually complete.
+        - If `make_future` would be expensive to re-invoke every loop iteration, build the
+          inner future once outside the loop and hold it with `coro::ref()` instead.
 
-`coro::never<T>()` is the lower-level primitive `when()` is built on: a future that never
-completes. Reach for it directly when you want a permanent placeholder branch rather than
-a conditional one.
+    `coro::never<T>()` is the lower-level primitive `when()` is built on: a future that never
+    completes. Reach for it directly when you want a permanent placeholder branch rather than
+    a conditional one.
 
 ### Joining futures — `join()`
 
@@ -1238,9 +1657,17 @@ The return type mirrors `select(F, SleepFuture)`:
 - `SelectBranch<0, T>` — the future completed in time.
 - `SelectBranch<1, void>` — the deadline elapsed first.
 
+Because `timeout()` is a `select()`, the rule about losing branches applies to it too. A
+timed-out `read()` loses nothing, but a timed-out `write()` may have sent part of its
+buffer — which is why `handle_connection` ends the session on a send timeout instead of
+trying again.
+
+A deadline elapsing is an ordinary result, not an error: `timeout()` does not throw when
+the timer wins. An exception thrown by the wrapped future still propagates as usual.
+
 ---
 
-## 10. Thread-safe communication
+## 11. Thread-safe communication
 
 So far `handle_connection` (section 6) has logged with a plain `std::printf`. That's fine
 for following along, but a real server would want those lines durable, written to a file
@@ -1264,36 +1691,35 @@ coro::Coro<void> handle_connection(SharedSink& sink, std::string log_line) {
 ```
 
 This compiles, and the lock does prevent interleaved writes. But `std::lock_guard` is held
-across a `co_await` suspension point, so it doesn't unlock until that `co_await` resumes —
-not just for the duration of the write, but until the executor reschedules the task. Obviously that unneccesary contention on a multi-threaded executor is not ideal, but on `SingleThreadExecutor` or
-`CurrentThreadExecutor` the problem is much worse: it can actually deadlock. If a second `handle_connection` runs while
-the first is suspended holding the mutex, it blocks the only worker thread there is. Even
-once the first write finishes, there's no thread free to resume that task, because the only
-thread there is, is the one blocked on the mutex. The whole event loop halts. It isn't just
-the two tasks stuck waiting on each other either; every task on the `Runtime` stops, with no
-exception or error message to explain why.
+across a `co_await` suspension point, so the mutex stays locked while the task is
+suspended. That breaks in two ways, one for each kind of executor.
 
-Swapping in `coro::Mutex`, which suspends instead of blocking, fixes the deadlock with the
-same ordering guarantee `std::mutex` gives. But it still costs scheduling overhead, which
-raises the question: does `SharedSink` need a lock at all? `coro::File`'s documentations
-the safetey guarantees, but what if it didn't or the next time we encounter a similar situation
-it's with an undocumented type? The responsibility of knowing whether a function or type is safe
-to use concurrently and for actually following those rules is left entirely on the programmer.
-The compiler provides no checks to catch mistakes or a wrong guess.
+**It can unlock on the wrong thread.** A `std::mutex` is owned by the thread that locked
+it, not by the task, and must be unlocked by that same thread. On a multi-threaded
+executor the task may resume after the `co_await` on a different worker thread (section
+6), and `~lock_guard` then unlocks a mutex that thread does not own, which
+is undefined behaviour. `std::recursive_mutex` makes it worse, because it records the
+owning thread and decides from that whether a `lock()` may proceed. Nothing reports the
+mistake; a plain mutex will often appear to work.
 
-By this point it's probably clear that the mutex, the race, and the deadlock are not the real
-root problem we're getting at here. They're all simply example symptoms caused by a common and
-much more fundamental underlying issue: allowing a mutable reference to coexist with any other
-references to the same object, mutable or not, is inherently risky. That risk can shows up as
-a data race across threads, a deadlock like this one within a single thread, or can even cause
-use-after-free or similar memory errors in purely sinlgle threaded code. It's such a common
-source of bugs that instead of treating safe use of shared mutable references as a discipline
-problem to be handled correctly by the programmer, Rust instead treats them as an error to
-be enforced at the language level by the compiler. This is the Rust borrow checker and it is
-one of the most foundational components at the very heart of the Rust language, not some obscure
-corner case. The Rust book literally begins introducing it in the same section that introduces
-what a variable is. Simply put, the borrow checker prevents these bugs by not letting code
-using shared mutable references to even compile in the first place.
+**It can deadlock.** On `CurrentThreadExecutor`, if a second `handle_connection` runs
+while the first is suspended holding the mutex, it blocks the only worker thread there is.
+Even once the first write finishes, no thread is free to resume that task, because the
+only thread is the one blocked on the mutex. The whole event loop halts — not just these
+two tasks, but every task on the `Runtime` — with no exception or error message to explain
+why. More worker threads only raise the number of waiting tasks it takes.
+
+Swapping in `coro::Mutex`, which suspends instead of blocking and is not tied to a thread,
+fixes both with the same ordering guarantee `std::mutex` gives. But it still costs scheduling overhead, which
+raises the question: does `SharedSink` need a lock at all? `coro::File` documents its
+safety guarantees, but the next type we meet might not. Knowing whether a type is safe to
+use concurrently, and then following those rules, is left entirely to the programmer; the
+compiler catches neither a mistake nor a wrong guess.
+
+The mutex, the race and the deadlock are all symptoms of one underlying hazard: a mutable
+reference to an object coexisting with any other reference to it. Rust considers this
+dangerous enough that its compiler rejects such code outright. C++ gives no such check, so
+the dependable fix is structural: do not share the object at all.
 
 !!! note "NOTE: so, is `coro::File` safe to share?"
     For the record: no — `coro::File` is documented as confined to a single task, with
@@ -1306,8 +1732,8 @@ using shared mutable references to even compile in the first place.
 > *"Do not communicate by sharing memory; instead, share memory by communicating."*
 > — Go team
 
-It is not just Rust that recognizes the shared mutable refrence hazzard. The quote above
-summarizes the cononical way Go encourage programmers to avoid the same types of errors.
+It is not just Rust that recognizes the shared mutable reference hazard. The quote above
+summarizes the canonical way Go encourages programmers to avoid the same types of errors.
 While not compiler enforced in Go the way it is in Rust, this is the same basic solution
 in action. Don't be careful with shared mutable references, instead have no shared references
 to be careful with in the first place.
@@ -1333,12 +1759,13 @@ Four channel variants are provided:
 Every channel end is a RAII handle. Dropping a handle signals disconnection to the other
 side automatically — no explicit `close()` call is needed:
 
-- **Sender dropped** — any receiver waiting for a value wakes immediately and gets a
-  `ChannelError` result. For `mpsc`, dropping all senders closes the channel and causes
-  the receiver's `next()` loop to terminate naturally.
-- **Receiver dropped** — any sender waiting to send wakes immediately and gets its value
-  back in the error slot of the returned `std::expected`, so move-only values are never
-  silently lost.
+- **Last sender dropped** — any receiver waiting for a value wakes immediately and is
+  told the channel is closed. Values already buffered are still delivered first. For
+  `mpsc`, this is what makes the receiver's `next()` loop terminate naturally.
+- **Receiver dropped** — a send fails and hands the value back in the error slot of the
+  returned `std::expected`, so move-only values are never silently lost. (`broadcast` is
+  the exception: with no receivers a send fails the same way, but the channel stays open
+  and new receivers can still subscribe.)
 
 For `watch`, the sender dropping is the normal way to signal that no more updates will
 arrive. Receivers observe this as an error on their next `changed()` call and can exit
@@ -1346,13 +1773,50 @@ cleanly — it is not an unexpected failure.
 
 #### Error handling
 
-All channel operations return `std::expected<T, ChannelError>` rather than throwing.
-Call `.value()` to throw on error, or check the result explicitly.
+Channels never throw, and they keep two kinds of failure apart:
+
+- **The channel itself has a problem** — it is closed, the other end is gone, a
+  `broadcast` receiver lagged. The *channel* reports this, in the return type of the
+  operation. On the receiving side it usually means "stop receiving".
+- **The sender has an error to report** — a parse failed, a request was rejected. That is
+  application data. Send it *through* the channel as an ordinary value, for example by
+  making the payload a `std::expected`. The receiver handles it and keeps receiving.
+
+Because the two travel separately, a receiver can always tell "the producer told me
+something went wrong" from "the producer is gone":
+
+```cpp
+// The payload is itself an expected — a decode failure is a message like any other.
+auto [tx, rx] = coro::mpsc_channel<std::expected<Frame, DecodeError>>(/*capacity=*/16);
+
+while (auto item = co_await rx.recv()) {  // nullopt: channel closed — stop receiving
+    if (!item->has_value()) {
+        log(item->error());               // error sent by the producer — keep going
+        continue;
+    }
+    handle(**item);
+}
+```
+
+How each channel reports its own state:
+
+| Operation | Returns | Channel-level outcome |
+|---|---|---|
+| `oneshot` `rx.recv()` | `std::expected<T, ChannelError>` | `Closed` — sender dropped without sending |
+| `mpsc` `rx.recv()` / `next(rx)` | `std::optional<T>` | `nullopt` — every sender dropped and the buffer is empty |
+| `watch` `rx.changed()` | `std::expected<void, ChannelError>` | `SenderDropped` — no more updates will arrive |
+| `broadcast` `rx.recv()` | `std::expected<T, BroadcastRecvError>` | `Lagged` (keep going) or `Closed` (stop) |
+| any `send()` | `std::expected<…, T>` | the unsent value handed back — nobody to receive it |
+
+For the `std::expected` results, call `.value()` to throw on error, or check the result
+explicitly. The short examples below ignore the result of `send()` because their
+receivers are known to be alive; real code should check it.
 
 ```cpp
 #include <coro/sync/oneshot.h>
 #include <coro/sync/mpsc.h>
 #include <coro/sync/watch.h>
+#include <coro/sync/broadcast.h>
 ```
 
 #### oneshot — single value, one sender, one receiver
@@ -1364,20 +1828,20 @@ Use `oneshot` to hand a single result from one task to another.
 coro::Coro<void> run() {
     auto [tx, rx] = coro::oneshot_channel<int>();
 
-    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 11
+    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 7
     auto h = coro::spawn(coro::co_invoke(
         [tx = std::move(tx)]() mutable -> coro::Coro<void> {
             tx.send(42);
             co_return;
         }));
 
-    auto result = co_await rx;      // std::expected<int, ChannelError>
+    auto result = co_await rx.recv();  // std::expected<int, ChannelError>
     std::cout << result.value() << "\n";  // 42
     co_await h;
 }
 ```
 
-If the sender is dropped without calling `send()`, `co_await rx` returns
+If the sender is dropped without calling `send()`, `co_await rx.recv()` returns
 `std::unexpected(ChannelError::Closed)`.
 
 #### mpsc — bounded queue, multiple producers, one consumer
@@ -1391,7 +1855,7 @@ coro::Coro<void> run() {
 
     // Spawn two producers — each holds a copy of the sender.
     // When both complete, their senders are dropped, closing the channel.
-    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 11
+    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 7
     auto h1 = coro::spawn(coro::co_invoke(
         [tx = tx.clone()]() mutable -> coro::Coro<void> {
             for (int j = 0; j < 3; ++j)
@@ -1416,6 +1880,13 @@ coro::Coro<void> run() {
 `send()` suspends the producer if the buffer is full, providing natural
 backpressure. Use `try_send()` for a non-blocking attempt.
 
+You will see the receive written two ways. Every channel has its own member function
+returning a future for the next value — `rx.recv()` here and on `oneshot` and `broadcast`, `rx.changed()` on `watch`. `mpsc` is also
+the one channel whose receiver is a `Stream`, so the generic `coro::next(rx)` works on it
+too. On an `mpsc` receiver the two are interchangeable: both yield `std::optional<T>`,
+with `nullopt` once every sender is gone, and neither loses a value if the future is
+dropped before it resolves — say, as the losing branch of a `select()`.
+
 A common pattern for signalling completion without an explicit flag: clone the sender into
 each spawned task and drop the original immediately. When the last task exits — whether
 normally, by throwing, or by cancellation — the last clone is dropped, the channel closes,
@@ -1432,7 +1903,7 @@ until the next update, then `borrow()` to read the current value.
 coro::Coro<void> run() {
     auto [tx, rx] = coro::watch_channel<int>(/*initial=*/0);
 
-    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 11
+    // co_invoke keeps the capturing lambda alive for the coroutine's lifetime — section 7
     auto h = coro::spawn(coro::co_invoke(
         [rx = std::move(rx)]() mutable -> coro::Coro<void> {
             while (true) {
@@ -1454,69 +1925,135 @@ coro::Coro<void> run() {
 `rx.clone()` creates an independent receiver with its own cursor — useful when
 multiple tasks need to track changes independently.
 
-**`WatchBorrowGuard`** — `borrow()` returns a `WatchBorrowGuard<T>`, a scoped read-lock handle
-borrowed from Rust's `watch` channel design. It holds a shared read lock on the
-channel's value for its entire lifetime, preventing any `send()` call from writing
-while it is held. Multiple receivers may hold `WatchBorrowGuard`s simultaneously — they
-share the read lock and do not block each other. Dereference it to access the value;
-it releases the lock when it goes out of scope.
+One rule to carry with you: `borrow()` returns a guard that holds a read lock on the
+value, so never keep it alive across a `co_await`. Copy the value out, as
+`*rx.borrow()` does above, and let the guard go. The sender has a matching
+`borrow_mut()` for updating the value in place.
+
+??? note "Deep dive: borrow guards — reading and updating a `watch` value in place"
+    **`WatchBorrowGuard`** — `borrow()` returns a `WatchBorrowGuard<T>`, a scoped read-lock handle
+    borrowed from Rust's `watch` channel design. It holds a shared read lock on the
+    channel's value for its entire lifetime, preventing any `send()` call from writing
+    while it is held. Multiple receivers may hold `WatchBorrowGuard`s simultaneously — they
+    share the read lock and do not block each other. Dereference it to access the value;
+    it releases the lock when it goes out of scope.
+
+    ```cpp
+    // changed() suspends until a new value is sent — no lock held while waiting.
+    co_await rx.changed();
+
+    {
+        auto guard = rx.borrow();  // ← shared read lock acquired here
+        use(*guard);               //   safe to read; other receivers can borrow too
+    }                              // ← guard destroyed, read lock released here
+
+    tx.send(new_config);           // fine — no WatchBorrowGuard alive, write lock available
+    ```
+
+    !!! warning
+        Do not hold a `WatchBorrowGuard` across a `co_await` point. If the coroutine
+        suspends while the guard is alive, the read lock is held for the entire suspension —
+        blocking every `send()` call until the coroutine is resumed and the guard finally
+        goes out of scope. Always copy the value out or scope the guard tightly before
+        any suspension point.
+
+    ```cpp
+    // WRONG — read lock held across suspension
+    auto guard = rx.borrow();
+    co_await do_work(*guard);   // send() is blocked for the duration of do_work
+
+    // CORRECT — copy out first, then suspend freely
+    auto value = *rx.borrow();  // guard destroyed at semicolon, lock released
+    co_await do_work(value);
+    ```
+
+    **`WatchBorrowMutGuard`** — the sender's counterpart is `borrow_mut()`, which acquires an
+    *exclusive* write lock on the value and returns a `WatchBorrowMutGuard<T>`. You modify the
+    value directly through the guard. When the guard is destroyed it automatically increments
+    the channel version and wakes all receivers — no separate `send()` call is needed. This
+    is the idiomatic way to update a field of a complex value in place rather than constructing
+    and moving an entirely new value.
+
+    ```cpp
+    struct Config { int timeout_ms; std::string endpoint; };
+    auto [tx, rx] = coro::watch_channel<Config>({500, "primary"});
+
+    {
+        auto guard = tx.borrow_mut();  // ← exclusive write lock acquired here
+        guard->timeout_ms = 1000;      //   mutate in place
+    }                                  // ← guard destroyed: version++, all receivers woken
+
+    // rx.changed() will now resolve for any receiver that hasn't seen this version.
+    ```
+
+    The same co_await warning applies with even more force: a `WatchBorrowMutGuard` holds an
+    *exclusive* lock, so every `borrow()` call on every receiver is blocked for the entire
+    suspension — not just `send()`. Always scope the guard tightly and never hold it across
+    a suspension point.
+
+    `tx.send_if_modified(f)` is the alternative when you want conditional notification: it calls
+    `f(T&)` under the write lock and only increments the version and wakes receivers if `f`
+    returns `true` — useful when the update may be a no-op and spurious wakeups are undesirable.
+
+#### broadcast — every receiver sees every message
+
+Use `broadcast` when several tasks each need to see every message — events, log lines,
+notifications. This is the difference from the other two multi-party channels: an `mpsc`
+value is consumed by its one receiver, and a `watch` receiver only ever sees the latest
+value, so anything sent in between is skipped. A `broadcast` receiver keeps its own
+position in a shared ring buffer and reads each message in order.
 
 ```cpp
-// changed() suspends until a new value is sent — no lock held while waiting.
-co_await rx.changed();
+coro::Coro<void> listen(int id, coro::BroadcastReceiver<std::string> rx) {
+    for (;;) {
+        // std::expected<std::string, coro::BroadcastRecvError>
+        auto r = co_await rx.recv();
+        if (r) {
+            std::cout << id << ": " << *r << "\n";
+        } else if (r.error().kind == coro::BroadcastRecvError::Kind::Lagged) {
+            // Fell too far behind — the oldest unread messages were overwritten.
+            std::cout << id << ": missed " << r.error().skipped << " messages\n";
+        } else {
+            co_return;  // Closed — every sender dropped and nothing left to read
+        }
+    }
+}
 
-{
-    auto guard = rx.borrow();  // ← shared read lock acquired here
-    use(*guard);               //   safe to read; other receivers can borrow too
-}                              // ← guard destroyed, read lock released here
+coro::Coro<void> run() {
+    auto [tx, rx1] = coro::broadcast_channel<std::string>(/*capacity=*/16);
+    auto rx2 = tx.subscribe();  // a second, independent receiver
 
-tx.send(new_config);           // fine — no WatchBorrowGuard alive, write lock available
+    auto h1 = coro::spawn(listen(1, std::move(rx1)));
+    auto h2 = coro::spawn(listen(2, std::move(rx2)));
+
+    tx.send("hello");  // both listeners print "hello"
+    tx.send("world");  // both listeners print "world"
+
+    // Explicitly drop tx — closes the channel so both listeners exit.
+    { auto _ = std::move(tx); }
+    co_await h1;
+    co_await h2;
+}
 ```
 
-!!! warning
-    Do not hold a `WatchBorrowGuard` across a `co_await` point. If the coroutine
-    suspends while the guard is alive, the read lock is held for the entire suspension —
-    blocking every `send()` call until the coroutine is resumed and the guard finally
-    goes out of scope. Always copy the value out or scope the guard tightly before
-    any suspension point.
+Three things differ from `mpsc`:
 
-```cpp
-// WRONG — read lock held across suspension
-auto guard = rx.borrow();
-co_await do_work(*guard);   // send() is blocked for the duration of do_work
+- **`send()` never suspends, so there is no backpressure.** The buffer is a fixed-size
+  ring; when it is full, `send()` overwrites the oldest message. A slow receiver cannot
+  stall the sender or the other receivers.
+- **A receiver that falls behind is told so.** If messages it had not read yet were
+  overwritten, its next `recv()` returns `Lagged` with the number it `skipped`, and the
+  receiver carries on from the oldest message still buffered. Size the capacity for the
+  burst you expect, and decide what a lagged receiver should do — carry on, resynchronise,
+  or give up.
+- **Receivers are added, not cloned.** `tx.subscribe()` or `rx.resubscribe()` creates a
+  new receiver that sees only messages sent *after* that call — there is no replay.
+  `tx.clone()` adds another sender. The message type must be copyable, since every
+  receiver gets its own copy.
 
-// CORRECT — copy out first, then suspend freely
-auto value = *rx.borrow();  // guard destroyed at semicolon, lock released
-co_await do_work(value);
-```
-
-**`WatchBorrowMutGuard`** — the sender's counterpart is `borrow_mut()`, which acquires an
-*exclusive* write lock on the value and returns a `WatchBorrowMutGuard<T>`. You modify the
-value directly through the guard. When the guard is destroyed it automatically increments
-the channel version and wakes all receivers — no separate `send()` call is needed. This
-is the idiomatic way to update a field of a complex value in place rather than constructing
-and moving an entirely new value.
-
-```cpp
-struct Config { int timeout_ms; std::string endpoint; };
-auto [tx, rx] = coro::watch_channel<Config>({500, "primary"});
-
-{
-    auto guard = tx.borrow_mut();  // ← exclusive write lock acquired here
-    guard->timeout_ms = 1000;      //   mutate in place
-}                                  // ← guard destroyed: version++, all receivers woken
-
-// rx.changed() will now resolve for any receiver that hasn't seen this version.
-```
-
-The same co_await warning applies with even more force: a `WatchBorrowMutGuard` holds an
-*exclusive* lock, so every `borrow()` call on every receiver is blocked for the entire
-suspension — not just `send()`. Always scope the guard tightly and never hold it across
-a suspension point.
-
-`tx.send_if_modified(f)` is the alternative when you want conditional notification: it calls
-`f(T&)` under the write lock and only increments the version and wakes receivers if `f`
-returns `true` — useful when the update may be a no-op and spurious wakeups are undesirable.
+`send()` returns the number of receivers the message was delivered to, or hands the value
+back as an error if there are currently none. Dropping every receiver does not close the
+channel; a sender can `subscribe()` new ones at any time.
 
 Additional primitives — `coro::Mutex`, `coro::Event`, and `coro::StreamHandle` — are
 available for cases where channels do not fit. See the [Cheat Sheet](cheatsheet.md) for a
@@ -1524,131 +2061,63 @@ quick reference.
 
 ---
 
-## 11. Capturing-lambda pitfall and `co_invoke`
-
-In section 10 the channel examples used `co_invoke` with a comment pointing here. This is
-why. A capturing lambda that returns `Coro<T>` has a subtle use-after-free when used as an
-rvalue. The compiler lowers the lambda to an anonymous struct; `operator()` — being a member
-function — captures `this` into the coroutine frame. The struct is a temporary and is
-destroyed at the end of the full expression, before the coroutine is ever polled.
-
-See [guideline CS.3](guidelines.md#cs3) in the Library Usage Guidelines for a full treatment of this pitfall and related patterns to avoid.
-
-This is a well-known enough hazard that the C++ Core Guidelines explicitly recommend
-never using capturing lambda coroutines — including value captures (`[=]`) — for exactly
-this reason. `co_invoke` is the pattern this library provides to work around it: wrap
-any capturing lambda in `co_invoke` and the library manages its lifetime for you.
-
-```cpp
-// DANGEROUS — lambda struct destroyed at ';', before first resumption
-auto coro = [x]() -> Coro<void> {
-    co_await something();
-    use(x);          // accesses this->x — 'this' is dangling
-}();
-co_await coro;       // use-after-free
-```
-
-Use `co_invoke` instead. It moves the lambda onto the heap inside a wrapper that keeps it
-alive for the coroutine's entire lifetime:
-
-```cpp
-#include <coro/co_invoke.h>
-
-// SAFE — lambda kept alive by co_invoke
-co_await co_invoke([x]() -> Coro<void> {
-    co_await something();
-    use(x);    // safe
-});
-
-// Also works with spawn:
-auto handle = spawn(co_invoke([x]() -> Coro<void> { ... }));
-```
-
-`co_invoke` also works with `CoroStream<T>` lambdas.
-
-### Member function coroutines implicitly capture `this`
-
-A related pitfall applies to non-static member function coroutines. The coroutine frame
-holds an implicit `this` pointer — if the object is destroyed while the task is still
-running, every subsequent member access is a use-after-free. `co_await`ing a member
-coroutine directly is safe because the spawner's scope keeps the object alive, but
-spawning one is dangerous:
-
-```cpp
-struct Processor {
-    int value = 42;
-    Coro<int> compute();
-};
-
-Coro<void> run() {
-    Processor p;
-    auto h = coro::spawn(p.compute());  // compute() holds this → &p
-
-    co_return;
-    // ① h destroyed (last declared, first destroyed) — compute() cancelled
-    // ② p destroyed (first declared, last destroyed) — p.value gone
-    // ③ run() completes — compute()'s drain starts here, after ②;
-    //    compute()'s destructors access &p via this, but p is already gone — use-after-free
-}
-```
-
-The safe patterns are the same `co_invoke` scope approach, or making the member function
-static and passing `std::shared_ptr<T>` explicitly to tie the object's lifetime to the
-task. See [Library Usage Guidelines](guidelines.md#cs4) for both patterns in full.
-
----
-
 ## 12. Graceful shutdown on OS signals
 
 A long-running server needs to stop cleanly when the operator sends `SIGINT` or
 `SIGTERM` — finish in-flight work, close listeners, exit — rather than dying
-mid-request. The channels from section 10 make the obvious approach tempting: install a
-raw `sigaction()` handler and push a message onto a channel for the server to receive.
-**Don't do this:**
+mid-request. `coro::signal()` and `coro::signal_stream()` (`#include <coro/io/signal.h>`)
+turn a signal into something a coroutine can simply `co_await`, so you never write a
+signal handler yourself. That is the one rule of this section: **do not install your own
+handler and call into coro from it** — not even a channel's `try_send()`. The deep dive
+below explains why; the rest of the section shows what to do instead.
 
-```cpp
-// DANGEROUS — do not do this
-coro::MpscSender<int> g_shutdown_tx;  // set before installing the handler
+??? note "Deep dive: why a raw signal handler is unsafe, and how `coro::signal()` avoids it"
+    The channels from section 11 make an obvious approach tempting: install a raw
+    `sigaction()` handler and push a message onto a channel for the server to receive.
+    **Don't do this:**
 
-void handle_sigint(int) {
-    g_shutdown_tx.try_send(0);  // unsafe — see below
-}
+    ```cpp
+    // DANGEROUS — do not do this
+    coro::MpscSender<int> g_shutdown_tx;  // set before installing the handler
 
-void install_handler() {
-    struct sigaction sa{};
-    sa.sa_handler = handle_sigint;
-    sigaction(SIGINT, &sa, nullptr);
-}
-```
+    void handle_sigint(int) {
+        g_shutdown_tx.try_send(0);  // unsafe — see below
+    }
 
-A POSIX signal handler runs in a severely restricted async-signal-safe context — the
-same category of restriction as a hardware interrupt handler, just delivered by the
-kernel to a regular thread instead of to hardware. `try_send()` takes a mutex lock and
-touches `shared_ptr` ref-counts internally; neither is guaranteed reentrant or
-signal-safe. If the signal arrives while the interrupted thread already holds that same
-mutex, or mid-allocation, the handler can deadlock or corrupt state. This applies to
-essentially every coro primitive, not just channels — `Event::set()`, `coro::spawn()`,
-and `Waker::wake()` all have the same problem. See [guideline
-SG.1](guidelines.md#sg1) for the full rule.
+    void install_handler() {
+        struct sigaction sa{};
+        sa.sa_handler = handle_sigint;
+        sigaction(SIGINT, &sa, nullptr);
+    }
+    ```
 
-!!! note "NOTE: bare-metal ports face the same problem from ISRs, not signals"
-    On the MCU port, `IsrEvent` and `IsrChannel` (`include/coro/sync/isr_event.h`) exist
-    to solve this exact mutex-safety problem, but for hardware interrupts instead of OS
-    signals. They are not available on desktop builds. On bare metal, with no OS
-    underneath, there is no I/O driver or self-pipe to write to, so a hardware-specific,
-    interrupt-safe primitive is the only option for signaling out of an ISR in that
-    environment.
+    A POSIX signal handler runs in a severely restricted async-signal-safe context — the
+    same category of restriction as a hardware interrupt handler, just delivered by the
+    kernel to a regular thread instead of to hardware. `try_send()` takes a mutex lock and
+    touches `shared_ptr` ref-counts internally; neither is guaranteed reentrant or
+    signal-safe. If the signal arrives while the interrupted thread already holds that same
+    mutex, or mid-allocation, the handler can deadlock or corrupt state. This applies to
+    essentially every coro primitive, not just channels — `Event::set()`, `coro::spawn()`,
+    and `Waker::wake()` all have the same problem. See [guideline
+    SG.1](guidelines.md#signal-safety) for the full rule.
 
-`coro::signal()` and `coro::signal_stream()` (`#include <coro/io/signal.h>`) exist so
-user code never has to write a raw handler at all. They solve the signal-safety problem
-with a self-pipe: the real OS-level handler coro installs only bumps an atomic counter
-and writes one byte to a pipe — both async-signal-safe — and all actual dispatch
-(coalescing repeat deliveries, waking the waiting coroutine) happens afterward, when the
-pipe wakes the Runtime's I/O driver, in ordinary non-handler context. See
-`doc/design/signal_handling.md` for the full design.
+    !!! note "NOTE: bare-metal ports face the same problem from ISRs, not signals"
+        On the MCU port, `IsrEvent` and `IsrChannel` (`include/coro/sync/isr_event.h`) exist
+        to solve this exact mutex-safety problem, but for hardware interrupts instead of OS
+        signals. They are not available on desktop builds. On bare metal, with no OS
+        underneath, there is no I/O driver or self-pipe to write to, so a hardware-specific,
+        interrupt-safe primitive is the only option for signaling out of an ISR in that
+        environment.
+
+    `coro::signal()` and `coro::signal_stream()` solve the signal-safety problem with a
+    self-pipe: the real OS-level handler coro installs only bumps an atomic counter
+    and writes one byte to a pipe — both async-signal-safe — and all actual dispatch
+    (coalescing repeat deliveries, waking the waiting coroutine) happens afterward, when the
+    pipe wakes the Runtime's I/O driver, in ordinary non-handler context. See
+    `doc/design/signal_handling.md` for the full design.
 
 `coro::signal(signum)` returns a one-shot `Future<void>` that resolves on the next
-delivery of that signal — `select` it (section 9) alongside the running server task so
+delivery of that signal — `select` it (section 10) alongside the running server task so
 either a normal exit or a signal triggers the same cleanup path:
 
 ```cpp
@@ -1674,7 +2143,7 @@ int main() {
 }
 ```
 
-`coro::ref(server_handle)` (section 9) keeps the losing branch's future usable after
+`coro::ref(server_handle)` (section 10) keeps the losing branch's future usable after
 `select` returns — without it, `select` would cancel `server_handle` the moment a
 signal won, racing with the explicit `cancel_and_join()` call below.
 
@@ -1683,11 +2152,12 @@ as a parameter, it doesn't thread that token down through every nested coroutine
 spawns, and it doesn't have to remember to check it — or cancel children in the right
 order — at every level of the call tree. `cancel_and_join()` cancels exactly one task,
 the root, from the top. Cancellation then propagates *down* automatically: each
-suspended `co_await` along every branch unwinds like an exception, running RAII
-destructors as it goes, which is what cancels and drains that branch's own children in
-turn. The bottom-up bookkeeping that a manual cancellation-token scheme requires — and
-the risk of forgetting one branch — is handled by the language's own stack-unwinding
-guarantees instead of by hand.
+suspended `co_await` along every branch unwinds much as it would for an exception,
+running RAII destructors as it goes, which is what cancels and drains that branch's own
+children in turn. (Much as, not exactly: recall from section 7 that no `catch` block runs
+on the way out, only destructors.) The bottom-up bookkeeping that a manual
+cancellation-token scheme requires — and the risk of forgetting one branch — is handled
+by the same destructor ordering the language already guarantees, instead of by hand.
 
 For a server that needs to react to several distinct signals differently — reload
 config on `SIGHUP`, shut down on `SIGTERM` — `coro::signal_stream()` yields a coalesced
@@ -1702,7 +2172,7 @@ while (std::optional<coro::SignalEvent> event = co_await coro::next(sigs)) {
 ```
 
 A session cancelled by this shutdown path drains exactly the same way as one cancelled by
-a timeout or evicted by `select` — section 8 covers the `FinalNotice` pattern for running
+a timeout or evicted by `select` — section 9 covers the `FinalNotice` pattern for running
 async cleanup (like a goodbye frame) from a destructor during that drain, and shutdown is
 just one more trigger for the same mechanism.
 
@@ -1724,9 +2194,12 @@ coro::Coro<void> handle_connection(coro::TcpStream stream) {
 This compiles and even works, in the sense that it produces the right answer — but
 there's no `co_await` in `legacy_blocking_call()`, so nothing about it tells the executor
 it should run something else in the meantime. The call just blocks the OS thread the way
-it would in any non-async program, for however long it takes. On a `CurrentThreadExecutor`
-every other task in the entire program is frozen for that duration — there's no other
-thread to pick up the slack. On a `WorkStealingExecutor` the other worker threads keep
+it would in any non-async program, for however long it takes. This is the cooperative
+scheduling of section 6 at work: the OS would take the core away from a blocked thread and
+give it to another, but nothing takes a worker thread away from a task, so a task that
+blocks takes its worker thread with it. On a `CurrentThreadExecutor` every other task in
+the entire program is frozen for that duration — there's no other thread to pick up the
+slack. On a `WorkStealingExecutor` the other worker threads keep
 going, but the one thread running `handle_connection` is gone from the pool until the
 call returns, and enough blocking calls landing on enough threads at once reproduces the
 single-threaded problem on however many threads you have.
@@ -1780,8 +2253,13 @@ section. Here it is in full — along with the companion client that exercises i
 nothing new introduced.
 
 The server brings together the runtime entry point, async I/O, a task per connection,
-`JoinSet` for dynamic fan-out, `select` to interleave accepting and draining, and
-`timeout` to evict stalled clients.
+`JoinSet` for dynamic fan-out, `select` to interleave accepting and draining, `timeout`
+to evict stalled clients, the async-cleanup pattern of section 9 to send each client a
+goodbye line however its session ends, and `signal` for a clean shutdown on Ctrl-C. Not
+every section ends up in it: the mutex and logger of section 11 were there to show how a
+feature works rather than because an echo server needs them.
+Channels (section 11) appear in the client below, and `spawn_blocking` (section 13) is
+the centrepiece of section 15.
 
 ### Server
 
@@ -1790,19 +2268,49 @@ The server brings together the runtime entry point, async I/O, a task per connec
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
+#include <coro/io/signal.h>
 #include <coro/io/tcp_listener.h>
 #include <coro/io/tcp_stream.h>
 #include <coro/task/join_set.h>
+#include <coro/sync/select.h>
 #include <coro/sync/timeout.h>
 #include <coro/sync/when.h>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
+#include <exception>
 #include <string>
 #include <thread>
+#include <variant>
 
 using namespace coro;
 using namespace std::chrono_literals;
 
+// Last message to a client before its connection closes (section 9). Takes the
+// stream by value — the goodbye task owns it.
+static Coro<void> send_goodbye(TcpStream stream) {
+    try {
+        // Bounded: a stalled client must not be able to hold up shutdown.
+        co_await timeout(1s, stream.write(std::string("goodbye\n")));
+    } catch (const std::exception&) {
+        // The peer is already gone — there is nobody left to say goodbye to.
+    }
+}
+
+// Sends the goodbye on every exit path of handle_connection: EOF, timeout, or
+// cancellation when the server shuts down.
+class FinalNotice {
+public:
+    explicit FinalNotice(TcpStream& stream) : m_stream(stream) {}
+    ~FinalNotice() {
+        coro::spawn(send_goodbye(std::move(m_stream))).cancelOnDestroy(false);
+    }
+private:
+    TcpStream& m_stream;
+};
+
 static Coro<void> handle_connection(TcpStream stream, int id) {
+    FinalNotice notice(stream);
     std::printf("[%d] connected\n", id);
     for (;;) {
         auto recv = co_await timeout(20s, stream.read(std::string(4096, '\0')));
@@ -1846,21 +2354,43 @@ static Coro<int> run_server() {
     }
 }
 
+// Runs the server until it exits on its own or SIGINT/SIGTERM arrives (section 12).
+static Coro<int> async_main() {
+    auto server_handle = coro::spawn(run_server());
+    auto result = co_await coro::select(
+        coro::ref(server_handle),
+        coro::signal(SIGINT),
+        coro::signal(SIGTERM)
+    );
+    if (result.index() == 0) {
+        co_return std::get<0>(result).value;  // run_server() exited on its own
+    }
+    // Cancelling run_server() drops `sessions`, which cancels and drains every
+    // connection still open before cancel_and_join() resolves. Each one sends its
+    // goodbye on the way out, so shutdown takes at most the 1s send_goodbye() allows.
+    std::printf("signal received — shutting down\n");
+    co_return co_await std::move(server_handle).cancel_and_join();
+}
+
 int main(int argc, char* argv[]) {
     int threads = (argc > 1) ? std::stoi(argv[1]) : 0;
 
     if (threads == 1) {
         Runtime rt(std::in_place_type<CurrentThreadExecutor>);
-        return rt.block_on(run_server());
+        return rt.block_on(async_main());
     } else {
         int n = threads > 1 ? threads : (int)std::thread::hardware_concurrency();
         Runtime rt(std::in_place_type<WorkStealingExecutor>, n);
-        return rt.block_on(run_server());
+        return rt.block_on(async_main());
     }
 }
 ```
 
-The full source with timestamps and structured logging is in
+The goodbye line is sent after the last echo, so the companion client below, which reads
+only in reply to its own messages, never sees it; connect with `nc 127.0.0.1 8080` and
+press Ctrl-C on the server to watch it arrive.
+
+The same server, with timestamped log lines in place of the bare `printf` calls, is in
 [examples/io/tcp_echo_server.cpp](../examples/io/tcp_echo_server.cpp).
 
 ### Client
@@ -1952,14 +2482,15 @@ coro::Coro<int> async_main(std::string message) {
     }();
 
     // Spawn the collector as a separate task with cancelOnDestroy(false).
-    // If clients.drain() throws, the remaining clients are cancelled and their
-    // senders dropped. The collector is not cancelled — it stays alive, flushes
-    // whatever replies are still in the channel, and only completes once the
-    // channel closes. async_main cannot exit until the collector finishes.
+    // If clients.drain() throws, every client has already finished and dropped its
+    // sender, but replies may still be sitting in the channel. The collector is not
+    // cancelled — it stays alive, flushes whatever is left, and completes once it
+    // sees the channel closed. async_main cannot exit until the collector finishes.
     JoinHandle<int> collector = coro::spawn(collect_results(std::move(rx)));
     collector.cancelOnDestroy(false);
 
-    // If any client throws, drain() rethrows immediately and cancels the rest.
+    // Waits for every client (section 8). If any threw, the first exception is
+    // rethrown here once they have all finished.
     co_await clients.drain();
 
     int written = co_await collector;
@@ -1996,16 +2527,17 @@ A few things worth noting:
   or by cancellation — the last clone is dropped, the channel closes, and the collector's
   `next(rx)` loop exits naturally with no explicit signal needed.
 - **`cancelOnDestroy(false)` for clean shutdown.** If a client times out, `clients.drain()`
-  rethrows the exception immediately and cancels the remaining clients. The collector is
-  not cancelled — it keeps running until those cancellations drop the last sender and close
-  the channel. Only then does the collector complete and allow `async_main` to exit. Without
-  `cancelOnDestroy(false)`, the collector would be cancelled as part of scope cleanup and
-  the channel would never be fully drained.
+  still waits for the remaining clients, then rethrows the exception out of `async_main`.
+  That unwinds past `co_await collector`, dropping the collector's handle while replies
+  may still be buffered in the channel. The collector is not cancelled — it keeps running
+  until it has read them all and seen the channel close, and only then is `async_main`
+  allowed to exit. Without `cancelOnDestroy(false)`, the collector would be cancelled as
+  part of scope cleanup and the channel would never be fully drained.
 - **Data ownership.** Each `run_client` call receives its own copy of `message` and an
   owned sender. No sharing, no synchronization needed.
 
-The full source with timestamps and structured logging is in
-[examples/io/tcp_echo_client.cpp](../examples/io/tcp_echo_client.cpp).
+The same client, with timestamped log lines and an optional host and port on the command
+line, is in [examples/io/tcp_echo_client.cpp](../examples/io/tcp_echo_client.cpp).
 
 ---
 
@@ -2103,16 +2635,23 @@ The full example follows, broken into labeled sections below.
 #include <complex>
 #include <cmath>
 #include <numbers>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <optional>
+#include <span>
+#include <string>
+#include <vector>
 
 #include <coro/coro.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
 #include <coro/sync/mpsc.h>
 #include <coro/sync/select.h>
+#include <coro/sync/when.h>
 #include <coro/task/spawn_blocking.h>
 #include <coro/task/join_set.h>
+#include <coro/io/signal.h>
 #include <coro/io/ws_stream.h>
 #include <coro/io/ws_listener.h>
 
@@ -2143,8 +2682,10 @@ the peer is already gone; `try_send()` silently discards the result if disconnec
 mid-FFT.
 
 Because `compute_worker` is a plain OS thread with no executor involvement, the
-Cooley-Tukey below can be replaced with FFTW, an MKL call, or a CUDA kernel[^dsp-gpu] —
-the orchestration layer above sees no difference:
+Cooley-Tukey below can be replaced with FFTW, an MKL call, or a CUDA kernel — the
+orchestration layer above sees no difference. ([Extending to GPU
+compute](#extending-to-gpu-compute), at the end of this section, covers what a GPU kernel
+adds.)
 
 ```cpp
 static void compute_worker(MpscReceiver<IqRequest> iq_rx) {
@@ -2192,71 +2733,65 @@ static void compute_worker(MpscReceiver<IqRequest> iq_rx) {
 ```
 
 **`handle_peer` — mpsc backpressure as flow control.** Each peer creates a private
-`mpsc` reply channel and runs a two-state loop. In the idle state it selects on both the
-WebSocket and the reply channel simultaneously — whichever arrives first is handled and
-the loop continues. When a new IQ block arrives it transitions to the sending state,
-where it selects on pushing the block into the shared compute channel and draining any
-result that comes back while it waits. Once the block is accepted the loop returns to
-idle. Backpressure is handled entirely by the compute channel: if it is full,
-`iq_tx.send()` suspends until space is available — no explicit flow control needed.
+`mpsc` reply channel and runs a single loop around one `select()` with three branches:
+read the next IQ block from the WebSocket, push the block it is holding into the shared
+compute channel, and deliver a result that has come back. Only the last is always live.
+The other two are gated with `coro::when()` (section 10) on whether a block is currently
+waiting to be pushed: while one is, the peer stops reading the WebSocket and offers the
+push instead; once the block is accepted it goes back to reading. Results are delivered
+either way, so a peer waiting on a full compute channel still drains its replies.
+Backpressure is handled entirely by the compute channel: if it is full, `iq_tx.send()`
+suspends until space is available — and because the peer isn't reading while it waits,
+that backpressure reaches all the way back to the client. No explicit flow control needed.
 
 ```cpp
-// One coroutine per peer. Two states: idle (select on ws + reply) and sending
-// (select on compute-channel push + reply). The compute channel's capacity is
-// the implicit backpressure bound — no explicit window management required.
+// One coroutine per peer, one select() per iteration. `pending_send` decides which of
+// the first two branches is live: reading a new block, or pushing the one already held.
+// The compute channel's capacity is the implicit backpressure bound — no explicit
+// window management required.
 static Coro<void> handle_peer(WsStream ws, MpscSender<IqRequest> iq_tx) {
     constexpr std::size_t expected_bytes = FFT_SIZE * sizeof(std::complex<float>);
     // Private reply channel for this peer. compute_worker sends results back here
     // via a cloned sender embedded in each IqRequest.
     auto [reply_tx, reply_rx] = mpsc_channel<Spectrum>(IQ_CAPACITY);
+
+    // Engaged while a block is waiting to be accepted by the compute channel.
+    // The send future is constructed once and stays here until it completes: the
+    // channel may be full, in which case the reply branch wins first and the send has
+    // to be offered again on the next iteration. coro::ref() lends the same suspended
+    // future to each select() without moving or destroying it, so it keeps its
+    // position in the channel's wait list until the send succeeds.
+    std::optional<MpscSendFuture<IqRequest>> pending_send;
     try {
         for (;;) {
-            // --- Idle state ---
-            // Loop until a valid IQ block arrives, delivering any results that
-            // come back from in-flight requests in the meantime.
-            std::optional<IqBlock> next_block;
-            while (!next_block.has_value()) {
-                // std::variant<WsStream::Message, std::optional<Spectrum>>
-                auto outcome = co_await select(ws.receive(), reply_rx.recv());
-                if (outcome.index() == 0) {
-                    auto& msg = std::get<0>(outcome);
-                    if (msg.data.size() >= expected_bytes) {
-                        next_block.emplace(FFT_SIZE);
-                        std::memcpy(next_block->data(), msg.data.data(), expected_bytes);
-                    }
-                } else {
-                    auto& result = std::get<1>(outcome);
-                    if (!result) return;  // compute_worker shut down
-                    std::span<const std::byte> bytes(
-                        reinterpret_cast<const std::byte*>(result->data()),
-                        result->size() * sizeof(float));
-                    co_await ws.send(bytes);
-                }
-            }
+            // std::variant<SelectBranch<0, WsStream::Message>,
+            //              SelectBranch<1, std::expected<void, IqRequest>>,
+            //              SelectBranch<2, std::optional<Spectrum>>>
+            auto outcome = co_await select(
+                // Branch 0: read the next block — only when not already holding one.
+                coro::when(!pending_send.has_value(), [&] { return ws.receive(); }),
+                // Branch 1: push the held block — only while one is waiting.
+                coro::when(pending_send.has_value(), [&] { return coro::ref(*pending_send); }),
+                // Branch 2: a result came back — always live.
+                reply_rx.recv());
 
-            // --- Sending state ---
-            // The send future is constructed once and held across multiple select()
-            // calls via coro::ref(). This is necessary because select() requires
-            // ownership of its futures but the channel may be full, causing the reply
-            // branch to win first. coro::ref() lets the same suspended send future be
-            // re-entered on each iteration without being moved or destroyed, preserving
-            // its position in the channel's wait list until the send succeeds.
-            // std::variant<std::expected<void, IqRequest>, std::optional<Spectrum>>
-            auto send_future = iq_tx.send(IqRequest{std::move(*next_block), reply_tx.clone()});
-            while (true) {
-                auto outcome = co_await select(coro::ref(send_future), reply_rx.recv());
-                if (outcome.index() == 0) {
-                    if (!std::get<0>(outcome).has_value()) return;  // compute_worker shut down
-                    break;  // block accepted — return to idle state
-                } else {
-                    // Result arrived while waiting to push — deliver it and retry the send.
-                    auto& result = std::get<1>(outcome);
-                    if (!result) return;
-                    std::span<const std::byte> bytes(
-                        reinterpret_cast<const std::byte*>(result->data()),
-                        result->size() * sizeof(float));
-                    co_await ws.send(bytes);
-                }
+            if (outcome.index() == 0) {
+                auto& msg = std::get<0>(outcome).value;
+                if (msg.data.size() < expected_bytes) continue;  // malformed — ignore
+                IqBlock block(FFT_SIZE);
+                std::memcpy(block.data(), msg.data.data(), expected_bytes);
+                // Branch 0 is now disabled and branch 1 enabled.
+                pending_send.emplace(iq_tx.send(IqRequest{std::move(block), reply_tx.clone()}));
+            } else if (outcome.index() == 1) {
+                if (!std::get<1>(outcome).value.has_value()) co_return;  // compute_worker shut down
+                pending_send.reset();  // block accepted — go back to reading
+            } else {
+                auto& result = std::get<2>(outcome).value;
+                if (!result) co_return;  // compute_worker shut down
+                std::span<const std::byte> bytes(
+                    reinterpret_cast<const std::byte*>(result->data()),
+                    result->size() * sizeof(float));
+                co_await ws.send(bytes);
             }
         }
     } catch (const std::exception&) {}
@@ -2268,13 +2803,18 @@ static Coro<void> handle_peer(WsStream ws, MpscSender<IqRequest> iq_tx) {
 connection. This is inexpensive — tasks are not OS threads and carry no kernel stack, so
 adding more peers is a scheduler entry, not a system call. A `JoinSet<void>` tracks peer
 handlers as connections arrive and depart, removing the need to manage their lifetimes
-manually. Shutdown flows through the channel: when the listener closes, the accept-loop
-drops its `iq_tx` clone; as each `handle_peer` exits it drops its own clone; when the
-last clone is gone `blocking_recv` returns `nullopt` and the compute worker exits. No
-explicit shutdown signals are needed — the channel's sender count is the signal:
+manually; the accept loop reaps finished handlers with the same `when()`-gated
+`next(peers)` branch as the section 10 server. `listener.accept()` never fails while the
+listener is alive, so the loop also races it against `SIGINT` (section 12) to give the
+server a way to stop. On Ctrl-C the server exits as soon as it can rather than waiting
+for clients to leave: the `JoinSet` is dropped, which cancels every peer handler still
+connected. Shutdown then flows through the channel: the accept loop drops its `iq_tx` clone; as each `handle_peer` is
+destroyed it drops its own clone; when the last clone is gone `blocking_recv` returns
+`nullopt` and the compute worker exits. Nothing tells the worker to stop explicitly —
+the channel's sender count is the signal:
 
 ```cpp
-static Coro<void> run_dsp(std::string url) {
+static Coro<void> run_dsp(uint16_t port) {
     // std::pair<MpscSender<IqRequest>, MpscReceiver<IqRequest>>
     auto [iq_tx, iq_rx] = mpsc_channel<IqRequest>(IQ_CAPACITY);
 
@@ -2283,30 +2823,44 @@ static Coro<void> run_dsp(std::string url) {
             compute_worker(std::move(iq_rx));
         });
 
-    WsListener listener = co_await WsListener::listen(url);
-    JoinSet<void> peers;
+    WsListener listener = co_await WsListener::bind("localhost", port);
 
-    try {
+    // Created once and lent to each select() with coro::ref(), so Ctrl-C is watched
+    // continuously rather than only while a select() is in progress.
+    auto interrupted = coro::signal(SIGINT);
+    {
+        JoinSet<void> peers;
         for (;;) {
-            // WsStream
-            WsStream ws = co_await listener.accept();
-            peers.spawn(handle_peer(std::move(ws), iq_tx.clone()));
+            // std::variant<SelectBranch<0, WsStream>, SelectBranch<1, bool>, SelectBranch<2, void>>
+            auto sel = co_await select(
+                // Branch 0: a new peer connected.
+                listener.accept(),
+                // Branch 1: a peer handler finished — reap it so the JoinSet doesn't
+                // grow without bound. Disabled while there is nothing to reap.
+                coro::when(!peers.empty(), [&] { return coro::next(peers); }),
+                // Branch 2: Ctrl-C.
+                coro::ref(interrupted));
+            if (sel.index() == 2) break;
+            if (sel.index() == 0)
+                peers.spawn(handle_peer(std::move(std::get<0>(sel).value), iq_tx.clone()));
+            // index 1: nothing to do — next(peers) already removed the finished handler.
         }
-    } catch (const std::exception&) {}
+        // peers dropped here — handlers still running are cancelled, and each drops
+        // its iq_tx clone as it is destroyed.
+    }
 
-    // Listener closed — drop our sender clone so the worker exits once all
-    // peer handlers have also finished and dropped their clones.
+    // Drop our own sender clone so the worker exits once the last peer handler's
+    // clone is gone too.
     { auto dropped = std::move(iq_tx); }
-    while (co_await coro::next(peers)) {}
     co_await std::move(worker);
 
     std::printf("server shutdown complete\n");
 }
 
 int main(int argc, char* argv[]) {
-    std::string url = argc > 1 ? argv[1] : "ws://localhost:9001/dsp";
+    uint16_t port = argc > 1 ? static_cast<uint16_t>(std::stoi(argv[1])) : 9001;
     Runtime rt;
-    rt.block_on(run_dsp(std::move(url)));
+    rt.block_on(run_dsp(port));
 }
 ```
 
@@ -2453,8 +3007,49 @@ DMA controllers, hardware interrupt handlers, completion ports.
 
 ---
 
+## Errors at a glance
+
+Every failure in this guide is reported in one of three ways — an exception, a
+`std::expected`, or a variant index:
+
+| Where | How a failure is reported |
+|---|---|
+| Inside a coroutine | An exception; it unwinds through each `co_await` exactly as through a function call |
+| I/O (`bind`, `accept`, `read`, `write`, …) | Throws `std::system_error` with the OS error code. End of stream is not an error: `read` returns `n == 0` |
+| A spawned task | Its exception is rethrown where the result is collected: `co_await handle`, `next(set)`, `set.drain()` |
+| A task whose handle was dropped or detached | Its result is discarded, exception included |
+| `select()`, `join()` | A throwing branch cancels the others; the exception is rethrown from the `co_await` |
+| `timeout()` | Not an error — branch 1 of the returned variant |
+| Channels (section 11) | Never throw; they return `std::expected` |
+| `Runtime::block_on()` | Rethrows whatever escapes the root coroutine |
+
+---
+
+## Recap
+
+That completes the tour. These are the points from the guide to carry into your own code:
+
+- **Calling a coroutine only creates it.** Nothing runs until it is `co_await`ed, spawned,
+  or handed to `Runtime::block_on()`.
+- **`co_await` suspends the coroutine, not the thread.** Never block inside a coroutine;
+  hand blocking work to `spawn_blocking()`.
+- **`spawn()` starts a task that runs independently**, possibly on another thread. Its
+  `JoinHandle` is the only way to its result — value or exception.
+- **Dropping a handle cancels the task, and the coroutine that dropped it waits for it.**
+  A cancelled task runs only its destructors, so all cleanup must be RAII.
+- **Never let a task refer to data in the frame that holds its handle.** Have the task own
+  its data, or spawn it from an inner `co_invoke` coroutine. Wrap every capturing lambda
+  coroutine in `co_invoke`.
+- **`select()`, `join()` and `timeout()` run several futures within one task.** A branch
+  that loses is abandoned along with whatever was moved into it; use `coro::ref()` to keep
+  a future alive across rounds.
+- **Pass data between tasks through channels** instead of sharing it behind a mutex.
+- **Let `coro::signal()` handle OS signals;** do not install a handler of your own.
+
 ## Next steps
 
+- Keep the [Cheat Sheet](cheatsheet.md) to hand: the API covered in this guide on a
+  single printable page.
 - Browse the [Patterns](notes/patterns.md) guide for idiomatic solutions to common async
   programming problems: request-reply, actors, graceful shutdown, fan-out, pipelines,
   retry with backoff, and more.

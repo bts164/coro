@@ -1,9 +1,19 @@
 # Versioning and Releases
 
 coro follows [Semantic Versioning](https://semver.org). Released versions are annotated
-git tags on `master` in the form `vX.Y.Z` — a tag is the sole trigger for a release, and
-there are no separate, persistent release branches. (Release-candidate tags are the one
-exception to the "on `master`" part — see below.)
+git tags on `master` in the form `vX.Y.Z`, and there are no separate, persistent release
+branches. (Release-candidate tags are the one exception to the "on `master`" part — see
+[Cutting a release](#cutting-a-release) below.)
+
+A final `vX.Y.Z` release tag is a *record* that a release happened, not the trigger that
+starts one: it's created by a manually dispatched release workflow only after that
+workflow's build and test steps succeed, and it's pushed at the exact commit that was
+built and tested — never pushed up front and built against afterward. This means a
+final release tag that exists always corresponds to something that was actually
+validated, and a failed or aborted release attempt never burns a version number or
+leaves a tag with no build behind it. Release-candidate tags are unaffected by this and
+stay simple, ordinary git tags — see [Cutting a release](#cutting-a-release) below for
+why that distinction holds and how rc and final tags fit together.
 
 The Conan recipe derives its version directly from git via `set_version()` rather than a
 hand-maintained version string:
@@ -11,7 +21,7 @@ hand-maintained version string:
 - On an exact `vX.Y.Z` release tag, the package version is the clean `X.Y.Z`.
 - On an exact `vX.Y.Z-rc.N` release-candidate tag — which can be cut on any branch, not
   just `master`, to get a testable build before merging — the package version is the
-  clean `X.Y.Z-rc.N`. See [Release candidates](#release-candidates) below.
+  clean `X.Y.Z-rc.N`. See [Cutting a release](#cutting-a-release) below.
 - On any other commit — on any branch — the version is a SemVer
   [prerelease](https://semver.org/#spec-item-9) identifier derived from `git describe`:
   the next unreleased version (patch-bumped by default; see
@@ -49,6 +59,223 @@ discourage cutting real releases while the API is still actively growing.
     so the usual minor-bump-for-additions discipline is expected to resume at that point,
     not fade out gradually.
 
+## No ABI stability across releases, including patches
+
+coro does not guarantee binary compatibility between any two versions, patch releases
+included. SemVer's usual patch-release connotation — "drop in the new binary without
+recompiling" — doesn't hold for a template/header-heavy C++ library: consumers compile
+directly against coro's headers, so there is no stable ABI boundary to preserve in the
+first place, regardless of how carefully a given release is scoped. The version number
+tracks *source/API* compatibility only — will existing valid consumer code keep compiling
+and behaving the same — not binary interchangeability. A patch release may still change
+header-visible implementation details; only changes to the observable API surface
+(signatures, semantics) warrant a minor or major bump.
+
+Consumers who link coro as a shared library (`coro`'s default) never get a stale cached
+binary across a patch bump silently: the `coro` recipe sets
+`package_id_non_embed_mode = "patch_mode"`, so any version change — patch included —
+changes the `package_id` of anything depending on it and forces a rebuild. (This is
+distinct from Conan's global default of `minor_mode` for this scenario, which would
+otherwise treat patch bumps as binary-compatible and skip the rebuild — see
+[`package_id_embed_mode` / `package_id_non_embed_mode`](https://docs.conan.io/2/reference/conanfile/attributes.html#package-id-embed-non-embed-python-unknown-mode-build-mode).
+Consumers that embed coro statically or header-only already get this via Conan's
+`full_mode` default for embedded dependencies.)
+
+## How the version is derived on non-tagged commits
+
+Only exact-tagged commits get a clean version (`X.Y.Z`, or `X.Y.Z-rc.N` — see
+[Cutting a release](#cutting-a-release)). Everything else — every ordinary commit on
+any branch, and any backport branch cut from an older release tag — derives its version
+automatically from git history via the recipe's `set_version()`, using
+`git describe --tags --long --dirty`:
+
+- If the nearest reachable tag is a plain `vX.Y.Z` release tag, one component is bumped
+  by one and a prerelease identifier is appended: `X.Y.(Z+1)-dev.N+gSHA` by default,
+  where `N` is the commit count since that tag and `gSHA` is the short commit hash. Some
+  bump (rather than reusing the last tag's number as-is) is required for correct SemVer
+  precedence — a prerelease of `X.Y.Z` sorts *before* the plain release `X.Y.Z`, so
+  reusing the last tag's number verbatim would make an in-progress build sort behind a
+  version already shipped. Bumping first guarantees every prerelease sorts after the
+  last real release, regardless of which component the next actual release turns out to
+  bump — patch is only the default; see
+  [Signaling a minor/major dev-build bump](#signaling-a-minormajor-dev-build-bump) for
+  how to bump minor or major instead.
+- If the nearest reachable tag is a `vX.Y.Z-rc.N` release-candidate tag, the patch is
+  **not** bumped again — the rc tag already names the pending version — and a `dev.M`
+  identifier is appended to it instead: `X.Y.Z-rc.N.dev.M+gSHA`, where `M` is the commit
+  count since the rc tag. This still sorts correctly: SemVer gives a prerelease with more
+  dot-separated fields higher precedence than a prefix-equal one with fewer, so
+  `X.Y.Z-rc.N.dev.M` always sorts after `X.Y.Z-rc.N` itself.
+- If the working tree has uncommitted changes, `.dirty` is appended to the identifier
+  so two different uncommitted edits never collide on the same version string — this
+  matters most for editable-mode local development, where an unchanged version despite
+  changed headers would defeat `package_id_non_embed_mode = "patch_mode"` above.
+- If a branch name can be resolved (see
+  [Metadata: branch name and dirty state](#metadata-branch-name-and-dirty-state) below),
+  it's appended to the build-metadata component (the part after `+`) of either format
+  above — `X.Y.(Z+1)-dev.N+gSHA.branchname` or `X.Y.Z-rc.N.dev.M+gSHA.branchname` — so a
+  version string alone hints at where a build came from, without needing to look up
+  `gSHA` in git first.
+
+Because `git describe` walks commit ancestry rather than global tag chronology, backport
+branches need no special-casing: branching from `v0.1.5`, committing a fix, and tagging
+`v0.1.6` there computes correctly even if a newer `v0.2.0` already exists elsewhere —
+it's simply not an ancestor of that branch.
+
+This does mean `set_version()` requires: (a) at least one reachable tag to exist at all
+(a one-time bootstrap requirement — the very first tag has to be created manually), and
+(b) enough git history to actually be present — a shallow clone (the default in many CI
+checkout actions, and possible locally too) can leave no tag reachable at all, in which
+case `set_version()` fails loudly rather than guessing a fallback version.
+
+Conan also re-evaluates the recipe later against its own cache-exported copy (e.g. when a
+consumer resolves `coro/<version>` from the cache), which never has `.git` —
+`exports_sources` only copies source files, not repository metadata. The recipe's
+`export()` method covers this: it runs right after `set_version()`'s first (real-tree)
+success and persists the computed version into `conandata.yml`'s `scm_version` key via
+[`update_conandata()`](https://docs.conan.io/2/reference/tools/files/basic.html#update-conandata),
+which — unlike `exports_sources` — is always copied into the cache. `set_version()` checks
+for that key *before* attempting `git describe` (rather than trying git first and falling
+back on failure), so every later cache-based evaluation reads the version straight back
+out of there instead of spawning an always-doomed `git` subprocess first.
+
+## Signaling a minor/major dev-build bump
+
+Bumping the patch component is only a *safe default*, not a claim about compatibility —
+it guarantees correct ordering (a dev build always sorts after the last release and
+before whatever comes next, whichever component that next release ends up bumping) but
+says nothing about what the pending change actually is. A dev build that already
+contains a breaking API change still reports itself as `X.Y.(Z+1)-dev.N+gSHA`, which
+looks minor/patch-compatible with the last release. This is consistent with SemVer
+itself — a prerelease's core version number was never meant to be a compatibility
+promise about its own content ([spec item 9](https://semver.org/#spec-item-9)) — but it's
+a real trap for anyone who's opted a version range into `resolve_prereleases=True`
+(see [Developing against an unreleased coro](#developing-against-an-unreleased-coro)
+below): a range like `coro/[~1.2]` would happily match a `1.2.4-dev.N` build that's
+actually heading toward a breaking `2.0.0`.
+
+To signal the correct component, add a tracked `conandata.yml` at the repo root:
+
+```yaml
+next_bump: minor  # or "major"; omit the key, or set "patch", for the default
+```
+
+`set_version()` reads `next_bump` (defaulting to `"patch"` when the key or the file is
+absent) and bumps that component instead: `minor` produces `X.(Y+1).0-dev.N+gSHA`,
+`major` produces `(X+1).0.0-dev.N+gSHA`. It's only consulted on this branch — exact tags
+(release or rc) and the rc-tag dev-build branch above ignore it entirely, since those
+already name their target version unambiguously.
+
+This is deliberately a manual, low-ceremony signal rather than something derived
+automatically (e.g. by scanning commit messages for a Conventional Commits
+`BREAKING CHANGE:`/`feat:` marker): set it once when starting work you already know is
+minor/major-worthy, and reset it to `patch` (or remove the key) once the real tag lands.
+There's no enforcement if you forget — the worst case is that dev builds keep bumping the
+wrong component until someone notices, which only affects the version *string* of
+unreleased, not-yet-tagged builds. That's judged not worth solving with a commit hook or
+CI check: the blast radius is cosmetic and self-corrects at the next real tag.
+
+`conandata.yml` is also where `export()` persists the computed `scm_version` fallback
+(see above) — `update_conandata()` merges rather than overwrites, and only ever writes to
+the *exported cache copy*, never back into this tracked file, so the two uses coexist
+without conflict.
+
+## Metadata: branch name and dirty state
+
+The `+gSHA` build-metadata component on non-tagged versions can carry two more
+dot-separated fields, each added only when resolvable — the whole component is
+diagnostic/informational and never affects version precedence or Conan resolution
+([SemVer spec item 10](https://semver.org/#spec-item-10)):
+
+- **Branch name.** Resolved in order: the CI-provided ref (`GITHUB_HEAD_REF` for PR
+  builds, falling back to `GITHUB_REF_NAME` for direct branch builds — coro is hosted on
+  GitHub, so no other CI provider needs to be special-cased), then `git branch
+  --show-current` for local builds. Sanitized to SemVer's build-metadata charset
+  (`[0-9A-Za-z-]`, so e.g. `feature/cool-thing` becomes `feature-cool-thing`) and
+  truncated to 12 characters. If neither source resolves — a detached-HEAD checkout of a
+  bare commit with no CI context — the field is simply omitted rather than guessed.
+  `gSHA` alone already makes every build fully traceable via `git log`/`git branch
+  --contains`; the branch name is a convenience on top of that, not a second source of
+  truth, so it's fine for it to be best-effort rather than required.
+- **Dirty state.** `.dirty` is appended when the working tree has uncommitted changes,
+  as already covered above.
+
+Exact tags (`vX.Y.Z` and `vX.Y.Z-rc.N`) never carry this metadata — a named, tagged
+checkpoint doesn't need it, the tag itself is the identifying information.
+
+## Cutting a release
+
+Coro's release process has two steps: cut one or more release candidates against the
+commit you want to validate, then promote whichever candidate passes testing to the
+final release. Both steps produce a tag, but only the final one is created by CI — the
+release workflow, not a person, decides when a final tag is ready to exist.
+
+### Step 1: cut a release candidate
+
+A release-candidate tag names a specific, already-CI-passing commit as a checkpoint
+worth testing more broadly — by hand, on real hardware, or by a consumer trying it out
+ahead of the real release. This step has no build/dispatch ceremony of its own; the
+commit already went through coro's normal CI to land where it is, so cutting the tag
+*is* the entire action:
+
+```bash
+git tag v1.2.3-rc.1
+git push origin v1.2.3-rc.1
+```
+
+- The commit can be on any branch, not just `master` — this is what makes it possible to
+  get a testable, pinnable build (`coro/1.2.3-rc.1`) out to a consumer before the branch
+  even merges.
+- Pick the target `X.Y.Z` the way you'd pick any release's version — based on what
+  actually changed since the last release (see
+  [Pre-1.0](#pre-10-minorpatch-discipline-is-relaxed-for-api-additions) and
+  [No ABI stability](#no-abi-stability-across-releases-including-patches) above for how
+  to judge that).
+- The rc's own tag never carries branch/dirty metadata — an exact tag is already a named
+  checkpoint, so there's nothing left for that metadata to add (see
+  [Metadata](#metadata-branch-name-and-dirty-state) above).
+- If testing turns up a problem, fix it on the same branch and cut `v1.2.3-rc.2` against
+  the new commit. There's no limit on how many candidates a release goes through, and no
+  cost to a candidate that doesn't pan out — unlike the final release below, nothing was
+  ever gated on this tag succeeding.
+
+### Step 2: promote a candidate to the final release
+
+Once a candidate has been tested enough to trust, promote it by manually dispatching the
+release workflow and giving it that candidate's tag (e.g. `v1.2.3-rc.2`) as input. The
+workflow checks out that exact commit, re-runs the build and test steps against it, and —
+only if they succeed — creates and pushes the final `vX.Y.Z` tag at that **same commit**:
+
+```text
+1. Confirm v1.2.3-rc.2 is the candidate you want to ship (the latest one for this
+   release — see the note below on why it must be the latest).
+2. From the Actions tab, run the release workflow, providing v1.2.3-rc.2 as input.
+3. The workflow rebuilds and retests that exact commit.
+4. On success, it tags and pushes v1.2.3 at the rc.2 commit, and publishes the
+   GitHub Release (see "Embedding the version in the built binary" and
+   "Non-Conan builds" below for what that release carries).
+5. If the workflow fails, nothing is tagged — fix the problem, cut a new
+   candidate (v1.2.3-rc.3), and retry from step 1.
+```
+
+Pinning the final tag to the rc's own commit — rather than to whatever the branch tip
+has moved on to by promotion time — is what makes "tested as a candidate" and "released
+as final" mean the *same* source, byte for byte: nothing new is compiled in between, so
+promotion is a stamp of approval on something already validated, not a rebuild of
+something merely similar to it. This is also why a release should always be promoted
+from its *most recent* rc: going back and promoting an older, superseded candidate would
+silently discard whatever changes later candidates picked up, and isn't a case this
+workflow is meant to support.
+
+The existing exact-tag handling in `set_version()` (described above) picks up both the
+rc and final tags automatically, with no rc/final-specific logic of its own — as far as
+version derivation is concerned, an rc tag and a final tag are just two shapes of "exact
+tag."
+
+Ordinary commits on the branch between rc tags still get a version automatically — see
+[How the version is derived on non-tagged commits](#how-the-version-is-derived-on-non-tagged-commits)
+above for the `X.Y.Z-rc.N.dev.M+gSHA` case.
+
 ## Developing against an unreleased coro
 
 For day-to-day development on a consumer alongside coro itself, the simplest and
@@ -59,16 +286,17 @@ cd coro && conan editable add .
 ```
 
 By default, this registers the editable package under whatever version `set_version()`
-currently computes for your working tree — the same prerelease derivation described below,
-`.dirty` included, since it still runs `git describe` against the real checkout. That's a
-problem: if the consumer requires coro via a version range (e.g. `coro/[>=1.0.0]`), Conan
-silently skips the editable package for that requirement — prereleases are excluded from
-range resolution by default, and the auto-derived dev version is always a prerelease.
-Without further configuration, Conan resolves the range against a cached or remote release
-instead, and your local edits are never built at all, with no error to flag that this
-happened. A consumer that pins coro to an exact version has the same problem unless that
-exact string happens to match the editable package's current derived version, which changes
-on every commit and any uncommitted edit — not a realistic thing to keep pinned to.
+currently computes for your working tree — the same prerelease derivation described
+above, `.dirty` included, since it still runs `git describe` against the real checkout.
+That's a problem: if the consumer requires coro via a version range (e.g.
+`coro/[>=1.0.0]`), Conan silently skips the editable package for that requirement —
+prereleases are excluded from range resolution by default, and the auto-derived dev
+version is always a prerelease. Without further configuration, Conan resolves the range
+against a cached or remote release instead, and your local edits are never built at all,
+with no error to flag that this happened. A consumer that pins coro to an exact version
+has the same problem unless that exact string happens to match the editable package's
+current derived version, which changes on every commit and any uncommitted edit — not a
+realistic thing to keep pinned to.
 
 **Recommended: register the package under an explicit version instead of the auto-derived
 one**, one patch ahead of whatever's actually published, with some build-metadata suffix
@@ -201,173 +429,6 @@ partial override can scope this to coro specifically if that global effect is ev
 problem, but the synthetic-version approach above already covers the common case well
 enough that this is rarely worth reaching for.)
 
-## No ABI stability across releases, including patches
-
-coro does not guarantee binary compatibility between any two versions, patch releases
-included. SemVer's usual patch-release connotation — "drop in the new binary without
-recompiling" — doesn't hold for a template/header-heavy C++ library: consumers compile
-directly against coro's headers, so there is no stable ABI boundary to preserve in the
-first place, regardless of how carefully a given release is scoped. The version number
-tracks *source/API* compatibility only — will existing valid consumer code keep compiling
-and behaving the same — not binary interchangeability. A patch release may still change
-header-visible implementation details; only changes to the observable API surface
-(signatures, semantics) warrant a minor or major bump.
-
-Consumers who link coro as a shared library (`coro`'s default) never get a stale cached
-binary across a patch bump silently: the `coro` recipe sets
-`package_id_non_embed_mode = "patch_mode"`, so any version change — patch included —
-changes the `package_id` of anything depending on it and forces a rebuild. (This is
-distinct from Conan's global default of `minor_mode` for this scenario, which would
-otherwise treat patch bumps as binary-compatible and skip the rebuild — see
-[`package_id_embed_mode` / `package_id_non_embed_mode`](https://docs.conan.io/2/reference/conanfile/attributes.html#package-id-embed-non-embed-python-unknown-mode-build-mode).
-Consumers that embed coro statically or header-only already get this via Conan's
-`full_mode` default for embedded dependencies.)
-
-## How the version is derived on non-tagged commits
-
-Only exact-tagged commits get a clean version (`X.Y.Z`, or `X.Y.Z-rc.N` — see
-[Release candidates](#release-candidates)). Everything else — every ordinary commit on
-any branch, and any backport branch cut from an older release tag — derives its version
-automatically from git history via the recipe's `set_version()`, using
-`git describe --tags --long --dirty`:
-
-- If the nearest reachable tag is a plain `vX.Y.Z` release tag, one component is bumped
-  by one and a prerelease identifier is appended: `X.Y.(Z+1)-dev.N+gSHA` by default,
-  where `N` is the commit count since that tag and `gSHA` is the short commit hash. Some
-  bump (rather than reusing the last tag's number as-is) is required for correct SemVer
-  precedence — a prerelease of `X.Y.Z` sorts *before* the plain release `X.Y.Z`, so
-  reusing the last tag's number verbatim would make an in-progress build sort behind a
-  version already shipped. Bumping first guarantees every prerelease sorts after the
-  last real release, regardless of which component the next actual release turns out to
-  bump — patch is only the default; see
-  [Signaling a minor/major dev-build bump](#signaling-a-minormajor-dev-build-bump) for
-  how to bump minor or major instead.
-- If the nearest reachable tag is a `vX.Y.Z-rc.N` release-candidate tag, the patch is
-  **not** bumped again — the rc tag already names the pending version — and a `dev.M`
-  identifier is appended to it instead: `X.Y.Z-rc.N.dev.M+gSHA`, where `M` is the commit
-  count since the rc tag. This still sorts correctly: SemVer gives a prerelease with more
-  dot-separated fields higher precedence than a prefix-equal one with fewer, so
-  `X.Y.Z-rc.N.dev.M` always sorts after `X.Y.Z-rc.N` itself.
-- If the working tree has uncommitted changes, `.dirty` is appended to the identifier
-  so two different uncommitted edits never collide on the same version string — this
-  matters most for editable-mode local development, where an unchanged version despite
-  changed headers would defeat `package_id_non_embed_mode = "patch_mode"` above.
-- If a branch name can be resolved (see below), it's appended to the build-metadata
-  component (the part after `+`) of either format above — `X.Y.(Z+1)-dev.N+gSHA.branchname`
-  or `X.Y.Z-rc.N.dev.M+gSHA.branchname` — so a version string alone hints at where a build
-  came from, without needing to look up `gSHA` in git first.
-
-Because `git describe` walks commit ancestry rather than global tag chronology, backport
-branches need no special-casing: branching from `v0.1.5`, committing a fix, and tagging
-`v0.1.6` there computes correctly even if a newer `v0.2.0` already exists elsewhere —
-it's simply not an ancestor of that branch.
-
-This does mean `set_version()` requires: (a) at least one reachable tag to exist at all
-(a one-time bootstrap requirement — the very first tag has to be created manually), and
-(b) enough git history to actually be present — a shallow clone (the default in many CI
-checkout actions, and possible locally too) can leave no tag reachable at all, in which
-case `set_version()` fails loudly rather than guessing a fallback version.
-
-Conan also re-evaluates the recipe later against its own cache-exported copy (e.g. when a
-consumer resolves `coro/<version>` from the cache), which never has `.git` —
-`exports_sources` only copies source files, not repository metadata. The recipe's
-`export()` method covers this: it runs right after `set_version()`'s first (real-tree)
-success and persists the computed version into `conandata.yml`'s `scm_version` key via
-[`update_conandata()`](https://docs.conan.io/2/reference/tools/files/basic.html#update-conandata),
-which — unlike `exports_sources` — is always copied into the cache. `set_version()` checks
-for that key *before* attempting `git describe` (rather than trying git first and falling
-back on failure), so every later cache-based evaluation reads the version straight back
-out of there instead of spawning an always-doomed `git` subprocess first.
-
-## Signaling a minor/major dev-build bump
-
-Bumping the patch component is only a *safe default*, not a claim about compatibility —
-it guarantees correct ordering (a dev build always sorts after the last release and
-before whatever comes next, whichever component that next release ends up bumping) but
-says nothing about what the pending change actually is. A dev build that already
-contains a breaking API change still reports itself as `X.Y.(Z+1)-dev.N+gSHA`, which
-looks minor/patch-compatible with the last release. This is consistent with SemVer
-itself — a prerelease's core version number was never meant to be a compatibility
-promise about its own content ([spec item 9](https://semver.org/#spec-item-9)) — but it's
-a real trap for anyone who's opted a version range into `resolve_prereleases=True`
-(see above): a range like `coro/[~1.2]` would happily match a `1.2.4-dev.N` build that's
-actually heading toward a breaking `2.0.0`.
-
-To signal the correct component, add a tracked `conandata.yml` at the repo root:
-
-```yaml
-next_bump: minor  # or "major"; omit the key, or set "patch", for the default
-```
-
-`set_version()` reads `next_bump` (defaulting to `"patch"` when the key or the file is
-absent) and bumps that component instead: `minor` produces `X.(Y+1).0-dev.N+gSHA`,
-`major` produces `(X+1).0.0-dev.N+gSHA`. It's only consulted on this branch — exact tags
-(release or rc) and the rc-tag dev-build branch above ignore it entirely, since those
-already name their target version unambiguously.
-
-This is deliberately a manual, low-ceremony signal rather than something derived
-automatically (e.g. by scanning commit messages for a Conventional Commits
-`BREAKING CHANGE:`/`feat:` marker): set it once when starting work you already know is
-minor/major-worthy, and reset it to `patch` (or remove the key) once the real tag lands.
-There's no enforcement if you forget — the worst case is that dev builds keep bumping the
-wrong component until someone notices, which only affects the version *string* of
-unreleased, not-yet-tagged builds. That's judged not worth solving with a commit hook or
-CI check: the blast radius is cosmetic and self-corrects at the next real tag.
-
-`conandata.yml` is also where `export()` persists the computed `scm_version` fallback
-(see above) — `update_conandata()` merges rather than overwrites, and only ever writes to
-the *exported cache copy*, never back into this tracked file, so the two uses coexist
-without conflict.
-
-## Release candidates
-
-Cutting a release candidate is a deliberate, named checkpoint — the same ceremony as
-cutting a final release tag, just earlier and on any branch:
-
-```bash
-git tag v1.2.3-rc.1
-```
-
-The numeric identifier is dot-separated (`rc.1`, not `rc1`) so it compares numerically
-per [SemVer's prerelease precedence rules](https://semver.org/#spec-item-11) —
-`rc.2` sorts before `rc.10` — the same reason the `dev.N` identifier above is
-dot-separated too. An exact rc tag produces a clean `X.Y.Z-rc.N` version with no
-build metadata, identical in spirit to a final release tag: by the time something is
-stable enough to name and hand to testers, it's no longer "an experimental build that
-needs tracing back to a branch," so there's nothing useful for branch/commit metadata to
-add. Bump `N` (`v1.2.3-rc.2`, `v1.2.3-rc.3`, ...) each time a new candidate is cut for
-the same target release; there's no automatic rule for *when* to cut one — that's a
-judgment call, not derived from commit count.
-
-Once testing passes, merge the branch back and tag the final `v1.2.3` release as usual;
-the existing exact-tag handling picks it up with no rc-specific logic involved.
-
-Ordinary commits on the branch between rc tags still get a version automatically — see
-the `X.Y.Z-rc.N.dev.M+gSHA` case above.
-
-## Metadata: branch name and dirty state
-
-The `+gSHA` build-metadata component on non-tagged versions can carry two more
-dot-separated fields, each added only when resolvable — the whole component is
-diagnostic/informational and never affects version precedence or Conan resolution
-([SemVer spec item 10](https://semver.org/#spec-item-10)):
-
-- **Branch name.** Resolved in order: the CI-provided ref (`GITHUB_HEAD_REF` for PR
-  builds, falling back to `GITHUB_REF_NAME` for direct branch builds — coro is hosted on
-  GitHub, so no other CI provider needs to be special-cased), then `git branch
-  --show-current` for local builds. Sanitized to SemVer's build-metadata charset
-  (`[0-9A-Za-z-]`, so e.g. `feature/cool-thing` becomes `feature-cool-thing`) and
-  truncated to 12 characters. If neither source resolves — a detached-HEAD checkout of a
-  bare commit with no CI context — the field is simply omitted rather than guessed.
-  `gSHA` alone already makes every build fully traceable via `git log`/`git branch
-  --contains`; the branch name is a convenience on top of that, not a second source of
-  truth, so it's fine for it to be best-effort rather than required.
-- **Dirty state.** `.dirty` is appended when the working tree has uncommitted changes,
-  as already covered above.
-
-Exact tags (`vX.Y.Z` and `vX.Y.Z-rc.N`) never carry this metadata — a named, tagged
-checkpoint doesn't need it, the tag itself is the identifying information.
-
 ## Embedding the version in the built binary
 
 The version is also made available to the C++ build itself (e.g. for a `--version`
@@ -395,9 +456,10 @@ Conan is not expected to work — there is no path that starts from a raw clone.
 materializing coro *and* its transitive dependencies as a self-contained, already-built
 folder (including any generated version/config files) — used two ways:
 
-- Run by a GitHub release job against an exact release tag and published as a tarball,
-  for consumers who'd rather just download a finished, non-Conan copy of a specific
-  version than run Conan themselves.
+- Run by the release workflow against the exact release tag it just created (see
+  [Cutting a release](#cutting-a-release) above) and published as a tarball on the
+  GitHub Release, for consumers who'd rather just download a finished, non-Conan copy of
+  a specific version than run Conan themselves.
 - Run locally by a consumer who wants a non-Conan copy of a version that doesn't have a
   published release tarball, or who has some other specific reason not to use one of
   the published tarballs.

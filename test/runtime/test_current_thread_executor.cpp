@@ -220,7 +220,7 @@ struct TimerFuture {
 
 } // namespace
 
-// --- Ready queue (ported from SingleThreadedExecutorTest) ---
+// --- Ready queue ---
 
 TEST(CurrentThreadExecutorTest, EmptyReturnsFalse) {
     auto h = make_executor();

@@ -170,7 +170,7 @@ Build and run `tcp_echo_client` from the main coro build (it uses the desktop ep
 make -j$(nproc) tcp_echo_client
 
 # Connect to the Pico — replace 192.168.1.42 with the actual IP
-./tcp_echo_client 192.168.1.42 8080 "hello pico"
+./tcp_echo_client "hello pico" 0 192.168.1.42 8080   # message, threads (0 = all cores), host, port
 ```
 
 You will see 10 client connections open, each sending 5 messages with randomised delays, and the Pico serial output logging each echo.

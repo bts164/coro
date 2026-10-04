@@ -1,4 +1,5 @@
 site_name: C++ Coro Library
+site_url: https://bts164.github.io/coro/
 docs_dir: doc
 exclude_docs: |
   pdf/
