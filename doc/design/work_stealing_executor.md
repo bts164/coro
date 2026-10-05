@@ -495,8 +495,40 @@ below for a full description of how it works and what changes when the time come
 
 ### Injection Queue
 
-Unchanged: `std::deque<shared_ptr<Task>>` protected by `m_mutex`. Remote wakers and
-`schedule()` calls push here. Workers drain it under the lock.
+A `std::deque<TaskBase*>` protected by `m_mutex`. Remote wakers, `schedule()` calls from
+non-worker threads, and local-queue overflow push here. Workers pop from it under the lock.
+
+The queue's length is also published in `std::atomic<std::size_t> m_injection_len`,
+written only under `m_mutex`. A worker whose local queue is empty reads it first and
+takes the lock only when it is non-zero. Tokio's inject queue does the same with its
+`len: AtomicUsize` and `is_empty()`.
+
+A zero read can be stale, so it is used only where a miss is harmless: Step 2 of the
+worker loop and the re-check after a steal sweep. The check before parking still takes
+`m_mutex` after the idle bit is set. A push that races with a lock-free read is
+therefore found before the worker sleeps, or its `notify_if_needed()` sees the idle bit.
+
+With the fixed-capacity local run queue (`CORO_USE_LOCAL_RUN_QUEUE`), Step 2 takes a
+batch instead of one task. The first task runs immediately and the rest are pushed onto
+the worker's local queue. The batch size follows Tokio's `Core::next_task()`:
+
+```cpp
+cap  = min(local.remaining_slots(), local.max_capacity() / 2);
+want = max(1, min(injection_len / num_workers + 1, cap));
+```
+
+The `1/num_workers` share leaves work for the other workers. The half-capacity limit
+keeps the batch in the half of the ring that overflow never spills back to the
+injection queue. The other injection-queue pops (after a steal sweep, before parking)
+still take one task.
+
+!!! note "NOTE: why Step 2 reads the length lock-free and pops in batches"
+    With the owned tasks sharded, a profile of `SkynetJoinTest.Stealing` put 36% of
+    samples on waiting for, or waking waiters of, `m_mutex` in Step 2. Adding the
+    lock-free length test alone moved that only to 25%, still at the Step 2 lock, so
+    the queue was not empty. The likely source is a fan-out workload overflowing the
+    256-slot local queues: each overflow spills a batch into the injection queue, and
+    workers were then taking the lock once per task to get them back.
 
 ### Worker Affinity
 
@@ -512,6 +544,43 @@ warm in L1/L2 and avoiding an injection-queue lock acquisition on the hot wakeup
 
 A single shared atomic `std::atomic<int> m_searching{0}` tracks the number of workers
 currently performing a steal sweep. No per-worker state is needed.
+
+### Owned tasks
+
+The executor holds one `shared_ptr` to every live task from `schedule()` until `poll()`
+returns done. Run queues hold raw `TaskBase*`, so this reference is what keeps a
+suspended task alive.
+
+The references live in `detail::OwnedTasks` (`include/coro/detail/owned_tasks.h`), which
+follows Tokio's `OwnedTasks` / `ShardedList`: an array of shards, each an intrusive
+doubly-linked list behind its own `std::mutex`.
+
+| Aspect | Choice |
+|---|---|
+| Shard count | `min(65536, bit_ceil(workers) * 4)`, the rule Tokio uses |
+| Shard selection | Hash of the task's address. Tokio uses its task ID; coro tasks have none, and the address is fixed for the task's lifetime |
+| Links | `TaskBase::owned_prev` / `owned_next`, stored in the task |
+| Strong reference | `TaskBase::owned_self`, stored in the task and cleared on removal |
+| Insert / remove | Lock one shard, a few pointer writes, no allocation |
+
+Storing the strong reference in the task makes a deliberate `shared_ptr` cycle. It is
+broken by `OwnedTasks::remove()` when the task finishes, or by `~OwnedTasks()` at
+executor shutdown for tasks that never finished. Both release the reference after
+dropping the shard lock, so task and user destructors never run under it.
+
+Two things Tokio has are left out because nothing in coro reads them: the live-task
+counter and the `closed` flag that rejects spawns during shutdown.
+
+!!! note "NOTE: why the owned tasks are sharded"
+    The first version was one `std::unordered_set<shared_ptr<TaskBase>>` behind one
+    mutex. Every spawn and every completion on every worker took that lock. A
+    frame-pointer profile of `SkynetJoinTest.Stealing` attributed 79% of samples to
+    waiting on that mutex or waking its waiters, with about 7.5 s of system time against
+    2.5 s of user time for 1.25 s of wall time.
+
+!!! tip "TODO: `WorkSharingExecutor` and `CurrentThreadExecutor` still use a single set"
+    `CurrentThreadExecutor` has no contention to remove, but the intrusive list would
+    still save it a hash-table insert and erase per task.
 
 ---
 

@@ -71,6 +71,7 @@ public:
         if (this != &other) {
             close();
             m_cancelOnDestroy = other.m_cancelOnDestroy;
+            m_finished        = other.m_finished;
             m_state           = std::move(other.m_state);
             m_task_ref        = std::move(other.m_task_ref);
         }
@@ -189,6 +190,9 @@ public:
         // (mark_done sets terminated without setting result, so checking result alone
         // would incorrectly leave a cancelled void task as Pending indefinitely).
         if (m_state->terminated) {
+            // Lets close() skip the cancel-and-register protocol: there is nothing
+            // left to cancel or to wait for.
+            m_finished = true;
             if (m_state->exception)
                 return PollError(m_state->exception);
             if constexpr (std::is_void_v<T>) {
@@ -216,17 +220,26 @@ private:
     // already ran it) is a no-op.
     void close() {
         if (!m_state) return;  // moved-from or already cleaned up
-        if (m_cancelOnDestroy) {
-            cancel();
-        }
-        if (detail::t_current_coro) {
-            detail::t_current_coro->add_child(m_task_ref);
+        // A handle that already saw the task terminate (the usual spawn-then-co_await
+        // case) has nothing to cancel, and the scope has nothing to wait for: its own
+        // sweep treats `terminated` as done (TaskBase::is_complete()). Skipping both
+        // keeps the parent's scope empty, so its poll() takes the no-children path.
+        if (!m_finished) {
+            if (m_cancelOnDestroy) {
+                cancel();
+            }
+            if (detail::t_current_coro) {
+                detail::t_current_coro->add_child(m_task_ref);
+            }
         }
         m_state.reset();
         m_task_ref = {};
     }
 
     bool m_cancelOnDestroy = true;
+    // Set by poll() once it has observed the task's terminal state. Only this handle
+    // reads or writes it, so it needs no lock.
+    bool m_finished = false;
     // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same TaskImpl
     // allocation as m_task_ref. Provides typed access to the result and waker slot.
     detail::Rc<detail::TaskState<T>> m_state;

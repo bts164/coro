@@ -180,8 +180,8 @@ futures can be cooperatively cancelled before the stream frame is destroyed.
 coroutine's execution. It is owned directly by the `Coro<T>` (or `CoroStream<T>`) object
 (value member, not `unique_ptr`).
 
-`CoroutineScope` contains a `std::mutex` which is not movable, but `Coro<T>` must be
-movable to be returned from coroutine functions and moved into a `Task`. This is safe
+`Coro<T>` must be movable to be returned from coroutine functions and moved into a
+`Task`, so `CoroutineScope` is move-only with defaulted move operations. Moving it is safe
 because:
 
 - Moves of `Coro<T>` only occur **before the first `poll()` call** — when the return value
@@ -191,9 +191,18 @@ because:
 - Before first `poll()`, `m_pending` is always empty. No `JoinHandle` destructor has fired,
   so the scope has no state that depends on its address.
 
-`CoroutineScope` therefore implements a custom move constructor and move-assignment that
-**moves `m_pending` and default-constructs a fresh mutex** at the destination. The source
-mutex is left in its default state and destroyed with the moved-from object.
+`CoroutineScope` holds no lock. Only the thread currently polling or destroying the owning
+coroutine touches `m_pending`: children are registered through `t_current_coro` during a
+synchronous `resume()` or `destroy()`, and the sweep runs from `poll()`. A child finishing
+on another thread fires the waker stored on its own `TaskState` and never reaches into the
+parent's scope. When the scope is empty, which is the common case, `poll()` skips the
+sweep and does not build a weak waker at all.
+
+A `JoinHandle` whose `poll()` has already seen the task terminate does not register on
+destruction, and does not call `cancel()` either. That keeps the scope empty for the
+usual spawn-then-`co_await` pattern. Nothing is lost: the sweep itself treats a
+terminated task as done, so the parent would have dropped the entry on its next `poll()`
+anyway. A handle dropped without being awaited to completion still registers.
 
 ### Thread-local current coroutine
 

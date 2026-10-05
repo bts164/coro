@@ -2,6 +2,7 @@
 
 #include <coro/runtime/executor.h>
 #include <coro/runtime/io_driver.h>
+#include <coro/detail/owned_tasks.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/work_stealing_deque.h>
@@ -17,7 +18,6 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 namespace coro {
@@ -162,6 +162,10 @@ private:
     // Same category 3 reasoning as m_local_queues.
     std::deque<detail::TaskBase*>             m_injection_queue;
     std::mutex                                m_mutex; ///< Guards m_injection_queue and m_stop.
+    /// m_injection_queue.size(), published so workers can skip m_mutex when the queue
+    /// is empty. Written only under m_mutex; read without it. A zero read may be stale,
+    /// so it must never be the last check before parking — that one takes m_mutex.
+    std::atomic<std::size_t>                  m_injection_len{0};
     bool                                      m_stop{false};
 
     // --- Construction barrier ---
@@ -186,9 +190,9 @@ private:
     static constexpr unsigned kEventInterval = IoDriverParker::kDefaultEventInterval;
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
-    // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
-    std::mutex                                                               m_owned_mutex;
-    std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
+    // Inserted in schedule(), removed after poll() returns true (task reached terminal state).
+    // Sharded so that workers spawning and completing tasks do not serialize on one lock.
+    detail::OwnedTasks m_owned_tasks;
 };
 
 } // namespace coro

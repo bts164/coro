@@ -162,7 +162,7 @@ public:
             }
 
             // Step 3: drain all scope children (pre-existing + newly registered above).
-            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
+            if (!m_scope.empty() && m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             return PollDropped;
         }
@@ -183,7 +183,7 @@ public:
                     return std::optional<T>(std::move(val));
                 }
             }
-            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
+            if (!m_scope.empty() && m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             auto& p = m_handle.promise();
             if (p.m_exception)
@@ -226,14 +226,14 @@ public:
                     return std::optional<T>(std::move(val));
                 }
             }
-            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
+            if (!m_scope.empty() && m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             if (promise.m_exception)
                 return PollError(promise.m_exception);
             return std::optional<T>(std::nullopt);
         }
 
-        if (m_scope.has_pending())
+        if (!m_scope.empty())
             m_scope.set_drain_waker(ctx.get_weak_waker());
 
         return PollPending;

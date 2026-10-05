@@ -222,7 +222,7 @@ public:
             }
 
             // Step 3: drain all scope children (pre-existing + newly registered above).
-            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
+            if (!m_scope.empty() && m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             return PollDropped;
         }
@@ -232,7 +232,7 @@ public:
 
         // Frame already ran to completion but children were still draining — re-check now.
         if (m_handle.done()) {
-            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
+            if (!m_scope.empty() && m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
             Destroy cleanup(this);
             auto& p = m_handle.promise();
@@ -267,7 +267,7 @@ public:
 
         if (m_handle.done()) {
             // Wait for any children spawned during this execution before completing.
-            if (m_scope.set_drain_waker(ctx.get_weak_waker()))
+            if (!m_scope.empty() && m_scope.set_drain_waker(ctx.get_weak_waker()))
                 return PollPending;
 
             Destroy cleanup(this);
@@ -284,7 +284,7 @@ public:
 
         // Coroutine suspended — check if pending children need the waker updated.
         // (Children drain in parallel with the coroutine's own suspension.)
-        if (m_scope.has_pending())
+        if (!m_scope.empty())
             m_scope.set_drain_waker(ctx.get_weak_waker());
 
         return PollPending;

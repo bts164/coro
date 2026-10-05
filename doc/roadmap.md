@@ -24,6 +24,39 @@ such machines.)
       This has no worker limit and wakes workers in LIFO order (warmer caches), but
       it is a larger rewrite of the park/notify protocol.
 
+## Move the `block_on` wait out of the task
+
+Every task carries a `std::condition_variable` (`TaskStateBase::cv`, 48 bytes), and
+every terminal method on `TaskState` calls `cv.notify_all()`. The only waiter is the
+thread inside `Runtime::block_on()`, and only for the root task: `WorkStealingExecutor`
+and `WorkSharingExecutor` implement `wait_for_completion()` as
+`state.wait_until_done()`. Worker threads never wait on it, `JoinHandle` uses the waker
+slot, and `CurrentThreadExecutor` runs its poll loop on the calling thread instead.
+
+!!! tip "TODO: wait for the root task through a waker, not a per-task condition variable"
+    `block_on()` keeps a mutex, a condition variable and a `done` flag on its own
+    stack and installs a waker on the root task's state that sets the flag and
+    notifies. The task already has a waker slot for this kind of notification. An
+    alternative is to hold the pair in the executor, since a `block_on()` call waits
+    for one task at a time.
+
+    What changes:
+
+    - `TaskStateBase` loses `cv` and `wait_until_done()`, and the four
+      `cv.notify_all()` calls in `task_state.h` go away.
+    - The rule that every terminal method must set `terminated` and notify under the
+      same lock (the race-condition note in `task_state.h`) no longer has to be upheld
+      in four places. The lost-wakeup reasoning moves to the one new waker.
+    - `Executor::wait_for_completion()` takes whatever the new wait object is. All
+      three executors and the Pico path are touched, and `CurrentThreadExecutor`'s
+      poll loop still needs a way to see that the root task finished.
+
+    This removes code and per-task state; it is not expected to show up in a
+    benchmark. A `TaskImpl<Coro<size_t>>` is 384 bytes and is rounded up to a multiple
+    of 64 by `alignas(64)` on `scheduling_state`, so dropping 48 bytes may not shrink
+    the allocation at all. Get a layout dump (`pahole`) first if size is the goal; see
+    the note on task size in `doc/design/task_and_executor.md`, "Internal Task types".
+
 ## Migrate error-returning futures to `std::expected`
 
 The library's error handling policy is `std::expected<T, E>` as the default, with

@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <memory>
 #include <vector>
-#include <coro/detail/mutex.h>
 
 namespace coro::detail {
 
@@ -27,11 +26,9 @@ namespace coro::detail {
  * completes) are stored as `weak_ptr<Waker>` on the child's `TaskState`, not here,
  * so no reference cycle is created. See doc/task_ownership.md.
  *
- * `CoroutineScope` contains a `std::mutex` and is therefore not copyable. It is movable
- * via a custom move constructor that moves the pending-child list and default-constructs
- * a fresh mutex at the destination. Moves only occur before the first `poll()` call
- * (when `Coro<T>` is returned from a coroutine function and moved into a `Task`), at
- * which point `m_pending` is always empty and the mutex is in its default unlocked state.
+ * `CoroutineScope` is move-only. Moves only occur before the first `poll()` call (when
+ * `Coro<T>` is returned from a coroutine function and moved into a `Task`), at which
+ * point `m_pending` is always empty.
  *
  * ### Registration
  * When a `JoinHandle` destructor fires while `t_current_coro` is non-null, it calls
@@ -43,22 +40,31 @@ namespace coro::detail {
  * finish. Once all children are done, `poll()` delivers `PollDropped`.
  *
  * ### Thread safety
- * All methods are protected by an internal mutex — safe for the multi-threaded executor.
+ * The scope has no lock. `m_pending` is only ever touched by the thread that is currently
+ * polling or destroying the owning coroutine, and the executor never runs one task on two
+ * threads at once:
+ * - `add_child()` is reached only through `t_current_coro`, which points at this scope
+ *   only inside a `CurrentCoroGuard` that spans a synchronous `resume()` or `destroy()`
+ *   of the owning coroutine on the current thread.
+ * - `empty()`, `has_pending()` and `set_drain_waker()` are called only from the owning
+ *   coroutine's `poll()`.
+ * - A child that finishes on another thread never touches its parent's scope. It fires
+ *   the waker stored on its own `TaskState`, under its own mutex.
+ * A task may be polled on a different worker each time; the executor's hand-off between
+ * workers orders those accesses, as it does for the coroutine frame itself.
+ *
+ * Potential race: this relies on `t_current_coro` being read on the thread that set it.
+ * Fiber code that drops a `JoinHandle` after the fiber has migrated to another worker
+ * must re-read the thread-local; if the compiler reused a thread-local address computed
+ * before the stack switch, `add_child()` would run against a scope another thread is
+ * polling, unsynchronized.
  */
 class CoroutineScope {
 public:
     CoroutineScope() = default;
 
-    // Move constructor: moves pending children, default-constructs a fresh mutex.
-    // Safe because moves only happen before first poll() when m_pending is always empty.
-    CoroutineScope(CoroutineScope&& other) noexcept
-        : m_pending(std::move(other.m_pending)) {}
-
-    CoroutineScope& operator=(CoroutineScope&& other) noexcept {
-        if (this != &other)
-            m_pending = std::move(other.m_pending);
-        return *this;
-    }
+    CoroutineScope(CoroutineScope&&) noexcept            = default;
+    CoroutineScope& operator=(CoroutineScope&&) noexcept = default;
 
     CoroutineScope(const CoroutineScope&)            = delete;
     CoroutineScope& operator=(const CoroutineScope&) = delete;
@@ -70,15 +76,22 @@ public:
      * The executor's owned map keeps the task alive — no ownership transfer is needed.
      */
     void add_child(Weak<TaskBase> task) {
-        std::lock_guard lock(m_mutex);
         m_pending.push_back(std::move(task));
     }
+
+    /**
+     * @brief Returns `true` if no child is registered, without sweeping.
+     *
+     * The common case: most coroutines never drop a `JoinHandle`. `poll()` checks this
+     * first so that it builds a weak waker only when there is a child to hand it to.
+     */
+    bool empty() const noexcept { return m_pending.empty(); }
 
     /**
      * @brief Sweeps completed or expired children and returns `true` if any remain.
      */
     bool has_pending() {
-        std::lock_guard lock(m_mutex);
+        if (m_pending.empty()) return false;
         m_pending.erase(
             std::remove_if(m_pending.begin(), m_pending.end(),
                 [](const Weak<TaskBase>& wp) {
@@ -104,7 +117,7 @@ public:
      * @return `true` if at least one child is still pending after the double-sweep.
      */
     bool set_drain_waker(Weak<Waker> waker) {
-        std::lock_guard lock(m_mutex);
+        if (m_pending.empty()) return false;
         auto is_done = [](const Weak<TaskBase>& wp) {
             auto t = wp.lock();
             return !t || t->is_complete();
@@ -120,7 +133,6 @@ public:
     }
 
 private:
-    detail::Mutex            m_mutex;
     std::vector<Weak<TaskBase>> m_pending;
 };
 

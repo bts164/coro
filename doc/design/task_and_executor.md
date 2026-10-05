@@ -386,6 +386,27 @@ executor->schedule(std::shared_ptr<TaskBase>(impl));  // inserts into executor's
 return StreamHandle<T>(std::move(sh_ptr));             // queue-access ref only
 ```
 
+!!! tip "PERF: a task is 384 bytes before the coroutine frame"
+    `sizeof(TaskImpl<Coro<size_t>>)` is 384 bytes on x86-64 GCC, for a 40-byte future.
+    In the Skynet stress test, which keeps about a million tasks alive, 18% to 37% of
+    samples are kernel page faults under the allocator, and those scale with bytes per
+    task. Contributors, from reading the headers (not yet confirmed with a layout dump):
+
+    - `alignas(64)` on `scheduling_state`, a field in the middle of `TaskBase`. It
+      pads on both sides and rounds the whole object up to a multiple of 64. Aligning
+      the object and placing the scheduling state first would give the same
+      false-sharing protection with less padding. Tokio aligns the whole task cell.
+    - `TaskStateBase::cv` (48 bytes), waited on only by `block_on()`. See
+      `doc/roadmap.md`, "Move the `block_on` wait out of the task".
+    - `TaskStateBase::mutex` (40 bytes). Tokio uses one atomic state word instead;
+      here that needs a profile to justify it under the mutex-over-atomics convention.
+    - `std::string name` (32 bytes), empty for most tasks.
+    - A result slot separate from the future. Tokio stores the output in the storage
+      the finished future occupied.
+    - The `OwnedTasks` links and self-reference (32 bytes).
+
+    Run `pahole` on `libcoro.so` before changing anything.
+
 ### Abstract Executor interface
 
 ```cpp
@@ -664,6 +685,11 @@ configure a name or buffer size before spawning.
 `block_on` runs the future on the calling thread and blocks until completion. This is the
 intended entry point from `main()`. With a `CurrentThreadExecutor`, it also turns the I/O
 driver on that thread whenever no task is ready.
+
+On the multi-threaded executors the calling thread sleeps on a condition variable stored
+in the root task's state. Every task carries that condition variable although only the
+root task's is ever waited on; `doc/roadmap.md`, "Move the `block_on` wait out of the
+task", plans to move it out.
 
 ### co_await inside Coro — await_transform
 

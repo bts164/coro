@@ -113,6 +113,23 @@ public:
      */
     Executor* owning_executor = nullptr;
 
+#ifndef CORO_PICO
+    /**
+     * @brief Intrusive membership in an executor's `OwnedTasks` (detail/owned_tasks.h).
+     *
+     * `owned_self` is the strong reference the list holds on this task, stored in
+     * the task itself so that linking allocates nothing; it is non-null exactly
+     * while the task is linked. This is a deliberate reference cycle, broken by
+     * `OwnedTasks::remove()` when the task reaches a terminal state, or by
+     * `~OwnedTasks()`.
+     *
+     * All three are read and written only under the task's shard mutex.
+     */
+    TaskBase*                 owned_prev = nullptr;
+    TaskBase*                 owned_next = nullptr;
+    std::shared_ptr<TaskBase> owned_self;
+#endif
+
     /**
      * @brief Advances the inner future by one step.
      * @return `true` if the task has reached a terminal state (Ready, Error, or Dropped);

@@ -266,6 +266,81 @@ represents as a `Future` (an `IsrEvent`, a channel receive, `sleep_for`, ...)
 — the fiber-land `co_await`, and what makes the wakeup event-driven rather
 than polled on a fixed cadence.
 
+### Thread-locals and worker migration
+
+A fiber is an ordinary spawned task, so under `WorkStealingExecutor` it can be
+polled on a different worker thread each time. Its stack moves with it. That
+conflicts with an assumption compilers make about thread-locals: a function
+runs on one thread from entry to exit, so the address of a thread-local can be
+computed once and reused for the rest of the function, including across calls
+to opaque functions. A fiber function that reads a thread-local, suspends, is
+resumed on another worker and reads the same thread-local again may therefore
+read the *previous* worker's copy.
+
+The access sites in the fiber bridge, checked against that hazard:
+
+| Site | Runs on | Thread-local read after a switch? | Exposed? |
+|---|---|---|---|
+| `FiberFuture<T>::poll()` | the worker's own stack | Yes, to restore the saved values, but `switch_context()` returns to `poll()` on the same thread that called it | No |
+| `fiber_yield()` | the fiber's stack | No, it reads all three before switching and nothing after | No |
+| `trampoline()` | the fiber's stack | No, it reads `t_fiber_start_arg` once on first entry | No |
+| `fiber_await()` | the fiber's stack | Yes, it reads `t_current_fiber_ctx` on every loop iteration, with `fiber_yield()` in between | **Yes** |
+
+!!! danger "WARNING: `fiber_await()` may poll with a stale `Context` after migration"
+    `fiber_await()` is a header template, and `t_current_fiber_ctx` is declared
+    in the same header, so the compiler is free to compute the thread-local's
+    address once and reuse it after `fiber_yield()` returns. If the fiber was
+    resumed on a different worker, the next `future.poll()` then receives
+    whatever `Context*` the previous worker's `t_current_fiber_ctx` holds at
+    that moment: null, or the `Context` of an unrelated fiber. Not yet
+    confirmed against generated code, and it cannot occur on
+    `CurrentThreadExecutor` or the Pico backend, where there is one thread.
+
+Boost.Fiber has the same exposure (its `work_stealing` and `shared_work`
+algorithms migrate fibers between threads) and avoids it by construction:
+
+- No thread-local for the current fiber appears in any header. The pointer
+  lives in `context.cpp` and is reachable only through `context::active()`,
+  which is declared in the header and defined in the compiled library.
+- Because the caller never sees a thread-local address, it has nothing to
+  cache. Each call computes the address again on whichever thread is running.
+- Everything else hangs off the fiber instead of the thread. The scheduler is
+  reached as `context::active()->get_scheduler()`, and migration re-points the
+  scheduler stored in the context. One thread-local is all there is to get
+  right.
+- Fiber bodies are told not to rely on thread-local storage across a
+  suspension; `fiber_specific_ptr` is the replacement.
+
+!!! tip "TODO: move the fiber thread-locals behind an out-of-line accessor"
+    Make the four `t_current_fiber_*` / `t_fiber_start_arg` variables `static`
+    in `src/task/fiber.cpp` and expose a non-inline accessor for the current
+    `Context*`, marked `noinline` so LTO cannot fold it back into the caller.
+    `fiber_await()` calls it on each loop iteration; `FiberFuture<T>::poll()`
+    saves and restores through out-of-line helpers. This also removes the
+    per-access initialisation wrapper that an `extern thread_local` with a
+    hidden initialiser can incur.
+
+The same rule applies to fiber bodies: user code running in a fiber must not
+hold a reference or pointer to a thread-local across `fiber_await()`, and
+should not assume two reads of the same thread-local on either side of one
+see the same thread's copy.
+
+`t_current_coro` (`coro_scope.h`) is deliberately left as a header-visible
+thread-local. It is read and written on every coroutine poll, and coroutine
+code cannot migrate inside a `CurrentCoroGuard`, which spans a synchronous
+`resume()` or `destroy()`. `FiberFuture<T>::poll()` installs no guard, so a
+`JoinHandle` dropped in a fiber body normally sees a null `t_current_coro`
+and registers with no scope.
+
+!!! warning "Potential race: stale `t_current_coro` in a fiber body"
+    `CoroutineScope` holds no lock (see
+    [coroutine_scope.md](coroutine_scope.md)). If a fiber function drops a
+    `JoinHandle` before and after a `fiber_await()`, and the compiler reuses
+    the `t_current_coro` address across the suspension, the second drop reads
+    the previous worker's pointer. If that worker is inside a coroutine
+    `resume()` at that moment, `add_child()` runs against a scope another
+    thread is using, unsynchronized. Narrow, and not observed.
+
 ### `spawn_fiber()` — the user-facing entry point, modeled on `spawn_blocking`
 
 A fiber's stack is exactly as non-cancellable as a `spawn_blocking` thread,
@@ -691,7 +766,12 @@ moving parts on top.
 
 ## Open Questions
 
-None currently open — cancellation, exception propagation, stack allocation
-strategy, the MSP/PSP stack model, and the testing strategy for the Pico
-backend's `switch_context()` have all been resolved above. This section is
-kept as a placeholder for whatever comes up during Phase 2 stubbing.
+Cancellation, exception propagation, stack allocation strategy, the MSP/PSP
+stack model, and the testing strategy for the Pico backend's
+`switch_context()` have all been resolved above.
+
+One is open: whether GCC actually caches the address of `t_current_fiber_ctx`
+across `fiber_yield()` inside `fiber_await()` on the desktop backend. See
+[Thread-locals and worker migration](#thread-locals-and-worker-migration).
+Inspecting the generated code for a `fiber_await()` instantiation settles it;
+the accessor change described there removes the question either way.

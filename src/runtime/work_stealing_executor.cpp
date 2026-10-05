@@ -37,18 +37,21 @@ using TaskSP = detail::TaskBase*;
 // Overflow handler for Local<TaskSP>::push_or_overflow().
 // Moves spilled tasks directly into the injection queue — no boxing needed.
 struct InjectionOverflow {
-    std::mutex&           mutex;
-    std::deque<TaskSP>&   queue;
+    std::mutex&               mutex;
+    std::deque<TaskSP>&       queue;
+    std::atomic<std::size_t>& len; ///< m_injection_len; written under `mutex`.
 
     void push(TaskSP task) {
         std::lock_guard lock(mutex);
         queue.push_back(std::move(task));
+        len.store(queue.size(), std::memory_order_release);
     }
 
     void push_batch(TaskSP* tasks, std::size_t n) {
         std::lock_guard lock(mutex);
         for (std::size_t i = 0; i < n; ++i)
             queue.push_back(std::move(tasks[i]));
+        len.store(queue.size(), std::memory_order_release);
     }
 };
 #endif
@@ -58,7 +61,8 @@ WorkStealingExecutor::WorkStealingExecutor(Runtime* runtime, std::size_t num_thr
     m_local_queues(std::min(num_threads, MAX_WORKERS)),
 #endif
     m_runtime(runtime),
-    m_driver(runtime->io_driver())
+    m_driver(runtime->io_driver()),
+    m_owned_tasks(std::min(num_threads, MAX_WORKERS))
 {
     // TODO: temporary cap. m_idle_mask is one uint64_t, so extra workers are dropped
     // rather than failing construction on >64-core machines, where the default
@@ -103,10 +107,7 @@ void WorkStealingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
-    {
-        std::lock_guard lock(m_owned_mutex);
-        m_owned_tasks.insert(task);
-    }
+    m_owned_tasks.insert(task);
     enqueue(std::move(task));
 }
 
@@ -117,13 +118,14 @@ void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
     if (local) {
         // Fast path: push to own local queue; spill to injection queue if full.
-        InjectionOverflow overflow{m_mutex, m_injection_queue};
+        InjectionOverflow overflow{m_mutex, m_injection_queue, m_injection_len};
         m_worker_queues[local_idx].local.push_or_overflow(task.get(), overflow);
     } else {
         // Local<T> is single-owner so we cannot push directly to another
         // worker's ring from here. All remote pushes go to the injection queue.
         std::lock_guard lock(m_mutex);
         m_injection_queue.push_back(task.get());
+        m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
     }
 #else
     if (local) {
@@ -138,6 +140,7 @@ void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
             // Remote path: injection queue.
             std::lock_guard lock(m_mutex);
             m_injection_queue.push_back(task.get());
+            m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
         }
     }
 #endif
@@ -263,12 +266,54 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 #endif
 
         // --- Step 2: injection queue ---
-        if (!task) {
+        // m_injection_len is read without the lock so that a worker whose local
+        // queue is empty does not serialize on m_mutex just to find nothing here.
+        // Potential race: a push can land right after a zero read. That is not a
+        // lost wakeup: this worker goes on to Step 4, which re-checks the queue
+        // under m_mutex after setting its idle bit, before it parks.
+        if (!task && m_injection_len.load(std::memory_order_acquire) != 0) {
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+            // Take a batch, not one task: the first is run now and the rest go onto
+            // this worker's local queue, so it does not come back to m_mutex for
+            // each of them. Sizing follows tokio's Core::next_task():
+            //  - a 1/n share of the queue (plus one), so peers get some too;
+            //  - at most half the local ring, so the batch lands in the half that
+            //    push_or_overflow() never spills back here;
+            //  - at most the free slots. Only this thread adds to its local queue
+            //    (stealers only remove), so the slots counted here are still free
+            //    when push_back() runs below, after the lock is dropped.
+            auto& local = m_worker_queues[worker_index].local;
+            detail::TaskBase* batch[detail::LOCAL_QUEUE_CAPACITY / 2];
+            std::size_t       taken = 0;
+            {
+                std::lock_guard lock(m_mutex);
+                const std::size_t len = m_injection_queue.size();
+                if (len != 0) {
+                    const std::size_t cap =
+                        std::min(local.remaining_slots(), local.max_capacity() / 2);
+                    const std::size_t want = std::max<std::size_t>(
+                        1, std::min(len / static_cast<std::size_t>(n) + 1, cap));
+                    for (; taken < want; ++taken) {
+                        batch[taken] = m_injection_queue.front();
+                        m_injection_queue.pop_front();
+                    }
+                    m_injection_len.store(m_injection_queue.size(),
+                                          std::memory_order_release);
+                }
+            }
+            if (taken != 0) {
+                task = batch[0]->shared_from_this();
+                for (std::size_t i = 1; i < taken; ++i)
+                    local.push_back(batch[i]);
+            }
+#else
             std::lock_guard lock(m_mutex);
             if (!m_injection_queue.empty()) {
                 task = std::move(m_injection_queue.front()->shared_from_this());
                 m_injection_queue.pop_front();
+                m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
             }
+#endif
         }
 
         // --- Step 3: enter searching (bounded) and steal ---
@@ -295,12 +340,14 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 #endif
                 }
 
-                // Re-check injection queue after sweep.
-                if (!task) {
+                // Re-check injection queue after sweep. Lock-free emptiness test
+                // as in Step 2; Step 4 covers a push that races with it.
+                if (!task && m_injection_len.load(std::memory_order_acquire) != 0) {
                     std::lock_guard lock(m_mutex);
                     if (!m_injection_queue.empty()) {
                         task = m_injection_queue.front()->shared_from_this();
                         m_injection_queue.pop_front();
+                        m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
                     }
                 }
 
@@ -338,6 +385,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                 if (!m_injection_queue.empty()) {
                     task = std::move(m_injection_queue.front()->shared_from_this());
                     m_injection_queue.pop_front();
+                    m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
                 }
             }
 
@@ -394,11 +442,11 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         if (done) {
             task->scheduling_state.store(
                 detail::SchedulingState::Done, std::memory_order_relaxed);
-            {
-                std::lock_guard lock(m_owned_mutex);
-                m_owned_tasks.erase(task);
-            }
-            // task.reset() here — owned map was the lifetime anchor
+            // Only the worker that polled a task to completion removes it, so no two
+            // threads remove the same task. remove() hands back the list's reference
+            // so that it is dropped here, outside the shard lock; `task` still holds
+            // one, so nothing is destroyed on this line.
+            m_owned_tasks.remove(*task).reset();
         } else {
             // Try Running → Idle.
             expected = detail::SchedulingState::Running;
