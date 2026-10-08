@@ -43,8 +43,15 @@ PicoClock::time_point PicoClock::now() noexcept {
     return time_point(duration(static_cast<rep>(time_us_64())));
 }
 
-void Runtime::add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot) {
-    m_current_thread_executor->add_timer(deadline, std::move(slot));
+detail::TimerId Runtime::add_timer(Instant deadline, detail::Weak<detail::Waker> waker) {
+    return m_current_thread_executor->add_timer(deadline, std::move(waker));
+}
+
+void Runtime::cancel_timer(detail::TimerId id) noexcept {
+    // Also reached from ~CurrentThreadExecutor(), as it destroys unfinished tasks
+    // and their futures. Its timer queue is still alive then; see the member order in
+    // current_thread_executor.h.
+    m_current_thread_executor->cancel_timer(id);
 }
 
 void Runtime::register_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker) {
@@ -73,12 +80,18 @@ Runtime::~Runtime() {
     // No explicit action needed here; member destructors fire in the right order.
 }
 
-void Runtime::add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot) {
+detail::TimerId Runtime::add_timer(Instant deadline, detail::Weak<detail::Waker> waker) {
     if (!turns_io_driver())
         throw std::logic_error(
             "coro timer: this runtime's executor never turns the IoDriver, so the "
             "timer could never fire; use Runtime(n)");
-    m_io_driver.add_timer(deadline, std::move(slot));
+    return m_io_driver.add_timer(deadline, std::move(waker));
+}
+
+void Runtime::cancel_timer(detail::TimerId id) noexcept {
+    // Must not touch m_executor: this is also reached from the executor's destructor,
+    // as it destroys unfinished tasks and their futures. m_io_driver outlives it.
+    m_io_driver.cancel_timer(id);
 }
 #endif
 

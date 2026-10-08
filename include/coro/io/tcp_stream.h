@@ -17,6 +17,8 @@
 
 #include <coro/coro.h>
 #include <coro/io/byte_buffer.h>
+#include <coro/detail/context.h>
+#include <coro/detail/poll_result.h>
 #include <coro/detail/rc.h>
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +30,136 @@
 namespace coro {
 
 class TcpListener;
-namespace detail { struct LwipTcpCtx; }
+
+namespace detail {
+
+struct LwipTcpCtx;
+
+// The non-template halves of the read and write futures below. Defined in
+// tcp_stream_lwip.cpp, which keeps the lwIP headers out of this file.
+
+/// Copies buffered bytes into `buf[filled, size)` and advances `filled`. Ready after
+/// the first chunk (`exact = false`), or once the buffer is full or the peer has
+/// closed (`exact = true`). Pending, with the context's waker stored as the
+/// connection's receive waker, when it needs bytes that haven't arrived. Bytes
+/// received before a connection error are delivered before the error is reported.
+PollResult<void> lwip_tcp_poll_read(LwipTcpCtx& tcp, std::byte* buf, std::size_t size,
+                                    std::size_t& filled, bool exact, Context& ctx);
+
+/// Queues `buf[written, size)` with lwIP as send-buffer space allows and advances
+/// `written`. Ready once everything is queued and flushed. Pending, with the
+/// context's waker stored as the connection's send waker, when the send buffer is
+/// full.
+PollResult<void> lwip_tcp_poll_write(LwipTcpCtx& tcp, const std::byte* buf, std::size_t size,
+                                     std::size_t& written, Context& ctx);
+
+/// Drops the connection's receive (or send) waker, for a future that is destroyed
+/// while pending.
+void lwip_tcp_cancel_read(LwipTcpCtx& tcp) noexcept;
+void lwip_tcp_cancel_write(LwipTcpCtx& tcp) noexcept;
+
+} // namespace detail
+
+/**
+ * @brief Future returned by `TcpStream::read()` (`Exact = false`) and `read_exact()`
+ * (`Exact = true`). Yields `{bytes_read, buf}`.
+ *
+ * Hand-written rather than a `Coro`, so a read has no coroutine frame and allocates
+ * nothing. When bytes are already buffered, the first `poll()` copies them out and
+ * returns ready with no suspension.
+ *
+ * `read()` returns after the first non-empty chunk, or 0 at EOF. `read_exact()` keeps
+ * going until the buffer is full or EOF; its progress lives in the future, so a
+ * dropped `read_exact()` loses the bytes it had already copied.
+ *
+ * Dropping it while pending is safe: the destructor takes its waker back out of the
+ * connection. It shares ownership of the connection state, so it may outlive the
+ * TcpStream, but then it never completes.
+ *
+ * Race note: lwIP callbacks run on the executor thread, never concurrently with
+ * `poll()`. Overlapping reads on one stream aren't supported: the second would
+ * replace the first's waker, and the two would split the byte stream between them.
+ */
+template<ByteBuffer Buf, bool Exact>
+class TcpReadFuture {
+public:
+    using OutputType = std::pair<std::size_t, Buf>;
+
+    TcpReadFuture(detail::Rc<detail::LwipTcpCtx> tcp, Buf buf)
+        : m_tcp(std::move(tcp)), m_buf(std::move(buf)) {}
+
+    // A moved-from future has no connection, so its destructor does nothing.
+    TcpReadFuture(TcpReadFuture&&) noexcept            = default;
+    TcpReadFuture& operator=(TcpReadFuture&&) noexcept = delete;
+
+    ~TcpReadFuture() {
+        if (m_tcp && m_waiting) detail::lwip_tcp_cancel_read(*m_tcp);
+    }
+
+    PollResult<OutputType> poll(detail::Context& ctx) {
+        auto result = detail::lwip_tcp_poll_read(*m_tcp,
+            reinterpret_cast<std::byte*>(std::ranges::data(m_buf)), std::ranges::size(m_buf),
+            m_filled, Exact, ctx);
+        m_waiting = result.isPending();
+        if (m_waiting)        return PollPending;
+        if (result.isError()) return PollError(result.error());
+        return OutputType{m_filled, std::move(m_buf)};
+    }
+
+private:
+    detail::Rc<detail::LwipTcpCtx> m_tcp;
+    Buf                            m_buf;
+    std::size_t                    m_filled  = 0;
+    // True while this future's waker may be the connection's receive waker.
+    bool                           m_waiting = false;
+};
+
+/**
+ * @brief Future returned by `TcpStream::write()`. Yields `buf` once every byte has
+ * been handed to lwIP.
+ *
+ * Hand-written for the same reason as `TcpReadFuture`: when lwIP's send buffer has
+ * room, the first `poll()` queues everything with no coroutine frame. Otherwise it
+ * keeps its progress and waits for acknowledgements to free space.
+ *
+ * Dropping it while pending is memory-safe, but may leave part of the buffer sent.
+ *
+ * Race note: as for `TcpReadFuture`. Overlapping writes on one stream aren't
+ * supported: the second would replace the first's waker, and their bytes could
+ * interleave.
+ */
+template<ByteBuffer Buf>
+class TcpWriteFuture {
+public:
+    using OutputType = Buf;
+
+    TcpWriteFuture(detail::Rc<detail::LwipTcpCtx> tcp, Buf buf)
+        : m_tcp(std::move(tcp)), m_buf(std::move(buf)) {}
+
+    TcpWriteFuture(TcpWriteFuture&&) noexcept            = default;
+    TcpWriteFuture& operator=(TcpWriteFuture&&) noexcept = delete;
+
+    ~TcpWriteFuture() {
+        if (m_tcp && m_waiting) detail::lwip_tcp_cancel_write(*m_tcp);
+    }
+
+    PollResult<Buf> poll(detail::Context& ctx) {
+        auto result = detail::lwip_tcp_poll_write(*m_tcp,
+            reinterpret_cast<const std::byte*>(std::ranges::data(m_buf)),
+            std::ranges::size(m_buf), m_written, ctx);
+        m_waiting = result.isPending();
+        if (m_waiting)        return PollPending;
+        if (result.isError()) return PollError(result.error());
+        return std::move(m_buf);
+    }
+
+private:
+    detail::Rc<detail::LwipTcpCtx> m_tcp;
+    Buf                            m_buf;
+    std::size_t                    m_written = 0;
+    // True while this future's waker may be the connection's send waker.
+    bool                           m_waiting = false;
+};
 
 /**
  * @brief Async TCP connection. Move-only; obtain via `co_await TcpStream::connect()`.
@@ -36,8 +167,16 @@ namespace detail { struct LwipTcpCtx; }
  * Uses the lwIP raw TCP API; all callbacks fire synchronously from the executor's
  * I/O tick (cyw43_arch_poll() on Pico, sys_check_timeouts() on host test builds).
  *
- * **Concurrency:** do not co_await read() and write() simultaneously from two tasks.
- * **Destruction:** destroying a TcpStream while a read() or write() is in flight is UB.
+ * **Concurrency:** only one read (`read()`/`read_exact()`) and only one `write()` may
+ * be in flight at a time. A read and a write may be in flight together.
+ *
+ * **Cancellation:** dropping a pending `read()` is safe and loses no data. Dropping a
+ * pending `read_exact()` loses the bytes it already read, and dropping a pending
+ * `write()` may leave part of the buffer sent: after either, the byte stream is out
+ * of step and the connection should be closed.
+ *
+ * **Destruction:** a read or write still pending when the TcpStream is destroyed
+ * never completes; drop it.
  */
 class TcpStream {
 public:
@@ -55,57 +194,41 @@ public:
     [[nodiscard]] static Coro<TcpStream> connect(std::string host, uint16_t port);
 
     /**
-     * @brief Reads up to buf.size() bytes. Returns {bytes_read, buf}; 0 bytes on EOF.
+     * @brief Reads up to buf.size() bytes. Returns {bytes_read, buf}; 0 bytes on EOF
+     * or for an empty buf.
      * @tparam Buf Any type satisfying ByteBuffer.
+     * @throws std::runtime_error (at co_await) on connection error.
      */
     template<ByteBuffer Buf>
-    [[nodiscard]] Coro<std::pair<std::size_t, Buf>> read(Buf buf) {
-        std::size_t n = co_await read_impl(
-            reinterpret_cast<std::byte*>(std::ranges::data(buf)),
-            std::ranges::size(buf));
-        co_return std::pair<std::size_t, Buf>{n, std::move(buf)};
+    [[nodiscard]] TcpReadFuture<Buf, false> read(Buf buf) {
+        return TcpReadFuture<Buf, false>(m_impl, std::move(buf));
     }
 
     /**
      * @brief Reads exactly buf.size() bytes. Returns {bytes_read, buf}.
      * bytes_read < buf.size() indicates EOF before the buffer was filled.
      * @tparam Buf Any type satisfying ByteBuffer.
+     * @throws std::runtime_error (at co_await) on connection error.
      */
     template<ByteBuffer Buf>
-    [[nodiscard]] Coro<std::pair<std::size_t, Buf>> read_exact(Buf buf) {
-        auto* data = reinterpret_cast<std::byte*>(std::ranges::data(buf));
-        const std::size_t size = std::ranges::size(buf);
-        std::size_t total = 0;
-        while (total < size) {
-            std::size_t n = co_await read_impl(data + total, size - total);
-            if (n == 0) break;
-            total += n;
-        }
-        co_return std::pair<std::size_t, Buf>{total, std::move(buf)};
+    [[nodiscard]] TcpReadFuture<Buf, true> read_exact(Buf buf) {
+        return TcpReadFuture<Buf, true>(m_impl, std::move(buf));
     }
 
     /**
      * @brief Writes all bytes in buf to the stream. Returns buf after completion.
      * @tparam Buf Any type satisfying ByteBuffer.
-     * @throws std::runtime_error on connection error.
+     * @throws std::runtime_error (at co_await) on connection error.
      */
     template<ByteBuffer Buf>
-    [[nodiscard]] Coro<Buf> write(Buf buf) {
-        co_await write_impl(
-            reinterpret_cast<const std::byte*>(std::ranges::data(buf)),
-            std::ranges::size(buf));
-        co_return std::move(buf);
+    [[nodiscard]] TcpWriteFuture<Buf> write(Buf buf) {
+        return TcpWriteFuture<Buf>(m_impl, std::move(buf));
     }
 
 private:
     friend class TcpListener;
 
     explicit TcpStream(detail::Rc<detail::LwipTcpCtx> impl);
-
-    // Defined in tcp_stream_lwip.cpp (or a stub). Never inline — keeps lwIP
-    // headers out of this file.
-    [[nodiscard]] Coro<std::size_t> read_impl(std::byte* buf, std::size_t size);
-    [[nodiscard]] Coro<void>        write_impl(const std::byte* buf, std::size_t size);
 
     detail::Rc<detail::LwipTcpCtx> m_impl;
 };

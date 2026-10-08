@@ -18,37 +18,51 @@
 namespace coro::detail {
 
 /**
- * @brief The state a SleepFuture shares with its TimerQueue entry.
+ * @brief Names one timer in a TimerQueue: its slot's index in the low 32 bits and
+ * that slot's generation in the high 32.
  *
- * The future stores its waker here on every pending poll and empties it when
- * dropped; the queue takes the waker out when the deadline passes. An entry whose
- * slot is empty is popped without a wake (lazy cancellation).
+ * An id goes stale when its timer fires or is cancelled. A stale id never matches a
+ * later timer in the same slot, because freeing a slot bumps its generation.
  */
-struct TimerSlot {
-    Mutex       mutex;
-    // Weak, as in ScheduledIo: the task owns the future, which owns this slot, so a
-    // strong waker here would be a reference cycle through the queue.
-    // GUARDED BY mutex.
-    Weak<Waker> waker;
-};
+using TimerId = std::uint64_t;
 
 /**
  * @brief A binary min-heap of {deadline, slot}, plus the "a thread is blocked
  * waiting for the earliest deadline" record that tells insert() when to unpark it.
  *
- * Thread-safe. Lock order: the queue's mutex may be held while taking a slot's
- * mutex, never the other way round.
+ * A timer is one heap entry and one slot, both in vectors the queue owns, so adding
+ * one allocates nothing once those have grown. cancel() is lazy: it empties the slot
+ * and leaves the heap entry to be popped at its deadline, or removed by a sweep once
+ * cancelled entries outnumber live ones.
+ *
+ * Thread-safe: one mutex guards everything, and it is never held while a waker is
+ * woken or any other lock is taken.
  */
 class TimerQueue {
 public:
+    /// A sweep needs at least this many cancelled entries, so a small queue doesn't
+    /// rebuild its heap every few cancels.
+    static constexpr std::size_t kSweepMinCancelled = 64;
+
+    struct Inserted {
+        TimerId id;
+        /// True if a thread is blocked in begin_wait()/end_wait() and the new deadline
+        /// is earlier than the one it is waiting for, so the caller must unpark it.
+        bool    unpark;
+    };
+
+    /// @brief Adds a timer that wakes `waker` once `deadline` has passed.
+    Inserted insert(Instant deadline, Weak<Waker> waker);
+
     /**
-     * @brief Adds an entry for `slot` at `deadline`.
+     * @brief Cancels a timer, so that it fires nothing.
      *
-     * @return true if a thread is blocked in begin_wait()/end_wait() and `deadline`
-     *         is earlier than every entry it computed its timeout from, so the caller
-     *         must unpark it.
+     * Does nothing if `id` is stale: the timer has already fired or been cancelled.
+     * The heap entry stays until its deadline, unless this cancel makes the cancelled
+     * entries outnumber the live ones (and reach kSweepMinCancelled), in which case
+     * it removes them all before returning.
      */
-    bool insert(Instant deadline, Rc<TimerSlot> slot);
+    void cancel(TimerId id) noexcept;
 
     /**
      * @brief For a thread about to block for up to `max_wait` (nullopt = no limit).
@@ -76,36 +90,61 @@ public:
      *
      * For IoDriver, which runs both on every turn. It dispatches I/O events before
      * calling this, so the wait stays recorded through that dispatch: an earlier
-     * insert() made meanwhile reports true, and its unpark makes the next turn return
-     * at once (one extra turn, the same benign race end_wait() already has).
+     * insert() made meanwhile reports `unpark`, and that unpark makes the next turn
+     * return at once (one extra turn, the same benign race end_wait() already has).
      *
      * @return The number of wakers fired.
      */
     std::size_t end_wait_and_fire_expired();
 
-    /// Entries in the heap, including cancelled ones not yet popped.
+    /// Entries in the heap, including cancelled ones not yet popped or swept.
     std::size_t size() const;
 
 private:
     struct Entry {
         Instant       deadline;
-        uint64_t      seq;   // insertion order: equal deadlines fire FIFO
-        Rc<TimerSlot> slot;
+        std::uint64_t seq;    // insertion order: equal deadlines fire FIFO
+        std::uint32_t slot;   // index into m_slots
     };
 
-    // std::push_heap/pop_heap build a max-heap; "later" puts the earliest on top.
+    // In use from insert() until its entry leaves the heap, then on m_free_slots.
+    struct Slot {
+        // Weak, as in ScheduledIo: a strong waker would keep a finished task alive
+        // until its deadline. Empty once cancelled.
+        Weak<Waker>   waker;
+        std::uint32_t generation = 0;
+        bool          cancelled  = false;
+    };
+
     std::size_t fire_expired(bool end_wait);
 
+    /// Takes a slot off the free list, or adds one. Caller holds m_mutex.
+    std::uint32_t take_slot();
+
+    /// Puts a slot whose entry has left the heap back on the free list, and bumps its
+    /// generation so that ids issued for it go stale. Caller holds m_mutex.
+    void free_slot(std::uint32_t index) noexcept;
+
+    /// Removes every cancelled entry from the heap. Caller holds m_mutex.
+    void sweep() noexcept;
+
+    // std::push_heap/pop_heap build a max-heap; "later" puts the earliest on top.
     static bool later(const Entry& a, const Entry& b) {
         if (a.deadline != b.deadline) return a.deadline > b.deadline;
         return a.seq > b.seq;
     }
 
-    mutable Mutex      m_mutex;
-    std::vector<Entry> m_heap;          // GUARDED BY m_mutex
-    uint64_t           m_next_seq = 0;  // GUARDED BY m_mutex
-    // True between a blocking begin_wait() and end_wait(). GUARDED BY m_mutex.
-    bool               m_waiting  = false;
+    mutable Mutex              m_mutex;
+    // Everything below is GUARDED BY m_mutex.
+    std::vector<Entry>         m_heap;
+    std::vector<Slot>          m_slots;
+    // Kept with capacity for every slot, so that freeing one never allocates.
+    std::vector<std::uint32_t> m_free_slots;
+    std::uint64_t              m_next_seq  = 0;
+    // Cancelled entries still in the heap.
+    std::size_t                m_cancelled = 0;
+    // True between a blocking begin_wait() and end_wait().
+    bool                       m_waiting   = false;
 };
 
 } // namespace coro::detail

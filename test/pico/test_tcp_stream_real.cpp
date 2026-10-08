@@ -2,11 +2,25 @@
 #include <coro/io/tcp_listener.h>
 #include <coro/runtime/runtime.h>
 #include <coro/coro.h>
+#include <coro/future.h>
+#include <coro/sync/select.h>
 #include <gtest/gtest.h>
 
 #include <lwip/init.h>
 #include <lwip/timeouts.h>
 #include <lwip/netif.h>
+
+// read and write are hand-written futures, not coroutines: no frame per transfer.
+static_assert(coro::Future<coro::TcpReadFuture<std::string, false>>);
+static_assert(coro::Future<coro::TcpReadFuture<std::string, true>>);
+static_assert(coro::Future<coro::TcpWriteFuture<std::string>>);
+
+// A future that is ready on its first poll. select(pending, ReadyNow{}) polls the
+// pending future once, then drops it.
+struct ReadyNow {
+    using OutputType = void;
+    coro::PollResult<void> poll(coro::detail::Context&) { return coro::PollReady; }
+};
 
 // ---------------------------------------------------------------------------
 // Fixture — initialises lwIP once per process.
@@ -127,7 +141,7 @@ TEST_F(LwipLoopback, ConnectionRefused) {
 }
 
 TEST_F(LwipLoopback, LargeDataTransfer) {
-    // Exercises the write_impl flow-control loop: total data (32 KB) exceeds
+    // Exercises the write future's flow-control loop: total data (32 KB) exceeds
     // TCP_SND_BUF (4 * TCP_MSS ≈ 5840 bytes), so write must chunk and wait for
     // on_sent callbacks to free send-buffer space before continuing.
     static constexpr std::size_t DATA_SIZE = 32 * 1024;
@@ -176,7 +190,7 @@ TEST_F(LwipLoopback, LargeDataTransfer) {
 }
 
 TEST_F(LwipLoopback, PartialRead) {
-    // Verifies that read_impl returns min(requested, available) and leaves
+    // Verifies that read() returns min(requested, available) and leaves
     // the remainder in rx_buf for the next call.
     coro::Runtime rt;
     bool done = false;
@@ -204,4 +218,70 @@ TEST_F(LwipLoopback, PartialRead) {
 
     poll_until(rt, done);
     ASSERT_TRUE(done) << "test timed out";
+}
+
+TEST_F(LwipLoopback, DroppedReadLosesNoData) {
+    // A read dropped mid-wait (it lost a select) has consumed nothing: the bytes
+    // that arrive afterwards go to the next read.
+    coro::Runtime rt;
+    bool done = false;
+    std::size_t branch = 0;
+    std::string received;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::size_t& branch, std::string& received)
+            -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19881);
+
+        rt.spawn([](coro::TcpListener l) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            // Wait for the client's go-ahead, so nothing is sent before its first
+            // read has been dropped.
+            auto [n, go] = co_await stream.read(std::string(1, '\0'));
+            (void)n; (void)go;
+            co_await stream.write(std::string("after drop"));
+        }(std::move(listener))).detach();
+
+        auto client = co_await coro::TcpStream::connect("127.0.0.1", 19881);
+
+        auto lost = co_await coro::select(client.read(std::string(64, '\0')), ReadyNow{});
+        branch = lost.index();
+
+        co_await client.write(std::string("g"));
+        auto [n, buf] = co_await client.read(std::string(64, '\0'));
+        buf.resize(n);
+        received = buf;
+        done = true;
+    }(rt, done, branch, received)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(branch, 1u);
+    EXPECT_EQ(received, "after drop");
+}
+
+TEST_F(LwipLoopback, EmptyBufferReadReturnsZeroAtOnce) {
+    coro::Runtime rt;
+    bool done = false;
+    std::size_t n_out = 99;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::size_t& n_out) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19882);
+
+        rt.spawn([](coro::TcpListener l) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            // Sends nothing: this read just holds the connection open.
+            auto [n, buf] = co_await stream.read(std::string(1, '\0'));
+            (void)n; (void)buf;
+        }(std::move(listener))).detach();
+
+        auto client = co_await coro::TcpStream::connect("127.0.0.1", 19882);
+        auto [n, buf] = co_await client.read(std::string());
+        (void)buf;
+        n_out = n;
+        done = true;
+    }(rt, done, n_out)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(n_out, 0u);
 }

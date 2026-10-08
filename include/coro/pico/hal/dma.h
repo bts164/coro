@@ -5,26 +5,33 @@
 #ifdef CORO_PICO
 
 #include <hardware/dma.h>
-#include <coro/coro.h>
+#include <coro/future.h>
+#include <coro/detail/context.h>
+#include <coro/detail/poll_result.h>
 #include <coro/sync/isr_event.h>
 
 namespace coro::pico::hal {
+
+class DmaWaitFuture; // defined below AsyncDmaTransfer, which it points at
 
 /**
  * @brief RAII async DMA channel wrapper.
  *
  * Claims one DMA channel on construction, releases it on destruction.
- * transfer() configures and starts a DMA transfer, then suspends the calling
- * coroutine until the DMA_IRQ_0 completion interrupt fires. start()/wait()
+ * transfer() configures and starts a DMA transfer and returns a future that
+ * completes when the DMA_IRQ_0 completion interrupt fires. start()/wait()
  * split those two steps apart for callers that must start a transfer from a
  * plain, non-coroutine context and await its completion elsewhere.
  *
  * Only one transfer may be in progress at a time per AsyncDmaTransfer instance.
  *
- * Cancellation: if the coroutine awaiting transfer()/wait() is cancelled, the
- * RAII destructor of the internal future calls dma_channel_abort()
- * immediately, stopping the DMA engine. The PIO TX FIFO (or other peripheral)
- * may contain stale data for one bus cycle after abort.
+ * Cancellation: if the future returned by transfer()/wait() is destroyed
+ * before it completes, its destructor calls dma_channel_abort() immediately,
+ * stopping the DMA engine. The PIO TX FIFO (or other peripheral) may contain
+ * stale data for one bus cycle after abort.
+ *
+ * transfer() and wait() return a hand-written future (DmaWaitFuture), not a
+ * Coro, so a transfer has no coroutine frame and allocates nothing.
  *
  * Usage:
  * @code
@@ -72,16 +79,18 @@ public:
     [[nodiscard]] int channel() const { return m_channel; }
 
     // Configures and starts the DMA transfer described by ctrl/read_addr/
-    // write_addr/transfer_count, then suspends until the DMA_IRQ_0 handler
-    // fires for this channel. Equivalent to start() followed by co_await wait().
+    // write_addr/transfer_count, and returns a future that completes when the
+    // DMA_IRQ_0 handler fires for this channel. Exactly start() followed by
+    // wait(): the transfer is started by this call, not by the first co_await
+    // of the result.
     //
-    // Cancellable: dma_channel_abort() is called immediately if the awaiting
-    // coroutine is cancelled. The abort is synchronous — the channel is free
-    // to reuse as soon as this coroutine resumes after cancellation.
-    [[nodiscard]] Coro<void> transfer(const dma_channel_config& ctrl,
-                                      const volatile void*       read_addr,
-                                      volatile void*             write_addr,
-                                      uint                       transfer_count);
+    // Cancellable: dma_channel_abort() is called immediately if the returned
+    // future is destroyed before it completes. The abort is synchronous — the
+    // channel is free to reuse as soon as the future is gone.
+    [[nodiscard]] DmaWaitFuture transfer(const dma_channel_config& ctrl,
+                                         const volatile void*       read_addr,
+                                         volatile void*             write_addr,
+                                         uint                       transfer_count);
 
     // Configures and starts the DMA transfer, then returns immediately
     // without waiting for it -- safe to call from a plain synchronous
@@ -93,15 +102,18 @@ public:
                volatile void*             write_addr,
                uint                       transfer_count);
 
-    // Suspends until the transfer started by start() completes. Must be
-    // called exactly once per start() call, only after it, and only on an
-    // instance constructed with track_completion=true.
+    // Returns a future that completes when the transfer started by start()
+    // does. Must be called exactly once per start() call, only after it, and
+    // only on an instance constructed with track_completion=true.
     //
     // Cancellable: same as transfer() -- dma_channel_abort() is called
-    // immediately if the awaiting coroutine is cancelled.
-    [[nodiscard]] Coro<void> wait();
+    // immediately if the returned future is destroyed before it completes,
+    // whether or not it was ever awaited.
+    [[nodiscard]] DmaWaitFuture wait();
 
 private:
+    friend class DmaWaitFuture;
+
     int      m_channel;
     bool     m_track_completion;
     IsrEvent m_done;
@@ -117,6 +129,45 @@ private:
     // Left unregistered (and this channel's DMA_IRQ_0 line left disabled) when
     // m_track_completion is false.
 };
+
+/**
+ * @brief Future returned by AsyncDmaTransfer::transfer() and wait(). Completes
+ * when the channel's DMA_IRQ_0 completion interrupt has fired.
+ *
+ * Satisfies Future<void>. An IsrWaitFuture on the channel's completion event,
+ * plus the clean-up the transfer needs: on completion it takes the channel out
+ * of the IRQ dispatch table, and if destroyed before completion it also calls
+ * dma_channel_abort().
+ *
+ * Holds a raw pointer to its AsyncDmaTransfer, which must outlive it (and
+ * cannot move).
+ */
+class DmaWaitFuture {
+public:
+    using OutputType = void;
+
+    // Abandons the transfer if it hasn't completed: see the class comment.
+    ~DmaWaitFuture();
+
+    // The source gives up the transfer, so its destructor aborts nothing.
+    DmaWaitFuture(DmaWaitFuture&& other) noexcept;
+    DmaWaitFuture& operator=(DmaWaitFuture&&)      = delete;
+    DmaWaitFuture(const DmaWaitFuture&)            = delete;
+    DmaWaitFuture& operator=(const DmaWaitFuture&) = delete;
+
+    PollResult<void> poll(detail::Context& ctx);
+
+private:
+    friend class AsyncDmaTransfer;
+
+    explicit DmaWaitFuture(AsyncDmaTransfer& dma);
+
+    // Null once the transfer has completed, or this future has been moved from.
+    AsyncDmaTransfer* m_dma;
+    IsrWaitFuture     m_wait;
+};
+
+static_assert(Future<DmaWaitFuture>);
 
 } // namespace coro::pico::hal
 

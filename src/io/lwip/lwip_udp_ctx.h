@@ -20,9 +20,10 @@ struct LwipUdpCtx {
     // this flag exists only for that precondition check.
     bool connected = false;
 
-    // Single in-flight receive — no queue. pending_buf is the caller's own buffer,
-    // registered for the duration of one recv_from_impl() call; on_recv copies directly
-    // into it and reports completion via result_ready.
+    // Single in-flight receive — no queue. pending_buf is the buffer inside the
+    // pending UdpRecvFuture, registered from its first poll until it completes or is
+    // destroyed; on_recv copies directly into it and reports completion via
+    // result_ready.
     std::byte*    pending_buf  = nullptr;
     std::size_t   pending_len  = 0;
     bool          result_ready = false;

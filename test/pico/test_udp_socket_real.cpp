@@ -2,11 +2,25 @@
 #include <coro/io/socket_address.h>
 #include <coro/runtime/runtime.h>
 #include <coro/coro.h>
+#include <coro/future.h>
+#include <coro/sync/select.h>
 #include <gtest/gtest.h>
 
 #include <lwip/init.h>
 #include <lwip/timeouts.h>
 #include <lwip/netif.h>
+
+// send and recv are hand-written futures, not coroutines: no frame per datagram.
+static_assert(coro::Future<coro::UdpSendFuture<std::string>>);
+static_assert(coro::Future<coro::UdpRecvFuture<std::string, true>>);
+static_assert(coro::Future<coro::UdpRecvFuture<std::string, false>>);
+
+// A future that is ready on its first poll. select(pending, ReadyNow{}) polls the
+// pending future once, then drops it.
+struct ReadyNow {
+    using OutputType = void;
+    coro::PollResult<void> poll(coro::detail::Context&) { return coro::PollReady; }
+};
 
 // ---------------------------------------------------------------------------
 // Fixture — initialises lwIP once per process.
@@ -162,4 +176,57 @@ TEST_F(LwipUdpLoopback, SendWithoutConnectThrows) {
     poll_until(rt, done);
     ASSERT_TRUE(done) << "test timed out";
     ASSERT_NE(caught, nullptr) << "expected send() to throw without connect()";
+}
+
+TEST_F(LwipUdpLoopback, DroppedRecvDeregistersAndNextRecvWorks) {
+    // A receive dropped mid-wait must take its buffer back out of the socket: the
+    // datagram sent afterwards has to land in the second receive's buffer, not the
+    // first one's (which is freed by then).
+    coro::Runtime rt;
+    bool done = false;
+    std::size_t branch = 0;
+    std::string received;
+
+    rt.spawn([](coro::Runtime&, bool& done, std::size_t& branch, std::string& received)
+            -> coro::Coro<void> {
+        auto server = co_await coro::UdpSocket::bind("127.0.0.1", 21051);
+        auto client = co_await coro::UdpSocket::bind("127.0.0.1", 21052);
+
+        auto lost = co_await coro::select(server.recv_from(std::string(64, '\0')), ReadyNow{});
+        branch = lost.index();
+
+        auto server_addr = coro::SocketAddress::parse("127.0.0.1", 21051).value();
+        co_await client.send_to(std::string("after drop"), server_addr);
+
+        auto [n, buf, sender] = co_await server.recv_from(std::string(64, '\0'));
+        (void)sender;
+        buf.resize(n);
+        received = buf;
+        done = true;
+    }(rt, done, branch, received)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(branch, 1u);
+    EXPECT_EQ(received, "after drop");
+}
+
+TEST_F(LwipUdpLoopback, RecvWithoutConnectThrows) {
+    coro::Runtime rt;
+    bool done = false;
+    std::exception_ptr caught;
+
+    rt.spawn([](coro::Runtime&, bool& done, std::exception_ptr& caught) -> coro::Coro<void> {
+        auto sock = co_await coro::UdpSocket::bind("127.0.0.1", 21061);
+        try {
+            co_await sock.recv(std::string(16, '\0'));
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    ASSERT_NE(caught, nullptr) << "expected recv() to throw without connect()";
 }

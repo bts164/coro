@@ -226,7 +226,9 @@ The exact return type differs per backend:
 | desktop (IoDriver) | `recv_segments_from()` | `UdpRecvSegmentsFuture<Buf>` | Same as `recv_from()`, with `recvmsg()` for the GRO segment size |
 | desktop (IoDriver) | `bind()`, `connect()`, `set_broadcast()`, `join_multicast()`, `leave_multicast()` | `Coro<T>` | Plain syscalls on the calling thread; no thread hop. Errors are thrown on `co_await`. `bind()` throws `std::logic_error` on a runtime whose executor doesn't turn the IoDriver (a `CurrentThreadExecutor` given its own `Parker`) |
 | desktop (IoDriver) | `set_segment_size()`, `set_gro()` | `void` | A plain `setsockopt()` |
-| lwIP (Pico) | all | `Coro<T>` | Callbacks fire synchronously inside the caller's own executor tick — no thread hop, so a plain `Coro` suffices, same as `TcpStream`'s lwIP methods |
+| lwIP (Pico) | `send_to()`, `send()` | `UdpSendFuture<Buf>` | A leaf future that never waits: `udp_sendto()` is synchronous, so the first `poll()` sends and completes |
+| lwIP (Pico) | `recv_from()`, `recv()` | `UdpRecvFuture<Buf, WithSender>` | A leaf future: the first `poll()` registers `on_recv`, which wakes it. Dropping it deregisters the callback |
+| lwIP (Pico) | `bind()`, `connect()`, `set_broadcast()`, `join_multicast()`, `leave_multicast()` | `Coro<T>` | One-shot setup calls off the data path. None of them suspends |
 
 **Concurrency** (matches the existing `TcpStream` restriction): only one receive
 (`recv_from()`/`recv()`) may be in flight at a time, and only one send (`send_to()`/`send()`)
@@ -617,7 +619,7 @@ struct LwipUdpCtx {
     bool connected = false;
 
     // Single in-flight receive — no queue. pending_buf is the caller's own buffer,
-    // registered for the duration of one recv_from_impl() call; on_recv copies directly
+    // registered while one UdpRecvFuture is pending; on_recv copies directly
     // into it and reports completion via result_ready.
     std::byte*    pending_buf  = nullptr;
     std::size_t   pending_len  = 0;
@@ -657,124 +659,84 @@ void LwipUdpCtx::on_recv(void* arg, udp_pcb* pcb, pbuf* p,
 }
 ```
 
-`udp_recv()` registers this callback fresh at the start of every `recv_from_impl()` call
+The first poll of every receive future registers this callback fresh with `udp_recv()`,
 and it deregisters itself (`udp_recv(pcb, nullptr, nullptr)`) the instant a datagram
 arrives — there is no "stays armed" mode. This means a datagram that arrives while no
 `recv_from()`/`recv()` call is currently registered is simply dropped by lwIP: nothing
 holds it, since lwIP (unlike a kernel socket) has no receive buffer of its own underneath
 `on_recv`. See [Known limitations](#known-limitations--future-work).
 
-### `recv_from_impl`
+### Send and receive futures
+
+`send_to()`, `send()`, `recv_from()` and `recv()` return hand-written futures, not
+`Coro`s, so a datagram costs no coroutine frame. The names match the desktop backend's:
+
+| Future | Returned by | Output |
+|---|---|---|
+| `UdpSendFuture<Buf>` | `send_to()`, `send()` | `Buf` |
+| `UdpRecvFuture<Buf, true>` | `recv_from()` | `tuple<size_t, Buf, SocketAddress>` |
+| `UdpRecvFuture<Buf, false>` | `recv()` | `pair<size_t, Buf>` |
+
+Each holds an `Rc<LwipUdpCtx>` and the caller's buffer. `udp_socket.h` must not include
+lwIP's headers, so the templates are thin: their `poll()` forwards to a non-template
+function in `udp_socket_lwip.cpp`.
 
 ```cpp
-template<ByteBuffer Buf>
-Coro<std::tuple<std::size_t, Buf, SocketAddress>> UdpSocket::recv_from_impl(detail::Rc<detail::LwipUdpCtx> ctx, Buf buf) {
-    struct DatagramReady {
-        using OutputType = void;
-        detail::Rc<detail::LwipUdpCtx> ctx;
-        PollResult<void> poll(detail::Context& cx) {
-            if (ctx->result_ready) return PollReady;
-            // RACE CONDITION NOTE: safe — on_recv fires on the executor thread
-            // (cyw43_arch_poll / sys_check_timeouts), never concurrently.
-            ctx->rx_waker = cx.getWaker();
-            return PollPending;
-        }
-    };
-
-    ctx->pending_buf  = reinterpret_cast<std::byte*>(buf.data());
-    ctx->pending_len  = buf.size();
-    ctx->result_ready = false;
-    udp_recv(ctx->pcb, &detail::LwipUdpCtx::on_recv, ctx.get());
-
-    co_await DatagramReady{ctx};
-
-    co_return {ctx->result_len, std::move(buf), ctx->result_sender};
+namespace coro::detail {
+// dest == nullptr sends to the connected peer. Never returns PollPending.
+PollResult<void> lwip_udp_send(LwipUdpCtx&, const std::byte* buf, std::size_t size,
+                               const SocketAddress* dest);
+PollResult<void> lwip_udp_poll_recv(LwipUdpCtx&, std::byte* buf, std::size_t size,
+                                    bool connected_only, bool& armed, std::size_t& n,
+                                    SocketAddress& sender, Context&);
+void lwip_udp_cancel_recv(LwipUdpCtx&) noexcept;
 }
 ```
 
-### `send_to_impl`
+**Send.** `lwip_udp_send()` allocates a `PBUF_RAM` pbuf, copies the payload in, and calls
+`udp_sendto()`, or `udp_send()` for the connected peer. Both are synchronous, so the
+future completes on its first poll, every time. A failure (not connected, an IPv6
+destination, `pbuf_alloc` out of memory, a send error) comes back as `PollError` and is
+thrown at the `co_await` as `std::runtime_error`. `dest` must hold an `Ipv4Address`: see
+[Known limitations](#known-limitations--future-work).
 
-No awaiting needed — `udp_sendto()` either copies the data into its own pbuf immediately
-(with `PBUF_RAM`) or fails synchronously. `dest` must currently hold an `Ipv4Address` —
-see [Known limitations](#known-limitations--future-work):
+**Receive.** `lwip_udp_poll_recv()`:
 
-```cpp
-Coro<void> UdpSocket::send_to_impl(const std::byte* buf, std::size_t size, SocketAddress dest) {
-    if (!std::holds_alternative<Ipv4Address>(dest.address))
-        throw std::runtime_error("UdpSocket::send_to: IPv6 destination not supported on the lwIP backend");
-    const auto& v4 = std::get<Ipv4Address>(dest.address);
+1. First poll: clear `result_ready`, register `on_recv` with `udp_recv()`, and set
+   `armed`. `recv()` first checks that the socket is connected.
+2. A later poll with `result_ready` set: `on_recv` has already copied the datagram into
+   the buffer and deregistered itself. Return the length and sender.
+3. Otherwise point `pending_buf` and `pending_len` at the future's buffer, store the
+   waker in `rx_waker`, and return pending.
 
-    pbuf* p = pbuf_alloc(PBUF_TRANSPORT, size, PBUF_RAM);
-    if (!p) throw std::runtime_error("UdpSocket::send_to: pbuf_alloc failed (out of memory)");
-    std::memcpy(p->payload, buf, size);
+A receive never completes on its first poll, because lwIP holds no datagram until a
+callback is registered.
 
-    ip_addr_t addr;
-    IP4_ADDR(&addr, v4.octets[0], v4.octets[1], v4.octets[2], v4.octets[3]);
+Dropping a pending receive (it lost a `select` to a timer, say) runs
+`lwip_udp_cancel_recv()` from the future's destructor: it deregisters `on_recv` and clears
+`pending_buf` and `rx_waker`, so no later datagram is written into a freed buffer.
 
-    err_t err = udp_sendto(m_impl->pcb, p, &addr, dest.port);
-    pbuf_free(p);
-    if (err != ERR_OK)
-        throw std::runtime_error("UdpSocket::send_to: udp_sendto failed");
-    co_return;
-}
-```
+!!! danger "WARNING: a polled receive future must not be moved"
+    From its first pending poll, `LwipUdpCtx::pending_buf` points at the buffer the future
+    owns. For a `std::array` buffer that storage is inside the future itself. Awaiting the
+    future directly, or through `select` and `timeout`, never moves it after a poll.
 
-Because this never suspends, `send_to()` on the Pico backend completes synchronously in
-practice — the `Coro<void>` return type is kept only for API symmetry with the desktop
-backend and to leave room for a future flow-control mechanism (see below) without an
-API break.
+### `connect`
 
-### `connect_impl`, `send_impl`, `recv_impl`
-
-`udp_connect()` is also synchronous: it stores the peer's address/port on the `pcb` and
+`udp_connect()` is synchronous: it stores the peer's address and port on the `pcb` and
 sets the `UDP_FLAGS_CONNECTED` flag, after which lwIP itself drops any datagram not from
-that peer before `on_recv` ever fires — no filtering logic needed on the `coro` side.
-`udp_send()` (vs. `udp_sendto()`) then reuses that stored peer:
+that peer before `on_recv` ever fires. No filtering is needed on the `coro` side.
+`connect()` also sets `LwipUdpCtx::connected`, which `send()` and `recv()` check. It is a
+`Coro<void>` that never suspends, kept as a coroutine because it is a one-shot call and
+matches the desktop signature.
+
+### `set_broadcast`, `join_multicast`, `leave_multicast`
+
+None of these suspend. Like `connect()` they are one-shot `Coro<void>`s, with the `Coro`
+wrapper only for API symmetry with the desktop backend:
 
 ```cpp
-Coro<void> UdpSocket::connect_impl(SocketAddress peer) {
-    if (!std::holds_alternative<Ipv4Address>(peer.address))
-        throw std::runtime_error("UdpSocket::connect: IPv6 peer not supported on the lwIP backend");
-    const auto& v4 = std::get<Ipv4Address>(peer.address);
-
-    ip_addr_t addr;
-    IP4_ADDR(&addr, v4.octets[0], v4.octets[1], v4.octets[2], v4.octets[3]);
-
-    err_t err = udp_connect(m_impl->pcb, &addr, peer.port);
-    if (err != ERR_OK)
-        throw std::runtime_error("UdpSocket::connect: udp_connect failed");
-    m_impl->connected = true;
-    co_return;
-}
-
-Coro<Buf> UdpSocket::send_impl(Buf buf) {
-    if (!m_impl->connected)
-        throw std::runtime_error("UdpSocket::send: not connected — call connect() first");
-
-    pbuf* p = pbuf_alloc(PBUF_TRANSPORT, buf.size(), PBUF_RAM);
-    if (!p) throw std::runtime_error("UdpSocket::send: pbuf_alloc failed (out of memory)");
-    std::memcpy(p->payload, buf.data(), buf.size());
-
-    err_t err = udp_send(m_impl->pcb, p);  // no addr/port — uses the connected peer
-    pbuf_free(p);
-    if (err != ERR_OK)
-        throw std::runtime_error("UdpSocket::send: udp_send failed");
-    co_return std::move(buf);
-}
-```
-
-`recv_impl` is `recv_from_impl` with the precondition check added and the `SocketAddress`
-element of the tuple dropped — it is implemented in terms of `recv_from_impl` rather than
-duplicated.
-
-### `set_broadcast_impl`, `join_multicast_impl`, `leave_multicast_impl`
-
-None of these suspend, so — like `send_to_impl`/`connect_impl` — they're plain `Coro<void>`
-kept synchronous in practice, with the `Coro` wrapper only for API symmetry with the
-desktop backend:
-
-```cpp
-Coro<void> UdpSocket::set_broadcast_impl(bool enabled) {
+Coro<void> UdpSocket::set_broadcast(bool enabled) {
     // No-op: IP_SOF_BROADCAST / IP_SOF_BROADCAST_RECV both default to 0 (lwIP's own
     // opt.h default, left unset in this project's lwipopts.h.in), so udp_sendto_if()
     // never checks an SOF_BROADCAST pcb flag in the first place — see
@@ -783,7 +745,7 @@ Coro<void> UdpSocket::set_broadcast_impl(bool enabled) {
     co_return;
 }
 
-Coro<void> UdpSocket::join_multicast_impl(Ipv4Address group, Ipv4Address iface) {
+Coro<void> UdpSocket::join_multicast(Ipv4Address group, Ipv4Address iface) {
     (void)iface;  // Pico has exactly one network interface; always joins on netif_default
     ip4_addr_t addr;
     IP4_ADDR(&addr, group.octets[0], group.octets[1], group.octets[2], group.octets[3]);
@@ -793,7 +755,7 @@ Coro<void> UdpSocket::join_multicast_impl(Ipv4Address group, Ipv4Address iface) 
     co_return;
 }
 
-Coro<void> UdpSocket::leave_multicast_impl(Ipv4Address group, Ipv4Address iface) {
+Coro<void> UdpSocket::leave_multicast(Ipv4Address group, Ipv4Address iface) {
     (void)iface;
     ip4_addr_t addr;
     IP4_ADDR(&addr, group.octets[0], group.octets[1], group.octets[2], group.octets[3]);
@@ -804,7 +766,7 @@ Coro<void> UdpSocket::leave_multicast_impl(Ipv4Address group, Ipv4Address iface)
 }
 ```
 
-Receiving multicast traffic needs no change to `on_recv`/`recv_from_impl` beyond the
+Receiving multicast traffic needs no change to `on_recv` or the receive future beyond the
 IGMP join itself: `bind()` already binds the `pcb` to `IP_ADDR_ANY`, which (like the
 desktop backend binding `0.0.0.0`) accepts a datagram addressed to any destination IP
 matching the port — multicast included — once `igmp_joingroup_netif()` has told the
@@ -835,7 +797,7 @@ sequenceDiagram
     Note over C,L: ... nothing registered — a datagram arriving now is dropped ...
 
     C->>C: co_await recv_from(buf)
-    C->>L: udp_recv(pcb, on_recv, ctx) — register for this call only
+    C->>L: first poll: udp_recv(pcb, on_recv, ctx) — register for this call only
     C->>C: suspends, awaiting result_ready
 
     L->>L: on_recv: copy min(pending_len, p->tot_len) bytes into pending_buf
@@ -843,7 +805,7 @@ sequenceDiagram
     L-->>C: result_ready = true; rx_waker->wake()
     E->>C: resumes, returns {result_len, buf, sender}
 
-    C->>L: udp_sendto(pcb, pbuf, addr, port) — synchronous, no suspension
+    C->>L: co_await send_to(): udp_sendto(pcb, pbuf, addr, port) — synchronous, no suspension
 ```
 
 Once `connect()` has been called, the same diagram applies with `udp_connect(pcb, addr,
@@ -867,7 +829,7 @@ port)` run once up front and `udp_send(pcb, pbuf)` (no address) replacing `udp_s
   specifically.** On the desktop backend this is a non-issue in practice: the
   kernel's own per-socket receive buffer (`SO_RCVBUF`) holds datagrams that arrive between
   calls, exactly as it would for any other UDP socket. lwIP has no equivalent — `on_recv`
-  is only ever registered for the duration of one `recv_from_impl()` call, and a datagram
+  is only ever registered while one receive future is pending, and a datagram
   arriving while nothing is registered is simply gone, with no buffer anywhere to catch
   it (see [Receive path](#receive-path) and the lwIP backend's `on_recv` above). This is a
   deliberate simplification (dropping order/backpressure semantics aren't a requirement

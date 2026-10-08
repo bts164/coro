@@ -6,8 +6,11 @@
 #include <coro/detail/timer_queue.h>
 #include <coro/runtime/clock.h>
 #include <chrono>
+#include <utility>
 
 namespace coro {
+
+class Runtime;
 
 /**
  * @brief Future that completes once a @ref Clock deadline has passed.
@@ -15,14 +18,21 @@ namespace coro {
  * Satisfies @ref Future<void>. The first pending `poll()` adds a timer to the
  * current runtime's queue: the IoDriver's on desktop, where the deadline bounds the
  * driver's `epoll_pwait2` at nanosecond resolution, or the CurrentThreadExecutor's
- * on Pico. Every later pending poll replaces the stored waker, so the latest
- * context is the one woken (e.g. under `select`).
+ * on Pico. The timer is an entry in the queue's own storage; the future holds only
+ * its id, and nothing is allocated.
  *
- * A leaf future with no `cancel()`: dropping it mid-wait is always safe. It empties
- * its timer slot, and the queue entry is later popped without a wake.
+ * A later pending poll does nothing if it brings the waker already registered, which
+ * is the usual case. If it brings a different one (the future lives in a coroutine
+ * frame that another task now polls), the timer is cancelled and added again for the
+ * new waker.
+ *
+ * A leaf future with no `cancel()`: dropping it mid-wait is always safe. It cancels
+ * its timer, and the queue entry is later removed without a wake.
  *
  * `poll()` checks the clock itself, so it is never ready early, and an early or
  * spurious wake just leaves it pending.
+ *
+ * The runtime it was first polled on must outlive it.
  *
  * @throws std::logic_error from the first pending `poll()` if the runtime's executor
  *         never turns the IoDriver (see `Runtime::add_timer()`).
@@ -34,14 +44,22 @@ public:
     using OutputType = void;
 
     explicit SleepFuture(Instant deadline) noexcept : m_deadline(deadline) {}
-    ~SleepFuture() { release(); }
+    ~SleepFuture() { cancel_timer(); }
 
-    SleepFuture(SleepFuture&& other) noexcept = default;
+    // The timer is named by id, not by this object's address, so a move is safe
+    // even after a poll.
+    SleepFuture(SleepFuture&& other) noexcept
+        : m_deadline(other.m_deadline),
+          m_runtime(std::exchange(other.m_runtime, nullptr)),
+          m_timer(other.m_timer),
+          m_waker(std::move(other.m_waker)) {}
     SleepFuture& operator=(SleepFuture&& other) noexcept {
         if (this != &other) {
-            release();
+            cancel_timer();
             m_deadline = other.m_deadline;
-            m_slot     = std::move(other.m_slot);
+            m_runtime  = std::exchange(other.m_runtime, nullptr);
+            m_timer    = other.m_timer;
+            m_waker    = std::move(other.m_waker);
         }
         return *this;
     }
@@ -54,12 +72,17 @@ public:
     Instant deadline() const noexcept { return m_deadline; }
 
 private:
-    /// Empties the slot's waker, so the queue entry fires nothing. Idempotent.
-    void release() noexcept;
+    /// Cancels the timer, if one is registered. Harmless if it has already fired.
+    void cancel_timer() noexcept;
 
-    Instant                       m_deadline;
-    // Null until the first pending poll; shared with the timer queue's entry.
-    detail::Rc<detail::TimerSlot> m_slot;
+    Instant                     m_deadline;
+    // The runtime the timer is registered with; null while none is.
+    Runtime*                    m_runtime = nullptr;
+    // Valid while m_runtime is set.
+    detail::TimerId             m_timer   = 0;
+    // The waker the timer was registered with, to recognise a re-poll that brings
+    // the same one. Holding it also keeps that comparison sound: see same_rc().
+    detail::Weak<detail::Waker> m_waker;
 };
 
 /// @brief Completes once `deadline` has passed.

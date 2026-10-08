@@ -180,6 +180,32 @@ Never work around this by constructing a span and passing it directly — the `r
 and `write()` methods no longer accept spans. If you are adding a new async I/O method,
 use a `ByteBuffer` template parameter rather than `std::span`.
 
+### Write per-operation async functions as futures, not coroutines
+
+A function returning `Coro<T>` allocates a coroutine frame on every call. For an
+operation that runs once per item on a hot path — a read, write, send, receive, tick,
+transfer, lock or wait — return a hand-written future instead: a class with an
+`OutputType` and a `poll()`, whose state lives inside the caller's own frame. It
+allocates nothing, and when the operation can finish at once its first `poll()`
+completes it with no suspension. `UdpSendFuture`, `FdReadFuture`, `SleepFuture` and
+`IntervalTimer::TickFuture` are examples to copy.
+
+This matters most on Pico, where the heap is small and every allocation is slow.
+
+Coroutines remain the right tool for one-shot or setup calls that are off the critical
+path (`connect`, `bind`, `accept`, `lookup_host`, `open`) and for multi-step logic that
+would otherwise become a hand-written state machine. A coroutine that only wraps a
+single `co_await` of an existing future should return that future directly.
+
+When writing such a future:
+
+- Do nothing with side effects in the constructor unless starting early is the point
+  (and then document it). The future is moved before its first poll.
+- Give it a destructor if a pending operation leaves anything registered (a waker, a
+  callback, armed hardware), so that dropping it mid-wait is safe.
+- Report failures with `PollError`, not by throwing from `poll()`.
+- Keep non-template work out of line when the header must not see a backend's headers.
+
 ### [[nodiscard]] on Future-returning functions
 
 All functions that return a `Future`, `Stream`, `JoinHandle`, `StreamHandle`, or builder

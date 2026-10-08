@@ -16,7 +16,7 @@ queue. Each I/O primitive built on it has its own document (see
 | `IoDriver`, `ScheduledIo`, `IoRegistration`, `IoDriverParker` | `include/coro/runtime/io_driver.h`, `src/runtime/io_driver.cpp` | `test/runtime/test_io_driver.cpp` |
 | `Parker`, `PollingParker` | `include/coro/runtime/parker.h` | `test/runtime/test_current_thread_executor.cpp` |
 | `Clock`, `Instant` | `include/coro/runtime/clock.h` | |
-| `detail::TimerQueue`, `detail::TimerSlot` | `include/coro/detail/timer_queue.h`, `src/detail/timer_queue.cpp` | `test/detail/test_timer_queue.cpp` |
+| `detail::TimerQueue`, `detail::TimerId` | `include/coro/detail/timer_queue.h`, `src/detail/timer_queue.cpp` | `test/detail/test_timer_queue.cpp` |
 
 ---
 
@@ -449,17 +449,24 @@ One timer queue type, used by the driver on desktop and by `CurrentThreadExecuto
 ```cpp
 namespace coro::detail {
 
-// Shared by a SleepFuture and its queue entry.
-struct TimerSlot {
-    Mutex       mutex;
-    Weak<Waker> waker;   // GUARDED BY mutex; empty once the future is dropped
-};
+// Names one timer: slot index in the low 32 bits, that slot's generation in the high 32.
+using TimerId = std::uint64_t;
 
 class TimerQueue {
 public:
-    // Adds an entry. Returns true if the caller must unpark the thread blocked
-    // waiting, because this deadline is earlier than the one it is waiting for.
-    bool insert(Instant deadline, Rc<TimerSlot> slot);
+    struct Inserted {
+        TimerId id;
+        // True if the caller must unpark the thread blocked waiting, because this
+        // deadline is earlier than the one it is waiting for.
+        bool    unpark;
+    };
+
+    // Adds a timer that wakes `waker` once `deadline` has passed.
+    Inserted insert(Instant deadline, Weak<Waker> waker);
+
+    // Cancels the timer, so it fires nothing. Does nothing if `id` is stale: the timer
+    // has already fired or been cancelled.
+    void cancel(TimerId id) noexcept;
 
     // For the thread about to block: min(max_wait, time to the earliest deadline),
     // rounded up. If that is non-zero, records that a waiter is blocked, for insert().
@@ -473,28 +480,75 @@ public:
 
     // Both of the above under one lock. IoDriver calls this once per turn.
     std::size_t end_wait_and_fire_expired();
+
+private:
+    struct Entry { Instant deadline; std::uint64_t seq; std::uint32_t slot; };
+    struct Slot  { Weak<Waker> waker; std::uint32_t generation; bool cancelled; };
+
+    Mutex                      m_mutex;      // guards everything below
+    std::vector<Entry>         m_heap;
+    std::vector<Slot>          m_slots;
+    std::vector<std::uint32_t> m_free_slots;
+    std::size_t                m_cancelled;  // cancelled entries still in the heap
 };
 
 }
 ```
 
+A timer is one heap entry plus one slot, with no allocation of its own:
+
+```mermaid
+flowchart LR
+    F["SleepFuture<br/>TimerId: generation + slot index"] -. cancel .-> S
+    subgraph Q["TimerQueue, one mutex"]
+        H["m_heap<br/>deadline, seq, slot index"] --> S["m_slots<br/>weak waker, generation, cancelled"]
+        FL["m_free_slots"] -. reuse .-> S
+    end
+```
+
 - **Binary heap.** A `std::vector` with `std::push_heap`/`std::pop_heap`, ordered by
   deadline then by insertion sequence number, so equal deadlines fire in FIFO order.
   Insert and pop are O(log n).
-- **Lazy cancellation.** Dropping a `SleepFuture` empties its slot's waker. The entry
-  stays in the heap until its deadline and is then popped without a wake. A cancelled
-  timer therefore costs memory and heap depth until its deadline, but never a wake.
-- **Wakes run outside the queue mutex.** `fire_expired()` moves the live wakers into a
-  local vector, unlocks, then wakes them. A wake enqueues onto an executor, which takes
-  that executor's locks, so holding the queue mutex across it would order the two locks
-  against `SleepFuture::poll()`, which takes them the other way round.
-- **Weak waker**, as in `ScheduledIo`, for the same reason.
+- **Slots.** Heap entries move on every insert and pop, so an id can't name a position in
+  the heap. It names a slot instead: an element of `m_slots`, which keeps its index from
+  `insert()` until its entry leaves the heap. The slot holds the waker and the entry
+  holds the slot's index, so `cancel()` reaches the waker by indexing, with no search and
+  no map.
+- **Generations.** A slot goes back on the free list when its entry leaves the heap, and
+  a later `insert()` reuses it. Freeing a slot bumps its generation, and an id carries
+  the generation it was issued with. An id for a timer that has already fired therefore
+  doesn't match, and can't cancel the slot's next tenant. This is what lets
+  `SleepFuture`'s destructor cancel without knowing whether its timer fired.
+- **Lazy cancellation.** `cancel()` drops the slot's waker and marks it cancelled. It
+  doesn't touch the heap: the entry stays until its deadline and is then popped without a
+  wake. A cancel is a lock and a few stores, with no O(log n) sift.
+- **Sweep.** So that cancelled entries can't accumulate without bound, `cancel()` counts
+  them. When they outnumber the live entries, and there are at least
+  `kSweepMinCancelled` (64) of them, it removes them all: `std::erase_if` over the heap,
+  freeing each slot, then `std::make_heap`. The heap is thus never more than about twice
+  the live timers. A sweep of n entries follows at least n/2 cancels, so it costs a
+  constant per cancel. It runs on the cancelling thread, which already holds the lock.
+- **Nothing allocated per timer.** The three vectors grow to the largest number of timers
+  pending at once and are reused from then on.
+- **Wakes run outside the queue mutex.** `fire_expired()` moves up to 32 live wakers
+  into a local array, unlocks, wakes them, and repeats while more are due, so firing
+  allocates nothing either. A wake enqueues onto an executor and takes that executor's
+  locks. Keeping the queue mutex out of that means it is never held while another lock
+  is taken.
+- **Weak waker**, as in `ScheduledIo`: a strong one would keep a finished task alive
+  until its deadline.
 
-!!! tip "PERF: cancelled timers stay in the heap until their deadline"
-    A loop that races a short operation against a long `timeout()` leaves one dead entry
-    per iteration until each deadline passes. If profiling shows that heap growing, store
-    each entry's heap index in its slot and remove it in O(log n) when the future is
-    dropped. A hashed timer wheel (tokio's design) is the next step after that.
+!!! danger "WARNING: the queue must outlive every future that holds a `TimerId`"
+    `SleepFuture`'s destructor calls `cancel()`. On the driver this follows from
+    `Runtime`'s destruction order (see [Runtime integration](#runtime-integration)).
+    `CurrentThreadExecutor` owns its queue itself, so it must declare the queue before
+    its task containers, so that the tasks are destroyed first.
+
+!!! tip "PERF: a sweep holds the queue mutex for O(n)"
+    Inserts and the driver's turn wait while a sweep runs. If a very large heap ever
+    makes that pause matter, have `cancel()` only set a flag and let the driver holder
+    sweep at the start of its next turn. A hashed timer wheel (tokio's design) removes a
+    cancelled timer in O(1) and needs no sweep, at a much larger cost in code.
 
 ### Who fires timers
 
@@ -525,16 +579,19 @@ tasks were woken either way.
 
 `begin_wait()` records a waiter only for a non-zero `effective`. A zero-timeout turn (a
 busy worker's `try_turn(0)`, or `IoDriverParker`'s every-61st turn) still fires expired
-timers, but `insert()` never unparks it. `IoDriver::add_timer(deadline, slot)` calls
-`insert()` and then `unpark()` if told to.
+timers, but `insert()` never unparks it. `IoDriver::add_timer(deadline, waker)` calls
+`insert()`, then `unpark()` if told to, and returns the `TimerId`.
+`IoDriver::cancel_timer(id)` is `cancel()`.
 
 Where a timer goes:
 
-- **Desktop `Runtime`**, any executor: `Runtime::add_timer()` adds it to the driver.
+- **Desktop `Runtime`**, any executor: `Runtime::add_timer()` adds it to the driver,
+  and `Runtime::cancel_timer()` cancels it there.
   `CurrentThreadExecutor`'s `IoDriverParker` and the multi-threaded executors' driver
   turns pick up the earliest deadline by themselves.
 - **`CurrentThreadExecutor`'s own `TimerQueue`** serves Pico and any executor built
-  without a `Runtime`, through `CurrentThreadExecutor::add_timer()`. Its loop brackets
+  without a `Runtime`, through `CurrentThreadExecutor::add_timer()` and
+  `cancel_timer()`. Its loop brackets
   `park()` with `begin_wait()`/`end_wait()` and calls `fire_expired()` after each batch.
   On Pico nothing blocks (`PollingParker`) and every insert comes from the executor's own
   thread; `add_timer()` still unparks when `insert()` says so, which costs nothing there
@@ -555,15 +612,24 @@ never early: `SleepFuture` checks the clock itself.
   recorded waiter and returns true. In the second case, `unpark()` writes the eventfd,
   which stays readable until the holder's poll consumes it, so an unpark made between
   `begin_wait()` and `epoll_pwait2()` is not lost.
+- **Sweep while the holder is blocked (benign).** A sweep can remove the entry the
+  holder computed its timeout from, leaving a later one at the front. `insert()` compares
+  against the current front, so it may now ask for an unpark the holder didn't need, and
+  never misses one it did. The holder still wakes at the removed entry's deadline, fires
+  nothing, and turns again.
 - **Stale waiter record (benign).** The holder returns from poll, but `insert()` runs
   before `end_wait()` and returns true. On the driver that window includes dispatching the
   I/O events, since `end_wait_and_fire_expired()` runs after it. The unpark makes the
   holder's *next* turn return immediately: one extra loop iteration, nothing lost.
 - **Future dropped while its timer is firing.** `fire_expired()` takes the waker out of
-  the slot under the slot mutex and wakes it after unlocking. A destructor that runs in
-  between finds the slot already empty. The wake then reaches a task whose future is
-  gone, which is a spurious wake the task tolerates. The `Weak` waker stops it from
-  touching a freed task.
+  the slot and frees the slot under the queue mutex, and wakes after unlocking. A
+  destructor that runs in between calls `cancel()` with an id whose generation no longer
+  matches, which does nothing. The wake then reaches a task whose future is gone, which
+  is a spurious wake the task tolerates. The `Weak` waker stops it from touching a freed
+  task.
+- **Cancel after the slot was reused.** The same stale id, arriving after another
+  `insert()` took the slot. The generation check keeps it from cancelling that other
+  timer.
 - **Clock read after the poll.** `fire_expired()` reads `Clock::now()` after
   `epoll_pwait2` returns. Rounding the timeout up guarantees the earliest deadline has
   passed by then, so a timer-only wake always fires something.
@@ -625,7 +691,10 @@ never early: `SleepFuture` checks the clock itself.
 | `IoDriver.PollIoWaitsForWritable`, `PollIoPassesThroughOtherErrors`, `UdpReceiveHandshake` | `poll_io()` end to end on real sockets. |
 | `IoDriverParker.*` | A zero wait turns only every N-th call; a non-zero wait always turns; `unpark()` interrupts an unlimited park. |
 | `TimerQueue.*` | Deadline and FIFO order, lazy cancellation, when `insert()` reports an unpark, `begin_wait()` bounds. |
-| `IoDriver.TurnTimesOutAtNextDeadline`, `ShorterMaxWaitBeatsTimer`, `CancelledTimerFiresNothing`, `EarlierTimerFromOtherThreadUnparks` | Timers on the driver. |
+| `TimerQueue.StaleIdIsIgnored`, `CancelAfterSlotReuseLeavesNewTimer` | A cancel after the timer fired does nothing, including once another timer has taken its slot. |
+| `TimerQueue.SlotsAreReused`, `SweepRemovesCancelledEntries`, `NoSweepBelowMinimum` | Fired and swept timers free their slots; cancelling more than half the heap shrinks it; a small heap is left alone. |
+| `TimerQueue.FiresMoreThanOneBatch`, `InsertAfterSweepStillUnparksWaiter` | More timers due than one wake batch all fire in order; an insert after a sweep emptied the heap still unparks the waiter. |
+| `IoDriver.TurnTimesOutAtNextDeadline`, `ShorterMaxWaitBeatsTimer`, `CancelledTimerFiresNothing`, `CancelAfterFireIsIgnored`, `EarlierTimerFromOtherThreadUnparks` | Timers on the driver. |
 
 ---
 
@@ -640,6 +709,7 @@ how often:
 | Every I/O operation | `ScheduledIo::m_mutex` in `poll_ready()`; an EAGAIN adds `clear_ready()` and a second `poll_ready()` |
 | Every event | `ScheduledIo::m_mutex` once in `dispatch()` |
 | Every turn | `m_turn_mutex`; the `TimerQueue` mutex twice (`begin_wait()`, `end_wait_and_fire_expired()`); `m_release_mutex` only when releases are pending |
+| Every sleep or timeout | The `TimerQueue` mutex once to insert and once to cancel |
 | Register / deregister | `m_release_mutex` on deregister |
 
 !!! tip "PERF: lock-free readiness on `ScheduledIo` (tokio's design)"

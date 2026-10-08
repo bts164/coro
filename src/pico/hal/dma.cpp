@@ -6,6 +6,7 @@
 #include <hardware/sync.h>
 #include <stdexcept>
 #include <mutex>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // Module-internal dispatch table and IRQ handler at file scope.
@@ -130,36 +131,57 @@ void AsyncDmaTransfer::start(const dma_channel_config& ctrl,
     dma_channel_start(static_cast<uint>(m_channel));
 }
 
-Coro<void> AsyncDmaTransfer::wait() {
-    // AbortGuard: if this coroutine is cancelled while suspended below, the
-    // guard destructor clears the dispatch entry and aborts the channel.
-    struct AbortGuard {
-        int         channel;
-        bool        active = true;
-        ~AbortGuard() {
-            if (active) {
-                uint32_t save = spin_lock_blocking(dispatch_lock());
-                s_dispatch[channel] = nullptr;
-                spin_unlock(dispatch_lock(), save);
-                dma_channel_abort(static_cast<uint>(channel));
-            }
-        }
-    } guard{m_channel};
+DmaWaitFuture AsyncDmaTransfer::wait() {
+    return DmaWaitFuture(*this);
+}
 
-    co_await m_done.wait_from(m_wait_baseline);
+DmaWaitFuture AsyncDmaTransfer::transfer(const dma_channel_config& ctrl,
+                                         const volatile void*       read_addr,
+                                         volatile void*             write_addr,
+                                         uint                       transfer_count) {
+    start(ctrl, read_addr, write_addr, transfer_count);
+    return wait();
+}
 
-    guard.active = false;
+// ---------------------------------------------------------------------------
+// DmaWaitFuture
+// ---------------------------------------------------------------------------
+
+// Takes the channel out of the dispatch table, so a late-firing IRQ signals nothing.
+static void clear_dispatch(int channel) {
     uint32_t save = spin_lock_blocking(dispatch_lock());
-    s_dispatch[m_channel] = nullptr;
+    s_dispatch[channel] = nullptr;
     spin_unlock(dispatch_lock(), save);
 }
 
-Coro<void> AsyncDmaTransfer::transfer(const dma_channel_config& ctrl,
-                                       const volatile void*       read_addr,
-                                       volatile void*             write_addr,
-                                       uint                       transfer_count) {
-    start(ctrl, read_addr, write_addr, transfer_count);
-    co_await wait();
+// Resolves against the baseline start() captured, not one taken here: the transfer
+// may already have completed by the time wait() is called.
+DmaWaitFuture::DmaWaitFuture(AsyncDmaTransfer& dma)
+    : m_dma(&dma), m_wait(dma.m_done.wait_from(dma.m_wait_baseline)) {}
+
+DmaWaitFuture::DmaWaitFuture(DmaWaitFuture&& other) noexcept
+    : m_dma(std::exchange(other.m_dma, nullptr)), m_wait(std::move(other.m_wait)) {}
+
+DmaWaitFuture::~DmaWaitFuture() {
+    if (m_dma == nullptr)
+        return;
+    // Destroyed before completion (the awaiting coroutine was cancelled, or the
+    // future was never awaited): stop the transfer.
+    // RACE CONDITION NOTE: the transfer may complete, and its IRQ fire, at any point
+    // here. Before clear_dispatch() that signals m_done, which nothing waits for any
+    // more; after it the handler finds no entry. Either way dma_channel_abort() on a
+    // finished channel is harmless.
+    clear_dispatch(m_dma->m_channel);
+    dma_channel_abort(static_cast<uint>(m_dma->m_channel));
+}
+
+PollResult<void> DmaWaitFuture::poll(detail::Context& ctx) {
+    auto result = m_wait.poll(ctx);
+    if (result.isReady()) {
+        clear_dispatch(m_dma->m_channel);
+        m_dma = nullptr;
+    }
+    return result;
 }
 
 } // namespace coro::pico::hal

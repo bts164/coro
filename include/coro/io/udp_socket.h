@@ -14,18 +14,136 @@
 #include <coro/coro.h>
 #include <coro/io/byte_buffer.h>
 #include <coro/io/socket_address.h>
+#include <coro/detail/context.h>
+#include <coro/detail/poll_result.h>
 #include <coro/detail/rc.h>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace coro {
 
-namespace detail { struct LwipUdpCtx; }
+namespace detail {
+
+struct LwipUdpCtx;
+
+// The non-template halves of the send and receive futures below. Defined in
+// udp_socket_lwip.cpp, which keeps the lwIP headers out of this file.
+
+/// Sends one datagram to `dest`, or to the connected peer if `dest` is null. lwIP
+/// copies it into a pbuf and hands it to the interface before returning, so the
+/// result is ready or an error, never pending.
+PollResult<void> lwip_udp_send(LwipUdpCtx& udp, const std::byte* buf, std::size_t size,
+                               const SocketAddress* dest);
+
+/// One poll of a receive. The first call (`armed` false) registers the receive
+/// callback to copy the next datagram into `buf`, and sets `armed`. Ready, with `n`
+/// and `sender` filled in and `armed` cleared, once that datagram has arrived.
+/// `connected_only` makes the first call fail unless connect() has been called.
+PollResult<void> lwip_udp_poll_recv(LwipUdpCtx& udp, std::byte* buf, std::size_t size,
+                                    bool connected_only, bool& armed, std::size_t& n,
+                                    SocketAddress& sender, Context& ctx);
+
+/// Deregisters the receive callback and drops the receive waker, for an armed
+/// receive that is destroyed before it completes.
+void lwip_udp_cancel_recv(LwipUdpCtx& udp) noexcept;
+
+} // namespace detail
+
+/**
+ * @brief Future returned by `UdpSocket::send()` / `send_to()`. Yields `buf`.
+ *
+ * Hand-written rather than a `Coro<Buf>`, so a send has no coroutine frame and
+ * allocates nothing of its own. An lwIP send never waits: the first `poll()` hands
+ * the datagram to lwIP and returns ready, or an error.
+ */
+template<ByteBuffer Buf>
+class UdpSendFuture {
+public:
+    using OutputType = Buf;
+
+    UdpSendFuture(detail::Rc<detail::LwipUdpCtx> udp, Buf buf,
+                  std::optional<SocketAddress> dest)
+        : m_udp(std::move(udp)), m_buf(std::move(buf)), m_dest(dest) {}
+
+    PollResult<Buf> poll(detail::Context&) {
+        auto result = detail::lwip_udp_send(*m_udp,
+            reinterpret_cast<const std::byte*>(std::ranges::data(m_buf)),
+            std::ranges::size(m_buf), m_dest ? &*m_dest : nullptr);
+        if (result.isError()) return PollError(result.error());
+        return std::move(m_buf);
+    }
+
+private:
+    detail::Rc<detail::LwipUdpCtx> m_udp;
+    Buf                            m_buf;
+    std::optional<SocketAddress>   m_dest;   // nullopt => send() on a connected socket
+};
+
+/**
+ * @brief Future returned by `UdpSocket::recv_from()` (`WithSender = true`, yields
+ * `{n, buf, sender}`) and `UdpSocket::recv()` (`WithSender = false`, yields `{n, buf}`).
+ *
+ * Hand-written rather than a `Coro`, so a receive has no coroutine frame and
+ * allocates nothing. The first `poll()` registers lwIP's receive callback, which
+ * copies the next datagram straight into this future's buffer. Nothing is registered
+ * before that poll, and a datagram that arrives while no receive is registered is
+ * dropped.
+ *
+ * Dropping it while pending is safe: the destructor deregisters the callback, so
+ * lwIP never writes into a buffer that has gone. A datagram that had already been
+ * copied into the dropped future is lost.
+ *
+ * @warning Must not be moved once polled. The callback holds a pointer into this
+ * future's buffer, which for an inline buffer (`std::array`, a short `std::string`)
+ * moves with the future. Every future is pinned after its first poll; here a
+ * violation would be a wild write.
+ *
+ * Race note: the callback runs on the executor thread, never concurrently with
+ * `poll()`. Overlapping receives on one socket aren't supported: the second would
+ * take over the callback and the first would never complete.
+ */
+template<ByteBuffer Buf, bool WithSender>
+class UdpRecvFuture {
+public:
+    using OutputType = std::conditional_t<WithSender,
+        std::tuple<std::size_t, Buf, SocketAddress>, std::pair<std::size_t, Buf>>;
+
+    UdpRecvFuture(detail::Rc<detail::LwipUdpCtx> udp, Buf buf)
+        : m_udp(std::move(udp)), m_buf(std::move(buf)) {}
+
+    // For the move before the first poll. A moved-from future has no socket, so its
+    // destructor does nothing.
+    UdpRecvFuture(UdpRecvFuture&&) noexcept            = default;
+    UdpRecvFuture& operator=(UdpRecvFuture&&) noexcept = delete;
+
+    ~UdpRecvFuture() {
+        if (m_udp && m_armed) detail::lwip_udp_cancel_recv(*m_udp);
+    }
+
+    PollResult<OutputType> poll(detail::Context& ctx) {
+        std::size_t   n = 0;
+        SocketAddress sender;
+        auto result = detail::lwip_udp_poll_recv(*m_udp,
+            reinterpret_cast<std::byte*>(std::ranges::data(m_buf)), std::ranges::size(m_buf),
+            /*connected_only=*/!WithSender, m_armed, n, sender, ctx);
+        if (result.isPending()) return PollPending;
+        if (result.isError())   return PollError(result.error());
+        if constexpr (WithSender) return OutputType{n, std::move(m_buf), sender};
+        else                      return OutputType{n, std::move(m_buf)};
+    }
+
+private:
+    detail::Rc<detail::LwipUdpCtx> m_udp;
+    Buf                            m_buf;
+    // True while lwIP's receive callback points at m_buf.
+    bool                           m_armed = false;
+};
 
 /**
  * @brief Async, connectionless UDP socket. Obtain via `co_await UdpSocket::bind()`.
@@ -38,6 +156,8 @@ namespace detail { struct LwipUdpCtx; }
  * **Concurrency:** only one receive (`recv_from()`/`recv()`) and only one send
  * (`send_to()`/`send()`) may be in flight at a time; `connect()` must not run
  * concurrently with either.
+ *
+ * **Cancellation:** dropping a pending send or receive is always safe.
  */
 class UdpSocket {
 public:
@@ -53,39 +173,34 @@ public:
     [[nodiscard]] static Coro<UdpSocket> bind(std::string host, uint16_t port);
 
     /// Sends buf as a single datagram to dest. Returns buf once the send completes.
+    /// @throws std::runtime_error (at co_await) if dest is IPv6 or lwIP rejects it.
     template<ByteBuffer Buf>
-    [[nodiscard]] Coro<Buf> send_to(Buf buf, SocketAddress dest) {
-        co_await send_to_impl(reinterpret_cast<const std::byte*>(std::ranges::data(buf)),
-                               std::ranges::size(buf), dest);
-        co_return std::move(buf);
+    [[nodiscard]] UdpSendFuture<Buf> send_to(Buf buf, SocketAddress dest) {
+        return UdpSendFuture<Buf>(m_impl, std::move(buf), dest);
     }
 
     /// Waits for the next datagram, copying it into buf. Returns {n, buf, sender}.
+    /// A datagram longer than buf is truncated to fit.
     template<ByteBuffer Buf>
-    [[nodiscard]] Coro<std::tuple<std::size_t, Buf, SocketAddress>> recv_from(Buf buf) {
-        auto [n, sender] = co_await recv_from_impl(
-            reinterpret_cast<std::byte*>(std::ranges::data(buf)), std::ranges::size(buf));
-        co_return std::tuple<std::size_t, Buf, SocketAddress>{n, std::move(buf), sender};
+    [[nodiscard]] UdpRecvFuture<Buf, true> recv_from(Buf buf) {
+        return UdpRecvFuture<Buf, true>(m_impl, std::move(buf));
     }
 
     /// Fixes peer as this socket's only correspondent.
     [[nodiscard]] Coro<void> connect(SocketAddress peer);
 
-    /// Sends buf to the peer fixed by connect(). Throws if not connected.
+    /// Sends buf to the peer fixed by connect().
+    /// @throws std::runtime_error (at co_await) if not connected.
     template<ByteBuffer Buf>
-    [[nodiscard]] Coro<Buf> send(Buf buf) {
-        co_await send_impl(reinterpret_cast<const std::byte*>(std::ranges::data(buf)),
-                            std::ranges::size(buf));
-        co_return std::move(buf);
+    [[nodiscard]] UdpSendFuture<Buf> send(Buf buf) {
+        return UdpSendFuture<Buf>(m_impl, std::move(buf), std::nullopt);
     }
 
-    /// Waits for the next datagram from the peer fixed by connect(). Throws if
-    /// not connected.
+    /// Waits for the next datagram from the peer fixed by connect().
+    /// @throws std::runtime_error (at co_await) if not connected.
     template<ByteBuffer Buf>
-    [[nodiscard]] Coro<std::pair<std::size_t, Buf>> recv(Buf buf) {
-        std::size_t n = co_await recv_impl(
-            reinterpret_cast<std::byte*>(std::ranges::data(buf)), std::ranges::size(buf));
-        co_return std::pair<std::size_t, Buf>{n, std::move(buf)};
+    [[nodiscard]] UdpRecvFuture<Buf, false> recv(Buf buf) {
+        return UdpRecvFuture<Buf, false>(m_impl, std::move(buf));
     }
 
     /// No-op on this backend — see doc/design/udp_socket.md's "Multicast and
@@ -102,13 +217,6 @@ public:
 
 private:
     explicit UdpSocket(detail::Rc<detail::LwipUdpCtx> impl);
-
-    // Defined in udp_socket_lwip.cpp. Never inline — keeps lwIP headers out of
-    // this file.
-    [[nodiscard]] Coro<void> send_to_impl(const std::byte* buf, std::size_t size, SocketAddress dest);
-    [[nodiscard]] Coro<std::tuple<std::size_t, SocketAddress>> recv_from_impl(std::byte* buf, std::size_t size);
-    [[nodiscard]] Coro<void> send_impl(const std::byte* buf, std::size_t size);
-    [[nodiscard]] Coro<std::size_t> recv_impl(std::byte* buf, std::size_t size);
 
     detail::Rc<detail::LwipUdpCtx> m_impl;
 };

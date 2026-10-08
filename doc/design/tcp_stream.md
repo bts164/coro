@@ -242,10 +242,37 @@ Connections still in the kernel's backlog are reset.
 With `CORO_TCP_BACKEND_LWIP` defined, `tcp_stream.h` and `tcp_listener.h` select a
 different class body over the lwIP raw TCP API (`src/io/lwip/tcp_stream_lwip.cpp`,
 `tcp_listener_lwip.cpp`). Callbacks fire on the executor thread from
-`cyw43_arch_poll()`, `connect` resolves names through lwIP's DNS, and reads and writes
-are `Coro`s. The public signatures match the desktop backend's. See
+`cyw43_arch_poll()`, and `connect` resolves names through lwIP's DNS. See
 [Pico Port](pico_port.md), "Component design", for its shared state, destructor and
 connect sequence.
+
+`connect` and `accept` are `Coro`s. `read`, `read_exact` and `write` return hand-written
+futures, as on desktop, so a transfer costs no coroutine frame:
+
+| Future | Returned by | Output |
+|---|---|---|
+| `TcpReadFuture<Buf, false>` | `read()` | `pair<size_t, Buf>` |
+| `TcpReadFuture<Buf, true>` | `read_exact()` | `pair<size_t, Buf>` |
+| `TcpWriteFuture<Buf>` | `write()` | `pair<size_t, Buf>` |
+
+Each holds an `Rc<LwipTcpCtx>` and the caller's buffer. `tcp_stream.h` must not include
+lwIP's headers, so `poll()` forwards to `detail::lwip_tcp_poll_read()` or
+`lwip_tcp_poll_write()` in `tcp_stream_lwip.cpp`.
+
+- **Read** drains `rx_buf` into the buffer first. With data taken (and, for
+  `read_exact`, the buffer full) it is ready. Otherwise a connection error becomes
+  `PollError`, EOF returns what was read, and anything else stores `rx_waker` and
+  waits for `on_recv`. A read into an empty buffer returns 0 at once.
+- **Write** copies as much as `tcp_sndbuf()` allows with `tcp_write()`
+  (`TCP_WRITE_FLAG_COPY`). With the send buffer full it flushes once with `tcp_output()`,
+  and if there is still no room stores `tx_waker` and waits for `on_sent`. It flushes
+  again when the last byte is queued.
+- **Dropping** a pending read or write clears its waker from the connection. Bytes a
+  read already copied out are lost with its buffer, and bytes a write already queued are
+  still sent. This matches the desktop futures.
+
+As on desktop, one read and one write may be pending at once, but not two of either: the
+connection has one waker slot per direction.
 
 ---
 
@@ -291,7 +318,9 @@ Name resolution is covered in `test/io/test_lookup_host.cpp`:
 | `LookupHostTest.ConnectByNameRethrowsLastError` | With every address refused, the error is `ECONNREFUSED`. |
 | `LookupHostTest.ConnectToUnresolvableNameThrowsDnsError` | `nonexistent.invalid` fails in `dns_error_category()`. |
 
-The lwIP backend has its own host-built test, `test/pico/test_tcp_stream_real.cpp`.
+The lwIP backend has its own host-built test, `test/pico/test_tcp_stream_real.cpp`. Besides
+the round trips it checks that a read dropped mid-wait loses no data and that a read
+into an empty buffer returns 0 at once.
 
 ---
 

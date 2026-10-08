@@ -475,11 +475,13 @@ on the blocking pool.
 ### `SleepFuture` / `sleep_for()`
 
 Deadlines are `Instant`s on `coro::Clock` (`steady_clock` on desktop). The first pending
-`poll()` adds a `{deadline, TimerSlot}` entry to the driver's `TimerQueue`; the nearest
-deadline bounds the driver's `epoll_pwait2` at nanosecond resolution. Each later pending
-poll replaces the slot's waker. Dropping the future empties the slot, and the entry is
-later popped without a wake (lazy cancellation). `poll()` checks the clock itself, so it
-is never ready early.
+`poll()` registers the deadline and a weak waker with the driver's `TimerQueue` and keeps
+the `TimerId` it gets back; the nearest deadline bounds the driver's `epoll_pwait2` at
+nanosecond resolution. Nothing is allocated per sleep. Later pending polls do nothing
+unless the waker has changed. Dropping the future cancels the timer by id, and the entry
+is later removed without a wake (lazy cancellation, with a sweep once cancelled entries
+outnumber live ones). `poll()` checks the clock itself, so it is never ready early. See
+[Timers](timers.md).
 
 ### `WsStream` / `WsListener`
 
@@ -694,7 +696,7 @@ profiling justifies the complexity:
 |---|---|---|
 | `SchedulingState` | `std::atomic` + CAS | Hot path; mutex would serialize all wakeups |
 | `ScheduledIo` readiness + wakers | `std::mutex` | Readiness check and waker store must be atomic with the driver's dispatch |
-| `TimerQueue` / `TimerSlot` | `std::mutex` | Heap updates and the waiting-thread record change together |
+| `TimerQueue` | `std::mutex` | Heap, timer slots, cancelled count and the waiting-thread record change together |
 | `BlockingState` | `std::mutex` | Low contention; protocol clarity outweighs cost |
 | Channel shared state | `std::mutex` | Multiple fields updated together; mutex makes invariants obvious |
 | `JoinSetSharedState` | `std::mutex` | List splice + counter + waker update must be atomic together |

@@ -161,12 +161,19 @@ bool CurrentThreadExecutor::poll_ready_tasks() {
     return true;
 }
 
-void CurrentThreadExecutor::add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot) {
+detail::TimerId CurrentThreadExecutor::add_timer(Instant deadline,
+                                                 detail::Weak<detail::Waker> waker) {
+    const auto inserted = m_timers.insert(deadline, std::move(waker));
     // True only while park_once() is parked for a later deadline, which a timer
     // added from the executor's own thread can never see.
     // Race (benign): park() may return for another reason before this unpark(); it
     // then makes the next park() return early, one extra loop iteration.
-    if (m_timers.insert(deadline, std::move(slot))) m_parker->unpark();
+    if (inserted.unpark) m_parker->unpark();
+    return inserted.id;
+}
+
+void CurrentThreadExecutor::cancel_timer(detail::TimerId id) noexcept {
+    m_timers.cancel(id);
 }
 
 void CurrentThreadExecutor::park_once() {

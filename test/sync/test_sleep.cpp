@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
+#include <coro/sync/interval.h>
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
 #include <coro/coro.h>
+#include <coro/coro_stream.h>
+#include <coro/stream.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/parker.h>
@@ -18,6 +21,7 @@ using namespace std::chrono_literals;
 
 // --- Concept check ---
 static_assert(Future<SleepFuture>);
+static_assert(Future<IntervalTimer::TickFuture>);
 
 // sleep_for completes after the requested duration.
 TEST(SleepTest, SleepForCompletesAfterDuration) {
@@ -118,6 +122,18 @@ Coro<void> many_short_sleeps(int n, std::chrono::microseconds each) {
     for (int i = 0; i < n; ++i) co_await sleep_for(each);
 }
 
+// Yields once, after sleeping.
+CoroStream<int> yield_after(std::chrono::milliseconds delay) {
+    co_await sleep_for(delay);
+    co_yield 1;
+}
+
+// Polls `stream` from this task, then gives up on it while it is still suspended.
+Coro<void> poll_briefly(CoroStream<int>& stream) {
+    auto r = co_await timeout(1ms, next(stream));
+    EXPECT_EQ(r.index(), 1u);
+}
+
 } // namespace
 
 // The driver's epoll_pwait2 timeout is nanosecond-resolution, so short sleeps are not
@@ -169,7 +185,7 @@ TEST(SleepTest, PassedDeadlineIsReadyWithoutATimer) {
     }());
 }
 
-// A sleep dropped before its deadline fires nothing: its slot is emptied and the
+// A sleep dropped before its deadline fires nothing: its timer is cancelled and the
 // queue entry is popped without a wake.
 TEST(SleepTest, DroppedSleepDoesNotWake) {
     Runtime rt(1);
@@ -184,8 +200,8 @@ TEST(SleepTest, DroppedSleepDoesNotWake) {
     }());
 }
 
-// A re-poll with a different context (as under select) replaces the stored waker;
-// only the latest is woken.
+// A re-poll with a different context moves the timer to the new waker; only the
+// latest is woken.
 TEST(SleepTest, RepollUpdatesWaker) {
     Runtime rt(1);
     rt.block_on([]() -> Coro<void> {
@@ -198,6 +214,73 @@ TEST(SleepTest, RepollUpdatesWaker) {
         EXPECT_EQ(second.wakes(), 1);
         EXPECT_TRUE(f.poll(second.ctx).isReady());
     }());
+}
+
+// A re-poll with the same context keeps the one timer: the waker fires once.
+TEST(SleepTest, RepollWithSameWakerKeepsTimer) {
+    Runtime rt(1);
+    rt.block_on([]() -> Coro<void> {
+        TestTask task;
+        SleepFuture f = sleep_for(5ms);
+        EXPECT_FALSE(f.poll(task.ctx).isReady());
+        EXPECT_FALSE(f.poll(task.ctx).isReady());
+        EXPECT_FALSE(f.poll(task.ctx).isReady());
+        co_await sleep_for(20ms);
+        EXPECT_EQ(task.wakes(), 1);
+        EXPECT_TRUE(f.poll(task.ctx).isReady());
+    }());
+}
+
+// The timer is named by id, so a polled sleep can still be moved: the moved-to
+// future owns the timer, and dropping the moved-from one cancels nothing.
+TEST(SleepTest, MovedAfterPollKeepsTimer) {
+    Runtime rt(1);
+    rt.block_on([]() -> Coro<void> {
+        TestTask task;
+        std::optional<SleepFuture> first(sleep_for(5ms));
+        EXPECT_FALSE(first->poll(task.ctx).isReady());
+        SleepFuture second = std::move(*first);
+        first.reset();
+        co_await sleep_for(20ms);
+        EXPECT_EQ(task.wakes(), 1);
+        EXPECT_TRUE(second.poll(task.ctx).isReady());
+    }());
+}
+
+// A stream suspended in a sleep is polled by one task, which then abandons it, and is
+// awaited by another. The sleep's timer still names the first task's waker; the
+// second task's poll must move it, or the second task is never woken.
+TEST(SleepTest, StreamHandedToAnotherTaskStillWakes) {
+    Runtime rt(4);
+    auto index = rt.block_on([]() -> Coro<int> {
+        CoroStream<int> stream = yield_after(50ms);
+        co_await spawn(poll_briefly(stream));
+        auto r = co_await timeout(2s, next(stream));
+        co_return static_cast<int>(r.index());
+    }());
+    EXPECT_EQ(index, 0);   // the stream's item, not the 2 s timeout
+}
+
+// Many timeouts that never expire: each registers a far-off timer (the short sleep
+// makes select poll both branches) and cancels it. The cancelled entries are swept
+// rather than piling up, and timers keep working afterwards.
+TEST(SleepTest, ManyCancelledTimeouts) {
+    Runtime rt(1);
+    auto start = std::chrono::steady_clock::now();
+    int done = rt.block_on([]() -> Coro<int> {
+        int n = 0;
+        for (int i = 0; i < 10000; ++i) {
+            auto r = co_await timeout(1h, []() -> Coro<int> {
+                co_await sleep_for(10us);
+                co_return 1;
+            }());
+            if (r.index() == 0) ++n;
+        }
+        co_await sleep_for(5ms);
+        co_return n;
+    }());
+    EXPECT_EQ(done, 10000);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
 }
 
 TEST(SleepTest, ManyConcurrentSleepers) {
@@ -236,6 +319,66 @@ TEST(TimeoutTest, TimeoutAtDeadlineWins) {
     EXPECT_EQ(index, 1);
     EXPECT_GE(elapsed, 30ms);
     EXPECT_LT(elapsed, 500ms);
+}
+
+TEST(IntervalTimerTest, TicksOncePerPeriod) {
+    Runtime rt(1);
+    const Instant start = Clock::now();
+    rt.block_on([]() -> Coro<void> {
+        IntervalTimer timer(5ms);
+        for (int i = 0; i < 4; ++i) co_await timer.tick();
+    }());
+    EXPECT_GE(Clock::now() - start, 20ms);
+}
+
+// Work done between ticks comes out of the wait: three 40 ms periods with 20 ms of
+// work in each take 120 ms, not 180 ms.
+TEST(IntervalTimerTest, AbsorbsWorkBetweenTicks) {
+    Runtime rt(1);
+    const Instant start = Clock::now();
+    rt.block_on([]() -> Coro<void> {
+        IntervalTimer timer(40ms);
+        for (int i = 0; i < 3; ++i) {
+            co_await sleep_for(20ms);
+            co_await timer.tick();
+        }
+    }());
+    const auto elapsed = Clock::now() - start;
+    EXPECT_GE(elapsed, 120ms);
+    EXPECT_LT(elapsed, 170ms);
+}
+
+// A tick dropped mid-wait doesn't advance the schedule: the next tick() still
+// completes one period after construction, not two.
+TEST(IntervalTimerTest, DroppedTickKeepsSchedule) {
+    Runtime rt(1);
+    const Instant start = Clock::now();
+    const auto index = rt.block_on([]() -> Coro<int> {
+        IntervalTimer timer(100ms);
+        auto r = co_await timeout(5ms, timer.tick());
+        co_await timer.tick();
+        co_return static_cast<int>(r.index());
+    }());
+    const auto elapsed = Clock::now() - start;
+    EXPECT_EQ(index, 1);
+    EXPECT_GE(elapsed, 100ms);
+    EXPECT_LT(elapsed, 180ms);
+}
+
+// After falling several periods behind, one tick is ready at once and the next
+// waits a full period: the missed ticks are not delivered in a burst.
+TEST(IntervalTimerTest, SkipsMissedTicks) {
+    Runtime rt(1);
+    const auto after_late = rt.block_on([]() -> Coro<Clock::duration> {
+        IntervalTimer timer(10ms);
+        co_await sleep_for(35ms);
+        const Instant late = Clock::now();
+        co_await timer.tick();   // overdue: ready at once
+        co_await timer.tick();
+        co_await timer.tick();
+        co_return Clock::now() - late;
+    }());
+    EXPECT_GE(after_late, 20ms);
 }
 
 // An executor that never turns the IoDriver cannot fire timers on it; the first

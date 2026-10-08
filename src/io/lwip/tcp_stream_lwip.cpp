@@ -16,6 +16,7 @@
 #include <lwip/err.h>  // err_t, ERR_* constants
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <string>
 
@@ -201,99 +202,97 @@ Coro<TcpStream> TcpStream::connect(std::string host, uint16_t port) {
     co_return TcpStream(std::move(ctx));
 }
 
-// ---------------------------------------------------------------------------
-// TcpStream::read_impl
-// ---------------------------------------------------------------------------
-
-Coro<std::size_t> TcpStream::read_impl(std::byte* buf, std::size_t size) {
-    // Capture ctx before any suspension so we don't hold a dangling `this`
-    // if the TcpStream object is moved while this coroutine is parked.
-    auto ctx_ptr = m_impl;
-
-    struct DataReady {
-        using OutputType = void;
-        detail::Rc<detail::LwipTcpCtx> ctx;
-
-        PollResult<void> poll(detail::Context& cx) {
-            if (!ctx->rx_buf.empty() || ctx->rx_eof || ctx->errored)
-                return PollReady;
-            // RACE CONDITION NOTE: safe — on_recv fires on the executor thread
-            // (from cyw43_arch_poll / sys_check_timeouts), never concurrently.
-            ctx->rx_waker = cx.getWaker();
-            return PollPending;
-        }
-    };
-
-    if (ctx_ptr->rx_buf.empty() && !ctx_ptr->rx_eof && !ctx_ptr->errored)
-        co_await DataReady{ctx_ptr};
-
-    // Drain buffered data first, even if the connection has since errored or
-    // closed. A RST or FIN can arrive immediately after the last data segment
-    // (common on loopback); reporting the error before returning buffered bytes
-    // would discard valid data the peer already sent. The error or EOF is only
-    // surfaced on the next call once the buffer is empty.
-    if (!ctx_ptr->rx_buf.empty()) {
-        auto n = std::min(size, ctx_ptr->rx_buf.size());
-        std::memcpy(buf, ctx_ptr->rx_buf.data(), n);
-        ctx_ptr->rx_buf.erase(ctx_ptr->rx_buf.begin(),
-                              ctx_ptr->rx_buf.begin() + static_cast<std::ptrdiff_t>(n));
-        co_return n;
-    }
-
-    if (ctx_ptr->errored)
-        throw std::runtime_error("TcpStream::read: " + lwip_err_string(ctx_ptr->error));
-
-    co_return std::size_t{0}; // EOF — graceful close, buffer already empty
-}
+} // namespace coro
 
 // ---------------------------------------------------------------------------
-// TcpStream::write_impl
+// Read and write futures: the halves that need lwIP  (coro::detail namespace)
 // ---------------------------------------------------------------------------
 
-Coro<void> TcpStream::write_impl(const std::byte* buf, std::size_t size) {
-    auto ctx_ptr = m_impl;
+namespace coro::detail {
 
-    struct SpaceAvailable {
-        using OutputType = void;
-        detail::Rc<detail::LwipTcpCtx> ctx;
-
-        PollResult<void> poll(detail::Context& cx) {
-            if (ctx->errored || !ctx->pcb) return PollReady;
-            if (tcp_sndbuf(ctx->pcb) > 0)  return PollReady;
-            ctx->tx_waker = cx.getWaker();
-            return PollPending;
-        }
-    };
-
-    if (ctx_ptr->errored || !ctx_ptr->pcb)
-        throw std::runtime_error("TcpStream::write: " + lwip_err_string(ctx_ptr->error));
-
-    const auto* src = reinterpret_cast<const uint8_t*>(buf);
-    std::size_t offset = 0;
-
-    while (offset < size) {
-        if (ctx_ptr->errored || !ctx_ptr->pcb)
-            throw std::runtime_error("TcpStream::write: " + lwip_err_string(ctx_ptr->error));
-
-        uint16_t avail = tcp_sndbuf(ctx_ptr->pcb);
-        if (avail == 0) {
-            tcp_output(ctx_ptr->pcb);
-            co_await SpaceAvailable{ctx_ptr};
+PollResult<void> lwip_tcp_poll_read(LwipTcpCtx& tcp, std::byte* buf, std::size_t size,
+                                    std::size_t& filled, bool exact, Context& ctx) {
+    while (filled < size) {
+        // Drain buffered data first, even if the connection has since errored or
+        // closed. A RST or FIN can arrive immediately after the last data segment
+        // (common on loopback); reporting the error before returning buffered bytes
+        // would discard valid data the peer already sent. The error or EOF is only
+        // surfaced once the buffer is empty.
+        if (!tcp.rx_buf.empty()) {
+            const auto n = std::min(size - filled, tcp.rx_buf.size());
+            std::memcpy(buf + filled, tcp.rx_buf.data(), n);
+            tcp.rx_buf.erase(tcp.rx_buf.begin(),
+                             tcp.rx_buf.begin() + static_cast<std::ptrdiff_t>(n));
+            filled += n;
+            if (!exact) break;
             continue;
         }
 
-        uint16_t chunk = static_cast<uint16_t>(
-            std::min<std::size_t>(avail, size - offset));
-        // TCP_WRITE_FLAG_COPY: lwIP copies the data immediately, so src only
-        // needs to be valid until tcp_write returns.
-        err_t err = tcp_write(ctx_ptr->pcb, src + offset, chunk, TCP_WRITE_FLAG_COPY);
-        if (err != ERR_OK)
-            throw std::runtime_error("TcpStream::write: tcp_write failed");
-        offset += chunk;
-    }
+        if (tcp.errored)
+            return PollError(std::make_exception_ptr(
+                std::runtime_error("TcpStream::read: " + lwip_err_string(tcp.error))));
 
-    if (ctx_ptr->pcb)
-        tcp_output(ctx_ptr->pcb);
+        if (tcp.rx_eof) break;   // graceful close, buffer already empty
+
+        // RACE CONDITION NOTE: safe — on_recv/on_err fire on the executor thread
+        // (from cyw43_arch_poll / sys_check_timeouts), never concurrently with this
+        // poll, so data can't arrive between the checks above and storing the waker.
+        tcp.rx_waker = ctx.getWaker();
+        return PollPending;
+    }
+    return PollReady;
 }
 
-} // namespace coro
+PollResult<void> lwip_tcp_poll_write(LwipTcpCtx& tcp, const std::byte* buf, std::size_t size,
+                                     std::size_t& written, Context& ctx) {
+    const auto write_error = [&tcp] {
+        return PollError(std::make_exception_ptr(
+            std::runtime_error("TcpStream::write: " + lwip_err_string(tcp.error))));
+    };
+
+    // Checked even for an empty buffer, so a write to a dead connection always fails.
+    if (tcp.errored || !tcp.pcb) return write_error();
+
+    const auto* src = reinterpret_cast<const uint8_t*>(buf);
+    bool flushed = false;
+
+    while (written < size) {
+        // tcp_output() and tcp_write() below can run on_err, which clears pcb.
+        if (tcp.errored || !tcp.pcb) return write_error();
+
+        const uint16_t avail = tcp_sndbuf(tcp.pcb);
+        if (avail == 0) {
+            if (!flushed) {
+                // Push out what is queued, then look once more before waiting.
+                tcp_output(tcp.pcb);
+                flushed = true;
+                continue;
+            }
+            // RACE CONDITION NOTE: safe — on_sent/on_err fire on the executor thread,
+            // never concurrently with this poll, so space can't be freed between the
+            // tcp_sndbuf() check and storing the waker.
+            tcp.tx_waker = ctx.getWaker();
+            return PollPending;
+        }
+
+        const auto chunk = static_cast<uint16_t>(
+            std::min<std::size_t>(avail, size - written));
+        // TCP_WRITE_FLAG_COPY: lwIP copies the data immediately, so src only
+        // needs to be valid until tcp_write returns.
+        const err_t err = tcp_write(tcp.pcb, src + written, chunk, TCP_WRITE_FLAG_COPY);
+        if (err != ERR_OK)
+            return PollError(std::make_exception_ptr(
+                std::runtime_error("TcpStream::write: tcp_write failed")));
+        written += chunk;
+        flushed = false;
+    }
+
+    if (tcp.pcb)
+        tcp_output(tcp.pcb);
+    return PollReady;
+}
+
+void lwip_tcp_cancel_read(LwipTcpCtx& tcp) noexcept  { tcp.rx_waker = nullptr; }
+void lwip_tcp_cancel_write(LwipTcpCtx& tcp) noexcept { tcp.tx_waker = nullptr; }
+
+} // namespace coro::detail

@@ -23,6 +23,9 @@
 //     used by the library: make_rc, copy/move, the aliasing constructor,
 //     implicit upcast across multiple inheritance, and Weak<T>::lock().
 //
+// Both also provide same_rc(weak, weak): whether two weak pointers refer to the
+// same object.
+//
 // Usage:
 //   #include <coro/detail/rc.h>
 //   coro::detail::Rc<Foo> p = coro::detail::make_rc<Foo>(args...);
@@ -296,6 +299,9 @@ public:
 
     bool expired() const { return !m_block || m_block->strong_count == 0; }
 
+    // See same_rc().
+    bool same_block(const NonAtomicWeak& other) const { return m_block == other.m_block; }
+
 private:
     void release() {
         if (m_block && m_block->release_weak()) delete m_block;
@@ -318,6 +324,15 @@ NonAtomicRc<T> make_rc(Args&&... args) {
 
 template<typename T> using Rc   = NonAtomicRc<T>;
 template<typename T> using Weak = NonAtomicWeak<T>;
+
+// True if `a` and `b` refer to the same object (share a control block), whether or
+// not it is still alive. Two empty pointers are the same. Holding either one keeps
+// the control block allocated, so its address can't be reused for another object
+// while the comparison still matters.
+template<typename T>
+bool same_rc(const NonAtomicWeak<T>& a, const NonAtomicWeak<T>& b) noexcept {
+    return a.same_block(b);
+}
 
 } // namespace coro::detail
 
@@ -344,6 +359,15 @@ namespace coro::detail {
     template<typename T, typename... Args>
     Rc<T> make_rc(Args&&... args) {
         return std::make_shared<T>(std::forward<Args>(args)...);
+    }
+
+    // True if `a` and `b` refer to the same object (share a control block), whether
+    // or not it is still alive. Two empty pointers are the same. Holding either one
+    // keeps the control block allocated, so its address can't be reused for another
+    // object while the comparison still matters.
+    template<typename T>
+    bool same_rc(const Weak<T>& a, const Weak<T>& b) noexcept {
+        return !a.owner_before(b) && !b.owner_before(a);
     }
 } // namespace coro::detail
 

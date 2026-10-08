@@ -139,7 +139,8 @@ Coro<TcpListener> TcpListener::bind(std::string host, uint16_t port) {
 // ---------------------------------------------------------------------------
 
 Coro<TcpStream> TcpListener::accept() {
-    // Capture ctx before any suspension for the same reason as read_impl.
+    // Capture ctx before any suspension, so the frame never holds a dangling `this`
+    // if the TcpListener is moved while this coroutine is parked.
     auto ctx_ptr = m_impl;
 
     struct ConnectionReady {

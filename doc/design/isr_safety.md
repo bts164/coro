@@ -242,9 +242,9 @@ the same thing happened, and every one of them resuming on the same signal is
 correct.
 
 The exact ordering guarantee: `signal_from_isr()` wakes every `wait()` that
-was already registered at the moment it's called — i.e. every `wait()` whose
-`co_await` was reached before this `signal_from_isr()`, regardless of which
-of them the executor happens to resume first. A `wait()` registered *after*
+was already made at the moment it's called — i.e. every `wait()` call that
+returned its future before this `signal_from_isr()`, regardless of which
+of them the executor happens to resume first. A `wait()` made *after*
 `signal_from_isr()` has already run does not observe that signal; it parks
 until the next one. A second `signal_from_isr()` before the first is observed
 does not queue (see Limitations below).
@@ -266,8 +266,9 @@ public:
         spin_unlock(m_lock, save);
     }
 
-    [[nodiscard]] coro::Coro<void> wait() {
-        co_await IsrWaitFuture{*this};
+    // The future itself, not a Coro wrapping it: no coroutine frame, no allocation.
+    [[nodiscard]] IsrWaitFuture wait() {
+        return IsrWaitFuture{*this};
     }
 
 private:
@@ -376,11 +377,11 @@ public:
     }
 
     // The claim (check flag, copy value, clear flag) all happens inside
-    // IsrChannelWaitFuture<T>::poll() -- one locked critical section, called
-    // at most once per receive() (see "Multiple waiters" below for why no
-    // explicit retry loop is needed here even under concurrent receivers).
-    [[nodiscard]] coro::Coro<T> receive() {
-        co_return co_await IsrChannelWaitFuture<T>{*this};
+    // IsrChannelWaitFuture<T>::poll() -- one locked critical section (see
+    // "Multiple waiters" below for why no explicit retry loop is needed here
+    // even under concurrent receivers).
+    [[nodiscard]] IsrChannelWaitFuture<T> receive() {
+        return IsrChannelWaitFuture<T>{*this};
     }
 
 private:
@@ -432,8 +433,8 @@ public:
     // suspending. The claim-and-decrement happens inside
     // IsrSemaphoreWaitFuture::poll() -- see "Multiple waiters" below for why no
     // explicit retry loop is needed here even under concurrent acquire()s.
-    [[nodiscard]] coro::Coro<void> acquire() {
-        co_await IsrSemaphoreWaitFuture{*this};
+    [[nodiscard]] IsrSemaphoreWaitFuture acquire() {
+        return IsrSemaphoreWaitFuture{*this};
     }
 
 private:

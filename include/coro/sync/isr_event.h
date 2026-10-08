@@ -37,15 +37,15 @@ class IsrWaitFuture; // defined below; friended by IsrEvent to reach its state d
  *
  * The ISR calls signal_from_isr() and any number of coroutines may
  * concurrently call wait(). signal_from_isr() wakes every wait() that was
- * already registered at the moment it's called -- i.e. every wait() whose
- * co_await was reached before this signal_from_isr(), regardless of which
- * of them the executor happens to resume first. A wait() registered after
+ * already made at the moment it's called -- i.e. every wait() call that
+ * returned its future before this signal_from_isr(), regardless of which
+ * of them the executor happens to resume first. A wait() made after
  * signal_from_isr() has already run does NOT observe that signal; it parks
  * until the next one. Meant to be wait()-ed on repeatedly across the
  * instance's lifetime (see doc/design/isr_safety.md's "Multiple waiters").
  *
  * Implemented as a 64-bit generation counter (m_epoch), not a bool flag. Each
- * wait() call captures the current epoch when it starts (inside
+ * wait() call captures the current epoch as it is called (inside
  * IsrWaitFuture's constructor) and resolves the moment the epoch changes --
  * i.e. the next signal_from_isr() strictly after that wait() began. This is
  * deliberately NOT "wait() observes any signal still pending from before it
@@ -88,20 +88,23 @@ public:
         spin_unlock(m_lock, save);
     }
 
+    // Returns a future that resolves on the first signal_from_isr() after
+    // this call. The baseline epoch is captured here, as wait() is called,
+    // not when the future is first polled.
+    //
+    // Returns the hand-written IsrWaitFuture itself and not a Coro wrapping
+    // it, so a wait has no coroutine frame and allocates nothing.
     // Defined below IsrWaitFuture, which it constructs.
-    [[nodiscard]] Coro<void> wait();
+    [[nodiscard]] IsrWaitFuture wait();
 
-    // Non-blocking snapshot of the current epoch, for callers that must arm
-    // hardware (e.g. gpio_set_irq_enabled()) and only start waiting some time
-    // later -- capturing the baseline here, before arming, and passing it to
-    // wait_from() below closes the gap that plain wait() cannot: wait()'s
-    // baseline isn't captured until IsrWaitFuture's constructor runs, which
-    // for a lazily-started Coro<void> is only once the caller actually
-    // co_awaits it -- i.e. strictly after arming, not atomically with it. Any
-    // edge landing in between would bump the epoch before that baseline is
-    // read, so wait() would just fold it into its own baseline and never
-    // resolve for it. See doc/design/isr_safety.md and gpio.cpp's
-    // arm_and_wait() for the motivating bug.
+    // Non-blocking snapshot of the current epoch, for callers that arm
+    // hardware (e.g. gpio_set_irq_enabled()) in one place and only call
+    // wait() some time later, e.g. from a separate function. An edge that
+    // lands in between bumps the epoch before wait() reads its baseline, so
+    // wait() would fold it into that baseline and never resolve for it.
+    // Capturing the baseline here, before arming, and passing it to
+    // wait_from() below closes that gap. See doc/design/isr_safety.md and
+    // AsyncDmaTransfer::start()/wait() for the motivating case.
     [[nodiscard]] uint64_t epoch() const noexcept {
         uint32_t save = spin_lock_blocking(m_lock);
         uint64_t e = m_epoch;
@@ -113,7 +116,7 @@ public:
     // `baseline` (as returned by epoch()) rather than after this call itself.
     // Use this together with epoch() to snapshot the baseline before arming
     // hardware that might signal before wait() is reached.
-    [[nodiscard]] Coro<void> wait_from(uint64_t baseline);
+    [[nodiscard]] IsrWaitFuture wait_from(uint64_t baseline);
 
 private:
     friend class IsrWaitFuture;
@@ -246,16 +249,16 @@ private:
 
 static_assert(Future<IsrWaitFuture>);
 
-inline Coro<void> IsrEvent::wait() {
+inline IsrWaitFuture IsrEvent::wait() {
     // IsrWaitFuture's constructor captures the current epoch as this call's
     // baseline -- see IsrEvent's class comment for why that's what makes
     // repeated wait()s and concurrent broadcast waiters both correct with
     // no explicit reset step.
-    co_await IsrWaitFuture{*this};
+    return IsrWaitFuture{*this};
 }
 
-inline Coro<void> IsrEvent::wait_from(uint64_t baseline) {
-    co_await IsrWaitFuture{*this, baseline};
+inline IsrWaitFuture IsrEvent::wait_from(uint64_t baseline) {
+    return IsrWaitFuture{*this, baseline};
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +298,10 @@ public:
         spin_unlock(m_lock, save);
     }
 
+    // Returns a future for the next value. A hand-written future and not a
+    // Coro, so a receive has no coroutine frame and allocates nothing.
     // Defined below IsrChannelWaitFuture<T>, which it constructs.
-    [[nodiscard]] Coro<T> receive();
+    [[nodiscard]] IsrChannelWaitFuture<T> receive();
 
 private:
     friend class IsrChannelWaitFuture<T>;
@@ -384,13 +389,13 @@ private:
 
 template<typename T>
     requires std::is_trivially_copyable_v<T>
-Coro<T> IsrChannel<T>::receive() {
+IsrChannelWaitFuture<T> IsrChannel<T>::receive() {
     // The claim (check flag, copy value, clear flag) all happens inside
-    // IsrChannelWaitFuture<T>::poll() -- one locked critical section, called
-    // at most once per receive() (see doc/design/isr_safety.md, "Multiple
-    // waiters" for why no explicit retry loop is needed here even under
-    // concurrent receivers).
-    co_return co_await IsrChannelWaitFuture<T>{*this};
+    // IsrChannelWaitFuture<T>::poll() -- one locked critical section. A poll()
+    // that finds the flag clear stays pending, so no explicit retry loop is
+    // needed here even under concurrent receivers (see
+    // doc/design/isr_safety.md, "Multiple waiters").
+    return IsrChannelWaitFuture<T>{*this};
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +427,10 @@ public:
         spin_unlock(m_lock, save);
     }
 
+    // Returns a future that claims one count. A hand-written future and not
+    // a Coro, so an acquire has no coroutine frame and allocates nothing.
     // Defined below IsrSemaphoreWaitFuture, which it constructs.
-    [[nodiscard]] Coro<void> acquire();
+    [[nodiscard]] IsrSemaphoreWaitFuture acquire();
 
 private:
     friend class IsrSemaphoreWaitFuture;
@@ -506,11 +513,11 @@ private:
 
 static_assert(Future<IsrSemaphoreWaitFuture>);
 
-inline Coro<void> IsrSemaphore::acquire() {
+inline IsrSemaphoreWaitFuture IsrSemaphore::acquire() {
     // The claim-and-decrement happens inside IsrSemaphoreWaitFuture::poll() --
     // see doc/design/isr_safety.md, "Multiple waiters" for why no explicit
     // retry loop is needed here even under concurrent acquire()s.
-    co_await IsrSemaphoreWaitFuture{*this};
+    return IsrSemaphoreWaitFuture{*this};
 }
 
 } // namespace coro

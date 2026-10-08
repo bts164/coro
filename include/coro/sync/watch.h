@@ -470,6 +470,17 @@ public:
     }
 
     /**
+     * @brief Returns a copy of the current value, taken under a read lock.
+     *
+     * For small values that are cheaper to copy than to hold a guard for. Like
+     * `borrow()`, it does **not** update `last_seen`.
+     */
+    [[nodiscard]] T get() const {
+        std::shared_lock lock(m_shared->value_mutex);
+        return m_shared->value;
+    }
+
+    /**
      * @brief Acquires a read lock, marks the current version as seen, and returns a guard.
      *
      * Equivalent to calling `borrow()` and then updating the receiver's version

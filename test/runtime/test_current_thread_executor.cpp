@@ -204,14 +204,11 @@ struct TimerFuture {
     CurrentThreadExecutor*    m_ex;
     std::chrono::microseconds m_delay;
     bool                      m_armed = false;
-    Rc<TimerSlot>             m_slot;
 
     PollResult<int> poll(Context& ctx) {
         if (!m_armed) {
             m_armed = true;
-            m_slot = make_rc<TimerSlot>();
-            m_slot->waker = ctx.get_weak_waker();
-            m_ex->add_timer(Clock::now() + m_delay, m_slot);
+            m_ex->add_timer(Clock::now() + m_delay, ctx.get_weak_waker());
             return PollPending;
         }
         return 1;

@@ -151,12 +151,22 @@ public:
     void unpark() noexcept;
 
     /**
-     * @brief Adds a timer that wakes `slot`'s waker once `deadline` has passed.
+     * @brief Adds a timer that wakes `waker` once `deadline` has passed.
      *
      * Thread-safe. If a thread is blocked in turn() for a later deadline, unparks it
      * so it recomputes its timeout. Used by `Runtime::add_timer()`.
+     *
+     * @return The id to pass to cancel_timer().
      */
-    void add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot);
+    detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
+
+    /**
+     * @brief Cancels a timer, so that it fires nothing. Thread-safe.
+     *
+     * Does nothing if the timer has already fired or been cancelled, so the caller
+     * need not know which. Used by `Runtime::cancel_timer()`.
+     */
+    void cancel_timer(detail::TimerId id) noexcept;
 
 private:
     friend class IoRegistration;

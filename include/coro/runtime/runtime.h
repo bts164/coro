@@ -73,9 +73,14 @@ public:
     explicit Runtime(bool enable_network = true);
     ~Runtime() = default;
 
-    /// @brief Adds a timer that wakes `slot`'s waker once `deadline` has passed, on
-    /// the CurrentThreadExecutor's queue. Used by SleepFuture.
-    void add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot);
+    /// @brief Adds a timer that wakes `waker` once `deadline` has passed, on the
+    /// CurrentThreadExecutor's queue. Used by SleepFuture.
+    /// @return The id to pass to cancel_timer().
+    detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
+
+    /// @brief Cancels a timer added by add_timer(). Does nothing if it has already
+    /// fired or been cancelled.
+    void cancel_timer(detail::TimerId id) noexcept;
 
     /// @brief Registers an ISR-safe waiter to be peeked once per event loop iteration.
     ///
@@ -135,11 +140,19 @@ public:
     /// (e.g. `UdpSocket::bind()`) throw `std::logic_error` when it is false.
     bool turns_io_driver() const noexcept { return m_executor->turns_io_driver(); }
 
-    /// @brief Adds a timer that wakes `slot`'s waker once `deadline` has passed, on
-    /// the driver's queue. Used by SleepFuture.
+    /// @brief Adds a timer that wakes `waker` once `deadline` has passed, on the
+    /// driver's queue. Used by SleepFuture.
+    /// @return The id to pass to cancel_timer().
     /// @throws std::logic_error if the executor doesn't turn the driver, where the
     ///         timer could never fire.
-    void add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot);
+    detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
+
+    /// @brief Cancels a timer added by add_timer(). Thread-safe. Does nothing if it
+    /// has already fired or been cancelled.
+    ///
+    /// Safe to call while the executor is being destroyed, which is when the futures
+    /// of unfinished tasks cancel their timers.
+    void cancel_timer(detail::TimerId id) noexcept;
 
     /// @brief Returns the runtime's BlockingPool. Used by spawn_blocking().
     BlockingPool& blocking_pool() { return m_blocking_pool; }

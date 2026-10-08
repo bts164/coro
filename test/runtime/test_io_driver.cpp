@@ -590,23 +590,12 @@ TEST(IoDriverParker, UnparkInterruptsUnlimitedPark) {
 
 // --- Timers on the driver ---
 
-namespace {
-
-detail::Rc<detail::TimerSlot> slot_for(TestTask& task) {
-    auto slot = detail::make_rc<detail::TimerSlot>();
-    std::lock_guard lock(slot->mutex);
-    slot->waker = task.ctx.get_weak_waker();
-    return slot;
-}
-
-} // namespace
-
 // An unbounded turn returns at the earliest deadline, and counts the timer it fired.
 TEST(IoDriver, TurnTimesOutAtNextDeadline) {
     IoDriver driver;
     TestTask task;
     const auto start = std::chrono::steady_clock::now();
-    driver.add_timer(Clock::now() + 30ms, slot_for(task));
+    driver.add_timer(Clock::now() + 30ms, task.ctx.get_weak_waker());
     EXPECT_EQ(driver.turn(std::nullopt), 1u);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_GE(elapsed, 30ms);
@@ -618,25 +607,37 @@ TEST(IoDriver, TurnTimesOutAtNextDeadline) {
 TEST(IoDriver, ShorterMaxWaitBeatsTimer) {
     IoDriver driver;
     TestTask task;
-    driver.add_timer(Clock::now() + 1h, slot_for(task));
+    driver.add_timer(Clock::now() + 1h, task.ctx.get_weak_waker());
     const auto start = std::chrono::steady_clock::now();
     EXPECT_EQ(driver.turn(10ms), 0u);
     EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
     EXPECT_EQ(task.wakes(), 0);
 }
 
-// A cancelled (emptied) slot still bounds the wait once, but fires nothing.
+// A cancelled timer still bounds the wait once, but fires nothing.
 TEST(IoDriver, CancelledTimerFiresNothing) {
     IoDriver driver;
     TestTask task;
-    auto slot = slot_for(task);
-    driver.add_timer(Clock::now() + 10ms, slot);
-    {
-        std::lock_guard lock(slot->mutex);
-        slot->waker.reset();
-    }
+    const detail::TimerId id = driver.add_timer(Clock::now() + 10ms, task.ctx.get_weak_waker());
+    driver.cancel_timer(id);
+    const auto start = std::chrono::steady_clock::now();
     EXPECT_EQ(driver.turn(1s), 0u);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 500ms);
     EXPECT_EQ(task.wakes(), 0);
+}
+
+// Cancelling a timer that has already fired does nothing, and does not disturb the
+// timer that reuses its slot.
+TEST(IoDriver, CancelAfterFireIsIgnored) {
+    IoDriver driver;
+    TestTask first, second;
+    const detail::TimerId id = driver.add_timer(Clock::now() + 5ms, first.ctx.get_weak_waker());
+    EXPECT_EQ(driver.turn(1s), 1u);
+    driver.add_timer(Clock::now() + 5ms, second.ctx.get_weak_waker());
+    driver.cancel_timer(id);
+    EXPECT_EQ(driver.turn(1s), 1u);
+    EXPECT_EQ(first.wakes(), 1);
+    EXPECT_EQ(second.wakes(), 1);
 }
 
 // A timer added from another thread, earlier than anything the blocked turn is
@@ -644,10 +645,10 @@ TEST(IoDriver, CancelledTimerFiresNothing) {
 TEST(IoDriver, EarlierTimerFromOtherThreadUnparks) {
     IoDriver driver;
     TestTask late, early;
-    driver.add_timer(Clock::now() + 1h, slot_for(late));
+    driver.add_timer(Clock::now() + 1h, late.ctx.get_weak_waker());
     std::thread t([&driver, &early] {
         std::this_thread::sleep_for(20ms);
-        driver.add_timer(Clock::now() + 10ms, slot_for(early));
+        driver.add_timer(Clock::now() + 10ms, early.ctx.get_weak_waker());
     });
     const auto start = std::chrono::steady_clock::now();
     // The first turn may return for the unpark alone (0 fired) before the deadline.

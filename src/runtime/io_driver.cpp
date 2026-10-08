@@ -107,10 +107,18 @@ void IoDriver::unpark() noexcept {
     m_unpark.wake();
 }
 
-void IoDriver::add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot) {
+detail::TimerId IoDriver::add_timer(Instant deadline, detail::Weak<detail::Waker> waker) {
+    const auto inserted = m_timers.insert(deadline, std::move(waker));
     // Race (benign): the holder may wake for another reason between insert() and
     // unpark(). The unpark then makes its next turn return at once: one extra turn.
-    if (m_timers.insert(deadline, std::move(slot))) unpark();
+    if (inserted.unpark) unpark();
+    return inserted.id;
+}
+
+void IoDriver::cancel_timer(detail::TimerId id) noexcept {
+    // No unpark: a holder blocked for this timer's deadline wakes then, finds nothing
+    // to fire, and turns again. One extra turn, and only if nothing else woke it.
+    m_timers.cancel(id);
 }
 
 void IoDriver::dispatch(const detail::sys::Event& event) {

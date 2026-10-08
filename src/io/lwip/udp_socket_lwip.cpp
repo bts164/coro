@@ -15,6 +15,7 @@
 #include <lwip/netif.h>
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <variant>
 
@@ -42,6 +43,81 @@ void LwipUdpCtx::on_recv(void* arg, udp_pcb* pcb, pbuf* p,
     ctx->result_sender = SocketAddress{v4, port};
     ctx->result_ready  = true;
     if (ctx->rx_waker) { auto w = std::move(ctx->rx_waker); w->wake(); }
+}
+
+// ---------------------------------------------------------------------------
+// Send and receive futures: the halves that need lwIP
+// ---------------------------------------------------------------------------
+
+static PollError udp_error(const char* what) {
+    return PollError(std::make_exception_ptr(std::runtime_error(what)));
+}
+
+PollResult<void> lwip_udp_send(LwipUdpCtx& udp, const std::byte* buf, std::size_t size,
+                               const SocketAddress* dest) {
+    if (!dest && !udp.connected)
+        return udp_error("UdpSocket::send: not connected — call connect() first");
+    if (dest && !std::holds_alternative<Ipv4Address>(dest->address))
+        return udp_error("UdpSocket::send_to: IPv6 destination not supported on the lwIP backend");
+
+    pbuf* p = pbuf_alloc(PBUF_TRANSPORT, static_cast<u16_t>(size), PBUF_RAM);
+    if (!p)
+        return udp_error(dest ? "UdpSocket::send_to: pbuf_alloc failed (out of memory)"
+                              : "UdpSocket::send: pbuf_alloc failed (out of memory)");
+    std::memcpy(p->payload, buf, size);
+
+    err_t err;
+    if (dest) {
+        const auto& v4 = std::get<Ipv4Address>(dest->address);
+        ip_addr_t addr;
+        IP4_ADDR(&addr, v4.octets[0], v4.octets[1], v4.octets[2], v4.octets[3]);
+        err = udp_sendto(udp.pcb, p, &addr, dest->port);
+    } else {
+        err = udp_send(udp.pcb, p);  // no addr/port — uses the connected peer
+    }
+    pbuf_free(p);
+    if (err != ERR_OK)
+        return udp_error(dest ? "UdpSocket::send_to: udp_sendto failed"
+                              : "UdpSocket::send: udp_send failed");
+    return PollReady;
+}
+
+PollResult<void> lwip_udp_poll_recv(LwipUdpCtx& udp, std::byte* buf, std::size_t size,
+                                    bool connected_only, bool& armed, std::size_t& n,
+                                    SocketAddress& sender, Context& ctx) {
+    if (!armed) {
+        if (connected_only && !udp.connected)
+            return udp_error("UdpSocket::recv: not connected — call connect() first");
+        udp.result_ready = false;
+        udp_recv(udp.pcb, &LwipUdpCtx::on_recv, &udp);
+        armed = true;
+    } else if (udp.result_ready) {
+        // on_recv has copied the datagram in and deregistered itself.
+        armed            = false;
+        udp.result_ready = false;
+        udp.pending_buf  = nullptr;
+        n      = udp.result_len;
+        sender = udp.result_sender;
+        return PollReady;
+    }
+    // Set on every pending poll: these are the caller's own buffer, which on_recv
+    // writes into.
+    // RACE CONDITION NOTE: safe — on_recv fires on the executor thread
+    // (cyw43_arch_poll / sys_check_timeouts), never concurrently with this poll, so a
+    // datagram can't arrive between the result_ready check and storing the waker.
+    udp.pending_buf = buf;
+    udp.pending_len = size;
+    udp.rx_waker    = ctx.getWaker();
+    return PollPending;
+}
+
+void lwip_udp_cancel_recv(LwipUdpCtx& udp) noexcept {
+    // pcb is null once the UdpSocket has been destroyed, which also detached on_recv.
+    if (udp.pcb) udp_recv(udp.pcb, nullptr, nullptr);
+    udp.pending_buf  = nullptr;
+    udp.pending_len  = 0;
+    udp.result_ready = false;
+    udp.rx_waker     = nullptr;
 }
 
 } // namespace coro::detail
@@ -111,82 +187,7 @@ Coro<void> UdpSocket::connect(SocketAddress peer) {
 }
 
 // ---------------------------------------------------------------------------
-// send_to_impl / send_impl
-// ---------------------------------------------------------------------------
-
-Coro<void> UdpSocket::send_to_impl(const std::byte* buf, std::size_t size, SocketAddress dest) {
-    if (!std::holds_alternative<Ipv4Address>(dest.address))
-        throw std::runtime_error("UdpSocket::send_to: IPv6 destination not supported on the lwIP backend");
-    const auto& v4 = std::get<Ipv4Address>(dest.address);
-
-    pbuf* p = pbuf_alloc(PBUF_TRANSPORT, static_cast<u16_t>(size), PBUF_RAM);
-    if (!p) throw std::runtime_error("UdpSocket::send_to: pbuf_alloc failed (out of memory)");
-    std::memcpy(p->payload, buf, size);
-
-    ip_addr_t addr;
-    IP4_ADDR(&addr, v4.octets[0], v4.octets[1], v4.octets[2], v4.octets[3]);
-
-    err_t err = udp_sendto(m_impl->pcb, p, &addr, dest.port);
-    pbuf_free(p);
-    if (err != ERR_OK)
-        throw std::runtime_error("UdpSocket::send_to: udp_sendto failed");
-    co_return;
-}
-
-Coro<void> UdpSocket::send_impl(const std::byte* buf, std::size_t size) {
-    if (!m_impl->connected)
-        throw std::runtime_error("UdpSocket::send: not connected — call connect() first");
-
-    pbuf* p = pbuf_alloc(PBUF_TRANSPORT, static_cast<u16_t>(size), PBUF_RAM);
-    if (!p) throw std::runtime_error("UdpSocket::send: pbuf_alloc failed (out of memory)");
-    std::memcpy(p->payload, buf, size);
-
-    err_t err = udp_send(m_impl->pcb, p);  // no addr/port — uses the connected peer
-    pbuf_free(p);
-    if (err != ERR_OK)
-        throw std::runtime_error("UdpSocket::send: udp_send failed");
-    co_return;
-}
-
-// ---------------------------------------------------------------------------
-// recv_from_impl / recv_impl
-// ---------------------------------------------------------------------------
-
-Coro<std::tuple<std::size_t, SocketAddress>> UdpSocket::recv_from_impl(std::byte* buf, std::size_t size) {
-    auto ctx_ptr = m_impl;
-
-    struct DatagramReady {
-        using OutputType = void;
-        detail::Rc<detail::LwipUdpCtx> ctx;
-        PollResult<void> poll(detail::Context& cx) {
-            if (ctx->result_ready) return PollReady;
-            // RACE CONDITION NOTE: safe — on_recv fires on the executor thread
-            // (cyw43_arch_poll / sys_check_timeouts), never concurrently.
-            ctx->rx_waker = cx.getWaker();
-            return PollPending;
-        }
-    };
-
-    ctx_ptr->pending_buf  = buf;
-    ctx_ptr->pending_len  = size;
-    ctx_ptr->result_ready = false;
-    udp_recv(ctx_ptr->pcb, &detail::LwipUdpCtx::on_recv, ctx_ptr.get());
-
-    co_await DatagramReady{ctx_ptr};
-
-    co_return std::tuple<std::size_t, SocketAddress>{ctx_ptr->result_len, ctx_ptr->result_sender};
-}
-
-Coro<std::size_t> UdpSocket::recv_impl(std::byte* buf, std::size_t size) {
-    if (!m_impl->connected)
-        throw std::runtime_error("UdpSocket::recv: not connected — call connect() first");
-    auto [n, sender] = co_await recv_from_impl(buf, size);
-    (void)sender; // connected socket — lwIP already filtered to only our peer
-    co_return n;
-}
-
-// ---------------------------------------------------------------------------
-// set_broadcast_impl, join_multicast_impl, leave_multicast_impl
+// set_broadcast, join_multicast, leave_multicast
 // ---------------------------------------------------------------------------
 
 Coro<void> UdpSocket::set_broadcast(bool enabled) {

@@ -2,10 +2,13 @@
 #include <coro/pico/hal/dma.h>
 #include <coro/runtime/runtime.h>
 #include <coro/coro.h>
+#include <coro/future.h>
 #include <coro/sync/join.h>
 #include <hardware/dma.h>  // stub
 #include <thread>
 #include <chrono>
+#include <type_traits>
+#include <utility>
 
 using namespace coro;
 using namespace coro::pico::hal;
@@ -36,6 +39,12 @@ static std::thread fire_irq_after(uint channel, std::chrono::milliseconds delay 
 
 static_assert(!std::is_copy_constructible_v<AsyncDmaTransfer>);
 static_assert(!std::is_move_constructible_v<AsyncDmaTransfer>);
+
+// transfer() and wait() return a hand-written future, not a coroutine.
+static_assert(Future<DmaWaitFuture>);
+static_assert(std::is_same_v<decltype(std::declval<AsyncDmaTransfer&>().wait()), DmaWaitFuture>);
+static_assert(!std::is_copy_constructible_v<DmaWaitFuture>);
+static_assert(!std::is_move_assignable_v<DmaWaitFuture>);
 
 // ---------------------------------------------------------------------------
 // AsyncDmaTransfer tests
@@ -193,4 +202,29 @@ TEST_F(AsyncDmaTransferTest, OnlyCorrectChannelWakesTransfer) {
     trigger.join();
     EXPECT_TRUE(a_done);
     EXPECT_TRUE(b_done);
+}
+
+TEST_F(AsyncDmaTransferTest, DroppedTransferCanBeFollowedByAnother) {
+    // transfer() starts the transfer when called. A future dropped without being
+    // awaited abandons it, and the channel is usable again straight away.
+    AsyncDmaTransfer dma;
+    bool completed = false;
+    uint ch = static_cast<uint>(dma.channel());
+
+    {
+        dma_channel_config cfg = dma_channel_get_default_config(ch);
+        auto abandoned = dma.transfer(cfg, nullptr, nullptr, 0);
+    }
+
+    auto trigger = fire_irq_after(ch);
+
+    make_rt().block_on([](AsyncDmaTransfer& dma, bool& done) -> Coro<void> {
+        dma_channel_config cfg = dma_channel_get_default_config(
+            static_cast<uint>(dma.channel()));
+        co_await dma.transfer(cfg, nullptr, nullptr, 0);
+        done = true;
+    }(dma, completed));
+
+    trigger.join();
+    EXPECT_TRUE(completed);
 }

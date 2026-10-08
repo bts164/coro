@@ -110,10 +110,15 @@ public:
     /// @brief Returns `true` if no task is waiting in the ready queue.
     bool empty() const;
 
-    /// @brief Adds a timer to this executor's own queue: `slot`'s waker fires once
+    /// @brief Adds a timer to this executor's own queue: `waker` fires once
     /// `deadline` has passed. Thread-safe; unparks the executor if it is parked
     /// for a later deadline. Used by `Runtime::add_timer()` on Pico.
-    void add_timer(Instant deadline, detail::Rc<detail::TimerSlot> slot);
+    /// @return The id to pass to cancel_timer().
+    detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
+
+    /// @brief Cancels a timer added by add_timer(). Thread-safe. Does nothing if it
+    /// has already fired or been cancelled.
+    void cancel_timer(detail::TimerId id) noexcept;
 
     /// @brief Fires wakers for any timers whose deadline has passed.
     /// Called from wait_for_completion() on every loop iteration.
@@ -148,6 +153,14 @@ private:
     std::unique_ptr<Parker> m_parker;
     bool                    m_turns_io_driver = false;  // set once in the constructor
 
+    // Internally synchronized. Lock order: m_ready_mutex, then the queue's mutex
+    // (park_once() calls begin_wait() under m_ready_mutex).
+    //
+    // Declared before m_ready and m_owned_tasks so that it is destroyed after them:
+    // destroying an unfinished task destroys its futures, and a SleepFuture cancels
+    // its timer in this queue from its destructor.
+    detail::TimerQueue m_timers;
+
     // m_ready_mutex serialises m_ready access against ISR preemption (Pico) or
     // concurrent thread wakers (multi-threaded platforms). See detail/mutex.h.
     mutable detail::Mutex m_ready_mutex;
@@ -155,10 +168,6 @@ private:
     // True from park_once()'s empty-queue check until park() returns. Read by
     // enqueue() to decide whether to unpark. GUARDED BY m_ready_mutex.
     bool m_parked = false;
-
-    // Internally synchronized. Lock order: m_ready_mutex, then the queue's mutex
-    // (park_once() calls begin_wait() under m_ready_mutex).
-    detail::TimerQueue m_timers;
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).

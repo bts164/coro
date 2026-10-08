@@ -260,8 +260,19 @@ The HAL layer depends on `coro_pico` (for `IsrEvent`) and on SDK hardware librar
 ### `AsyncDmaTransfer` — RAII async DMA channel
 
 `AsyncDmaTransfer` claims one DMA channel on construction, performs an async transfer
-that suspends the coroutine until completion (via `IsrEvent`), and releases the channel
+whose future completes when the DMA IRQ fires (via `IsrEvent`), and releases the channel
 on destruction. Cancellation aborts the in-progress transfer immediately.
+
+`transfer()` and `wait()` return `DmaWaitFuture`, a hand-written future and not a `Coro`,
+so a transfer has no coroutine frame and allocates nothing. It wraps an `IsrWaitFuture` on
+`m_done`. On completion it takes the channel out of the dispatch table; if destroyed
+first, it also calls `dma_channel_abort()`.
+
+!!! danger "WARNING: `transfer()` starts the transfer when called"
+    `transfer()` is `start()` followed by `wait()`. The DMA engine is running by the time
+    it returns, not from the first `co_await` of the result. A returned future that is
+    dropped without being awaited aborts the transfer. The `AsyncDmaTransfer` must
+    outlive the future.
 
 ```cpp
 // include/coro/pico/hal/dma.h
@@ -277,11 +288,11 @@ public:
     int channel() const;
 
     // Configures and starts the transfer described by ctrl/read_addr/write_addr/count.
-    // Suspends the calling coroutine until the DMA IRQ fires; at most one executor
+    // The returned future completes when the DMA IRQ fires; at most one executor
     // loop iteration of latency between IRQ and resumption.
-    // Cancellable: if the awaiting coroutine is cancelled, the in-progress transfer
-    // is aborted immediately via dma_channel_abort() (synchronous and safe).
-    [[nodiscard]] coro::Coro<void> transfer(
+    // Cancellable: if the future is destroyed before it completes, the in-progress
+    // transfer is aborted immediately via dma_channel_abort() (synchronous and safe).
+    [[nodiscard]] DmaWaitFuture transfer(
         const dma_channel_config& ctrl,
         const volatile void*      read_addr,
         volatile void*            write_addr,
@@ -557,8 +568,8 @@ The same executor as on desktop (see [Executor Design](executor_design.md),
 
 `SleepFuture` is the same code as on desktop (see [Timers](timers.md)). Its deadline is
 a `coro::Instant` from `coro::Clock`, which on Pico reads `time_us_64()`. On the first
-pending `poll()` it calls `current_runtime().add_timer(deadline, slot)`, which lands in
-the executor's queue. `check_expired_timers()` fires the waker once the deadline has
+pending `poll()` it calls `current_runtime().add_timer(deadline, waker)`, which lands in
+the executor's queue, and keeps the `TimerId` it returns to cancel the timer if dropped. `check_expired_timers()` fires the waker once the deadline has
 passed; the next `poll()` returns `PollReady`.
 
 `timeout<F>` is implemented on top of `sleep_for` and works unchanged on Pico because
