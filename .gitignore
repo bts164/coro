@@ -16,3 +16,5 @@ examples/pico/ws2812_tcp/wifi_credentials.h
 examples/pico/profiles/rp2040-arm-none-eabi.profile
 **/*_pb2.py
 **/__pycache__
+node_modules
+test/target/emulator/.cache

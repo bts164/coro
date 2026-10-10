@@ -19,6 +19,7 @@
 #include <coro/detail/timer_queue.h>
 #include <coro/runtime/clock.h>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -64,9 +65,10 @@ public:
     explicit CurrentThreadExecutor(std::unique_ptr<Parker> parker);
 
     // Overload for Runtime(std::in_place_type<CurrentThreadExecutor>, parker).
-    // The Runtime passes itself as the first argument; we ignore it.
-    CurrentThreadExecutor(Runtime* /*rt*/, std::unique_ptr<Parker> parker)
-        : CurrentThreadExecutor(std::move(parker)) {}
+    // The Runtime passes itself as the first argument; it is kept only to report
+    // shutdown progress to.
+    CurrentThreadExecutor(Runtime* rt, std::unique_ptr<Parker> parker)
+        : CurrentThreadExecutor(std::move(parker)) { m_runtime = rt; }
 
 #ifndef CORO_PICO
     /// Desktop default, used by `Runtime(1)` and
@@ -102,6 +104,22 @@ public:
     /// True only when built by `CurrentThreadExecutor(Runtime*)`, whose parker turns
     /// the runtime's driver. A caller-supplied parker may not.
     bool turns_io_driver() const noexcept override { return m_turns_io_driver; }
+
+    /// Cancels every owned task; later schedule() calls cancel their task too.
+    void begin_shutdown() override;
+
+    /// True while a scheduled task has not finished.
+    bool has_tasks() const override;
+
+    /// True: nothing runs unless a thread is in wait_for_completion() or run_until().
+    bool runs_on_calling_thread() const noexcept override { return true; }
+
+    /// @brief Runs the same loop as wait_for_completion() until `done()` returns
+    /// true. Used by `Runtime::shutdown()` to drain the cancelled tasks.
+    void run_until(const std::function<bool()>& done) override;
+
+    /// Unparks the loop so that it evaluates its exit condition again.
+    void recheck_run_until() noexcept override;
 
     /// @brief Drains the ready queue: polls each task once in FIFO order.
     /// @return `true` if at least one task was polled.
@@ -150,6 +168,19 @@ private:
     /// parked, and parks once.
     void park_once();
 
+    /// The event loop behind wait_for_completion() and run_until(). Defined in the
+    /// .cpp, its only user.
+    template<typename Done>
+    void run_loop(Done&& done);
+
+    /// Tells the owning Runtime, if any, that a task was spawned or finished while
+    /// the executor is shutting down.
+    void notify_shutdown_progress() noexcept;
+
+    /// The owning Runtime. Null for a standalone executor and on Pico, where the
+    /// executor is the only place tasks live and nobody needs telling.
+    Runtime* m_runtime = nullptr;
+
     std::unique_ptr<Parker> m_parker;
     bool                    m_turns_io_driver = false;  // set once in the constructor
 
@@ -171,8 +202,10 @@ private:
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
-    detail::Mutex                                       m_owned_mutex;
+    mutable detail::Mutex                               m_owned_mutex;
     std::unordered_set<detail::Rc<detail::TaskBase>>     m_owned_tasks;
+    // Set by begin_shutdown(), never cleared. GUARDED BY m_owned_mutex.
+    bool                                                m_closed = false;
 
 #ifdef CORO_PICO
     struct IsrPollRegistration {

@@ -208,7 +208,7 @@ tx.try_send(v);                    // non-blocking attempt
 while (std::optional<int> v = co_await coro::next(rx))
     use(*v);
 // for plain OS threads (not coroutines): blocks the calling thread
-std::optional<int> v = rx.blocking_recv();
+std::optional<int> v = coro::blocking_next(rx);
 ```
 
 ## watch — last-value broadcast, multiple senders, many receivers

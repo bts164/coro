@@ -7,10 +7,12 @@
 # flags needed on the conan CLI; an explicit `-o with_sanitize=...` still
 # overrides this if you pass one.
 #
-# Valid values: none (default), asan, tsan
+# Valid values: none (default), asan, tsan, ubsan. A Pico (baremetal) build
+# has only ubsan and treats asan/tsan as none; see BUILD.md.
 #
 # export CORO_SANITIZE=asan
 # export CORO_SANITIZE=tsan
+# export CORO_SANITIZE=ubsan
 
 # Recommended runtime options for whichever sanitizer is selected above —
 # see BUILD.md "Recommended environment variables when running sanitizer

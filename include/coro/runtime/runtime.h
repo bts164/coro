@@ -7,6 +7,7 @@
 #include <coro/runtime/io_driver.h>
 #include <coro/task/spawn_on.h>
 #include <coro/task/spawn_blocking.h>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #endif
@@ -20,6 +21,7 @@
 #ifdef CORO_PICO
 #include <coro/detail/isr_flag.h>
 #endif
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <type_traits>
@@ -29,6 +31,34 @@ namespace coro {
 
 #ifdef CORO_PICO
 class CurrentThreadExecutor;  // forward declaration for Runtime::m_current_thread_executor
+
+/**
+ * @brief What the Pico Runtime's event loop drives on each iteration, besides tasks
+ * and timers.
+ *
+ * `coro::pico` links the CYW43 driver and lwIP whichever is chosen; this only decides
+ * what is called.
+ */
+enum class PicoNetwork {
+    /// Nothing. For firmware that uses neither Wi-Fi nor sockets. Sockets must not be
+    /// used on this runtime: nothing would ever complete them.
+    None,
+
+    /// lwIP without the radio: lwIP's timers (`sys_check_timeouts()`) and its
+    /// loopback queue. For a board with no CYW43 chip, or one whose radio is never
+    /// started. Sockets work over `127.0.0.1`, and over any interface the application
+    /// adds and feeds itself. The application must call `lwip_init()` once before the
+    /// first socket call; nothing else does when `cyw43_arch_init()` is not used.
+    Lwip,
+
+    /// The CYW43 Wi-Fi driver and lwIP, through `cyw43_arch_poll()`, plus lwIP's
+    /// loopback queue. Requires `cyw43_arch_init()` to have been called before the
+    /// runtime first runs: `cyw43_arch_poll()` reads driver state that only it sets
+    /// up, so calling it without is undefined behaviour, not a wasted call. A Wi-Fi
+    /// connection made later from a task (`cyw43_arch_wifi_connect_async()`) is fine;
+    /// it is this poll that makes it progress.
+    Cyw43,
+};
 #endif
 
 // Forward declarations — must be visible inside template bodies below because
@@ -54,24 +84,14 @@ public:
 #ifdef CORO_PICO
     /// @brief Constructs a Runtime backed by CurrentThreadExecutor.
     ///
-    /// `enable_network` gates whether the event loop calls `cyw43_arch_poll()`
-    /// each iteration. Pass `false` for firmware that never touches WiFi/lwIP
-    /// (`coro::pico`/`coro::pico_hal` still unconditionally link
-    /// `pico_cyw43_arch_lwip_poll` -- see cmake/platforms/pico.cmake -- so the
-    /// symbol is always present; this only controls whether it's ever called).
-    /// Skipping the call matters on boards with no CYW43 chip wired up at all
-    /// (a plain, non-W Pico): `cyw43_arch_poll()` touches driver state that was
-    /// never initialized there, since `cyw43_arch_init()` was never called --
-    /// calling it anyway is undefined behavior, not just a wasted poll.
-    ///
-    /// Leave at the default (`true`) for any firmware that does call
-    /// `cyw43_arch_init()` (Pico W boards) -- including firmware that connects
-    /// to WiFi from a coroutine after the Runtime has already started, since
-    /// unlike `cyw43_arch_wifi_connect_blocking()`'s hand-rolled wait loop, an
-    /// async connect (`cyw43_arch_wifi_connect_async()`) depends on this
-    /// same per-iteration `cyw43_arch_poll()` to make progress.
-    explicit Runtime(bool enable_network = true);
-    ~Runtime() = default;
+    /// `network` selects what the event loop drives on each iteration besides tasks
+    /// and timers; see @ref PicoNetwork. The default, `PicoNetwork::Cyw43`, is for
+    /// firmware that calls `cyw43_arch_init()`. Firmware that never does (any
+    /// firmware for a board without the radio) must pass `Lwip` or `None`.
+    explicit Runtime(PicoNetwork network = PicoNetwork::Cyw43);
+
+    /// @brief Calls shutdown().
+    ~Runtime();
 
     /// @brief Adds a timer that wakes `waker` once `deadline` has passed, on the
     /// CurrentThreadExecutor's queue. Used by SleepFuture.
@@ -81,6 +101,11 @@ public:
     /// @brief Cancels a timer added by add_timer(). Does nothing if it has already
     /// fired or been cancelled.
     void cancel_timer(detail::TimerId id) noexcept;
+
+    /// @brief Always false here: with one thread and no blocking pool, nothing can
+    /// be waiting on a timer once shutdown() has drained the tasks. See the desktop
+    /// overload.
+    bool io_shut_down() const noexcept { return false; }
 
     /// @brief Registers an ISR-safe waiter to be peeked once per event loop iteration.
     ///
@@ -102,7 +127,9 @@ public:
 
     /// @brief Drains the coroutine ready queue once. Returns true if any task was polled.
     ///
-    /// Call this from the firmware main loop alongside `cyw43_arch_poll()`:
+    /// For firmware that runs its own main loop instead of `block_on()`. It runs
+    /// tasks only: it fires no timers and drives no part of the network, whatever
+    /// @ref PicoNetwork the runtime was built with. The loop must do that itself:
     /// @code
     /// while (true) {
     ///     rt.poll();
@@ -129,22 +156,44 @@ public:
     explicit Runtime(std::in_place_type_t<ExecutorType>, Args&&... args)
         : m_blocking_pool(this),
           m_executor(std::make_unique<ExecutorType>(this, std::forward<Args>(args)...))
-    {}
+    {
+        m_turns_io_driver = m_executor->turns_io_driver();
+    }
 
+    /// @brief Calls shutdown().
     ~Runtime();
+
+    /// @brief Called by the executor and the blocking pool, while the runtime shuts
+    /// down, each time a task is spawned or finishes: wakes the thread in shutdown()
+    /// to look again. Internal; thread-safe.
+    void shutdown_progress() noexcept;
 
     /// @brief Returns the runtime's epoll I/O driver. See doc/design/io_driver.md.
     IoDriver& io_driver() { return m_io_driver; }
 
     /// @brief True if the executor turns io_driver(). Driver-backed I/O primitives
     /// (e.g. `UdpSocket::bind()`) throw `std::logic_error` when it is false.
-    bool turns_io_driver() const noexcept { return m_executor->turns_io_driver(); }
+    ///
+    /// A property of the executor the runtime was built with: it does not change
+    /// when the runtime shuts down. io_shut_down() reports that.
+    bool turns_io_driver() const noexcept { return m_turns_io_driver; }
+
+    /// @brief True once shutdown() has stopped the executor and shut the I/O driver
+    /// down: no timer will fire and no I/O readiness will be reported again.
+    /// Thread-safe; takes no lock.
+    ///
+    /// Only a waiter the runtime does not own can observe it: a thread outside the
+    /// runtime, or a task of another runtime, that waits on one of this runtime's
+    /// timers or sockets. shutdown() wakes such a waiter, and its future then fails
+    /// instead of waiting for good. See IoDriver::shutdown().
+    bool io_shut_down() const noexcept { return m_io_driver.is_shut_down(); }
 
     /// @brief Adds a timer that wakes `waker` once `deadline` has passed, on the
-    /// driver's queue. Used by SleepFuture.
+    /// driver's queue. Used by SleepFuture. Thread-safe.
     /// @return The id to pass to cancel_timer().
     /// @throws std::logic_error if the executor doesn't turn the driver, where the
     ///         timer could never fire.
+    /// @throws std::runtime_error if the runtime has shut down.
     detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
 
     /// @brief Cancels a timer added by add_timer(). Thread-safe. Does nothing if it
@@ -162,6 +211,42 @@ public:
     Runtime& operator=(const Runtime&) = delete;
 
     /**
+     * @brief Cancels and drains every task the runtime owns, then stops its threads.
+     * Blocks until that is done. Calling it again does nothing.
+     *
+     * Every task is cancelled, detached ones and `spawn_blocking` callables included,
+     * and the runtime keeps running until the last of them has finished: timers fire,
+     * I/O is dispatched, and a task or callable that spawns while it shuts down gets
+     * a task that is already cancelled. Once this returns no task of this runtime
+     * exists, so a `JoinHandle`, a waker or a channel end that outlives the runtime
+     * is safe to use and to destroy.
+     *
+     * It waits for as long as the slowest task takes to stop. A blocking callable
+     * that never reaches a cancellation point keeps it waiting.
+     *
+     * A thread outside the runtime (or a task of another runtime) that is waiting on
+     * one of this runtime's timers or sockets is not cancelled, but it is released:
+     * once the tasks are gone the I/O driver is shut down, which wakes every such
+     * waiter, and its future fails (`std::runtime_error` from a timer,
+     * `std::system_error` with `std::errc::operation_canceled` from a socket).
+     *
+     * Preconditions: no `block_on()` is in progress, and no thread outside the
+     * runtime is spawning on it. Must not be called from one of the runtime's own tasks or
+     * blocking callables: that thread would wait for itself, so the call throws
+     * `std::logic_error`, which terminates the program because this is `noexcept`.
+     *
+     * Afterwards the Runtime can only be destroyed: `block_on()`, `spawn()` and
+     * `spawn_blocking()` throw `std::runtime_error`.
+     *
+     * See doc/design/runtime_shutdown.md.
+     */
+    void shutdown() noexcept;
+
+    /// @brief The exception a future fails with when the runtime it waits on has
+    /// shut down: the `std::runtime_error` that spawn() throws then. Internal.
+    static std::exception_ptr shut_down_error();
+
+    /**
      * @brief Runs `future` on the calling thread, blocking until it completes.
      *
      * Sets the thread-local current runtime for the duration of the call so that
@@ -171,9 +256,13 @@ public:
      * @param future The top-level future to drive to completion.
      * @return The value produced by `future` (void for `Future<void>`).
      * @throws Any exception propagated out of the future.
+     * @throws std::runtime_error if the runtime has been shut down, or shuts down
+     *         before `future` completes (a `block_on()` made by a blocking callable
+     *         while shutdown() is draining).
      */
     template<Future F>
     typename F::OutputType block_on(F future) {
+        check_running();
         set_current_runtime(this);
         auto impl = detail::make_rc<detail::TaskImpl<F>>(std::move(future));
         // Category 2 (doc/task_ownership.md): aliased shared_ptr into the same
@@ -192,12 +281,16 @@ public:
         set_current_runtime(nullptr);
         if (state->exception)
             std::rethrow_exception(state->exception);
+        // Neither a result nor an exception: the task was cancelled, which only
+        // shutdown() does to a block_on() task.
+        if (!state->result) throw_cancelled_by_shutdown();
         if constexpr (!std::is_void_v<typename F::OutputType>)
             return std::move(*state->result);
     }
 
     /// @brief Submits a pre-constructed task directly. Used internally by @ref JoinSet.
     void schedule_task(detail::Rc<detail::TaskBase> task) {
+        check_running();
         m_executor->schedule(std::move(task));
     }
 
@@ -206,6 +299,7 @@ public:
      */
     template<Future F>
     [[nodiscard]] JoinHandle<typename F::OutputType> spawn(F future) {
+        check_running();
         return SpawnBuilder(m_executor.get()).spawn(std::move(future));
     }
 
@@ -214,6 +308,7 @@ public:
      */
     template<Stream S>
     [[nodiscard]] StreamHandle<typename S::ItemType> spawn(S stream) {
+        check_running();
         return SpawnBuilder(m_executor.get()).spawn(std::move(stream));
     }
 
@@ -221,10 +316,27 @@ public:
      * @brief Returns a @ref SpawnBuilder for configuring a task before spawning it.
      */
     [[nodiscard]] SpawnBuilder build_task() {
+        check_running();
         return SpawnBuilder(m_executor.get());
     }
 
 private:
+    /// Throws std::runtime_error once shutdown() has returned.
+    void check_running() const {
+        if (m_shut_down) throw_shut_down();
+    }
+    [[noreturn]] static void throw_shut_down();
+    [[noreturn]] static void throw_cancelled_by_shutdown();
+
+    // Set by shutdown() just before it returns.
+    //
+    // RACE: read without a lock on every spawn. The only write comes after the last
+    // task has finished, and a task's spawn() happens before its removal from the
+    // executor's owned-task list, which shutdown() observes under that list's
+    // mutex. A thread outside the runtime that spawns while another thread shuts it
+    // down does race, and breaks shutdown()'s precondition.
+    bool m_shut_down = false;
+
 #ifdef CORO_PICO
     CurrentThreadExecutor*    m_current_thread_executor = nullptr;
     std::unique_ptr<Executor> m_executor;
@@ -240,9 +352,27 @@ private:
     //                     call current_runtime() during their final work item.
     //   m_executor    — destroyed first: joins its worker threads, so no task runs
     //                   once the members above start going away.
+    //
+    // shutdown() has emptied the executor and the pool and stopped their threads
+    // before any of this is destroyed; the order still matters for a Runtime whose
+    // constructor throws part-way.
     IoDriver                  m_io_driver;
     BlockingPool              m_blocking_pool;
-    std::unique_ptr<Executor> m_executor;
+    std::unique_ptr<Executor> m_executor;   // null once shutdown() has returned
+    // m_executor->turns_io_driver(), read once in the constructor. A copy because
+    // add_timer() and socket creation may run on a thread outside the runtime while
+    // shutdown() resets m_executor.
+    bool                      m_turns_io_driver = false;
+
+    // Shutdown state. See shutdown() in runtime.cpp for the protocol.
+    // Lock order: m_shutdown_mutex, then an executor's owned-task mutex or the
+    // pool's mutex. Never the other way round.
+    std::mutex              m_shutdown_mutex;
+    std::condition_variable m_shutdown_cv;
+    bool                    m_shutdown_started = false;  // GUARDED BY m_shutdown_mutex
+    // The executor the shutdown thread is running in run_until(), if any, so that
+    // shutdown_progress() can unpark it. GUARDED BY m_shutdown_mutex.
+    Executor*               m_shutdown_driver = nullptr;
 #endif
 };
 

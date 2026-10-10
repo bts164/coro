@@ -18,20 +18,23 @@ using namespace std::chrono_literals;
 namespace {
 
 // Appends its id to a shared log on every wake.
-class LoggingWaker : public Waker, public std::enable_shared_from_this<LoggingWaker> {
+class LoggingWaker : public Waker {
 public:
     LoggingWaker(int id, std::vector<int>* log) : m_id(id), m_log(log) {}
     void wake() override { m_log->push_back(m_id); }
-    Rc<Waker> clone() override { return shared_from_this(); }
+    // A new waker with the same effect. The queue never clones; a clone that
+    // returned this object would need enable_shared_from_this, which the Pico
+    // build's Rc does not have.
+    Rc<Waker> clone() override { return make_rc<LoggingWaker>(m_id, m_log); }
 private:
     int               m_id;
     std::vector<int>* m_log;
 };
 
 struct Timer {
-    std::shared_ptr<LoggingWaker> waker;
+    Rc<LoggingWaker> waker;
 
-    Timer(int id, std::vector<int>* log) : waker(std::make_shared<LoggingWaker>(id, log)) {}
+    Timer(int id, std::vector<int>* log) : waker(make_rc<LoggingWaker>(id, log)) {}
 };
 
 // The slot index half of an id.
@@ -371,4 +374,56 @@ TEST(TimerQueue, InsertAfterSweepStillUnparksWaiter) {
     Timer t(1000, &log);
     EXPECT_TRUE(q.insert(Clock::now() + 1h, t.waker).unpark);
     q.end_wait();
+}
+
+// --- Closing ---
+
+// Closing wakes every live timer whatever its deadline, and skips the cancelled ones.
+TEST(TimerQueue, CloseWakesLiveTimersAndEmptiesTheQueue) {
+    TimerQueue q;
+    std::vector<int> log;
+    Timer t1(1, &log), t2(2, &log), t3(3, &log);
+    q.insert(Clock::now() + 1h, t1.waker);
+    const TimerId cancelled = q.insert(Clock::now() + 1h, t2.waker).id;
+    q.insert(Clock::now() - 1s, t3.waker);
+    q.cancel(cancelled);
+
+    EXPECT_EQ(q.close_and_wake_all(), 2u);
+    ASSERT_EQ(log.size(), 2u);
+    EXPECT_NE(log[0], 2);
+    EXPECT_NE(log[1], 2);
+    EXPECT_EQ(q.size(), 0u);
+
+    // Nothing is left to fire, and closing again does nothing.
+    EXPECT_EQ(q.fire_expired(), 0u);
+    EXPECT_EQ(q.close_and_wake_all(), 0u);
+    EXPECT_EQ(log.size(), 2u);
+}
+
+TEST(TimerQueue, InsertAfterCloseIsRefused) {
+    TimerQueue q;
+    std::vector<int> log;
+    Timer t(1, &log);
+    q.close_and_wake_all();
+
+    const auto inserted = q.insert(Clock::now() - 1s, t.waker);
+    EXPECT_TRUE(inserted.closed);
+    EXPECT_FALSE(inserted.unpark);
+    EXPECT_EQ(q.size(), 0u);
+    EXPECT_EQ(q.fire_expired(), 0u);
+    EXPECT_TRUE(log.empty());
+}
+
+// An id issued before the close is stale after it: cancelling it touches nothing.
+TEST(TimerQueue, CancelAfterCloseIsIgnored) {
+    TimerQueue q;
+    std::vector<int> log;
+    Timer t(1, &log);
+    const auto inserted = q.insert(Clock::now() + 1h, t.waker);
+    EXPECT_FALSE(inserted.closed);
+    EXPECT_EQ(q.close_and_wake_all(), 1u);
+
+    q.cancel(inserted.id);
+    EXPECT_EQ(q.size(), 0u);
+    EXPECT_EQ(log, (std::vector<int>{1}));
 }

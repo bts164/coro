@@ -1,9 +1,9 @@
 #include <chrono>
 #include <cstdint>
 
-// No-op cyw43_arch_poll for executor-only tests.
-// The executor calls this in its poll loop in place of blocking; without any
-// TCP sources compiled there are no lwIP callbacks to fire, so a no-op is correct.
+// No-op cyw43_arch_poll(): there is no radio on the host. A Runtime built with
+// PicoNetwork::Cyw43 calls it on every loop; one built with PicoNetwork::Lwip
+// drives lwIP itself and never does.
 void cyw43_arch_poll() {}
 
 // time_us_64 stub — returns microseconds since the first call, matching the

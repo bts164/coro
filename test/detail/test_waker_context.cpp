@@ -5,11 +5,15 @@
 using namespace coro;
 using namespace coro::detail;
 
+namespace {
+
 class MockWaker : public detail::Waker {
 public:
     MOCK_METHOD(void, wake, (), (override));
     MOCK_METHOD(Rc<Waker>, clone, (), (override));
 };
+
+}  // namespace
 
 TEST(ContextTest, GetWakerReturnsSamePointer) {
     auto waker = make_rc<MockWaker>();

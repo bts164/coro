@@ -2,12 +2,13 @@
 #include <gmock/gmock.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
-#include <atomic>
-#include <chrono>
+#include <mutex>
+#include <stdexcept>
 
 using namespace coro;
 using namespace coro::detail;
-using namespace std::chrono_literals;
+
+namespace {
 
 class MockWaker : public Waker {
 public:
@@ -25,6 +26,8 @@ struct NeverReadyFuture {
     using OutputType = int;
     PollResult<int> poll(Context&) { return PollPending; }
 };
+
+}  // namespace
 
 // --- TaskImpl tests ---
 
@@ -50,8 +53,8 @@ TEST(TaskTest, PendingTaskPollReturnsFalse) {
 TEST(TaskTest, PollWritesResultToState) {
     auto waker = make_rc<MockWaker>();
     Context ctx(waker);
-    auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{99});
-    std::shared_ptr<TaskState<int>> state = impl;
+    auto impl = make_rc<TaskImpl<ImmediateFuture>>(ImmediateFuture{99});
+    Rc<TaskState<int>> state = impl;
     impl->poll(ctx);
     std::lock_guard lock(state->mutex);
     ASSERT_TRUE(state->result.has_value());
@@ -67,8 +70,8 @@ TEST(TaskTest, PollWritesExceptionToState) {
             return PollError(std::make_exception_ptr(std::runtime_error("boom")));
         }
     };
-    auto impl = std::make_shared<TaskImpl<ThrowingFuture>>(ThrowingFuture{});
-    std::shared_ptr<TaskState<int>> state = impl;
+    auto impl = make_rc<TaskImpl<ThrowingFuture>>(ThrowingFuture{});
+    Rc<TaskState<int>> state = impl;
     impl->poll(ctx);
     std::lock_guard lock(state->mutex);
     EXPECT_NE(state->exception, nullptr);
@@ -77,8 +80,8 @@ TEST(TaskTest, PollWritesExceptionToState) {
 TEST(TaskTest, CancelledTaskIsSkipped) {
     auto waker = make_rc<MockWaker>();
     Context ctx(waker);
-    auto impl = std::make_shared<TaskImpl<ImmediateFuture>>(ImmediateFuture{5});
-    std::shared_ptr<TaskState<int>> state = impl;
+    auto impl = make_rc<TaskImpl<ImmediateFuture>>(ImmediateFuture{5});
+    Rc<TaskState<int>> state = impl;
     state->cancelled.store(true);
     EXPECT_TRUE(impl->poll(ctx));  // treated as done (cancelled)
     std::lock_guard lock(state->mutex);

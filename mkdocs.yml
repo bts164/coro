@@ -42,6 +42,7 @@ nav:
   - Getting Started Guide: getting_started.md
   - Library Usage Guidelines: guidelines.md
   - Cheat Sheet: cheatsheet.md
+  - Known Issues: known_issues.md
   - API Reference:
     - Key Types:
       - Concepts:
@@ -98,6 +99,7 @@ nav:
       - Runtime, Tasks, and Executors: design/task_and_executor.md
       - Executor Scheduling Design: design/executor_design.md
       - Work-Stealing Scheduler: design/work_stealing_executor.md
+      - Runtime Shutdown: design/runtime_shutdown.md
       - Blocking Thread Pool: design/spawn_blocking.md
       - blocking_wait / blocking_next: design/blocking_wait.md
     - I/O Subsystem:
@@ -117,6 +119,7 @@ nav:
       - Raspberry Pi Pico Port: design/pico_port.md
       - ISR Safety: design/isr_safety.md
       - GpioPin: design/gpio_pin.md
+      - On-Target Tests: design/on_target_tests.md
     - Module Structure: design/module_structure.md
   - Examples & Tutorials:
     - Examples: tutorials/examples.md

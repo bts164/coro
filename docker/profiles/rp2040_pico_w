@@ -1,0 +1,27 @@
+# The host profile of the CI image's Pico builds (docker/Dockerfile.ubuntu2404):
+# RP2040, Pico W board.
+[settings]
+os=baremetal
+arch=armv6
+build_type=Release
+compiler=gcc
+compiler.version=13
+compiler.libcxx=libstdc++11
+compiler.cppstd=gnu23
+
+[conf]
+# "cppstd" must stay in this list: without it compiler.cppstd above is ignored and
+# GCC 13 falls back to C++17, which has no coroutines.
+tools.cmake.cmaketoolchain:enabled_blocks=["cppstd", "user_toolchain", "find_paths"]
+# Conan renders a profile as a Jinja2 template. The image sets PICO_SDK_PATH.
+tools.cmake.cmaketoolchain:user_toolchain=["{{ os.getenv("PICO_SDK_PATH", "/opt/pico-sdk") }}/cmake/preload/toolchains/pico_arm_cortex_m0plus_gcc.cmake"]
+tools.build:cxxflags=["-fcoroutines"]
+# See the same line in the default profile.
+tools.cmake.cmaketoolchain:user_presets=
+
+# No CC or CXX here: the SDK toolchain file picks the ARM compiler, and the SDK's own
+# build-machine tools (pioasm) must not inherit it.
+[buildenv]
+PICO_SDK_PATH={{ os.getenv("PICO_SDK_PATH", "/opt/pico-sdk") }}
+PICO_PLATFORM=rp2040
+PICO_BOARD=pico_w

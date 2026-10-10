@@ -318,9 +318,15 @@ Name resolution is covered in `test/io/test_lookup_host.cpp`:
 | `LookupHostTest.ConnectByNameRethrowsLastError` | With every address refused, the error is `ECONNREFUSED`. |
 | `LookupHostTest.ConnectToUnresolvableNameThrowsDnsError` | `nonexistent.invalid` fails in `dns_error_category()`. |
 
-The lwIP backend has its own host-built test, `test/pico/test_tcp_stream_real.cpp`. Besides
-the round trips it checks that a read dropped mid-wait loses no data and that a read
-into an empty buffer returns 0 at once.
+The lwIP backend is tested by the same file. `test/io/test_tcp_stream.cpp` is also built
+against lwIP on the host (`test_tcp_stream_pico`) and into the on-target firmware; its
+tests of the other executors, IPv6 and errno values are compiled for the desktop only.
+One test is lwIP-only: a read into an empty buffer returns 0 at once.
+
+!!! warning "FIXME: the backends report errors with different exception types"
+    The desktop backend throws `std::system_error` carrying the errno; the lwIP backend
+    throws `std::runtime_error` with a message. `ConnectRefusedThrowsOnAwait` therefore
+    checks each differently, and portable code can only catch `std::exception`.
 
 ---
 

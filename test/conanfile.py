@@ -1,5 +1,6 @@
 import os, sys
 from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
 
@@ -34,14 +35,21 @@ class CoroRecipe(ConanFile):
         "fPIC": [True, False],
         "with_gperftools": [True, False],
         "with_local_run_queue": [True, False],
-        "with_sanitize": ["none", "asan", "tsan"]
+        "with_sanitize": ["none", "asan", "tsan", "ubsan"],
+        # Bare metal only (settings.os == "baremetal"); removed otherwise. The
+        # on-target firmware compiles GoogleTest from source by default
+        # (cmake/on_target_pico.cmake). True takes it from the Conan package
+        # instead, which has not been made to work yet -- see
+        # doc/design/on_target_tests.md.
+        "gtest_from_conan": [True, False],
     }
     default_options = {
         "shared": True,
         "fPIC": True,
         "with_gperftools": True,
         "with_local_run_queue": True,
-        "with_sanitize": "none"
+        "with_sanitize": "none",
+        "gtest_from_conan": False,
     }
 
     # Mirrors conanfile.py's _env_bool/config_options: lets CORO_<OPTION> in
@@ -62,11 +70,21 @@ class CoroRecipe(ConanFile):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
 
-        self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
-        self.options.with_gperftools = self._env_bool(
-            "CORO_WITH_GPERFTOOLS", self.options.with_gperftools)
-        self.options.with_local_run_queue = self._env_bool(
-            "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
+        # baremetal (Pico): builds the on-target firmware images instead of the
+        # desktop executables. Mirrors the root conanfile.py -- always static,
+        # and none of the desktop-only options apply.
+        if self.settings.os == "baremetal":
+            self.package_type = "static-library"
+            self.options.rm_safe("shared")
+            self.options.rm_safe("fPIC")
+            self.options.rm_safe("with_gperftools")
+        else:
+            self.options.rm_safe("gtest_from_conan")
+            self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
+            self.options.with_gperftools = self._env_bool(
+                "CORO_WITH_GPERFTOOLS", self.options.with_gperftools)
+            self.options.with_local_run_queue = self._env_bool(
+                "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
 
         # CORO_SANITIZE in the environment sets the default so the test
         # binaries are built with the same sanitizer as the coro package
@@ -76,13 +94,25 @@ class CoroRecipe(ConanFile):
         # values onto self.options, so an explicit -o with_sanitize=... still
         # overrides this; configure() runs too late for this purpose (after
         # that merge).
+        # baremetal has only ubsan (cmake/Sanitize.cmake). An asan or tsan
+        # left in the environment for the desktop builds means none there,
+        # so one .envrc serves both; an explicit -o is rejected in validate().
         sanitize = os.environ.get("CORO_SANITIZE", "none").strip().lower()
-        if sanitize not in ("none", "asan", "tsan"):
+        allowed = (("none", "ubsan") if self.settings.os == "baremetal"
+                   else ("none", "asan", "tsan", "ubsan"))
+        if sanitize not in allowed:
             sanitize = "none"
         self.options.with_sanitize = sanitize
 
+    def validate(self):
+        if (self.settings.os == "baremetal"
+                and str(self.options.with_sanitize) in ("asan", "tsan")):
+            raise ConanInvalidConfiguration(
+                "with_sanitize on baremetal must be none or ubsan: ASan and "
+                "TSan need a runtime a microcontroller does not have")
+
     def configure(self):
-        if self.options.shared:
+        if self.options.get_safe("shared"):
             self.options.rm_safe("fPIC")
 
     # Pins the coro/ dependency to exactly the version this same checkout's
@@ -104,6 +134,14 @@ class CoroRecipe(ConanFile):
         return os.environ.get("CORO_TEST_VERSION") or self.version
 
     def requirements(self):
+        if self.settings.os == "baremetal":
+            self.requires(f"coro/{self._coro_dependency_version()}", options={
+                "with_sanitize": self.options.with_sanitize
+            })
+            if self.options.gtest_from_conan:
+                self.requires("gtest/[>=1.14.0 <2]",
+                              options={"disable_pthreads": True})
+            return
         self.requires(f"coro/{self._coro_dependency_version()}", options={
             "with_gperftools": self.options.with_gperftools,
             "with_local_run_queue": self.options.with_local_run_queue,
@@ -113,12 +151,23 @@ class CoroRecipe(ConanFile):
         self.requires("libunicorn/2.1.4")
 
     def layout(self):
+        # Keeps the firmware build apart from the desktop one, which would
+        # otherwise share build/Release and the "conan-release" preset name:
+        # this gives build/baremetal/Release and "conan-baremetal-release".
+        if self.settings.os == "baremetal":
+            self.folders.build_folder_vars = ["settings.os"]
         cmake_layout(self)
 
     def generate(self):
         deps = CMakeDeps(self)
         deps.generate()
         tc = CMakeToolchain(self)
+        # The toolchain for baremetal is owned by pico_sdk_init(), not Conan --
+        # see the root conanfile.py's generate().
+        if self.settings.os == "baremetal":
+            tc.cache_variables["CORO_PLATFORM"] = "pico"
+            tc.cache_variables["CORO_TEST_GTEST_FROM_CONAN"] = bool(
+                self.options.gtest_from_conan)
         tc.cache_variables["WITH_SANITIZE"] = str(self.options.with_sanitize)
         tc.generate()
 

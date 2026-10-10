@@ -137,6 +137,15 @@ Pico. On a desktop `Runtime` whose executor never turns the driver (a
 `CurrentThreadExecutor` given its own `Parker`), it throws `std::logic_error`, because
 the timer could never fire. That exception propagates from the first pending `poll()`.
 
+Once the runtime has shut down, its queue is closed. Closing wakes every timer still in
+it, whatever the deadline. A `SleepFuture` polled again before its deadline therefore
+asks the runtime whether it has shut down (`Runtime::io_shut_down()`, one atomic load,
+only on a re-poll) and, if so, fails with `std::runtime_error` instead of returning
+pending for a timer that no longer exists. A sleep first polled after the shutdown gets
+the same error from `add_timer()`. Only a waiter the runtime does not own can see
+either; its own tasks have finished by then. See [I/O Driver](io_driver.md),
+"Shutdown".
+
 ## `timeout` and `timeout_at`
 
 `timeout(d, f)` is `select(f, sleep_for(d))`, and `timeout_at(t, f)` is
@@ -210,10 +219,11 @@ frame and allocates nothing, like the sleep inside it. A tick dropped mid-wait l
 | `SleepTest.StreamHandedToAnotherTaskStillWakes` | A `CoroStream` suspended in a sleep, polled by one task and then awaited by another, wakes the second. |
 | `SleepTest.ManyConcurrentSleepers` | 10,000 spawned sleeps of 1–50 ms on `Runtime(4)` all complete. |
 | `SleepTest.WorksWithWorkSharingRuntime` | The WorkSharing driver handoff fires timers. |
+| `RuntimeShutdown.OutsideThreadWaitingOnTimerIsReleased`, `TimerAndSocketAfterShutdownThrow` | A sleep waited on by a thread outside the runtime fails with `std::runtime_error` when the runtime shuts down, as does one started afterwards. |
 | `SleepTest.ThrowsWithoutDriver` | On a `CurrentThreadExecutor` with a `PollingParker`, awaiting `sleep_for()` throws `std::logic_error`. |
+| `SleepTest.ConcurrentSleepersWakeInDeadlineOrder` | Three sleeps spawned out of order finish in deadline order. |
 | `TimeoutTest.*` | The future or the deadline wins as expected; `timeout_at()` returns the timeout branch at its deadline. |
 | `IntervalTimerTest.*` | Ticks come once per period; work between ticks is absorbed; a tick dropped mid-wait leaves the schedule alone; missed ticks are skipped, not delivered in a burst. |
-| `SleepPicoTest.*` (`test_pico_suite`) | Sleep, ordering, `timeout` and `IntervalTimer` on the Pico `Runtime` over a stubbed `time_us_64()`. |
 
 The queue itself is covered by `test/detail/test_timer_queue.cpp` and the driver's timer
 tests in `test/runtime/test_io_driver.cpp`.

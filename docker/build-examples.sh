@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Compiles every example under examples/ inside the same Ubuntu 24.04 / GCC 13
-# image used by run-sanitizer-build.sh, to catch example build breakage before
-# it's caught (or missed) by CI. Examples are not run, only built — except
+# Compiles every example under examples/ inside a platform's CI image
+# (docker/Dockerfile.<platform>, see docker/build-image.sh), to catch example build
+# breakage. CI does not build the examples, and this script has no counterpart in
+# ci/. Examples are not run, only built — except
 # where examples/grpc/README.md documents an interactive client/server smoke
 # test, which is intentionally left to the developer.
 #
 # examples/pico is out of scope here: it cross-compiles against the Pico SDK
 # (arm-none-eabi-gcc), which has no equivalent in this desktop image.
 #
-# Usage: docker/build-examples.sh
+# Usage: [CORO_PLATFORM=<platform>] docker/build-examples.sh
 #
-# Mounts the live repo at /workspace read-only, same as run-sanitizer-build.sh.
+# The platform is CORO_PLATFORM, or the primary one (docker/common.sh) if that is not
+# set.
+#
+# Mounts the live repo at /workspace read-only, same as run-tests.sh.
 # examples/io and examples/grpc are conanfile.py recipes (same shape as
 # test/conanfile.py), built with `conan install` + `conan build .` — no manual
 # cmake invocation or CMakeUserPresets.json involved, so the user_presets=
@@ -19,16 +23,15 @@
 # subfolder per project, since the source tree itself is read-only.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG=coro-sanitizer-test   # same image as run-sanitizer-build.sh
-
-docker build -t "$IMAGE_TAG" -f "$REPO_ROOT/docker/Dockerfile.ubuntu2404" "$REPO_ROOT"
+# Sets REPO_ROOT, IMAGE and VOLUME_PREFIX; builds the image if this machine does not have it.
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+use_image
 
 docker run --rm -i \
     -v "$REPO_ROOT:/workspace:ro" \
-    -v coro-examples-builds:/builds \
-    -v coro-examples-conan-cache:/root/.conan2/p \
-    "$IMAGE_TAG" \
+    -v "$VOLUME_PREFIX-examples-builds:/builds" \
+    -v "$VOLUME_PREFIX-conan-cache:/root/.conan2/p" \
+    "$IMAGE" \
     bash -s <<'EOF'
         set -xeuo pipefail
 

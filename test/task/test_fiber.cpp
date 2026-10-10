@@ -4,6 +4,7 @@
 #include <coro/sync/event.h>
 #include <coro/sync/sleep.h>
 #include <coro/task/fiber.h>
+#include "executor_traits.h"
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -15,7 +16,13 @@
 using namespace std::chrono_literals;
 
 namespace {
+#ifdef CORO_PICO
+// Every fiber stack comes out of a heap of under 200 KB. 8 KB leaves room for the
+// exception unwinder, which PropagatesException runs on the fiber's own stack.
+constexpr size_t kStackSize = 8 * 1024;
+#else
 constexpr size_t kStackSize = 64 * 1024;
+#endif
 
 // Minimal Waker for driving FiberFuture<T>::poll() directly, without a Runtime.
 struct NoOpWaker : coro::detail::Waker {
@@ -101,10 +108,14 @@ TEST(Fiber, FiberAwaitOutsideFiberThrows) {
 // ---------------------------------------------------------------------------
 // fiber_await() bridging a real coro::Future — driven by a Runtime so wakeups
 // are event-driven rather than polled on a fixed cadence.
+//
+// The runtime comes from CurrentThreadTraits (executor_traits.h): one thread on
+// the desktop, and on Pico a runtime that leaves the Wi-Fi driver alone.
 // ---------------------------------------------------------------------------
 
 TEST(Fiber, SpawnFiberRunsAndCompletes) {
-    coro::Runtime rt(1);
+    CurrentThreadTraits traits;
+    coro::Runtime& rt = traits.rt;
     std::atomic<bool> ran{false};
 
     rt.block_on([&]() -> coro::Coro<void> {
@@ -116,7 +127,8 @@ TEST(Fiber, SpawnFiberRunsAndCompletes) {
 }
 
 TEST(Fiber, FiberAwaitBridgesEventWakeup) {
-    coro::Runtime rt(1);
+    CurrentThreadTraits traits;
+    coro::Runtime& rt = traits.rt;
     coro::Event ev;
     std::atomic<bool> resumed{false};
 
@@ -138,7 +150,8 @@ TEST(Fiber, FiberAwaitBridgesEventWakeup) {
 }
 
 TEST(Fiber, FiberAwaitLoopMultipleWaits) {
-    coro::Runtime rt(1);
+    CurrentThreadTraits traits;
+    coro::Runtime& rt = traits.rt;
     std::atomic<int> count{0};
 
     rt.block_on([&]() -> coro::Coro<void> {
@@ -160,7 +173,8 @@ TEST(Fiber, FiberAwaitLoopMultipleWaits) {
 // ---------------------------------------------------------------------------
 
 TEST(Fiber, HandleCanBeAwaitedForResult) {
-    coro::Runtime rt(1);
+    CurrentThreadTraits traits;
+    coro::Runtime& rt = traits.rt;
     int result = 0;
 
     rt.block_on([&]() -> coro::Coro<void> {
@@ -175,7 +189,8 @@ TEST(Fiber, HandleCanBeAwaitedForResult) {
 }
 
 TEST(Fiber, HandleDroppedWithoutJoinKeepsRunningToCompletion) {
-    coro::Runtime rt(1);
+    CurrentThreadTraits traits;
+    coro::Runtime& rt = traits.rt;
     std::atomic<bool> ran{false};
 
     rt.block_on([&]() -> coro::Coro<void> {
@@ -195,8 +210,13 @@ TEST(Fiber, HandleDroppedWithoutJoinKeepsRunningToCompletion) {
 // ---------------------------------------------------------------------------
 // Stack overflow — guard page below the usable stack region reliably faults
 // rather than silently corrupting adjacent memory.
+//
+// Desktop only. A microcontroller has no guard page and no second process to die
+// in: the Pico backend checks a canary word at the next context switch and then
+// halts the board (coro_fiber_stack_overflow), which would end the whole run.
 // ---------------------------------------------------------------------------
 
+#ifndef CORO_PICO
 TEST(FiberDeathTest, StackOverflowFaultsOnGuardPage) {
     EXPECT_DEATH(
         {
@@ -219,3 +239,4 @@ TEST(FiberDeathTest, StackOverflowFaultsOnGuardPage) {
         },
         "");
 }
+#endif  // CORO_PICO

@@ -3,6 +3,7 @@
 #include <coro/detail/context.h>
 #include <coro/detail/poll_result.h>
 #ifndef CORO_PICO
+#include <coro/detail/blocking_cancel.h>
 #include <coro/detail/blocking_waker.h>
 #include <type_traits>
 #endif
@@ -162,13 +163,30 @@ template<typename T>
  * @brief Polls @p future to completion on the calling thread, blocking the OS thread
  * between polls. Returns the future's value, or rethrows its exception.
  *
- * Unlike `Runtime::block_on()`, this does not create an executor or a reactor — it builds
- * a minimal condvar-backed `Waker` and loop-polls `future` directly, reusing whatever
- * `current_runtime()` context is already active on the calling thread (ambient on a
- * `spawn_blocking` thread; see `coro::spawn_blocking()`). A future that touches the
- * runtime (a timer, a socket, a child task) requires that context to be active —
- * `current_runtime()` throws `std::runtime_error` otherwise, the same as it would from
- * any other thread with no active runtime.
+ * Unlike `Runtime::block_on()`, this does not create an executor or a reactor — it
+ * loop-polls `future` directly, reusing whatever `current_runtime()` context is already
+ * active on the calling thread (ambient on a `spawn_blocking` thread; see
+ * `coro::spawn_blocking()`). A future that touches the runtime (a timer, a socket, a
+ * child task) requires that context to be active — `current_runtime()` throws
+ * `std::runtime_error` otherwise, the same as it would from any other thread with no
+ * active runtime.
+ *
+ * Never call it from a coroutine: it blocks the executor thread.
+ *
+ * **Cancellation.** Inside a `spawn_blocking` callable this is a cancellation point. If
+ * the blocking task has been asked to cancel (and no `BlockingCancelShield` is alive),
+ * it throws @ref BlockingCancelled, whether the request was already pending on entry or
+ * arrives while waiting. Before it throws, `future` is shut down the way a cancelled
+ * task shuts down the future it runs: a @ref Cancellable future is cancelled and polled
+ * until it has drained, so that whatever it owns (a coroutine frame, its children) is
+ * gone before the caller's stack unwinds; a leaf future is destroyed. Whatever the
+ * drained future produced, even a value, is discarded. The drain itself cannot be
+ * cancelled.
+ *
+ * **A dropped future.** If `future` reports `PollDropped`, there is no value to return:
+ * this throws @ref BlockingCancelled, for every output type, on every thread, shielded
+ * or not. That is the synchronous counterpart of a coroutine being dropped at a
+ * `co_await`.
  *
  * See doc/design/blocking_wait.md for the full design and rationale.
  *
@@ -176,17 +194,67 @@ template<typename T>
  */
 template<Future F>
 typename F::OutputType blocking_wait(F future) {
-    auto waker = detail::make_rc<detail::BlockingWaker>();
-    detail::Context ctx(waker->clone());
-    for (;;) {
-        auto r = future.poll(ctx);
-        if (!r.isPending()) {
-            r.rethrowIfError();
-            if constexpr (std::is_void_v<typename F::OutputType>) return;
-            else return std::move(r).value();
+    detail::BlockingTaskBase* const task = detail::current_blocking_task();
+
+    if (task == nullptr) {
+        // Not a blocking pool thread: park on a private condvar-backed waker.
+        auto waker = detail::make_rc<detail::BlockingWaker>();
+        detail::Context ctx(waker->clone());
+        for (;;) {
+            auto r = future.poll(ctx);
+            if (r.isDropped()) throw BlockingCancelled{};
+            if (!r.isPending()) {
+                r.rethrowIfError();
+                if constexpr (std::is_void_v<typename F::OutputType>) return;
+                else return std::move(r).value();
+            }
+            waker->wait_for_wake();
         }
-        waker->wait_for_wake();
     }
+
+    // On a blocking pool thread. The blocking task is the waker, so that cancel_task()
+    // (which wakes the task) reaches this thread while it is parked here. Wakers left
+    // behind in futures an earlier blocking_wait() polled can also wake it; park()
+    // returning only ever means "poll again", so those are harmless.
+    detail::Context ctx(detail::blocking_task_waker(*task));
+
+    // Already cancelled on entry: don't start waiting on anything, go straight to
+    // shutting `future` down.
+    if (!detail::blocking_cancel_pending(*task)) {
+        for (;;) {
+            auto r = future.poll(ctx);
+            if (r.isDropped()) throw BlockingCancelled{};
+            if (!r.isPending()) {
+                r.rethrowIfError();
+                if constexpr (std::is_void_v<typename F::OutputType>) return;
+                else return std::move(r).value();
+            }
+            detail::blocking_task_park(*task);
+            // RACE: the cancelled flag is set before the task is woken, so a park()
+            // that returned because of a cancel always sees it here. A cancel that
+            // lands after this check is caught after the next park(), which returns at
+            // once because the cancel's wake left the task RunningAndNotified.
+            if (detail::blocking_cancel_pending(*task)) break;
+        }
+    }
+
+    // Cancelled. This is what TaskImpl::poll() does with the future of a cancelled
+    // task, and for the same reason: a Cancellable future may own a coroutine frame
+    // and children that hold references into things that are about to unwind, so it
+    // has to be drained, not just dropped. Cancel it once and poll until it is no
+    // longer pending, even if it was never polled before (a coroutine that has not
+    // started still owns its arguments, and a JoinHandle its running task). Its
+    // outcome is discarded, even a value. A leaf future is simply destroyed.
+    if constexpr (Cancellable<F>) {
+        future.cancel();
+        for (;;) {
+            auto r = future.poll(ctx);
+            if (!r.isPending()) break;
+            detail::blocking_task_park(*task);
+        }
+    }
+    // `future` is destroyed as the exception leaves this function.
+    throw BlockingCancelled{};
 }
 
 #endif // CORO_PICO

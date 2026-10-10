@@ -1,4 +1,13 @@
+// SleepFuture, timeout and IntervalTimer on every backend: the desktop IoDriver's
+// timers, and the Pico runtime's own TimerQueue read against PicoClock (time_us_64(),
+// stubbed on the host, the hardware timer on the board).
+//
+// Time is read with coro::Clock throughout, which is the clock the timers use on
+// each backend. The tests under #ifndef CORO_PICO need another executor, threads, or
+// thousands of timers at once.
+
 #include <gtest/gtest.h>
+#include "executor_traits.h"
 #include <coro/sync/interval.h>
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
@@ -6,15 +15,17 @@
 #include <coro/coro_stream.h>
 #include <coro/stream.h>
 #include <coro/runtime/runtime.h>
+#include <chrono>
+#include <optional>
+#include <vector>
+
+#ifndef CORO_PICO
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/parker.h>
 #include <coro/runtime/work_sharing_executor.h>
-#include <atomic>
-#include <chrono>
 #include <memory>
-#include <optional>
 #include <stdexcept>
-#include <vector>
+#endif
 
 using namespace coro;
 using namespace std::chrono_literals;
@@ -25,42 +36,42 @@ static_assert(Future<IntervalTimer::TickFuture>);
 
 // sleep_for completes after the requested duration.
 TEST(SleepTest, SleepForCompletesAfterDuration) {
-    Runtime rt(1);
-    auto start = std::chrono::steady_clock::now();
+    SingleThreadRuntime rt;
+    auto start = Clock::now();
     rt.block_on([]() -> Coro<void> {
         co_await sleep_for(100ms);
     }());
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     EXPECT_GE(elapsed, 100ms);
 }
 
 // sleep_for does not complete significantly before the deadline.
 TEST(SleepTest, SleepForDoesNotFireEarly) {
-    Runtime rt(1);
-    auto start = std::chrono::steady_clock::now();
+    SingleThreadRuntime rt;
+    auto start = Clock::now();
     rt.block_on([]() -> Coro<void> {
         co_await sleep_for(30ms);
     }());
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     // Allow 5 ms early tolerance for scheduling jitter.
     EXPECT_GE(elapsed, 25ms);
 }
 
 // Two sequential sleeps accumulate correctly.
 TEST(SleepTest, SequentialSleeps) {
-    Runtime rt(1);
-    auto start = std::chrono::steady_clock::now();
+    SingleThreadRuntime rt;
+    auto start = Clock::now();
     rt.block_on([]() -> Coro<void> {
         co_await sleep_for(20ms);
         co_await sleep_for(20ms);
     }());
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     EXPECT_GE(elapsed, 40ms);
 }
 
 // timeout: future completes before deadline — returns branch 0.
 TEST(TimeoutTest, FutureWinsBeforeDeadline) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto result = rt.block_on([]() -> Coro<int> {
         auto r = co_await timeout(500ms, []() -> Coro<int> {
             co_return 42;
@@ -72,52 +83,61 @@ TEST(TimeoutTest, FutureWinsBeforeDeadline) {
 
 // timeout: deadline passes before a never-completing future — returns branch 1.
 TEST(TimeoutTest, DeadlineWinsAgainstSlowFuture) {
-    Runtime rt(1);
-    auto start = std::chrono::steady_clock::now();
+    SingleThreadRuntime rt;
+    auto start = Clock::now();
     auto result = rt.block_on([]() -> Coro<int> {
         // sleep_for(500ms) is the "slow future"; timeout wraps it with a 50ms deadline.
         // The inner sleep should be cancelled by the timeout.
         auto r = co_await timeout(50ms, sleep_for(500ms));
         co_return static_cast<int>(r.index()); // 1 = timeout branch
     }());
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
 
     //EXPECT_EQ(result, 1);
     EXPECT_GE(elapsed, 50ms);
     EXPECT_LT(elapsed, 400ms); // should not wait for the inner 500ms sleep
 }
 
+#ifndef CORO_PICO
 // sleep_for works on the multi-threaded executor too.
 TEST(SleepTest, WorksWithMultiThreadedRuntime) {
     Runtime rt(4);
-    auto start = std::chrono::steady_clock::now();
+    auto start = Clock::now();
     rt.block_on([]() -> Coro<void> {
         co_await sleep_for(50ms);
     }());
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     EXPECT_GE(elapsed, 50ms);
 }
+#endif  // CORO_PICO
 
-// --- Timers on the IoDriver (doc/design/timers.md) ---
+// --- The timer behind a sleep (doc/design/timers.md) ---
 
 namespace {
 
-class CountingWaker : public detail::Waker,
-                      public std::enable_shared_from_this<CountingWaker> {
+// Counts its wakes. The count is a plain int: every test that uses one runs on a
+// single-threaded runtime, so the timer fires on the thread that reads the count.
+class CountingWaker : public detail::Waker {
 public:
-    void wake() override { count.fetch_add(1, std::memory_order_relaxed); }
-    detail::Rc<detail::Waker> clone() override { return shared_from_this(); }
-    int value() const { return count.load(std::memory_order_relaxed); }
+    explicit CountingWaker(detail::Rc<int> count) : m_count(std::move(count)) {}
+    void wake() override { ++*m_count; }
+    // A second waker on the same count: the Pico build's Rc has no
+    // enable_shared_from_this to hand out this one.
+    detail::Rc<detail::Waker> clone() override {
+        return detail::make_rc<CountingWaker>(m_count);
+    }
 private:
-    std::atomic<int> count{0};
+    detail::Rc<int> m_count;
 };
 
 struct TestTask {
-    std::shared_ptr<CountingWaker> waker = std::make_shared<CountingWaker>();
-    detail::Context ctx{waker};
-    int wakes() const { return waker->value(); }
+    detail::Rc<int>           count = detail::make_rc<int>(0);
+    detail::Rc<CountingWaker> waker = detail::make_rc<CountingWaker>(count);
+    detail::Context           ctx{waker};
+    int wakes() const { return *count; }
 };
 
+#ifndef CORO_PICO
 Coro<void> many_short_sleeps(int n, std::chrono::microseconds each) {
     for (int i = 0; i < n; ++i) co_await sleep_for(each);
 }
@@ -133,41 +153,45 @@ Coro<void> poll_briefly(CoroStream<int>& stream) {
     auto r = co_await timeout(1ms, next(stream));
     EXPECT_EQ(r.index(), 1u);
 }
+#endif  // CORO_PICO
 
 } // namespace
+
+#ifndef CORO_PICO
 
 // The driver's epoll_pwait2 timeout is nanosecond-resolution, so short sleeps are not
 // rounded up to a millisecond (libuv's timers were). 1000 x 200 us is 0.2 s of sleep;
 // at 1 ms per sleep it would take over a second.
 TEST(SleepTest, SubMillisecondPrecisionCurrentThread) {
-    Runtime rt(1);
-    auto start = std::chrono::steady_clock::now();
+    SingleThreadRuntime rt;
+    auto start = Clock::now();
     rt.block_on(many_short_sleeps(1000, 200us));
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     EXPECT_GE(elapsed, 200ms);
     EXPECT_LT(elapsed, 1s);
 }
 
 TEST(SleepTest, SubMillisecondPrecisionWorkStealing) {
     Runtime rt(4);
-    auto start = std::chrono::steady_clock::now();
+    auto start = Clock::now();
     rt.block_on(many_short_sleeps(1000, 200us));
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     EXPECT_GE(elapsed, 200ms);
     EXPECT_LT(elapsed, 1s);
 }
 
 TEST(SleepTest, WorksWithWorkSharingRuntime) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>, std::size_t{4});
-    auto start = std::chrono::steady_clock::now();
+    auto start = Clock::now();
     rt.block_on([]() -> Coro<void> {
         co_await sleep_for(30ms);
     }());
-    EXPECT_GE(std::chrono::steady_clock::now() - start, 30ms);
+    EXPECT_GE(Clock::now() - start, 30ms);
 }
+#endif  // CORO_PICO
 
 TEST(SleepTest, SleepUntil) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     const Instant deadline = Clock::now() + 25ms;
     rt.block_on([](Instant d) -> Coro<void> {
         co_await sleep_until(d);
@@ -176,7 +200,7 @@ TEST(SleepTest, SleepUntil) {
 }
 
 TEST(SleepTest, PassedDeadlineIsReadyWithoutATimer) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     rt.block_on([]() -> Coro<void> {
         TestTask task;
         SleepFuture f = sleep_until(Clock::now() - 1ms);
@@ -188,7 +212,7 @@ TEST(SleepTest, PassedDeadlineIsReadyWithoutATimer) {
 // A sleep dropped before its deadline fires nothing: its timer is cancelled and the
 // queue entry is popped without a wake.
 TEST(SleepTest, DroppedSleepDoesNotWake) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     rt.block_on([]() -> Coro<void> {
         TestTask task;
         {
@@ -203,7 +227,7 @@ TEST(SleepTest, DroppedSleepDoesNotWake) {
 // A re-poll with a different context moves the timer to the new waker; only the
 // latest is woken.
 TEST(SleepTest, RepollUpdatesWaker) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     rt.block_on([]() -> Coro<void> {
         TestTask first, second;
         SleepFuture f = sleep_for(5ms);
@@ -218,7 +242,7 @@ TEST(SleepTest, RepollUpdatesWaker) {
 
 // A re-poll with the same context keeps the one timer: the waker fires once.
 TEST(SleepTest, RepollWithSameWakerKeepsTimer) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     rt.block_on([]() -> Coro<void> {
         TestTask task;
         SleepFuture f = sleep_for(5ms);
@@ -234,7 +258,7 @@ TEST(SleepTest, RepollWithSameWakerKeepsTimer) {
 // The timer is named by id, so a polled sleep can still be moved: the moved-to
 // future owns the timer, and dropping the moved-from one cancels nothing.
 TEST(SleepTest, MovedAfterPollKeepsTimer) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     rt.block_on([]() -> Coro<void> {
         TestTask task;
         std::optional<SleepFuture> first(sleep_for(5ms));
@@ -247,6 +271,31 @@ TEST(SleepTest, MovedAfterPollKeepsTimer) {
     }());
 }
 
+// Sleepers spawned out of order wake in the order of their deadlines.
+TEST(SleepTest, ConcurrentSleepersWakeInDeadlineOrder) {
+    SingleThreadRuntime rt;
+    std::vector<int> order;
+    rt.block_on([](std::vector<int>& out) -> Coro<void> {
+        auto a = spawn([](std::vector<int>& o) -> Coro<void> {
+            co_await sleep_for(30ms);
+            o.push_back(3);
+        }(out));
+        auto b = spawn([](std::vector<int>& o) -> Coro<void> {
+            co_await sleep_for(10ms);
+            o.push_back(1);
+        }(out));
+        auto c = spawn([](std::vector<int>& o) -> Coro<void> {
+            co_await sleep_for(20ms);
+            o.push_back(2);
+        }(out));
+        co_await a;
+        co_await b;
+        co_await c;
+    }(order));
+    EXPECT_EQ(order, (std::vector<int>{1, 2, 3}));
+}
+
+#ifndef CORO_PICO
 // A stream suspended in a sleep is polled by one task, which then abandons it, and is
 // awaited by another. The sleep's timer still names the first task's waker; the
 // second task's poll must move it, or the second task is never woken.
@@ -265,8 +314,8 @@ TEST(SleepTest, StreamHandedToAnotherTaskStillWakes) {
 // makes select poll both branches) and cancels it. The cancelled entries are swept
 // rather than piling up, and timers keep working afterwards.
 TEST(SleepTest, ManyCancelledTimeouts) {
-    Runtime rt(1);
-    auto start = std::chrono::steady_clock::now();
+    SingleThreadRuntime rt;
+    auto start = Clock::now();
     int done = rt.block_on([]() -> Coro<int> {
         int n = 0;
         for (int i = 0; i < 10000; ++i) {
@@ -280,13 +329,13 @@ TEST(SleepTest, ManyCancelledTimeouts) {
         co_return n;
     }());
     EXPECT_EQ(done, 10000);
-    EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
+    EXPECT_LT(Clock::now() - start, 5s);
 }
 
 TEST(SleepTest, ManyConcurrentSleepers) {
     constexpr int kSleepers = 10000;
     Runtime rt(4);
-    auto start = std::chrono::steady_clock::now();
+    auto start = Clock::now();
     int done = rt.block_on([]() -> Coro<int> {
         std::vector<JoinHandle<void>> handles;
         handles.reserve(kSleepers);
@@ -302,27 +351,28 @@ TEST(SleepTest, ManyConcurrentSleepers) {
         }
         co_return n;
     }());
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     EXPECT_EQ(done, kSleepers);
     EXPECT_GE(elapsed, 50ms);
     EXPECT_LT(elapsed, 2s);
 }
+#endif  // CORO_PICO
 
 TEST(TimeoutTest, TimeoutAtDeadlineWins) {
-    Runtime rt(1);
-    auto start = std::chrono::steady_clock::now();
+    SingleThreadRuntime rt;
+    auto start = Clock::now();
     auto index = rt.block_on([]() -> Coro<int> {
         auto r = co_await timeout_at(Clock::now() + 30ms, sleep_for(1s));
         co_return static_cast<int>(r.index());
     }());
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed = Clock::now() - start;
     EXPECT_EQ(index, 1);
     EXPECT_GE(elapsed, 30ms);
     EXPECT_LT(elapsed, 500ms);
 }
 
 TEST(IntervalTimerTest, TicksOncePerPeriod) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     const Instant start = Clock::now();
     rt.block_on([]() -> Coro<void> {
         IntervalTimer timer(5ms);
@@ -334,7 +384,7 @@ TEST(IntervalTimerTest, TicksOncePerPeriod) {
 // Work done between ticks comes out of the wait: three 40 ms periods with 20 ms of
 // work in each take 120 ms, not 180 ms.
 TEST(IntervalTimerTest, AbsorbsWorkBetweenTicks) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     const Instant start = Clock::now();
     rt.block_on([]() -> Coro<void> {
         IntervalTimer timer(40ms);
@@ -351,7 +401,7 @@ TEST(IntervalTimerTest, AbsorbsWorkBetweenTicks) {
 // A tick dropped mid-wait doesn't advance the schedule: the next tick() still
 // completes one period after construction, not two.
 TEST(IntervalTimerTest, DroppedTickKeepsSchedule) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     const Instant start = Clock::now();
     const auto index = rt.block_on([]() -> Coro<int> {
         IntervalTimer timer(100ms);
@@ -368,7 +418,7 @@ TEST(IntervalTimerTest, DroppedTickKeepsSchedule) {
 // After falling several periods behind, one tick is ready at once and the next
 // waits a full period: the missed ticks are not delivered in a burst.
 TEST(IntervalTimerTest, SkipsMissedTicks) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     const auto after_late = rt.block_on([]() -> Coro<Clock::duration> {
         IntervalTimer timer(10ms);
         co_await sleep_for(35ms);
@@ -381,6 +431,7 @@ TEST(IntervalTimerTest, SkipsMissedTicks) {
     EXPECT_GE(after_late, 20ms);
 }
 
+#ifndef CORO_PICO
 // An executor that never turns the IoDriver cannot fire timers on it; the first
 // pending poll says so rather than hanging.
 TEST(SleepTest, ThrowsWithoutDriver) {
@@ -391,3 +442,4 @@ TEST(SleepTest, ThrowsWithoutDriver) {
         co_await sleep_for(1ms);
     }()), std::logic_error);
 }
+#endif  // CORO_PICO

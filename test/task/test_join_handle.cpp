@@ -3,9 +3,12 @@
 #include <coro/task/join_handle.h>
 #include <coro/future.h>
 #include <stdexcept>
+#include <string>
 
 using namespace coro;
 using namespace coro::detail;
+
+namespace {
 
 class MockWaker : public detail::Waker {
 public:
@@ -13,12 +16,12 @@ public:
     MOCK_METHOD(Rc<detail::Waker>, clone, (), (override));
 };
 
-static std::shared_ptr<detail::TaskState<int>> make_int_state() {
-    return std::make_shared<detail::TaskState<int>>();
+Rc<detail::TaskState<int>> make_int_state() {
+    return make_rc<detail::TaskState<int>>();
 }
 
-static std::shared_ptr<detail::TaskState<void>> make_void_state() {
-    return std::make_shared<detail::TaskState<void>>();
+Rc<detail::TaskState<void>> make_void_state() {
+    return make_rc<detail::TaskState<void>>();
 }
 
 // --- Concept checks (compile-time) ---
@@ -26,6 +29,8 @@ static std::shared_ptr<detail::TaskState<void>> make_void_state() {
 static_assert(Future<JoinHandle<int>>);
 static_assert(Future<JoinHandle<void>>);
 static_assert(Future<JoinHandle<std::string>>);
+
+}  // namespace
 
 // --- Construction and move ---
 

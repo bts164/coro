@@ -327,6 +327,57 @@ keep that cheap, both taken from tokio:
   until some unrelated event. Only an executor that never turns the driver lets the list
   grow without bound.
 
+### Shutdown
+
+`IoDriver::shutdown()` is the last step of `Runtime::shutdown()`, after the executor's
+threads have stopped. From then on nothing turns the driver, so a waiter left on it
+would never be woken. The runtime's own tasks have all finished by then. What can be
+left is a waiter the runtime does not own: a thread outside it, or a task of another
+runtime, parked on one of this driver's registrations or timers (see
+[runtime_shutdown.md](runtime_shutdown.md), "Waiters on the I/O driver from outside the
+runtime").
+
+The poller knows registrations only as opaque keys, so the driver keeps its own list of
+them: an intrusive list through `ScheduledIo`, under `m_registrations_mutex`. `add()`
+links a registration and `deregister()` unlinks it, so the mutex is taken twice in a
+registration's lifetime and never per operation. This is tokio's `RegistrationSet`.
+
+`shutdown()` then:
+
+1. Sets the driver's `is_shut_down()` flag.
+2. For every listed registration, sets `ScheduledIo::m_shutdown` and takes its reader
+   and writer wakers, under that registration's mutex.
+3. Wakes those wakers, outside both locks.
+4. Closes the timer queue, which removes every timer and wakes its waker
+   (`TimerQueue::close_and_wake_all()`).
+
+Afterwards:
+
+| Call | Result |
+|---|---|
+| `IoRegistration::poll_ready()` | Always returns an event, with `shutdown` set; stores no waker |
+| `IoRegistration::poll_io()` | Returns the error `sys::kDriverShutDown` (`ECANCELED`) without running the operation. Each I/O future already turns an errno into a `std::system_error` |
+| `IoDriver::add_timer()` | Throws `std::runtime_error` |
+| A `SleepFuture` polled again before its deadline | Checks `is_shut_down()` and fails with `std::runtime_error` |
+| Registering a new fd | Throws `std::runtime_error` |
+| `deregister()`, `cancel_timer()`, `turn()`, `unpark()` | Work as before, so sockets and futures that outlive the shutdown are destroyed as usual |
+
+Races:
+
+- A `poll_ready()` on another thread stores its waker under the registration's mutex,
+  the same one `shutdown()` sets the flag under. It either stored first and is woken,
+  or runs afterwards and sees the flag.
+- An `add()` holds `m_registrations_mutex` across the poller call and the link, so
+  `shutdown()` sees either a linked registration or none; a later `add()` is refused.
+- A `deregister()` unlinks under `m_registrations_mutex` before it gives up its
+  reference, so every registration `shutdown()` walks is alive.
+- A timer insert takes the queue's mutex either before the close, and is woken by it,
+  or after, and is refused.
+- `is_shut_down()` is an atomic flag, read without a lock. `SleepFuture` reads it on a
+  re-poll that otherwise touches nothing shared, which is the hot path of a timeout
+  raced against a busy future. It is written once, before anyone is woken, so a waiter
+  woken by `shutdown()` always sees it.
+
 ---
 
 ## Who turns the driver
@@ -695,6 +746,9 @@ never early: `SleepFuture` checks the clock itself.
 | `TimerQueue.SlotsAreReused`, `SweepRemovesCancelledEntries`, `NoSweepBelowMinimum` | Fired and swept timers free their slots; cancelling more than half the heap shrinks it; a small heap is left alone. |
 | `TimerQueue.FiresMoreThanOneBatch`, `InsertAfterSweepStillUnparksWaiter` | More timers due than one wake batch all fire in order; an insert after a sweep emptied the heap still unparks the waiter. |
 | `IoDriver.TurnTimesOutAtNextDeadline`, `ShorterMaxWaitBeatsTimer`, `CancelledTimerFiresNothing`, `CancelAfterFireIsIgnored`, `EarlierTimerFromOtherThreadUnparks` | Timers on the driver. |
+| `TimerQueue.CloseWakesLiveTimersAndEmptiesTheQueue`, `InsertAfterCloseIsRefused`, `CancelAfterCloseIsIgnored` | Closing the queue wakes every live timer, refuses later inserts and leaves old ids stale. |
+| `IoDriver.ShutdownWakesWaitersAndFailsPollIo`, `ShutdownIsReportedOnAReadyDirection`, `ShutdownRefusesNewRegistrations` | Shutdown wakes both directions once; `poll_io()` then fails without running the operation; a new registration throws. |
+| `IoDriver.DeregisterAfterShutdownIsSafe`, `ShutdownSkipsDeregisteredRegistrations`, `ShutdownWakesTimersAndRefusesNewOnes` | The registration list across deregistration in any order; timers woken, refused and cancelled after shutdown. |
 
 ---
 

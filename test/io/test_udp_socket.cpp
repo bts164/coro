@@ -1,24 +1,37 @@
+// UdpSocket and SocketAddress, on every backend: the desktop sockets on the IoDriver
+// (doc/design/udp_socket.md) and lwIP, built for the host and on the board. The tests
+// use 127.0.0.1, which on lwIP is its loopback interface.
+//
+// Most tests are shared. The desktop-only and lwIP-only ones are in their own
+// sections at the end.
+
 #include <gtest/gtest.h>
-#include <coro/io/lookup_host.h>
 #include <coro/io/udp_socket.h>
 #include <coro/io/socket_address.h>
 #include <coro/runtime/runtime.h>
 #include <coro/coro.h>
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
+#include "net_runtime.h"
+#ifndef CORO_UDP_BACKEND_LWIP
+#include <coro/io/lookup_host.h>
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/parker.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <chrono>
 #include <memory>
+#include <variant>
+#include <vector>
+#endif
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <variant>
-#include <vector>
 
 using namespace coro;
 using namespace std::chrono_literals;
@@ -29,13 +42,34 @@ using namespace std::chrono_literals;
 
 static_assert(Future<Coro<UdpSocket>>);
 static_assert(Future<Coro<void>>);
+// send and recv are hand-written futures, not coroutines: no frame per datagram.
 static_assert(Future<UdpSendFuture<std::string>>);
 static_assert(Future<UdpRecvFuture<std::string, true>>);
-static_assert(Future<UdpRecvSegmentsFuture<std::string>>);
+static_assert(Future<UdpRecvFuture<std::string, false>>);
 // Leaf futures: safe to drop mid-wait, so they expose no cancel().
 static_assert(!Cancellable<UdpSendFuture<std::string>>);
 static_assert(!Cancellable<UdpRecvFuture<std::string, true>>);
+#ifndef CORO_UDP_BACKEND_LWIP
+static_assert(Future<UdpRecvSegmentsFuture<std::string>>);
 static_assert(!Cancellable<UdpRecvSegmentsFuture<std::string>>);
+#endif
+
+namespace {
+
+// The receive starts on an empty socket, so it has to wait for the datagram.
+Coro<void> recv_waits_then_completes(uint16_t port) {
+    auto server = co_await UdpSocket::bind("127.0.0.1", port);
+    auto client = co_await UdpSocket::bind("127.0.0.1", 0);
+    auto pending = coro::spawn(server.recv_from(std::string(64, '\0')));
+    co_await coro::sleep_for(50ms);
+    co_await client.send_to(std::string("late"), SocketAddress::parse("127.0.0.1", port).value());
+    auto [n, buf, sender] = co_await pending;
+    (void)sender;
+    buf.resize(n);
+    EXPECT_EQ(buf, "late");
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // SocketAddress
@@ -45,18 +79,6 @@ TEST(SocketAddressTest, ParseAndFormatIpv4) {
     auto addr = SocketAddress::parse("127.0.0.1", 9001);
     ASSERT_TRUE(addr.has_value());
     EXPECT_EQ(addr->to_string(), "127.0.0.1:9001");
-}
-
-TEST(SocketAddressTest, ParseAndFormatIpv6) {
-    auto addr = SocketAddress::parse("::1", 9001);
-    ASSERT_TRUE(addr.has_value());
-    EXPECT_EQ(addr->to_string(), "[::1]:9001");
-}
-
-TEST(SocketAddressTest, ParseIpv6WithScope) {
-    auto addr = SocketAddress::parse("fe80::1%3", 9001);
-    ASSERT_TRUE(addr.has_value());
-    EXPECT_EQ(addr->to_string(), "[fe80::1%3]:9001");
 }
 
 TEST(SocketAddressTest, ParseInvalidReturnsNullopt) {
@@ -78,7 +100,7 @@ TEST(SocketAddressTest, EqualityCompares) {
 // ---------------------------------------------------------------------------
 
 TEST(UdpSocketTest, SendToRecvFromRoundTrip) {
-    Runtime rt;
+    NetRuntime rt;
     rt.block_on([]() -> Coro<void> {
         auto server = co_await UdpSocket::bind("127.0.0.1", 30001);
         auto client = co_await UdpSocket::bind("127.0.0.1", 30002);
@@ -94,7 +116,7 @@ TEST(UdpSocketTest, SendToRecvFromRoundTrip) {
 }
 
 TEST(UdpSocketTest, RecvFromTruncatesOversizedDatagram) {
-    Runtime rt;
+    NetRuntime rt;
     rt.block_on([]() -> Coro<void> {
         auto server = co_await UdpSocket::bind("127.0.0.1", 30011);
         auto client = co_await UdpSocket::bind("127.0.0.1", 30012);
@@ -115,7 +137,7 @@ TEST(UdpSocketTest, RecvFromTruncatesOversizedDatagram) {
 // ---------------------------------------------------------------------------
 
 TEST(UdpSocketTest, ConnectSendRecvRoundTrip) {
-    Runtime rt;
+    NetRuntime rt;
     rt.block_on([]() -> Coro<void> {
         auto server = co_await UdpSocket::bind("127.0.0.1", 30021);
         auto client = co_await UdpSocket::bind("127.0.0.1", 30022);
@@ -134,6 +156,127 @@ TEST(UdpSocketTest, ConnectSendRecvRoundTrip) {
         rbuf.resize(rn);
         EXPECT_EQ(rbuf, "reply");
     }());
+}
+
+// send() has no destination until connect() fixes one.
+TEST(UdpSocketTest, SendWithoutConnectThrows) {
+    NetRuntime rt;
+    const bool threw = rt.block_on([]() -> Coro<bool> {
+        auto sock = co_await UdpSocket::bind("127.0.0.1", 30092);
+        try {
+            co_await sock.send(std::string("no peer"));
+        } catch (const std::exception&) {
+            co_return true;
+        }
+        co_return false;
+    }());
+    EXPECT_TRUE(threw);
+}
+
+// ---------------------------------------------------------------------------
+// UdpSocket — options
+// ---------------------------------------------------------------------------
+
+// A no-op on the lwIP backend (doc/design/udp_socket.md, "Multicast and broadcast").
+TEST(UdpSocketTest, SetBroadcastDoesNotThrow) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto sock = co_await UdpSocket::bind("0.0.0.0", 30041);
+        co_await sock.set_broadcast(true);
+        co_await sock.set_broadcast(false);
+    }());
+}
+
+// ---------------------------------------------------------------------------
+// UdpSocket — waiting and dropping
+// ---------------------------------------------------------------------------
+
+TEST(UdpSocketTest, RecvWaitsThenCompletes) {
+    NetRuntime rt;
+    rt.block_on(recv_waits_then_completes(30091));
+}
+
+// A receive that loses a race to a timer is dropped mid-wait. It leaves no buffer
+// behind in the socket, so the next datagram goes to the next receive.
+TEST(UdpSocketTest, DroppedRecvLosesNoDatagram) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto server = co_await UdpSocket::bind("127.0.0.1", 30086);
+        auto client = co_await UdpSocket::bind("127.0.0.1", 0);
+        auto timed = co_await coro::timeout(20ms, server.recv_from(std::string(64, '\0')));
+        EXPECT_EQ(timed.index(), 1u);   // timed out; the receive was dropped
+
+        co_await client.send_to(std::string("after-drop"),
+                                SocketAddress::parse("127.0.0.1", 30086).value());
+        auto [n, buf, sender] = co_await server.recv_from(std::string(64, '\0'));
+        (void)sender;
+        buf.resize(n);
+        EXPECT_EQ(buf, "after-drop");
+    }());
+}
+
+#ifndef CORO_UDP_BACKEND_LWIP
+// ===========================================================================
+// Desktop only: IPv6, multicast (lwIP's loopback interface has no IGMP), GSO and
+// GRO, errno values, the other executors, and behaviour the lwIP backend does not
+// have.
+// ===========================================================================
+
+namespace {
+
+bool ipv6_loopback_available() {
+    const int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr   = in6addr_loopback;
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    ::close(fd);
+    return ok;
+}
+
+constexpr int kConcurrentDatagrams = 100;   // well under the default SO_RCVBUF
+
+Coro<void> echo_n(std::shared_ptr<UdpSocket> sock, int n) {
+    for (int i = 0; i < n; ++i) {
+        auto [len, buf, from] = co_await sock->recv_from(std::string(16, '\0'));
+        buf.resize(len);
+        co_await sock->send_to(std::move(buf), from);
+    }
+}
+
+Coro<void> send_n(std::shared_ptr<UdpSocket> sock, SocketAddress dest, int n) {
+    for (int i = 0; i < n; ++i)
+        co_await sock->send_to(std::to_string(i), dest);
+}
+
+// Returns how many distinct datagrams 0..n-1 came back.
+Coro<int> recv_n(std::shared_ptr<UdpSocket> sock, int n) {
+    std::vector<bool> seen(n, false);
+    for (int i = 0; i < n; ++i) {
+        auto [len, buf, from] = co_await sock->recv_from(std::string(16, '\0'));
+        (void)from;
+        buf.resize(len);
+        const int v = std::stoi(buf);
+        if (v >= 0 && v < n) seen[v] = true;
+    }
+    int distinct = 0;
+    for (bool b : seen) distinct += b ? 1 : 0;
+    co_return distinct;
+}
+
+} // namespace
+
+TEST(SocketAddressTest, ParseAndFormatIpv6) {
+    auto addr = SocketAddress::parse("::1", 9001);
+    ASSERT_TRUE(addr.has_value());
+    EXPECT_EQ(addr->to_string(), "[::1]:9001");
+}
+
+TEST(SocketAddressTest, ParseIpv6WithScope) {
+    auto addr = SocketAddress::parse("fe80::1%3", 9001);
+    ASSERT_TRUE(addr.has_value());
+    EXPECT_EQ(addr->to_string(), "[fe80::1%3]:9001");
 }
 
 // ---------------------------------------------------------------------------
@@ -180,17 +323,8 @@ TEST(UdpSocketTest, SendToStillWorksAfterConnectToDifferentPeer) {
 }
 
 // ---------------------------------------------------------------------------
-// UdpSocket — set_broadcast / join_multicast / leave_multicast
+// UdpSocket — join_multicast / leave_multicast
 // ---------------------------------------------------------------------------
-
-TEST(UdpSocketTest, SetBroadcastDoesNotThrow) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        auto sock = co_await UdpSocket::bind("0.0.0.0", 30041);
-        co_await sock.set_broadcast(true);
-        co_await sock.set_broadcast(false);
-    }());
-}
 
 TEST(UdpSocketTest, JoinAndLeaveMulticastDoesNotThrow) {
     Runtime rt;
@@ -341,64 +475,6 @@ TEST(UdpSocketTest, GroUnsupportedOffLinux) {
 // UdpSocket on the IoDriver (doc/design/udp_socket.md, "Desktop (IoDriver) backend")
 // ---------------------------------------------------------------------------
 
-namespace {
-
-bool ipv6_loopback_available() {
-    const int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_addr   = in6addr_loopback;
-    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-    ::close(fd);
-    return ok;
-}
-
-// The receive starts on an empty socket, so it hits EAGAIN and waits on the driver.
-Coro<void> recv_waits_then_completes(uint16_t port) {
-    auto server = co_await UdpSocket::bind("127.0.0.1", port);
-    auto client = co_await UdpSocket::bind("127.0.0.1", 0);
-    auto pending = coro::spawn(server.recv_from(std::string(64, '\0')));
-    co_await coro::sleep_for(50ms);
-    co_await client.send_to(std::string("late"), SocketAddress::parse("127.0.0.1", port).value());
-    auto [n, buf, sender] = co_await pending;
-    (void)sender;
-    buf.resize(n);
-    EXPECT_EQ(buf, "late");
-}
-
-constexpr int kConcurrentDatagrams = 100;   // well under the default SO_RCVBUF
-
-Coro<void> echo_n(std::shared_ptr<UdpSocket> sock, int n) {
-    for (int i = 0; i < n; ++i) {
-        auto [len, buf, from] = co_await sock->recv_from(std::string(16, '\0'));
-        buf.resize(len);
-        co_await sock->send_to(std::move(buf), from);
-    }
-}
-
-Coro<void> send_n(std::shared_ptr<UdpSocket> sock, SocketAddress dest, int n) {
-    for (int i = 0; i < n; ++i)
-        co_await sock->send_to(std::to_string(i), dest);
-}
-
-// Returns how many distinct datagrams 0..n-1 came back.
-Coro<int> recv_n(std::shared_ptr<UdpSocket> sock, int n) {
-    std::vector<bool> seen(n, false);
-    for (int i = 0; i < n; ++i) {
-        auto [len, buf, from] = co_await sock->recv_from(std::string(16, '\0'));
-        (void)from;
-        buf.resize(len);
-        const int v = std::stoi(buf);
-        if (v >= 0 && v < n) seen[v] = true;
-    }
-    int distinct = 0;
-    for (bool b : seen) distinct += b ? 1 : 0;
-    co_return distinct;
-}
-
-} // namespace
-
 TEST(UdpSocketTest, BindIpv6Loopback) {
     if (!ipv6_loopback_available()) GTEST_SKIP() << "no IPv6 loopback on this host";
     Runtime rt;
@@ -446,26 +522,6 @@ TEST(UdpSocketTest, RecvWaitsThenCompletesWorkStealing) {
 TEST(UdpSocketTest, RecvWaitsThenCompletesCurrentThread) {
     Runtime rt(1);
     rt.block_on(recv_waits_then_completes(30085));
-}
-
-// A receive that loses a race to a timer is dropped mid-wait. A dropped receive leaves
-// only a stale weak waker in the registration, never an armed buffer, so the next
-// datagram goes to the next receive.
-TEST(UdpSocketTest, DroppedRecvLosesNoDatagram) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        auto server = co_await UdpSocket::bind("127.0.0.1", 30086);
-        auto client = co_await UdpSocket::bind("127.0.0.1", 0);
-        auto timed = co_await coro::timeout(20ms, server.recv_from(std::string(64, '\0')));
-        EXPECT_EQ(timed.index(), 1u);   // timed out; the receive was dropped
-
-        co_await client.send_to(std::string("after-drop"),
-                                SocketAddress::parse("127.0.0.1", 30086).value());
-        auto [n, buf, sender] = co_await server.recv_from(std::string(64, '\0'));
-        (void)sender;
-        buf.resize(n);
-        EXPECT_EQ(buf, "after-drop");
-    }());
 }
 
 // The pending receive shares the socket's state, so destroying the UdpSocket handle
@@ -542,3 +598,26 @@ TEST(UdpSocketTest, RecvWaitsOnWorkSharing) {
     }());
     EXPECT_EQ(n, 5u);
 }
+
+#else
+// ===========================================================================
+// lwIP only
+// ===========================================================================
+
+// recv() takes datagrams from the connected peer only, so it needs one. On the
+// desktop an unconnected recv() is allowed and takes them from anyone.
+TEST(UdpSocketTest, RecvWithoutConnectThrows) {
+    NetRuntime rt;
+    const bool threw = rt.block_on([]() -> Coro<bool> {
+        auto sock = co_await UdpSocket::bind("127.0.0.1", 30093);
+        try {
+            co_await sock.recv(std::string(16, '\0'));
+        } catch (const std::exception&) {
+            co_return true;
+        }
+        co_return false;
+    }());
+    EXPECT_TRUE(threw);
+}
+
+#endif // CORO_UDP_BACKEND_LWIP

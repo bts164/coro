@@ -5,6 +5,7 @@
 #include <coro/sync/select.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -296,8 +297,9 @@ TYPED_TEST(OneshotVoidTest, SecondRecvReturnsClosed) {
 }
 
 // ---------------------------------------------------------------------------
-// spawn_blocking and direct blocking_recv tests — desktop only
-// (blocking_recv uses cv.wait; on CORO_PICO that spins forever)
+// Receiving from a blocking thread — desktop only. The channel has no blocking
+// call of its own: blocking_wait(rx.recv()) is used, which is a cancellation point
+// on a spawn_blocking thread.
 // ---------------------------------------------------------------------------
 
 #ifndef CORO_PICO
@@ -305,20 +307,20 @@ TYPED_TEST(OneshotVoidTest, SecondRecvReturnsClosed) {
 TEST(OneshotBlockingTest, BlockingRecvTwiceSecondClosed) {
     auto [tx, rx] = oneshot_channel<int>();
     tx.send(99);
-    auto r1 = rx.blocking_recv();
+    auto r1 = coro::blocking_wait(rx.recv());
     EXPECT_TRUE(r1.has_value());
     EXPECT_EQ(*r1, 99);
-    auto r2 = rx.blocking_recv();
+    auto r2 = coro::blocking_wait(rx.recv());
     EXPECT_FALSE(r2.has_value());
 }
 
 TEST(OneshotBlockingTest, BlockingRecvTwiceClosedString) {
     auto [tx, rx] = oneshot_channel<std::string>();
     tx.send("world");
-    auto r1 = rx.blocking_recv();
+    auto r1 = coro::blocking_wait(rx.recv());
     EXPECT_TRUE(r1.has_value());
     EXPECT_EQ(*r1, "world");
-    auto r2 = rx.blocking_recv();
+    auto r2 = coro::blocking_wait(rx.recv());
     EXPECT_FALSE(r2.has_value());
 }
 
@@ -330,7 +332,7 @@ TEST(OneshotBlockingTest, BlockingRecvGetsValue) {
         tx.send(42);
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> int {
-                auto r = rx.blocking_recv();
+                auto r = coro::blocking_wait(rx.recv());
                 return r.has_value() ? *r : -1;
             });
     }(result));
@@ -344,7 +346,7 @@ TEST(OneshotBlockingTest, BlockingRecvBlocksUntilSend) {
         auto [tx, rx] = oneshot_channel<int>();
         auto handle = coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> int {
-                auto r = rx.blocking_recv();
+                auto r = coro::blocking_wait(rx.recv());
                 return r.has_value() ? *r : -1;
             });
         tx.send(99);
@@ -361,7 +363,7 @@ TEST(OneshotBlockingTest, BlockingRecvReturnsClosedWhenSenderDropped) {
         { auto dropped = std::move(tx); }
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> bool {
-                auto r = rx.blocking_recv();
+                auto r = coro::blocking_wait(rx.recv());
                 return !r.has_value() && r.error() == ChannelError::Closed;
             });
     }(got_closed));
@@ -388,7 +390,7 @@ TEST(OneshotVoidBlockingTest, BlockingRecvGetsSignal) {
         tx.send();
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> bool {
-                return rx.blocking_recv().has_value();
+                return coro::blocking_wait(rx.recv()).has_value();
             });
     }(got_signal));
     EXPECT_TRUE(got_signal);
@@ -402,11 +404,36 @@ TEST(OneshotVoidBlockingTest, BlockingRecvReturnsClosedWhenSenderDropped) {
         { auto dropped = std::move(tx); }
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> bool {
-                auto r = rx.blocking_recv();
+                auto r = coro::blocking_wait(rx.recv());
                 return !r.has_value() && r.error() == ChannelError::Closed;
             });
     }(got_closed));
     EXPECT_TRUE(got_closed);
+}
+
+TEST(OneshotBlockingTest, BlockingRecvIsCancelledWhileParked) {
+    Runtime rt(1);
+    bool unwound = false;
+    rt.block_on([](bool& out) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<int>();
+        auto [started_tx, started_rx] = oneshot_channel<void>();
+        auto unwound = std::make_shared<std::atomic<bool>>(false);
+        auto handle = coro::spawn_blocking(
+            [rx = std::move(rx), started_tx = std::move(started_tx), unwound]() mutable {
+                started_tx.send();
+                try {
+                    (void)coro::blocking_wait(rx.recv());   // parks: nothing is sent
+                } catch (const coro::BlockingCancelled&) {
+                    unwound->store(true);
+                    throw;
+                }
+            });
+        (void)co_await started_rx.recv();
+        // `tx` is still alive, so only the cancellation can end the wait.
+        co_await std::move(handle).cancel_and_join();
+        out = unwound->load();
+    }(unwound));
+    EXPECT_TRUE(unwound);
 }
 
 #endif  // !CORO_PICO

@@ -568,8 +568,11 @@ broken by `OwnedTasks::remove()` when the task finishes, or by `~OwnedTasks()` a
 executor shutdown for tasks that never finished. Both release the reference after
 dropping the shard lock, so task and user destructors never run under it.
 
-Two things Tokio has are left out because nothing in coro reads them: the live-task
-counter and the `closed` flag that rejects spawns during shutdown.
+Each shard also has a `closed` flag, as Tokio's does, set by `close_and_collect()` when
+the runtime shuts down. `insert()` and `remove()` report it, under the shard lock they
+already hold. A task inserted into a closed shard is not rejected as in Tokio: it is
+born cancelled and drained (see [runtime_shutdown.md](runtime_shutdown.md)). Tokio's
+live-task counter is left out because nothing in coro reads it.
 
 !!! note "NOTE: why the owned tasks are sharded"
     The first version was one `std::unordered_set<shared_ptr<TaskBase>>` behind one

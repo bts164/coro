@@ -127,8 +127,7 @@ public:
 private:
     // Runs on the fiber's own stack. Reads `this` back out of t_fiber_start_arg
     // (stashed by poll() immediately before the switch that starts us), invokes
-    // the entry callable, stores its result/exception (exactly like
-    // BlockingState<T> does for spawn_blocking), and switches back to the
+    // the entry callable, stores its result/exception, and switches back to the
     // caller. Never returns: the caller's poll() only ever resumes this stack
     // again via switch_context(), never by falling off the end of this function.
     static void trampoline() {
@@ -201,12 +200,12 @@ typename F::OutputType fiber_await(F future) {
 /**
  * @brief Handle to a running fiber. Returned by `spawn_fiber()`. Satisfies `Future<T>`.
  *
- * Modeled on `BlockingHandle<T>` (spawn_blocking.h), not `JoinHandle<T>`: there is no
- * `.cancel()` method at all, and dropping the handle *always* detaches, never cancels —
- * not merely a default that can be overridden. Once execution has entered the entry
- * callable's non-coroutine call frames, there is no compiler-generated hook to unwind
- * through safely (same restriction `BlockingHandle<T>` documents for spawn_blocking's
- * worker threads), so the capability isn't offered in the first place.
+ * Unlike `JoinHandle<T>`, there is no `.cancel()` method at all, and dropping the handle
+ * *always* detaches, never cancels — not merely a default that can be overridden. Once
+ * execution has entered the entry callable's non-coroutine call frames, there is no
+ * compiler-generated hook to unwind through safely, so the capability isn't offered in
+ * the first place. (`BlockingHandle<T>` can request cancellation because a blocking
+ * callable has cancellation points that throw; a fiber has none.)
  *
  * **Awaiting:** `co_await handle` suspends the caller until the fiber runs to completion
  * and returns its value (or rethrows its exception).

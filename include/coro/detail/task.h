@@ -374,7 +374,29 @@ public:
         LifecycleHookScope hooks{*this};
 
         if (m_cancelled.load(std::memory_order_relaxed)) {
-            // Consumer dropped the StreamHandle — close the queue and terminate.
+            // Cancelled: the consumer dropped or cancelled the StreamHandle, or the
+            // runtime is shutting down. A stream with a cancel() (a CoroStream, a
+            // StreamHandle) may own children of its own, so it is cancelled once and
+            // then polled until it has drained, as TaskImpl does for a Cancellable
+            // future. Items it still yields on the way are discarded. A stream with no
+            // cancel() is a leaf and is simply destroyed.
+            if constexpr (requires(S& s) { s.cancel(); }) {
+                if (!m_cancel_requested) {
+                    m_pending.reset();
+                    m_stream->cancel();
+                    m_cancel_requested = true;
+                }
+                for (;;) {
+                    auto result = m_stream->poll_next(ctx);
+                    if (result.isPending()) return false;
+                    if (result.isDropped() || result.isError()) break;
+                    auto item = std::move(result).value();
+                    if (!item.has_value()) break;
+                }
+            }
+            // The queue is closed only now, after the drain: a consumer that called
+            // StreamHandle::cancel() and kept reading sees end-of-stream once the
+            // stream underneath has actually stopped, not before.
             Weak<Waker> consumer_wk;
             {
                 std::lock_guard lock(this->mutex);
@@ -469,6 +491,7 @@ private:
     std::optional<S>        m_stream;
     std::optional<ItemType> m_pending;
     bool                    m_completed = false;
+    bool                    m_cancel_requested = false;
     RelaxedState<bool>      m_cancelled{false};
 };
 

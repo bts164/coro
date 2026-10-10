@@ -1,10 +1,19 @@
-name: Sanitizer builds
+name: Tests
 
-# Mirrors docker/run-sanitizer-build.sh — see that script and
-# docker/Dockerfile.ubuntu2404 for the local dry-run equivalent of this job.
-# Runs natively on ubuntu-24.04 rather than through Docker since the GitHub
-# runner image already matches what the Dockerfile mirrors (Ubuntu 24.04,
-# GCC 13) — no need to pay for a Docker build/pull in CI itself.
+# Builds the library and its tests and runs them, on each supported platform.
+#
+# One platform, the primary one, runs the tests under each sanitizer. Every other
+# platform runs them once, with no sanitizer: that shows the library builds and
+# passes there without paying for the sanitizer runs again.
+#
+# Each job is ci/run-tests.sh, run in the platform's CI image
+# (docker/Dockerfile.<platform>). docker/run-tests.sh runs the same script in the
+# same image on your own machine.
+#
+# To add a platform: add docker/Dockerfile.<platform> and docker/profiles/<platform>,
+# then name it in both lists below. To change the primary platform, move the
+# sanitizer rows to it, and change PRIMARY_PLATFORM in docker/common.sh, which is what
+# pico_emulator.yml and a local run use.
 
 on:
   push:
@@ -13,81 +22,58 @@ on:
   workflow_dispatch:
 
 jobs:
-  sanitize:
+  image:
+    uses: ./.github/workflows/ci_image.yml
+    with:
+      # Every platform named in the test job's list, separated by spaces.
+      # Not yet rocky10: docker/Dockerfile.rocky10 is unfinished.
+      platforms: ubuntu2404
+    permissions:
+      contents: read
+      packages: write
+
+  test:
+    name: ${{ matrix.platform }} (${{ matrix.sanitizer }})
+    needs: image
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [asan, tsan]
+        include:
+          # The primary platform: once under each sanitizer. asan includes UBSan.
+          - { platform: ubuntu2404, sanitizer: asan }
+          - { platform: ubuntu2404, sanitizer: tsan }
+          # Every other platform: once, plain.
+          # - { platform: rocky10, sanitizer: none }
     runs-on: ubuntu-24.04
-    env:
-      CORO_SANITIZE: ${{ matrix.sanitizer }}
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ fromJSON(needs.image.outputs.images)[matrix.platform] }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # --privileged only so that the ThreadSanitizer step below may change a kernel
+      # setting. (--init is harmless; it is there because the value cannot be empty.)
+      options: ${{ matrix.sanitizer == 'tsan' && '--privileged' || '--init' }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # actions/checkout defaults to fetch-depth: 1 with no tags, but
-          # conan_version.py derives the package version from `git describe
-          # --tags --match v[0-9]*.[0-9]*.[0-9]*` (see docker/run-sanitizer-build.sh's
-          # equivalent git config step) -- without full history and tags that
-          # describe finds nothing to match against and version detection fails.
+          # conan_version.py derives the package version from `git describe --tags`,
+          # which finds nothing in the default shallow, tagless checkout.
           fetch-depth: 0
 
-      - name: Install system dependencies
+      # ThreadSanitizer aborts at start-up when the kernel randomises more address
+      # bits than it expects. It is a setting of the runner's kernel, which the
+      # container shares; docker/run-tests.sh makes the same check locally.
+      - name: Lower address-space randomisation for ThreadSanitizer
+        if: matrix.sanitizer == 'tsan'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            git \
-            pkg-config \
-            python3 \
-            python3-pip \
-            python3-venv \
-            libcap-dev \
-            ca-certificates \
-            gcc-arm-none-eabi
-
-      - name: Install Conan and CMake
-        run: pip install --break-system-packages --no-cache-dir conan "cmake>=3.31"
-
-      - name: Write Conan default profile
-        run: |
-          mkdir -p ~/.conan2/profiles
-          cat > ~/.conan2/profiles/default <<'EOF'
-          [settings]
-          arch=x86_64
-          build_type=Release
-          compiler=gcc
-          compiler.cppstd=gnu23
-          compiler.libcxx=libstdc++11
-          compiler.version=13
-          os=Linux
-
-          [conf]
-          tools.compilation:verbosity=verbose
-          EOF
-
-      - name: Export coro package to the Conan cache
-        run: conan export .
-
-      - name: Export libunicorn package to the Conan cache
-        run: conan export test/libunicorn
-
-      - name: Conan install (test package)
-        working-directory: test
-        run: |
-          mkdir -p build
-          conan install . --build=missing -f json > build/graph.json
-
-      - name: Conan build (test package)
-        working-directory: test
-        run: conan build . --build=missing
-
-      - name: Run tests under ${{ matrix.sanitizer }}
-        working-directory: test/build/Release
-        run: |
-          if [ "${{ matrix.sanitizer }}" = asan ]; then
-            export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
-            export UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1
-          else
-            export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1
+          bits="$(cat /proc/sys/vm/mmap_rnd_bits)"
+          echo "vm.mmap_rnd_bits is $bits"
+          if [ "$bits" -gt 28 ]; then
+            echo 28 > /proc/sys/vm/mmap_rnd_bits
           fi
-          ctest -V
+
+      - name: Build and run the tests
+        run: ci/run-tests.sh ${{ matrix.sanitizer }}

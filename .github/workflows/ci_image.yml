@@ -1,0 +1,115 @@
+name: CI image
+
+# Makes sure the images the test jobs run in are in the GitHub container registry,
+# and tells the calling workflow their names.
+#
+# A platform's image is built from docker/Dockerfile.<platform> and its profiles, and
+# its tag is a hash of those files (docker/common.sh). So this builds and pushes only
+# when one of them has changed; otherwise it finds the image there and does nothing.
+#
+# Called by the test workflows, whose jobs then run in the images (`container:`). Can
+# also be run by hand. docker/build-image.sh builds the same images locally.
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: >-
+          The platforms to publish, as in docker/Dockerfile.<platform>, separated by
+          spaces. Empty for the primary one (docker/common.sh).
+        type: string
+        default: ''
+    outputs:
+      images:
+        description: >-
+          A JSON object from each platform's name to the full name of its image,
+          registry and tag included. Use: fromJSON(...)[platform].
+        value: ${{ jobs.names.outputs.images }}
+      primary:
+        description: The name of the primary platform.
+        value: ${{ jobs.names.outputs.primary }}
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Platforms to publish, separated by spaces. Empty for the primary one.
+        type: string
+        default: ''
+
+jobs:
+  names:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      images: ${{ steps.names.outputs.images }}
+      primary: ${{ steps.names.outputs.primary }}
+      publish: ${{ steps.names.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name the images
+        id: names
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          # --list prints every platform, the primary one first.
+          primary="$(docker/build-image.sh --list | head -n 1)"
+          # A registry path must be lower case; an owner's name need not be.
+          registry="ghcr.io/${GITHUB_REPOSITORY,,}"
+          images='{}'
+          for platform in $(docker/build-image.sh --list); do
+            name="$(CORO_PLATFORM="$platform" docker/build-image.sh --print-name)"
+            images="$(jq -c --arg p "$platform" --arg i "$registry/$name" '. + {($p): $i}' <<< "$images")"
+          done
+          # One argument per platform.
+          read -ra publish_list <<< "${PLATFORMS:-$primary}"
+          publish="$(jq -cn '$ARGS.positional' --args "${publish_list[@]}")"
+          {
+            echo "primary=$primary"
+            echo "images=$images"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: names
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.names.outputs.publish) }}
+    name: publish (${{ matrix.platform }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CORO_PLATFORM: ${{ matrix.platform }}
+      IMAGE: ${{ fromJSON(needs.names.outputs.images)[matrix.platform] }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Look for the image
+        id: look
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A pull request from a fork gets a read-only token and cannot push. If it
+      # changes an image, its test jobs fail to find the new one; a maintainer has to
+      # publish it by running this workflow on the branch.
+      - name: Build and push the image
+        if: >-
+          steps.look.outputs.found == 'false' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
+        run: |
+          docker/build-image.sh
+          docker tag "$(docker/build-image.sh --print-name)" "$IMAGE"
+          docker push "$IMAGE"

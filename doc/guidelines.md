@@ -8,8 +8,6 @@ each rule has a short title, a rationale, and concrete examples.
 
 ## Table of Contents
 
-- [Potential GCC Issue: Structured Bindings in Coroutines (Unconfirmed, Low Severity)](#potential-gcc-issue-structured-bindings-in-coroutines-unconfirmed-low-severity)
-    - GCC.1 — Structured bindings in coroutines are fine to use; a past leak report tied to this pattern did not reproduce on retest
 - [Coroutine Scope](#coroutine-scope)
     - CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
     - CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
@@ -23,7 +21,6 @@ each rule has a short title, a rationale, and concrete examples.
     - CA.3 — Check for cancellation in long-running loops
     - CA.4 — Do not put blocking destructors in futures that may be cancelled as a losing branch
 - [Blocking Work](#blocking-work)
-    - BL.5 — Do not call `MpscReceiver::blocking_recv()` from a coroutine
 - [Channels](#channels)
     - CH.5 — Do not await `Event::wait()` from more than one coroutine at a time
 - [Select and Timeout](#select-and-timeout)
@@ -35,68 +32,6 @@ each rule has a short title, a rationale, and concrete examples.
     - IS.1 — Only call `signal_from_isr()` or `send_from_isr()` from an interrupt handler
     - IS.2 — Keep interrupt handlers minimal: write a flag or value and return immediately
     - IS.3 — Declare `IsrEvent` and `IsrChannel<T>` at static or class scope; never as coroutine locals
-
----
-
-## Potential GCC Issue: Structured Bindings in Coroutines (Unconfirmed, Low Severity)
-
-!!! note "NOTE: Status downgraded — likely a false alarm, kept here only as a watch-item"
-    This section used to document what we believed was a confirmed GCC compiler defect: structured
-    bindings (`auto [a, b] = expr`) allegedly leaking when the bound variables span a real `co_await`
-    suspension inside a coroutine. A full retest — reverting every workaround in the test suite back
-    to plain structured bindings and rerunning under ASan+LSan (`detect_leaks=1`) — found **zero
-    leaks**, including in the specific case that originally reported one. We now think this was more
-    likely a bug in our own channel/future code than a compiler defect, but that isn't proven either
-    way — hence "potential," not "ruled out." **Use structured bindings normally; don't avoid the
-    pattern.** If you ever see an LSan/ASan leak that traces back to a structured binding inside a
-    coroutine, treat it as a real lead worth investigating from scratch rather than assuming it's
-    this issue.
-
-### GCC.1 — Structured bindings in coroutines are fine to use; a past leak report tied to this pattern did not reproduce on retest
-
-**Background:** The original theory was a GCC implementation defect (related to GCC PR 100611 and
-siblings) where the anonymous storage object `__e` created by `auto [a, b] = expr` allegedly never
-had its destructor called when `__e` was placed in the coroutine frame (i.e., a variable bound from
-`__e` was still in scope at a real `co_await` point). If real, this would leak anything `__e` holds
-on the heap: strings, channel handles, `unique_ptr`s, and so on. It was "confirmed" at the time by
-stepping through `Coro::poll()` in a debugger and observing `Destroy` call `m_handle.destroy()` on a
-done handle without the bound type's destructor appearing to fire.
-
-**What changed:** This theory drove a defensive workaround — manually unpacking
-(`auto ch = expr; auto a = std::move(ch.first); ...`) instead of using structured bindings — across
-dozens of call sites in the test suite (`test_oneshot.cpp`, `test_mpsc.cpp`, `test_watch.cpp`), most
-of which didn't even exercise a genuine suspension point — a sign the workaround had become a
-reflexive habit rather than something actively re-verified. The long-term mitigation floated at the
-time (changing every channel factory to return a non-aggregate named struct so structured bindings
-would be a compile error) was never implemented — `oneshot_channel`, `mpsc_channel`, and
-`watch_channel` still return plain `std::pair` today.
-
-On retest, reverting all of the workarounds back to plain `auto [a, b] = expr` and rerunning the
-full suite under ASan+LSan found no leaks anywhere, including in the originally-reported case
-(`OneshotTest.ReceiverSuspendsUntilSend`, which genuinely suspends via `co_await coro::spawn(...)`).
-Separately, this same investigation found a real, confirmed bug in `IntrusiveList::is_linked()`
-(it couldn't disambiguate a never-linked node from a node that was the sole element of a list) that
-produced symptoms — an ASan heap-use-after-free — initially suspected to be "the framework is
-broken" but that turned out to be ordinary application-level logic going wrong on a specific edge
-case. That track record makes "our own bug, not the compiler" the more likely explanation here too,
-though it remains unproven.
-
-**Current guidance:** Use structured bindings freely in coroutine bodies, including across real
-suspension points:
-
-```cpp
-// Fine — no known leak, including across the suspension on the next line:
-auto [tx, rx] = oneshot_channel<int>();
-co_await coro::spawn([](OneshotSender<int> tx) -> Coro<void> {
-    tx.send(7);
-    co_return;
-}(std::move(tx)));
-auto result = co_await rx.recv();
-```
-
-If you ever observe an LSan/ASan leak that traces back to a structured binding spanning a
-suspension point, capture a minimal standalone repro (no test framework, no runtime) before
-assuming it's a compiler issue.
 
 ---
 
@@ -112,6 +47,10 @@ The coroutine scope mechanism provides a runtime safety net: the parent frame is
 until all non-detached children have drained. However, there is a window at `co_return` and
 at thrown exceptions where locals are destroyed before the drain wait begins — which is the
 source of the pitfalls below.
+
+A `spawn_blocking` callable that spawns tasks is subject to the same rule, without the
+safety net: it has no coroutine scope, so nothing waits for a child whose handle it drops.
+See CS.2 for the pattern to use there.
 
 ```cpp
 // BAD — local_data is destroyed at co_return before the drain begins.
@@ -180,6 +119,32 @@ Coro<void> process_many(std::vector<Item>& items) {
         co_await js.drain();
     }(items));
 }
+```
+
+The same applies inside a `spawn_blocking` callable. Its locals are destroyed when it
+returns or unwinds, and a task handle among them is cancelled but not waited for: a
+blocking callable has no coroutine scope at all. Put the handle in a `co_invoke` scope and
+wait on that with `blocking_wait()`. If the blocking task is cancelled, `blocking_wait()`
+cancels the inner coroutine and keeps polling until it and its children have drained
+before it throws `BlockingCancelled`, so the callable's locals outlive every child.
+
+```cpp
+// BAD — if anything below the spawn throws (BlockingCancelled included), buf is
+// destroyed while the child is still running.
+spawn_blocking([] {
+    Buffer buf;
+    auto h = spawn(fill(buf));
+    blocking_wait(std::move(h));
+});
+
+// GOOD — JoinHandle in the inner scope, buf in the callable's own stack frame
+spawn_blocking([] {
+    Buffer buf;
+    blocking_wait(co_invoke([](Buffer& buf) -> Coro<void> {
+        auto h = spawn(fill(buf));
+        co_await h;
+    }(buf)));
+});
 ```
 
 ### CS.3 — Never invoke a capturing lambda coroutine directly; use `co_invoke`
@@ -569,19 +534,20 @@ Coro<void> good() {
 }
 ```
 
-### BL.2 — Never call `blocking_get()` from a coroutine
+### BL.2 — Never call `blocking_wait()` or `blocking_next()` from a coroutine
 
-**Reason:** `BlockingHandle::blocking_get()` synchronously waits for the blocking thread
-to finish. Calling it from a coroutine running on an executor worker thread is identical
-to any other blocking call on that thread — it stalls the worker and starves other tasks.
-`blocking_get()` exists exclusively for use inside other `spawn_blocking` callables, where
-the calling thread is already a blocking pool thread and is allowed to block.
+**Reason:** `blocking_wait()` parks the calling thread until the future it is given
+completes. Calling it from a coroutine running on an executor worker thread is identical
+to any other blocking call on that thread — it stalls the worker and starves other tasks,
+possibly including the one that would complete the future. `blocking_wait()` is for
+threads that are allowed to block, such as the blocking pool thread running a
+`spawn_blocking` callable.
 
 ```cpp
 // BAD — blocks an executor worker
 Coro<void> bad() {
     auto handle = spawn_blocking([]() { return compute(); });
-    int result = handle.blocking_get();  // blocks the worker thread
+    int result = blocking_wait(std::move(handle));  // blocks the worker thread
     co_return;
 }
 
@@ -590,21 +556,22 @@ Coro<void> good() {
     int result = co_await spawn_blocking([]() { return compute(); });
 }
 
-// ALSO GOOD — blocking_get() from within another spawn_blocking callable
+// ALSO GOOD — blocking_wait() from within another spawn_blocking callable
 int result = co_await spawn_blocking([]() -> int {
     auto inner = spawn_blocking([]() { return sub_compute(); });
-    return inner.blocking_get();  // safe — this is a blocking pool thread, not a worker
+    return blocking_wait(std::move(inner));  // safe — a blocking pool thread, not a worker
 });
 ```
 
 ### BL.3 — Move data into `spawn_blocking` callables; do not capture by reference
 
-**Reason:** Dropping a `BlockingHandle` detaches the blocking thread rather than waiting
-for it. Unlike async `spawn` (which can be cooperatively cancelled), a blocking thread
-cannot be interrupted — waiting for it on drop could deadlock. Because the detach is
-unconditional, there is no drain guarantee: the thread may still be running when the
-spawning coroutine's locals are destroyed. A reference capture into a detached thread is
-a use-after-free waiting to happen. This is the C++ analogue of Rust's `'static + Send`
+**Reason:** Dropping a `BlockingHandle` asks the blocking task to stop but does not wait
+for it. The request only takes effect when the callable reaches a cancellation point
+(`blocking_wait()`, `blocking_next()`, `blocking_cancellation_point()`), which it may
+never do — a blocking thread cannot be interrupted, so waiting for it on drop could
+deadlock. There is therefore no drain guarantee: the thread may still be running when the
+spawning coroutine's locals are destroyed, and a reference captured into it is a
+use-after-free waiting to happen. This is the C++ analogue of Rust's `'static + Send`
 bound on `spawn_blocking` closures.
 
 ```cpp
@@ -612,7 +579,7 @@ bound on `spawn_blocking` closures.
 Coro<void> bad() {
     std::string data = load_data();
     auto h = spawn_blocking([&data]() { return process(data); });
-    co_return;  // handle dropped → detach → data destroyed → thread reads garbage
+    co_return;  // handle dropped → not waited for → data destroyed → thread reads garbage
 }
 
 // GOOD — move data into the callable
@@ -621,34 +588,6 @@ Coro<void> good() {
     auto h = spawn_blocking([data = std::move(data)]() { return process(data); });
     co_return;
 }
-```
-
-### BL.5 — Do not call `MpscReceiver::blocking_recv()` from a coroutine
-
-**Reason:** `blocking_recv()` is a synchronous, thread-blocking receive designed for plain
-OS threads that cannot `co_await`. Calling it from a coroutine running on an executor
-worker thread blocks that worker until an item arrives — starving every other task
-scheduled on that thread, identical to any other blocking call (BL.1). Use
-`co_await next(rx)` from coroutines; reserve `blocking_recv()` for `std::thread` bodies
-or `spawn_blocking` callables.
-
-```cpp
-// BAD — blocks the executor worker until an item arrives
-Coro<void> bad(MpscReceiver<int> rx) {
-    std::optional<int> v = rx.blocking_recv();  // blocks the worker thread
-}
-
-// GOOD — suspends the coroutine; executor thread stays free
-Coro<void> good(MpscReceiver<int> rx) {
-    while (std::optional<int> v = co_await coro::next(rx))
-        use(*v);
-}
-
-// ALSO GOOD — blocking_recv() from a plain OS thread or spawn_blocking
-std::thread([rx = std::move(rx)]() mutable {
-    while (std::optional<int> v = rx.blocking_recv())
-        use(*v);
-}).detach();
 ```
 
 ### BL.4 — Use a nested `Runtime` with `CurrentThreadExecutor` inside `spawn_blocking` to run async code in isolation
@@ -932,11 +871,14 @@ js.spawn(important_work());             // JoinSet takes ownership
 
 ### SC.2 — Never discard a `BlockingHandle` without intent
 
-**Reason:** Dropping a `BlockingHandle` unconditionally detaches the blocking thread —
-the callable runs to completion on the pool and its result is silently discarded. Unlike
-dropping a `JoinHandle` (which at least triggers a drain), there is no cleanup signal and
-no way to know whether the work succeeded or failed. For any operation with observable
-side effects or a result you care about, always `co_await` the handle.
+**Reason:** Dropping a `BlockingHandle` requests cancellation of the blocking task and
+does not wait for it. A callable that has not started yet never runs; one that is running
+is thrown out of its next cancellation point, or runs to completion if it has none.
+Either way the result is discarded, and unlike dropping a `JoinHandle` (which triggers a
+drain) nothing tells you which of these happened or when the thread is done. For any
+operation with observable side effects or a result you care about, `co_await` the
+handle. For work that should finish in the background whatever happens to the handle,
+say so with `.detach()`.
 
 ```cpp
 // BAD — result silently discarded; no way to know if it succeeded
@@ -944,6 +886,9 @@ spawn_blocking([]() { return write_file(); });  // [[nodiscard]] warning
 
 // GOOD
 auto result = co_await spawn_blocking([]() { return write_file(); });
+
+// GOOD — runs to completion in the background; nothing observes the result
+spawn_blocking([]() { return write_file(); }).detach();
 ```
 
 ### SC.3 — Always call `drain()` on a `JoinSet` unless cancellation of pending tasks is intentional

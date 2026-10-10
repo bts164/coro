@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <mutex>
 #include <optional>
 #include <type_traits>
@@ -39,10 +40,15 @@ enum class IoDirection { Read, Write };
  * Pass it back to clear_ready() after the syscall returned EAGAIN. `tick` identifies
  * the readiness generation the caller acted on, so a readiness event that arrived
  * after the failed syscall is not cleared by mistake.
+ *
+ * `shutdown` is set once the driver has been shut down. The caller must then fail the
+ * operation instead of waiting: no readiness will ever be reported again.
+ * IoRegistration::poll_io() does this.
  */
 struct IoReadyEvent {
     IoDirection direction;
     uint64_t    tick;
+    bool        shutdown = false;
 };
 
 namespace detail {
@@ -71,6 +77,14 @@ private:
     // reference here would form a cycle. GUARDED BY m_mutex.
     Weak<Waker>  m_reader;
     Weak<Waker>  m_writer;
+    // Set by IoDriver::shutdown(): every poll_ready() from then on reports it.
+    // GUARDED BY m_mutex.
+    bool         m_shutdown = false;
+
+    // Links in the driver's list of live registrations, which shutdown() walks.
+    // GUARDED BY IoDriver::m_registrations_mutex.
+    ScheduledIo* m_prev = nullptr;
+    ScheduledIo* m_next = nullptr;
 };
 
 } // namespace detail
@@ -80,8 +94,8 @@ private:
  *
  * Thread safety:
  *  - turn() may run on only one thread at a time (serialized by an internal mutex).
- *  - unpark(), and registering/deregistering via IoRegistration, are safe from any
- *    thread, including while another thread is blocked in turn().
+ *  - unpark(), shutdown(), and registering/deregistering via IoRegistration, are safe
+ *    from any thread, including while another thread is blocked in turn().
  *
  * @warning The driver must outlive every IoRegistration created from it.
  */
@@ -151,12 +165,44 @@ public:
     void unpark() noexcept;
 
     /**
+     * @brief Tells every waiter that this driver will not be turned again.
+     *
+     * Called by `Runtime::shutdown()` once the executor's threads have stopped. A
+     * task of that runtime never sees it: they have all finished by then. It is for
+     * a waiter the runtime does not own: a thread outside it, or a task of another
+     * runtime, waiting on one of this driver's timers or registrations. Without this
+     * it would wait for good.
+     *
+     *  - Every registration is marked shut down and its waiters are woken. From then
+     *    on IoRegistration::poll_io() fails with `sys::kDriverShutDown`, without
+     *    running the operation.
+     *  - Every timer is removed and its waker woken. is_shut_down() tells the woken
+     *    waiter why; add_timer() throws from then on.
+     *  - Registering a new fd throws.
+     *
+     * turn(), unpark(), cancel_timer() and deregistering keep working, so futures
+     * and sockets that outlive the shutdown are destroyed as usual. Thread-safe and
+     * idempotent.
+     */
+    void shutdown() noexcept;
+
+    /**
+     * @brief True once shutdown() has begun. Thread-safe; takes no lock.
+     *
+     * For a timer's owner that was polled again before its deadline: the wake may be
+     * shutdown()'s, and the timer is then gone.
+     */
+    bool is_shut_down() const noexcept { return m_shut_down.load(std::memory_order_acquire); }
+
+    /**
      * @brief Adds a timer that wakes `waker` once `deadline` has passed.
      *
      * Thread-safe. If a thread is blocked in turn() for a later deadline, unparks it
      * so it recomputes its timeout. Used by `Runtime::add_timer()`.
      *
      * @return The id to pass to cancel_timer().
+     * @throws std::runtime_error if the driver has been shut down: the timer could
+     *         never fire.
      */
     detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
 
@@ -172,6 +218,7 @@ private:
     friend class IoRegistration;
 
     /// Registers `fd`; returns the state its IoRegistration will share.
+    /// @throws std::runtime_error if the driver has been shut down.
     detail::Rc<detail::ScheduledIo> add(detail::sys::RawFd fd, detail::sys::Interest interest);
 
     /// Deregisters `fd` and defers releasing `io` until the start of the next turn().
@@ -214,6 +261,24 @@ private:
     // Fired at the end of every turn; its earliest deadline bounds the poll.
     // Internally synchronized.
     detail::TimerQueue m_timers;
+
+    // Every registration between add() and deregister(), so that shutdown() can
+    // reach them: the poller knows them only as opaque keys. An intrusive list
+    // through ScheduledIo::m_prev/m_next. Taken once per registration's lifetime at
+    // each end, never per operation.
+    //
+    // Lock order: m_registrations_mutex, then a ScheduledIo's m_mutex.
+    std::mutex           m_registrations_mutex;
+    detail::ScheduledIo* m_registrations = nullptr;   // GUARDED BY m_registrations_mutex
+    // Set by shutdown(); add() refuses from then on. GUARDED BY m_registrations_mutex.
+    bool                 m_closed = false;
+
+    // m_closed for readers that must not take a lock: SleepFuture checks it on a
+    // re-poll that would otherwise touch nothing shared. Written once, by shutdown(),
+    // before it wakes anyone, so a waiter woken by shutdown() sees it. An atomic
+    // rather than a mutex because that re-poll is on the hot path of every timeout
+    // raced against a busy future.
+    std::atomic<bool>    m_shut_down{false};
 };
 
 /**
@@ -244,6 +309,7 @@ public:
 
     /// Registers `fd` with `driver` for edge-triggered readiness in `interest`.
     /// @throws std::system_error if the OS rejects the registration.
+    /// @throws std::runtime_error if `driver` has been shut down.
     IoRegistration(IoDriver& driver, detail::sys::RawFd fd,
                    detail::sys::Interest interest = detail::sys::Interest::read_write());
 
@@ -262,6 +328,9 @@ public:
      * waker and returns `std::nullopt` if that direction isn't ready.
      *
      * Replaces any previously stored waker for that direction.
+     *
+     * Once the driver has been shut down it always returns an event, with `shutdown`
+     * set, and stores nothing.
      */
     std::optional<IoReadyEvent> poll_ready(IoDirection direction, detail::Context& ctx);
 
@@ -281,6 +350,10 @@ public:
      * an errno. Loops `poll_ready()` → `op()` → `clear_ready()` while `op()` would
      * block. tokio's `Registration::poll_io`.
      *
+     * Once the driver has been shut down, `op()` is not run and the result is the
+     * error `sys::kDriverShutDown`: waiting could never end. A future that was already
+     * waiting is woken by IoDriver::shutdown() and gets that error from its next poll.
+     *
      * @return `std::nullopt` if the direction isn't ready (the context's waker is
      *         stored, and the driver will wake it); otherwise `op()`'s result, either
      *         a value or an error other than would-block.
@@ -292,6 +365,8 @@ public:
         for (;;) {
             auto ready = poll_ready(direction, ctx);
             if (!ready) return std::nullopt;
+            if (ready->shutdown)
+                return std::invoke_result_t<Op&>(std::unexpect, detail::sys::kDriverShutDown);
             auto result = op();
             if (result || !detail::sys::would_block(result.error())) return result;
             // Race (handled): readiness that arrived after op() saw EAGAIN bumped the

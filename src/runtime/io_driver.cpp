@@ -1,7 +1,9 @@
 #include <coro/runtime/io_driver.h>
 
 #include <cassert>
+#include <stdexcept>
 #include <utility>
+#include <vector>
 
 // ThreadSanitizer detection: GCC defines __SANITIZE_THREAD__, Clang has the feature test.
 #if defined(__SANITIZE_THREAD__)
@@ -107,8 +109,45 @@ void IoDriver::unpark() noexcept {
     m_unpark.wake();
 }
 
+void IoDriver::shutdown() noexcept {
+    // An allocation failure below terminates (noexcept), as it would in the
+    // destructor path this runs on.
+    std::vector<detail::Rc<detail::Waker>> wakers;
+    {
+        std::lock_guard lock(m_registrations_mutex);
+        if (m_closed) return;
+        m_closed = true;
+        // Before any wake below, and before the timers are woken: a waiter that
+        // shutdown() wakes must find the flag set when it polls again.
+        m_shut_down.store(true, std::memory_order_release);
+
+        // Race (handled): a deregister() on another thread unlinks under
+        // m_registrations_mutex before it gives up its reference, so every node
+        // reached here is alive. An add() either linked its node before this lock
+        // was taken, or finds m_closed and throws.
+        for (detail::ScheduledIo* io = m_registrations; io != nullptr; io = io->m_next) {
+            std::lock_guard io_lock(io->m_mutex);
+            // Race (handled): poll_ready() stores its waker under this same mutex.
+            // It either stored before this and is woken below, or runs after and
+            // sees m_shutdown.
+            io->m_shutdown = true;
+            if (auto reader = std::exchange(io->m_reader, {}).lock())
+                wakers.push_back(std::move(reader));
+            if (auto writer = std::exchange(io->m_writer, {}).lock())
+                wakers.push_back(std::move(writer));
+        }
+    }
+    // Wake outside both locks, as dispatch() does.
+    for (const auto& waker : wakers) waker->wake();
+
+    m_timers.close_and_wake_all();
+}
+
 detail::TimerId IoDriver::add_timer(Instant deadline, detail::Weak<detail::Waker> waker) {
     const auto inserted = m_timers.insert(deadline, std::move(waker));
+    if (inserted.closed)
+        throw std::runtime_error(
+            "coro::IoDriver: the driver has been shut down (its Runtime has shut down)");
     // Race (benign): the holder may wake for another reason between insert() and
     // unpark(). The unpark then makes its next turn return at once: one extra turn.
     if (inserted.unpark) unpark();
@@ -158,12 +197,21 @@ void IoDriver::dispatch(const detail::sys::Event& event) {
 
 detail::Rc<detail::ScheduledIo> IoDriver::add(detail::sys::RawFd fd, detail::sys::Interest interest) {
     auto io = detail::make_rc<detail::ScheduledIo>();
+    // Held across register_fd() so that shutdown() sees either no registration or a
+    // linked one. Once per registration, so the syscall under the lock is no concern.
+    std::lock_guard lock(m_registrations_mutex);
+    if (m_closed)
+        throw std::runtime_error(
+            "coro::IoDriver: the driver has been shut down (its Runtime has shut down)");
     // Race (ordered by the kernel): a turn() blocked in poll() on another thread can
     // fetch an event naming `io` as soon as register_fd() adds it, and dispatch() then
     // touches it. epoll_ctl() happens before the epoll_wait() that returns it; this
     // annotation only makes that visible to TSan.
     publish_to_poller(io.get());
-    m_poller.register_fd(fd, io.get(), interest);
+    m_poller.register_fd(fd, io.get(), interest);   // may throw: nothing linked yet
+    io->m_next = m_registrations;
+    if (m_registrations != nullptr) m_registrations->m_prev = io.get();
+    m_registrations = io.get();
     return io;
 }
 
@@ -175,6 +223,15 @@ void IoDriver::deregister(detail::sys::RawFd fd, detail::Rc<detail::ScheduledIo>
     // recovered here.
     [[maybe_unused]] const bool removed = m_poller.deregister_fd(fd);
     assert(removed && "IoRegistration: fd closed before deregister()");
+    {
+        // Out of shutdown()'s reach before this function gives up its reference.
+        std::lock_guard lock(m_registrations_mutex);
+        if (io->m_prev != nullptr) io->m_prev->m_next = io->m_next;
+        else                       m_registrations    = io->m_next;
+        if (io->m_next != nullptr) io->m_next->m_prev = io->m_prev;
+        io->m_prev = nullptr;
+        io->m_next = nullptr;
+    }
     {
         // Nobody can wait on this registration any more; drop the wakers now
         // rather than when the deferred release happens.
@@ -238,6 +295,8 @@ std::optional<IoReadyEvent> IoRegistration::poll_ready(IoDirection direction,
                                                        detail::Context& ctx) {
     assert(m_io && "poll_ready() on an empty IoRegistration");
     std::lock_guard lock(m_io->m_mutex);
+    if (m_io->m_shutdown)
+        return IoReadyEvent{direction, m_io->m_tick, true};
     const bool ready = direction == IoDirection::Read ? m_io->m_readable
                                                       : m_io->m_writable;
     if (ready)

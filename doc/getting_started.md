@@ -2241,8 +2241,9 @@ co_await coro::spawn_blocking([]() -> int {
 
 !!! warning "Ownership"
     The callable must own all its data — do not capture references or pointers into the
-    spawning coroutine's locals. The blocking thread may outlive the spawning coroutine
-    if the `BlockingHandle` is dropped without awaiting.
+    spawning coroutine's locals. Dropping the `BlockingHandle` without awaiting it asks
+    the blocking work to stop but does not wait for it, so the thread may outlive the
+    spawning coroutine.
 
 ---
 
@@ -2672,7 +2673,7 @@ struct IqRequest {
 
 **`compute_worker` — keeping the compute off the executor, and using the right tool for
 parallelism.** `spawn_blocking` places this function on a dedicated OS thread so the FFT
-never touches an executor thread. The loop calls `blocking_recv` to wait for work without
+never touches an executor thread. The loop calls `blocking_next` to wait for work without
 spinning. Each `IqRequest` carries an `MpscSender<Spectrum>` cloned from a per-peer
 reply channel — the "call me when done" address bundled with the work. `try_send()` delivers
 the result directly to the peer that issued the request with no routing and no shared state.
@@ -2690,7 +2691,7 @@ adds.)
 ```cpp
 static void compute_worker(MpscReceiver<IqRequest> iq_rx) {
     // std::optional<IqRequest>
-    while (auto req = iq_rx.blocking_recv()) {
+    while (auto req = coro::blocking_next(iq_rx)) {
         if (req->reply.is_closed()) continue;  // peer gone, skip FFT
 
         // Cooley-Tukey FFT — replace this block with FFTW or a vendor library.
@@ -2809,7 +2810,7 @@ listener is alive, so the loop also races it against `SIGINT` (section 12) to gi
 server a way to stop. On Ctrl-C the server exits as soon as it can rather than waiting
 for clients to leave: the `JoinSet` is dropped, which cancels every peer handler still
 connected. Shutdown then flows through the channel: the accept loop drops its `iq_tx` clone; as each `handle_peer` is
-destroyed it drops its own clone; when the last clone is gone `blocking_recv` returns
+destroyed it drops its own clone; when the last clone is gone `blocking_next` returns
 `nullopt` and the compute worker exits. Nothing tells the worker to stop explicitly —
 the channel's sender count is the signal:
 

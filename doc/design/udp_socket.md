@@ -896,20 +896,21 @@ included in this first iteration — see [Multicast and broadcast](#multicast-an
 **Implemented and tested.** Both backends are in place per the design above:
 `include/coro/io/socket_address.h` + `src/io/socket_address.cpp` (shared), and the
 desktop/lwIP `UdpSocket` split described in [File structure](#file-structure). Real gtest
-coverage exists for both: `test/io/test_udp_socket.cpp` runs against the desktop
-IoDriver backend (`SocketAddress` parse/format round trips; `send_to`/`recv_from`; truncation of
-oversized datagrams; `connect`/`send`/`recv`; mixing `send_to`/`recv_from` with a
-connected socket; `set_broadcast`; `join_multicast`/`leave_multicast`, including an actual
-multicast loopback delivery test), and `test/pico/test_udp_socket_real.cpp` runs the
-same core scenarios against real lwIP in NO_SYS mode over the host loopback netif
-(multicast excluded there — lwIP's default loopback netif doesn't set `NETIF_FLAG_IGMP`,
-so `igmp_joingroup_netif()` isn't exercisable against it regardless of `UdpSocket`'s own
-correctness). CMake wiring: `src/io/socket_address.cpp`, `src/io/udp_socket.cpp`,
+coverage exists for both, from one file. `test/io/test_udp_socket.cpp` runs against the
+desktop IoDriver backend (`SocketAddress` parse/format round trips; `send_to`/`recv_from`;
+truncation of oversized datagrams; `connect`/`send`/`recv`; mixing `send_to`/`recv_from`
+with a connected socket; `set_broadcast`; `join_multicast`/`leave_multicast`, including an
+actual multicast loopback delivery test), and the same file is built against real lwIP in
+NO_SYS mode over its loopback netif, on the host (`test_udp_socket_pico`) and in the
+on-target firmware. The core scenarios are shared; IPv6, GSO/GRO and multicast are
+compiled for the desktop only (lwIP's default loopback netif doesn't set
+`NETIF_FLAG_IGMP`, so `igmp_joingroup_netif()` isn't exercisable against it regardless of
+`UdpSocket`'s own correctness). CMake wiring: `src/io/socket_address.cpp`, `src/io/udp_socket.cpp`,
 `src/detail/socket_state.cpp` and `src/detail/sys/udp_posix.cpp` are part of the desktop
 `coro` target; `cmake/platforms/pico.cmake`'s `coro_pico` target
 additionally defines `CORO_UDP_BACKEND_LWIP` and compiles `socket_address.cpp` +
 `udp_socket_lwip.cpp`; `test/CMakeLists.txt` adds `test_udp_socket` (desktop) and a new
-`coro_lwip_udp` library + `test_udp_socket_real` executable (real lwIP), plus
+`coro_lwip_udp` library + `test_udp_socket_pico` executable (real lwIP), plus
 `igmp.c` in the `lwip_host` source list and `LWIP_IGMP 1` in the host test
 `lwipopts.h` (needed for the library to link `join_multicast`/`leave_multicast`'s
 `igmp_joingroup_netif`/`igmp_leavegroup_netif` calls, even though that path isn't

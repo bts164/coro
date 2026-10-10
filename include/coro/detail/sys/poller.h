@@ -35,6 +35,10 @@ inline bool would_block(int err) noexcept {
     return err == EAGAIN || err == EWOULDBLOCK;
 }
 
+/// The errno an I/O operation fails with when the driver its fd is registered with
+/// has been shut down, so that it can never be woken for readiness again.
+inline constexpr int kDriverShutDown = ECANCELED;
+
 /// Which readiness directions a registration is interested in.
 struct Interest {
     bool readable = false;

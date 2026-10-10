@@ -1,7 +1,11 @@
 #include <coro/detail/intrusive_list.h>
 #include <gtest/gtest.h>
 
+#include <vector>
+
 using namespace coro::detail;
+
+namespace {
 
 struct Node : IntrusiveListNode {
     int value;
@@ -10,12 +14,14 @@ struct Node : IntrusiveListNode {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-static std::vector<int> drain(IntrusiveList<IntrusiveListNode*>& list) {
+std::vector<int> drain(IntrusiveList<IntrusiveListNode*>& list) {
     std::vector<int> out;
     while (auto* raw = list.pop_front())
         out.push_back(static_cast<Node*>(raw)->value);
     return out;
 }
+
+}  // namespace
 
 // ── basic ops ────────────────────────────────────────────────────────────────
 

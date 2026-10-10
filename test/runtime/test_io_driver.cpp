@@ -16,6 +16,7 @@
 #include <expected>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -660,4 +661,109 @@ TEST(IoDriver, EarlierTimerFromOtherThreadUnparks) {
     EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
     EXPECT_EQ(early.wakes(), 1);
     EXPECT_EQ(late.wakes(), 0);
+}
+
+// --- Shutdown ---
+
+// A waiter parked on a registration is woken, and its next poll_io() fails with the
+// shutdown error without running the operation.
+TEST(IoDriver, ShutdownWakesWaitersAndFailsPollIo) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a);
+    TestTask reader, writer;
+
+    observe_eagain(reg, IoDirection::Read, reader);
+    observe_eagain(reg, IoDirection::Write, writer);
+    ASSERT_FALSE(reg.poll_ready(IoDirection::Read, reader.ctx).has_value());
+    ASSERT_FALSE(reg.poll_ready(IoDirection::Write, writer.ctx).has_value());
+    EXPECT_FALSE(driver.is_shut_down());
+
+    driver.shutdown();
+    EXPECT_TRUE(driver.is_shut_down());
+    EXPECT_EQ(reader.wakes(), 1);
+    EXPECT_EQ(writer.wakes(), 1);
+
+    int calls = 0;
+    auto r = reg.poll_io(IoDirection::Read, reader.ctx, [&]() -> std::expected<std::size_t, int> {
+        ++calls;
+        return std::size_t{0};
+    });
+    ASSERT_TRUE(r.has_value());
+    ASSERT_FALSE(r->has_value());
+    EXPECT_EQ(r->error(), detail::sys::kDriverShutDown);
+    EXPECT_EQ(calls, 0);
+
+    // Idempotent: nobody is woken twice.
+    driver.shutdown();
+    EXPECT_EQ(reader.wakes(), 1);
+    EXPECT_EQ(writer.wakes(), 1);
+}
+
+// A direction that was ready is reported shut down too: nothing may start a wait.
+TEST(IoDriver, ShutdownIsReportedOnAReadyDirection) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a);
+    TestTask task;
+
+    driver.shutdown();
+    auto ready = reg.poll_ready(IoDirection::Write, task.ctx);
+    ASSERT_TRUE(ready.has_value());
+    EXPECT_TRUE(ready->shutdown);
+    EXPECT_EQ(task.wakes(), 0);
+}
+
+TEST(IoDriver, ShutdownRefusesNewRegistrations) {
+    IoDriver driver;
+    SocketPair sp;
+    driver.shutdown();
+    EXPECT_THROW(IoRegistration(driver, sp.a), std::runtime_error);
+}
+
+// Registrations that outlive the shutdown are still dropped normally, in any order.
+TEST(IoDriver, DeregisterAfterShutdownIsSafe) {
+    IoDriver driver;
+    SocketPair sp1, sp2, sp3;
+    IoRegistration first(driver, sp1.a);
+    IoRegistration middle(driver, sp2.a);
+    IoRegistration last(driver, sp3.a);
+
+    driver.shutdown();
+    middle.deregister();
+    last.deregister();
+    first.deregister();
+    EXPECT_FALSE(first);
+    EXPECT_EQ(driver.turn(0ms), 0u);
+}
+
+// A registration dropped before the shutdown is not touched by it.
+TEST(IoDriver, ShutdownSkipsDeregisteredRegistrations) {
+    IoDriver driver;
+    SocketPair sp1, sp2;
+    IoRegistration kept(driver, sp1.a);
+    TestTask task;
+    {
+        IoRegistration dropped(driver, sp2.a);
+        observe_eagain(dropped, IoDirection::Read, task);
+        ASSERT_FALSE(dropped.poll_ready(IoDirection::Read, task.ctx).has_value());
+    }
+    driver.shutdown();
+    EXPECT_EQ(task.wakes(), 0);
+}
+
+// Every timer is woken whatever its deadline; adding one afterwards throws, and
+// cancelling one from before does nothing.
+TEST(IoDriver, ShutdownWakesTimersAndRefusesNewOnes) {
+    IoDriver driver;
+    TestTask task;
+    const detail::TimerId id = driver.add_timer(Clock::now() + 1h, task.ctx.get_weak_waker());
+
+    driver.shutdown();
+    EXPECT_EQ(task.wakes(), 1);
+    EXPECT_THROW(driver.add_timer(Clock::now() + 1h, task.ctx.get_weak_waker()),
+                 std::runtime_error);
+    driver.cancel_timer(id);
+    EXPECT_EQ(driver.turn(0ms), 0u);
+    EXPECT_EQ(task.wakes(), 1);
 }

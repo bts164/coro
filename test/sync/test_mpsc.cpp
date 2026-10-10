@@ -7,6 +7,7 @@
 #include <coro/future.h>
 #include <coro/stream.h>
 #include <coro/runtime/runtime.h>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -423,7 +424,9 @@ TEST(MpscSingleThreadedTest, ReceiverDroppedWhileSenderInWaiters) {
 }
 
 // ---------------------------------------------------------------------------
-// spawn_blocking tests — desktop only
+// Channels from a spawn_blocking callable — desktop only. The channel has no
+// blocking calls of its own: a callable uses blocking_wait(tx.send(v)) and
+// blocking_next(rx), which are cancellation points.
 // ---------------------------------------------------------------------------
 
 TEST(MpscBlockingTest, BlockingRecvGetsPreloadedValue) {
@@ -434,7 +437,7 @@ TEST(MpscBlockingTest, BlockingRecvGetsPreloadedValue) {
         co_await tx.send(42);
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> int {
-                auto v = rx.blocking_recv();
+                auto v = coro::blocking_next(rx);
                 return v ? *v : -1;
             });
     }(result));
@@ -448,7 +451,7 @@ TEST(MpscBlockingTest, BlockingRecvBlocksUntilSent) {
         auto [tx, rx] = mpsc_channel<int>(4);
         auto handle = coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> int {
-                auto v = rx.blocking_recv();
+                auto v = coro::blocking_next(rx);
                 return v ? *v : -1;
             });
         co_await tx.send(99);
@@ -465,7 +468,7 @@ TEST(MpscBlockingTest, BlockingRecvReturnsNulloptWhenAllSendersDropped) {
         { auto dropped = std::move(tx); }
         out = co_await coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> bool {
-                return !rx.blocking_recv().has_value();
+                return !coro::blocking_next(rx).has_value();
             });
     }(got_nullopt));
     EXPECT_TRUE(got_nullopt);
@@ -477,7 +480,7 @@ TEST(MpscBlockingTest, BlockingSendDeliversToAsyncReceiver) {
     rt.block_on([](int& out) -> Coro<void> {
         auto [tx, rx] = mpsc_channel<int>(4);
         auto handle = coro::spawn_blocking(
-            [tx = std::move(tx)]() mutable { tx.blocking_send(77); });
+            [tx = std::move(tx)]() mutable { (void)coro::blocking_wait(tx.send(77)); });
         auto v = co_await next(rx);
         out = *v;
         co_await std::move(handle);
@@ -493,7 +496,7 @@ TEST(MpscBlockingTest, BlockingSendBlocksUntilSpace) {
         co_await tx.send(1);
         co_await tx.send(2);
         auto handle = coro::spawn_blocking(
-            [tx = std::move(tx)]() mutable { tx.blocking_send(3); });
+            [tx = std::move(tx)]() mutable { (void)coro::blocking_wait(tx.send(3)); });
         auto v = co_await next(rx);
         out.push_back(*v);
         co_await std::move(handle);
@@ -511,7 +514,7 @@ TEST(MpscBlockingTest, BlockingSendReturnsUnsentValueWhenReceiverDropped) {
         { auto dropped = std::move(rx); }
         out = co_await coro::spawn_blocking(
             [tx = std::move(tx)]() mutable -> std::optional<int> {
-                auto r = tx.blocking_send(2);
+                auto r = coro::blocking_wait(tx.send(2));
                 return r.has_value() ? std::nullopt : std::optional<int>{r.error()};
             });
     }(unsent));
@@ -528,8 +531,8 @@ TEST(MpscBlockingTest, BlockingWorkerPipeline) {
         auto worker = coro::spawn_blocking(
             [in_rx  = std::move(in_rx),
              out_tx = std::move(out_tx)]() mutable {
-                while (auto v = in_rx.blocking_recv())
-                    if (!out_tx.blocking_send(*v * 2).has_value()) break;
+                while (auto v = coro::blocking_next(in_rx))
+                    if (!coro::blocking_wait(out_tx.send(*v * 2)).has_value()) break;
             });
         co_await in_tx.send(1);
         co_await in_tx.send(2);
@@ -552,7 +555,7 @@ TEST(MpscBlockingTest, BlockingRecvZeroCopyNoDuplicates) {
         auto worker = coro::spawn_blocking(
             [rx = std::move(rx)]() mutable -> std::vector<int> {
                 std::vector<int> vals;
-                while (auto v = rx.blocking_recv()) vals.push_back(*v);
+                while (auto v = coro::blocking_next(rx)) vals.push_back(*v);
                 return vals;
             });
         out = co_await std::move(worker);
@@ -560,6 +563,61 @@ TEST(MpscBlockingTest, BlockingRecvZeroCopyNoDuplicates) {
     }(received));
     EXPECT_EQ(received.size(), 4u);
     EXPECT_EQ(received, (std::vector<int>{0, 1, 2, 3}));
+}
+
+TEST(MpscBlockingTest, BlockingRecvIsCancelledWhileParked) {
+    Runtime rt(1);
+    bool unwound = false;
+    rt.block_on([](bool& out) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+        auto [started_tx, started_rx] = mpsc_channel<int>(1);
+        auto unwound = std::make_shared<std::atomic<bool>>(false);
+        auto handle = coro::spawn_blocking(
+            [rx = std::move(rx), started_tx = std::move(started_tx), unwound]() mutable {
+                (void)coro::blocking_wait(started_tx.send(0));
+                try {
+                    (void)coro::blocking_next(rx);   // parks: nothing is ever sent
+                } catch (const coro::BlockingCancelled&) {
+                    unwound->store(true);
+                    throw;
+                }
+            });
+        (void)co_await next(started_rx);
+        // The sender is still alive, so only the cancellation can end the wait.
+        co_await std::move(handle).cancel_and_join();
+        out = unwound->load();
+    }(unwound));
+    EXPECT_TRUE(unwound);
+}
+
+TEST(MpscBlockingTest, BlockingSendIsCancelledWhileParked) {
+    Runtime rt(1);
+    bool unwound = false;
+    std::vector<int> received;
+    rt.block_on([](bool& out, std::vector<int>& received) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+        auto [started_tx, started_rx] = mpsc_channel<int>(1);
+        co_await tx.send(1);                         // the channel is now full
+        auto unwound = std::make_shared<std::atomic<bool>>(false);
+        auto handle = coro::spawn_blocking(
+            [tx = tx.clone(), started_tx = std::move(started_tx), unwound]() mutable {
+                (void)coro::blocking_wait(started_tx.send(0));
+                try {
+                    (void)coro::blocking_wait(tx.send(2));   // parks: no space
+                } catch (const coro::BlockingCancelled&) {
+                    unwound->store(true);
+                    throw;
+                }
+            });
+        (void)co_await next(started_rx);
+        co_await std::move(handle).cancel_and_join();
+        out = unwound->load();
+        // The cancelled send left nothing behind in the channel.
+        { auto dropped = std::move(tx); }
+        while (auto v = co_await next(rx)) received.push_back(*v);
+    }(unwound, received));
+    EXPECT_TRUE(unwound);
+    EXPECT_EQ(received, (std::vector<int>{1}));
 }
 
 #endif  // !CORO_PICO

@@ -62,6 +62,43 @@ the same resolved directory (`CORO_PICO_LWIPOPTS_INCLUDE_DIR`), so an
 override always applies consistently across every coro-provided lwIP
 target in one build — never just one of them.
 
+## Loopback
+
+The bundled `lwipopts.h` enables lwIP's loopback interface (`LWIP_HAVE_LOOPIF`) and
+loopback on every interface (`LWIP_NETIF_LOOPBACK`). A connection to `127.0.0.1`, or
+to the device's own address, reaches the device itself, as it does on a desktop.
+
+lwIP does not deliver a looped packet when it is sent. In a build without an operating
+system it puts the packet on a queue and waits for `netif_poll_all()` to be called.
+Neither the Pico SDK nor the CYW43 driver calls it, so the Pico `Runtime` does, on
+every loop iteration.
+
+What the runtime drives is chosen when it is constructed, with `coro::PicoNetwork`:
+
+| `PicoNetwork` | Each loop iteration calls | The application must first call |
+|---|---|---|
+| `Cyw43` (default) | `cyw43_arch_poll()`, `netif_poll_all()` | `cyw43_arch_init()` |
+| `Lwip` | `sys_check_timeouts()`, `netif_poll_all()` | `lwip_init()` |
+| `None` | nothing | nothing |
+
+`Lwip` is lwIP without the radio. Loopback is the only interface unless the application
+adds its own, and it works on a plain Pico. The on-target networking tests use it.
+
+!!! danger "WARNING: a `PicoNetwork::None` runtime must not be used with sockets"
+    That runtime drives no part of the network stack: no lwIP timer fires and no
+    looped packet is delivered, so a socket operation on it never completes.
+
+!!! danger "WARNING: the default runtime requires `cyw43_arch_init()`"
+    `cyw43_arch_poll()` on a board where the driver was never initialised is undefined
+    behaviour. Firmware that does not start the radio must construct the runtime with
+    `PicoNetwork::Lwip` or `PicoNetwork::None`.
+
+!!! note "NOTE: the loopback queue has no length limit"
+    `LWIP_LOOPBACK_MAX_PBUFS` is left at lwIP's default of 0, which means unlimited.
+    The queue is emptied once per loop iteration, so it holds only what tasks send to
+    the device itself between two suspension points. Each queued packet is a copy
+    allocated from the heap.
+
 ## Future: packages split out of `coro` itself
 
 If `coro_pico_mqtt` (or a future `coro_pico_https`) is ever split into its

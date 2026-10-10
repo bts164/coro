@@ -202,4 +202,5 @@ every layer, no risk of getting stuck at a blocking call that never checks the f
 - [Cheat Sheet](cheatsheet.md) — the core API on a single printable page.
 - [Patterns](notes/patterns.md) — idiomatic solutions to recurring async programming problems: request-reply, actors, graceful shutdown, fan-out, pipelines, retry, and more.
 - [Library Usage Guidelines](guidelines.md) — [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines) style rules for writing correct, safe, and idiomatic code with this library
+- [Known Issues](known_issues.md) — compiler and toolchain problems you may hit, with their symptoms and workarounds.
 - [Internal Design Details](design/architecture.md) — architecture, design decisions, and implementation reference.

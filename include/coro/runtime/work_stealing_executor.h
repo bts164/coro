@@ -81,6 +81,12 @@ public:
     /// Workers park in the driver and busy workers poll it; see park_worker().
     bool turns_io_driver() const noexcept override { return true; }
 
+    /// Cancels every owned task; later schedule() calls cancel their task too.
+    void begin_shutdown() override;
+
+    /// True while a scheduled task has not finished.
+    bool has_tasks() const override;
+
 private:
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
     // shared_ptr<TaskBase> is stored by value directly in the ring buffer.

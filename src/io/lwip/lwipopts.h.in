@@ -47,6 +47,13 @@
 #define LWIP_DNS                    1
 #define LWIP_IPV6                   0
 
+// Loopback — 127.0.0.1 and the device's own address reach the device itself, as
+// they do on a desktop OS. Looped packets are queued and delivered by
+// netif_poll_all(), which Runtime calls every loop iteration (runtime.cpp);
+// nothing else in a NO_SYS build drains that queue.
+#define LWIP_HAVE_LOOPIF            1
+#define LWIP_NETIF_LOOPBACK         1
+
 // TCP buffer sizes — 8 × MSS gives reasonable throughput on WiFi
 #define TCP_MSS                     1460
 #define TCP_WND                     (8 * TCP_MSS)

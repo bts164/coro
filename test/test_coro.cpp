@@ -2,13 +2,19 @@
 #include <gmock/gmock.h>
 #include <coro/coro.h>
 #include <coro/future.h>
-#include <coro/sync/join.h>
-#include <coro/runtime/runtime.h>
 #include <stdexcept>
 #include <string>
 
+// The Skynet benchmark at the end needs a multi-threaded runtime.
+#ifndef CORO_PICO
+#include <coro/sync/join.h>
+#include <coro/runtime/runtime.h>
+#endif
+
 using namespace coro;
 using namespace coro::detail;
+
+namespace {
 
 class MockWaker : public detail::Waker {
 public:
@@ -72,6 +78,8 @@ Coro<std::string> chain_two() {
 static_assert(Future<Coro<int>>);
 static_assert(Future<Coro<void>>);
 static_assert(Future<Coro<std::string>>);
+
+}  // namespace
 
 // --- Construction and move tests ---
 
@@ -164,6 +172,8 @@ TEST(CoroTest, InnerFutureErrorRethrown) {
 
 // --- Suspension (two-poll Future) ---
 
+namespace {
+
 // A Future that returns Pending on the first poll and Ready(value) on the second.
 class TwoPollFuture {
 public:
@@ -190,6 +200,8 @@ private:
 Coro<int> awaits_two_poll(TwoPollFuture f) {
     co_return co_await std::move(f);
 }
+
+}  // namespace
 
 TEST(CoroTest, SuspendsOnPendingInnerFuture) {
     auto waker = make_rc<MockWaker>();
@@ -223,6 +235,8 @@ TEST(CoroTest, ResumesAfterInnerFutureBecomesReady) {
 
 // --- Spurious-wake correctness ---
 
+namespace {
+
 // A Future that returns Pending for the first N polls, then Ready.
 // Models a future that fires its waker before it is actually done (spurious wake).
 class SpuriousWakeFuture {
@@ -250,6 +264,8 @@ Coro<int> awaits_spurious(SpuriousWakeFuture f) {
     co_return co_await std::move(f);
 }
 
+}  // namespace
+
 // The outer Coro must absorb spurious wakes without resuming the coroutine
 // until the inner future is genuinely ready.
 TEST(CoroTest, SpuriousWakeDoesNotResumeCoroutine) {
@@ -273,6 +289,10 @@ TEST(CoroTest, SpuriousWakeDoesNotResumeCoroutine) {
     EXPECT_EQ(r.value(), 55);
 }
 
+#ifndef CORO_PICO
+
+namespace {
+
 template<std::size_t... Is>
 Coro<size_t> skynet(size_t my_num, size_t remaining, std::index_sequence<Is...> seq) {
     if (remaining == 1) {
@@ -282,7 +302,11 @@ Coro<size_t> skynet(size_t my_num, size_t remaining, std::index_sequence<Is...> 
     co_return ((std::get<Is>(results)) + ...);
 }
 
+}  // namespace
+
 TEST(CoroTest, DISABLED_Skynet) {
     size_t result = Runtime(4).block_on(skynet(0, 1000000, std::make_index_sequence<10>{}));
     EXPECT_EQ(result, 499999500000);
 }
+
+#endif  // CORO_PICO

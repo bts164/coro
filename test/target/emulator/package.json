@@ -1,0 +1,12 @@
+{
+  "name": "coro-on-target-emulator",
+  "description": "Runs the on-target test firmware in an RP2040 emulator. See test/README.md.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "rp2040js": "1.4.0"
+  }
+}

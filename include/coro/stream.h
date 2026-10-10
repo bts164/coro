@@ -83,20 +83,71 @@ NextFuture<S> next(S& stream) {
 
 #ifndef CORO_PICO
 
+namespace detail {
+
+/**
+ * @brief The future `blocking_next()` waits on: `next(stream)`, plus the means to shut
+ * the stream down when the blocking task is cancelled.
+ *
+ * `NextFuture` is deliberately not @ref Cancellable. It borrows the stream, and a
+ * `select()` that drops a losing `next(stream)` branch must leave the stream running for
+ * the next round. `blocking_next()` is different: when it is cancelled the caller's stack
+ * is about to unwind and take the stream with it, so the stream has to be cancelled and
+ * drained first, as a cancelled task drains the stream it runs. This adapter is
+ * `Cancellable` exactly when the stream has a `cancel()`; `blocking_wait()` then runs the
+ * drain. A stream with no `cancel()` (a channel receiver) is a leaf and is left alone.
+ */
+template<Stream S>
+class BlockingNextFuture {
+public:
+    using OutputType = StreamItem<typename S::ItemType>;
+
+    explicit BlockingNextFuture(S& stream) : m_stream(stream) {}
+
+    PollResult<OutputType> poll(Context& ctx) {
+        for (;;) {
+            auto r = m_stream.poll_next(ctx);
+            if (!m_draining || r.isPending() || r.isDropped() || r.isError()) return r;
+            // Draining. A stream that buffers (StreamHandle) hands out the items it
+            // already holds before it reports that its producer has stopped; discard
+            // them and keep going until it is exhausted.
+            OutputType item = std::move(r).value();
+            if (!item) return PollResult<OutputType>(std::move(item));
+        }
+    }
+
+    void cancel() requires requires(S& s) { s.cancel(); } {
+        m_stream.cancel();
+        m_draining = true;
+    }
+
+private:
+    S&   m_stream;
+    bool m_draining = false;
+};
+
+} // namespace detail
+
 /**
  * @brief Pulls exactly one item from @p stream, blocking the calling OS thread until it's
- * available. Equivalent to `blocking_wait(next(stream))`.
+ * available. The blocking counterpart of `co_await next(stream)`.
  *
  * Same runtime-context requirement as @ref blocking_wait: a future that touches the
  * runtime requires an active `current_runtime()` on the calling thread (ambient on a
  * `spawn_blocking` thread). See doc/design/blocking_wait.md.
+ *
+ * **Cancellation.** A cancellation point, like @ref blocking_wait. If the blocking task
+ * is cancelled and @p stream has a `cancel()` (a `CoroStream`, a `StreamHandle`), the
+ * stream is cancelled and polled until it has drained before @ref BlockingCancelled is
+ * thrown. The stream is finished after that; all that is left to do with it is destroy
+ * it.
  *
  * @return `nullopt`/`false` once the stream is exhausted (matching `next()`'s return type
  * for the stream's `ItemType` — `bool` for `void` streams, `optional<T>` otherwise).
  */
 template<Stream S>
 detail::StreamItem<typename S::ItemType> blocking_next(S& stream) {
-    return blocking_wait(next(stream));
+    return blocking_wait(detail::BlockingNextFuture<S>(stream));
 }
 
 #endif // CORO_PICO

@@ -171,8 +171,8 @@ allocation and sizing": the Pico backend has no safe universal default, so
 every call site passes one explicitly on both backends.
 
 The trampoline invokes the entry callable in a `try`/`catch`, storing the
-result or `std::current_exception()` into `FiberFuture`'s own state (exactly
-like `BlockingState<T>` does for `spawn_blocking`) before switching back to
+result or `std::current_exception()` into `FiberFuture`'s own state (as the
+blocking task does for `spawn_blocking`) before switching back to
 the caller. `poll()` returns `PollError`/`PollReady` from that stored state
 like any other `Future` — an uncaught exception needs no special handling.
 
@@ -349,14 +349,18 @@ non-coroutine call frames, there is no compiler-generated hook to unwind
 through safely, and force-unwinding through code that doesn't expect it (a
 third-party library, here) can leave that library's own state corrupted even
 if the C++ side unwinds memory-safely. `doc/guidelines.md`'s BL.3/SC.2
-already document this exact restriction for `spawn_blocking`'s
+already document the same restriction for `spawn_blocking`'s
 `BlockingHandle<T>`: "a blocking thread cannot be interrupted — waiting for
-it on drop could deadlock," so dropping detaches rather than cancels.
+it on drop could deadlock," so dropping never waits. (A blocking task can be
+*asked* to stop, because its callable can reach a cancellation point and
+unwind by an exception it expects; see
+[spawn_blocking.md](spawn_blocking.md#cancellation-and-ownership). A fiber
+running third-party code has no such point.)
 
-`spawn_fiber()` copies `BlockingHandle<T>`'s *shape* exactly — the caller gets
-a handle back that can be `co_await`ed for the result, or simply dropped to
-let the work keep running in the background — but with the cancellation
-capability removed rather than just defaulted off:
+`spawn_fiber()` gives the shape of a detached `BlockingHandle<T>` — the caller
+gets a handle back that can be `co_await`ed for the result, or simply dropped
+to let the work keep running in the background — with no cancellation
+capability at all:
 
 ```cpp
 template<typename T>
@@ -385,18 +389,18 @@ FiberHandle<T> spawn_fiber(std::function<T()> entry, size_t stack_size) {
 }
 ```
 
-Deliberately *not* built on a heap-allocated `FiberState<T>` mirroring
-`BlockingState<T>`, even though that's the more literal reading of "modeled on
-`BlockingHandle<T>`": `spawn_blocking()` needs its own shared state because the
-work runs on a separate OS thread with no relationship to the coro executor at
-all — `BlockingState<T>` is the only channel between that thread and the
+Deliberately *not* built on a task type of its own mirroring
+`spawn_blocking()`'s `BlockingTaskImpl<F>`, even though that's the more literal
+reading of "modeled on `BlockingHandle<T>`": `spawn_blocking()` needs its own
+task type because the work runs on a separate OS thread that no executor
+polls — that task is the only channel between the thread and the
 `BlockingHandle<T>` sitting in a coroutine frame. A fiber has no such separate
 worker; it only ever makes progress by being polled by the executor, which is
 exactly what `coro::spawn()` already sets up via `TaskState<T>`/`JoinHandle<T>`.
 Reinventing that plumbing under a different name would be more code for the
 same guarantees, not fewer. `FiberHandle<T>` instead wraps a `JoinHandle<T>`
-purely as an implementation detail, restricted to the shape `BlockingHandle<T>`
-exposes: no `.cancel()` method anywhere in the public interface, and the
+purely as an implementation detail, restricted to awaiting and dropping:
+no `.cancel()` method anywhere in the public interface, and the
 destructor unconditionally calls `.detach()` — never `.cancel()` — so
 `JoinHandle<T>`'s cancellation machinery is simply never reached, regardless of
 whether the caller ever awaits the handle or drops it immediately. This is not
@@ -411,9 +415,8 @@ enclosing scope at all: the executor's owned map becomes its sole anchor, the
 same as any other detached fire-and-forget task.
 
 The entry callable's return value, if `T` isn't `void`, is computed and then
-simply discarded if nothing is left to observe it — same as `BlockingHandle<T>`'s
-destructor comment already says today ("the blocking thread runs to completion
-and the result is discarded"). Because there is no `.cancel()` method anywhere
+simply discarded if nothing is left to observe it — same as for a detached
+`BlockingHandle<T>`. Because there is no `.cancel()` method anywhere
 in `FiberHandle<T>`'s public interface, there's no code path that could ever
 attempt to cancel a fiber mid-switch, whether the handle is awaited, dropped
 immediately, or held and dropped later.

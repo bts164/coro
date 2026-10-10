@@ -55,7 +55,7 @@ Dependencies are managed with Conan.
   `JoinHandle<T>`; `.detach()` for fire-and-forget
 - **`co_invoke()`** — run a lambda as a coroutine in the current scope
 - **`spawn_blocking()`** — run a blocking callable on a dedicated `BlockingPool` thread;
-  returns `BlockingHandle<T>`; fire-and-forget on drop
+  returns `BlockingHandle<T>`; dropping it requests cancellation without waiting
 
 ### Structured Concurrency
 - **Coroutine scope** — every coroutine implicitly tracks child tasks; frame destruction
@@ -75,7 +75,8 @@ Dependencies are managed with Conan.
   coroutine; latch semantics; single waiter; `clear()` to reset
 - **`oneshot`** — single value; synchronous send, async receive
 - **`mpsc`** — bounded ring buffer; cloneable sender, single `Stream<T>` receiver;
-  intrusive waiter nodes; zero-copy direct-handoff paths; `blocking_recv()` for OS threads
+  intrusive waiter nodes; zero-copy direct-handoff paths; from an OS thread, `blocking_next(rx)` and
+  `blocking_wait(tx.send(v))`
 - **`watch`** — latest-value; synchronous overwrite; `changed()` + `borrow()` (returns
   `WatchBorrowGuard<T>` holding a shared read lock); cloneable sender and receiver
 - **`broadcast`** — fixed-capacity ring buffer; every receiver sees every value sent
@@ -504,17 +505,23 @@ but required by the lws API.
 
 ### Shutdown ordering
 
+`~Runtime` calls `Runtime::shutdown()`, which cancels every executor task and every
+blocking task and waits, with the executor, the pool and the driver all still running,
+until none is left. Only then does it tear down:
+
 ```
+Runtime::shutdown():
+  1. cancel every task of both kinds; wait until both are drained
+  2. m_blocking_pool.stop()   // wait for pool threads to exit
+  3. m_executor.reset()       // join worker threads
+  4. m_io_driver.shutdown()   // wake and fail waiters from outside the runtime
 Runtime::~Runtime():
-  1. m_executor      // join worker threads — no task runs after this
-  2. m_blocking_pool // join blocking pool threads
-  3. m_io_driver     // close the epoll and eventfd
+  5. m_io_driver              // close the epoll and eventfd
 ```
 
-Members are destroyed in reverse declaration order. The executor goes first: its tasks
-own the futures that own `IoRegistration`s, and those deregister from a driver that is
-still alive. Only executor threads turn the driver, so once the executor is gone nothing
-dispatches.
+By step 2 every future has been destroyed, so every `IoRegistration` has already
+deregistered from a driver that was still being turned. See
+[runtime_shutdown.md](runtime_shutdown.md).
 
 ---
 
@@ -533,13 +540,15 @@ int result = co_await coro::spawn_blocking([]() -> int {
 - Idle threads time out after a keep-alive period (default 10s) and exit.
 - Threads are detached at creation; the pool tracks `total_threads` and `idle_threads`
   under a mutex to know when shutdown is complete.
-- Each call allocates a `shared_ptr<BlockingState<T>>` shared between the `BlockingHandle`
-  and the pool thread. `BlockingState` holds a mutex, a condition variable (for
-  `blocking_get()`), the waker, and the result as
-  `std::optional<std::expected<T, std::exception_ptr>>`.
-- Dropping a `BlockingHandle` before the callable returns **detaches** — the thread runs
-  to completion and discards the result. Waiting is not safe because blocking threads
-  cannot be cooperatively cancelled.
+- Each call allocates one `BlockingTaskImpl<F>`, which is a `TaskBase` and a
+  `TaskState<T>` like the task behind `spawn()`, and stores the callable. It is the
+  pool's queue entry, the result channel to the `BlockingHandle`, and the waker and
+  parking spot for `blocking_wait()` on that thread.
+- Dropping a `BlockingHandle` before the callable returns **requests cancellation and
+  does not wait**. The callable sees the request as a `BlockingCancelled` exception at
+  its next cancellation point (`blocking_wait()`, `blocking_next()`,
+  `blocking_cancellation_point()`); one that never reaches one runs to completion.
+  Waiting is not safe because cancellation of a blocking thread cannot be guaranteed.
 - Worker threads call `set_current_runtime(m_runtime)` on startup so that code running
   inside a `spawn_blocking` callable can itself call `spawn_blocking` or `spawn`.
 
@@ -697,7 +706,7 @@ profiling justifies the complexity:
 | `SchedulingState` | `std::atomic` + CAS | Hot path; mutex would serialize all wakeups |
 | `ScheduledIo` readiness + wakers | `std::mutex` | Readiness check and waker store must be atomic with the driver's dispatch |
 | `TimerQueue` | `std::mutex` | Heap, timer slots, cancelled count and the waiting-thread record change together |
-| `BlockingState` | `std::mutex` | Low contention; protocol clarity outweighs cost |
+| Blocking task result + parking | `std::mutex` (`TaskStateBase`) | Low contention; protocol clarity outweighs cost. Its `SchedulingState` is the same CAS machine as any task |
 | Channel shared state | `std::mutex` | Multiple fields updated together; mutex makes invariants obvious |
 | `JoinSetSharedState` | `std::mutex` | List splice + counter + waker update must be atomic together |
 

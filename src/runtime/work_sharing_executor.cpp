@@ -45,11 +45,42 @@ void WorkSharingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
+    bool closed;
     {
         std::lock_guard lock(m_owned_mutex);
         m_owned_tasks.insert(task);
+        closed = m_closed;
+    }
+    if (closed) {
+        // Spawned during shutdown: born cancelled. The task is Notified, so
+        // cancel_task() only sets the flag; its first poll shuts the future down.
+        task->cancel_task();
+        // RACE: see Runtime::shutdown(). Announced while the spawner is still a
+        // live task, which is what keeps the "no tasks left" check from missing a
+        // task handed between the executor and the blocking pool.
+        m_runtime->shutdown_progress();
     }
     enqueue(std::move(task));
+}
+
+void WorkSharingExecutor::begin_shutdown() {
+    std::vector<std::shared_ptr<detail::TaskBase>> tasks;
+    {
+        std::lock_guard lock(m_owned_mutex);
+        m_closed = true;
+        tasks.assign(m_owned_tasks.begin(), m_owned_tasks.end());
+    }
+    // Outside m_owned_mutex: cancel_task() wakes the task, which may take m_mutex.
+    //
+    // RACE: a concurrent schedule() either inserted its task before m_closed was
+    // set, and the task is in `tasks`, or after, and schedule() cancels it itself.
+    for (auto& task : tasks)
+        task->cancel_task();
+}
+
+bool WorkSharingExecutor::has_tasks() const {
+    std::lock_guard lock(m_owned_mutex);
+    return !m_owned_tasks.empty();
 }
 
 void WorkSharingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
@@ -132,10 +163,15 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
         if (done) {
             task->scheduling_state.store(
                 detail::SchedulingState::Done, std::memory_order_relaxed);
+            bool closed;
             {
                 std::lock_guard lock(m_owned_mutex);
                 m_owned_tasks.erase(task);
+                closed = m_closed;
             }
+            // Shutting down: tell the thread in Runtime::shutdown() the set shrank.
+            // The runtime outlives this call: it joins this worker before it goes.
+            if (closed) m_runtime->shutdown_progress();
             // task.reset() here — owned map was the lifetime anchor
         } else {
             // Try Running → Idle: park the task; executor's owned map keeps it alive.

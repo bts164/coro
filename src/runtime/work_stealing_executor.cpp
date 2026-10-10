@@ -107,8 +107,26 @@ void WorkStealingExecutor::schedule(std::shared_ptr<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
-    m_owned_tasks.insert(task);
+    if (m_owned_tasks.insert(task)) {
+        // Spawned during shutdown: born cancelled. The task is Notified, so
+        // cancel_task() only sets the flag; its first poll shuts the future down.
+        task->cancel_task();
+        // RACE: see Runtime::shutdown(). Announced while the spawner is still a
+        // live task, which is what keeps the "no tasks left" check from missing a
+        // task handed between the executor and the blocking pool.
+        m_runtime->shutdown_progress();
+    }
     enqueue(std::move(task));
+}
+
+void WorkStealingExecutor::begin_shutdown() {
+    // Outside the shard locks: cancel_task() wakes the task, which may take m_mutex.
+    for (auto& task : m_owned_tasks.close_and_collect())
+        task->cancel_task();
+}
+
+bool WorkStealingExecutor::has_tasks() const {
+    return !m_owned_tasks.empty();
 }
 
 void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
@@ -446,7 +464,11 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
             // threads remove the same task. remove() hands back the list's reference
             // so that it is dropped here, outside the shard lock; `task` still holds
             // one, so nothing is destroyed on this line.
-            m_owned_tasks.remove(*task).reset();
+            auto removed = m_owned_tasks.remove(*task);
+            removed.task.reset();
+            // Shutting down: tell the thread in Runtime::shutdown() the list shrank.
+            // The runtime outlives this call: it joins this worker before it goes.
+            if (removed.closed) m_runtime->shutdown_progress();
         } else {
             // Try Running → Idle.
             expected = detail::SchedulingState::Running;

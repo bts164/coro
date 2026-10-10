@@ -1,0 +1,20 @@
+# The build-machine profile of the CI image (docker/Dockerfile.ubuntu2404), and the
+# host profile of its desktop builds.
+[settings]
+arch=x86_64
+build_type=Release
+compiler=gcc
+compiler.cppstd=gnu23
+compiler.libcxx=libstdc++11
+compiler.version=13
+os=Linux
+
+[conf]
+tools.compilation:verbosity=verbose
+tools.build:cxxflags=["-fcoroutines"]
+# The scripts in docker/ bind-mount /workspace read-only and route all writes into
+# named volumes (test/build + the Conan cache) instead — this disables
+# CMakeUserPresets.json, the one file CMakeToolchain otherwise writes straight into
+# the (read-only) source folder root. Not needed here since the scripts drive the
+# build via `conan build .`, not a manual `cmake --preset`.
+tools.cmake.cmaketoolchain:user_presets=

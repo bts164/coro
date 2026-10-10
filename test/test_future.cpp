@@ -2,15 +2,22 @@
 #include <gmock/gmock.h>
 #include <coro/future.h>
 
-#include <chrono>
-#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+// blocking_wait() parks the calling thread, so the Pico build has neither it nor
+// the tests for it.
+#ifndef CORO_PICO
+#include <chrono>
+#include <future>
 #include <thread>
+#endif
 
 using namespace coro;
 using namespace coro::detail;
+
+namespace {
 
 class MockWaker : public detail::Waker {
 public:
@@ -61,6 +68,8 @@ struct WrongReturnType {
     int poll(detail::Context&) { return 0; }
 };
 static_assert(!Future<WrongReturnType>);
+
+}  // namespace
 
 // --- Runtime tests ---
 
@@ -121,6 +130,8 @@ TEST(CoroNeverFutureTest, VoidOutputTypeCompiles) {
 
 // --- blocking_wait ---
 
+#ifndef CORO_PICO
+
 namespace {
 
 struct ImmediateVoidFuture {
@@ -171,6 +182,29 @@ TEST(BlockingWaitTest, RethrowsException) {
     EXPECT_THROW(blocking_wait(ErrorFuture{}), std::runtime_error);
 }
 
+// A future that was cancelled and drained has no value to return. blocking_wait()
+// throws BlockingCancelled, the synchronous counterpart of a coroutine being dropped
+// at a co_await. Cancellation of the calling blocking task itself is covered in
+// test/task/test_spawn_blocking.cpp.
+namespace {
+
+struct DroppedIntFuture {
+    using OutputType = int;
+    PollResult<int> poll(detail::Context&) { return PollDropped; }
+};
+
+struct DroppedVoidFuture {
+    using OutputType = void;
+    PollResult<void> poll(detail::Context&) { return PollDropped; }
+};
+
+} // namespace
+
+TEST(BlockingWaitTest, DroppedFutureThrowsBlockingCancelled) {
+    EXPECT_THROW(blocking_wait(DroppedIntFuture{}), BlockingCancelled);
+    EXPECT_THROW(blocking_wait(DroppedVoidFuture{}), BlockingCancelled);
+}
+
 TEST(BlockingWaitTest, BlocksUntilWokenFromAnotherThread) {
     auto promise = std::make_shared<std::promise<Rc<detail::Waker>>>();
     auto waker_future = promise->get_future();
@@ -185,3 +219,5 @@ TEST(BlockingWaitTest, BlocksUntilWokenFromAnotherThread) {
     EXPECT_EQ(result, 99);
     waker_thread.join();
 }
+
+#endif  // CORO_PICO

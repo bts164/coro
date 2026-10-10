@@ -18,6 +18,9 @@ constexpr TimerId make_id(std::uint32_t index, std::uint32_t generation) {
 
 TimerQueue::Inserted TimerQueue::insert(Instant deadline, Weak<Waker> waker) {
     std::lock_guard lock(m_mutex);
+    // Race (handled): an insert() that takes the lock before close_and_wake_all() is
+    // in the heap that it empties, and is woken; one that takes it after lands here.
+    if (m_closed) return Inserted{0, false, true};
     // The waiter's timeout was computed from the front entry, or is unbounded if the
     // heap was empty. Until its end_wait(), the front gets earlier only through
     // inserts, each of which saw m_waiting and so reported it. A sweep can make the
@@ -178,6 +181,32 @@ std::size_t TimerQueue::fire_expired(bool end_wait) {
         if (!more) break;
     }
     return fired;
+}
+
+std::size_t TimerQueue::close_and_wake_all() {
+    // Not batched like fire_expired(): this runs once, at shutdown, where an
+    // allocation is no concern.
+    std::vector<Rc<Waker>> wakers;
+    {
+        std::lock_guard lock(m_mutex);
+        m_closed = true;
+        wakers.reserve(m_heap.size() - m_cancelled);
+        for (const Entry& entry : m_heap) {
+            Slot& slot = m_slots[entry.slot];
+            if (!slot.cancelled) {
+                if (Rc<Waker> waker = slot.waker.lock()) wakers.push_back(std::move(waker));
+            }
+            free_slot(entry.slot);   // bumps the generation: every id is now stale
+        }
+        m_heap.clear();
+        m_cancelled = 0;
+    }
+    // Wake outside the lock, as fire_expired() does.
+    //
+    // Race (benign): a future dropped between the unlock and its wake cancels a
+    // stale id, which does nothing, and the wake is spurious.
+    for (const Rc<Waker>& waker : wakers) waker->wake();
+    return wakers.size();
 }
 
 std::size_t TimerQueue::size() const {

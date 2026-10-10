@@ -49,6 +49,16 @@ if(CORO_PLATFORM STREQUAL "pico")
         include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/platforms/pico_mqtt.cmake)
     endif()
 
+    # Empty unless WITH_SANITIZE is ubsan; see cmake/Sanitize.cmake.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Sanitize.cmake)
+    if(CORO_SANITIZE_OPTIONS)
+        target_compile_options(coro_pico     PRIVATE ${CORO_SANITIZE_OPTIONS})
+        target_compile_options(coro_pico_hal PRIVATE ${CORO_SANITIZE_OPTIONS})
+        if(CORO_PICO_WITH_MQTT)
+            target_compile_options(coro_pico_mqtt PRIVATE ${CORO_SANITIZE_OPTIONS})
+        endif()
+    endif()
+
     target_include_directories(coro_pico PUBLIC ${CORO_GENERATED_INCLUDE_DIR})
     install(FILES ${CORO_GENERATED_INCLUDE_DIR}/coro/version.h DESTINATION include/coro)
 
@@ -83,8 +93,11 @@ if(CORO_PLATFORM STREQUAL "pico")
         PATTERN "sys" EXCLUDE
         # spawn_blocking.h declares BlockingPool unconditionally (no CORO_PICO guard)
         # and calls Runtime::blocking_pool(), which only exists in the non-CORO_PICO
-        # Runtime — desktop-only, would fail to compile on pico.
-        PATTERN "spawn_blocking.h" EXCLUDE)
+        # Runtime — desktop-only, would fail to compile on pico. blocking_task.h and
+        # blocking_cancel.h are its (and blocking_wait's) desktop-only support.
+        PATTERN "spawn_blocking.h" EXCLUDE
+        PATTERN "blocking_task.h" EXCLUDE
+        PATTERN "blocking_cancel.h" EXCLUDE)
 else()
     option(WITH_GPERFTOOLS "Build with gperftools" OFF)
     option(CORO_USE_LOCAL_RUN_QUEUE "Use lock-free local run queue in WorkStealingExecutor (experimental)" ON)

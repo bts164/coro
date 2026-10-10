@@ -115,8 +115,11 @@ a `File` sees every completed write.
 ### Eager operations
 
 The futures are `BlockingHandle`s, not lazy futures: an operation starts when the method
-is called, like a `JoinHandle`. `co_await` hides the difference. Dropping the handle
-detaches the job, which runs to completion and discards its result, buffer included.
+is called, like a `JoinHandle`. `co_await` hides the difference. `File` returns its
+handles already detached (`BlockingHandle::detach()`), so dropping one does not cancel
+the job: it runs to completion and discards its result, buffer included. Without that, a
+job dropped while still queued would be skipped, and whether a dropped `write()` reached
+the file would depend on timing.
 For `read()`/`write()` at the file position, that means the position still moves.
 
 !!! note "NOTE: no write-behind, unlike `tokio::fs::File`"
@@ -171,8 +174,9 @@ failure if all of them fail, as tokio does.
   matters. A `File` must not be moved or assigned while another task is calling it.
 - **Dropped open.** If the `OpenFuture` is dropped before its job finishes, the `File`
   dies with the job's discarded result and closes its fd: no leak.
-- **Runtime shutdown.** The Runtime destroys its executor before its blocking pool, so no
-  task can be left awaiting a job that the pool abandons.
+- **Runtime shutdown.** The Runtime cancels and drains its tasks and its blocking jobs
+  together before it stops either, so no task is left awaiting a job that the pool
+  abandons. See [runtime_shutdown.md](runtime_shutdown.md).
 
 !!! tip "TODO: io_uring backend for files"
     `sys/file.h` is the seam for an io_uring backend (`IORING_OP_READ`/`WRITE`/`FSYNC`

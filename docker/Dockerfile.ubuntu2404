@@ -1,8 +1,19 @@
-# Mirrors the ubuntu-24.04 runner used by .github/workflows/tests.yml's asan/tsan
-# jobs, for dry-running them locally before pushing. See docker/run-sanitizer-build.sh.
+# The primary platform's CI image, and the one the scripts in this directory run in
+# unless CORO_PLATFORM names another: Ubuntu 24.04 with GCC 13, the ARM toolchain, the
+# Pico SDK and picotool, and the Conan profiles docker/profiles/ubuntu2404 (as the
+# default profile) and docker/profiles/rp2040_pico_w.
+#
+# Build it with docker/build-image.sh. The image's tag is a hash of this file and
+# those profiles (docker/common.sh), so any change here makes a new image; CI publishes it
+# from .github/workflows/ci_image.yml.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PICO_SDK_PATH=/opt/pico-sdk
+ENV PICO_SDK_VERSION=2.2.0
+# Conan's home is otherwise under $HOME, which a GitHub container job points
+# somewhere else; the profiles and the configuration below would then not be found.
+ENV CONAN_HOME=/root/.conan2
 
 # build-essential's default gcc/g++ on 24.04 is GCC 13 — same as the runner
 # image. libcap-dev is here for the same reason it's in conanfile.py's
@@ -22,6 +33,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         git \
+        nodejs \
+        npm \
         pkg-config \
         python3 \
         python3-pip \
@@ -29,29 +42,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcap-dev \
         ca-certificates \
         gcc-arm-none-eabi \
+        libnewlib-arm-none-eabi \
+        libstdc++-arm-none-eabi-newlib \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --break-system-packages --no-cache-dir conan "cmake>=3.31"
 
-COPY <<EOF /root/.conan2/profiles/default
-[settings]
-arch=x86_64
-build_type=Release
-compiler=gcc
-compiler.cppstd=gnu23
-compiler.libcxx=libstdc++11
-compiler.version=13
-os=Linux
+RUN git clone --depth 1 --branch "$PICO_SDK_VERSION" \
+      https://github.com/raspberrypi/pico-sdk.git "$PICO_SDK_PATH" && \
+    git -C "$PICO_SDK_PATH" submodule update --init --depth 1
 
-[conf]
-tools.compilation:verbosity=verbose
-# run-sanitizer-build.sh bind-mounts /workspace read-only and routes all
-# writes into named volumes (test/build + the Conan cache) instead — this
-# disables CMakeUserPresets.json, the one file CMakeToolchain otherwise
-# writes straight into the (read-only) source folder root. Not needed here
-# since the script drives the build via `conan build .`, not a manual
-# `cmake --preset`.
-tools.cmake.cmaketoolchain:user_presets=
+# Without an installed picotool the SDK downloads and builds one inside every
+# firmware build, and touches the top-level CMakeLists.txt to do it, which fails on
+# the read-only source mount. PICOTOOL_NO_LIBUSB: it only converts images here, it
+# never talks to a board.
+RUN git clone --depth 1 --branch "$PICO_SDK_VERSION" \
+      https://github.com/raspberrypi/picotool.git /tmp/picotool && \
+    cmake -S /tmp/picotool -B /tmp/picotool/build \
+      -DPICO_SDK_PATH="$PICO_SDK_PATH" -DPICOTOOL_NO_LIBUSB=1 && \
+    cmake --build /tmp/picotool/build -j4 && \
+    cmake --install /tmp/picotool/build && \
+    rm -rf /tmp/picotool
+
+# The build context is docker/ (see docker/build-image.sh), so this is docker/profiles.
+# This platform's own profile becomes the image's default, so a conan command that
+# names no profile uses it. The Pico profile is the same on every platform.
+COPY profiles/ubuntu2404 /root/.conan2/profiles/default
+COPY profiles/rp2040_pico_w /root/.conan2/profiles/rp2040_pico_w
+
+COPY <<EOF /root/.conan2/global.conf
+tools.build:jobs=4
 EOF
 
 WORKDIR /workspace

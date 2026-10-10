@@ -23,7 +23,6 @@ using OneshotSlotType = std::conditional_t<std::is_void_v<T>, std::monostate, T>
 template<typename T>
 struct OneshotShared {
     detail::Mutex                        mutex;
-    detail::CondVar                      cv;             ///< Notified on send() and sender drop; used by blocking_recv.
     std::optional<OneshotSlotType<T>>    slot;           ///< Filled by send().
     bool                                 sender_alive   = true;
     bool                                 receiver_alive = true;
@@ -170,7 +169,6 @@ public:
                 return std::unexpected<std::decay_t<U>>(std::forward<U>(value));
             }
             m_shared->slot = std::forward<std::decay_t<U>>(value);
-            m_shared->cv.notify_all();
             waker = std::move(m_shared->receiver_waker);
             m_shared->sender_alive = false; // consumed
         }
@@ -195,7 +193,6 @@ public:
             if (!m_shared->receiver_alive)
                 return std::unexpected(ChannelError::Closed);
             m_shared->slot = std::monostate{};
-            m_shared->cv.notify_all();
             waker = std::move(m_shared->receiver_waker);
             m_shared->sender_alive = false;
         }
@@ -214,7 +211,6 @@ private:
         {
             std::lock_guard lock(m_shared->mutex);
             m_shared->sender_alive = false;
-            m_shared->cv.notify_all();
             waker = std::move(m_shared->receiver_waker);
         }
         if (waker) waker->wake();
@@ -285,33 +281,6 @@ public:
      */
     [[nodiscard]] OneshotRecvFuture<T> recv() {
         return OneshotRecvFuture<T>(m_shared);
-    }
-
-    /**
-     * @brief Blocks the calling OS thread until the sender sends a value or is dropped.
-     *
-     * Intended for use on threads created by `spawn_blocking`. **Do not call from a
-     * coroutine or executor thread** — it will block the thread and stall the executor.
-     *
-     * @return `T` (or `void`) on success; `std::unexpected(ChannelError::Closed)` if the
-     *         sender was dropped without sending.
-     */
-    std::expected<T, ChannelError> blocking_recv() {
-        std::unique_lock lock(m_shared->mutex);
-        m_shared->cv.wait(lock, [this] {
-            return m_shared->slot.has_value() || !m_shared->sender_alive;
-        });
-        if (m_shared->slot.has_value()) {
-            if constexpr (std::is_void_v<T>) {
-                m_shared->slot.reset();
-                return {};
-            } else {
-                auto result = std::move(*m_shared->slot);
-                m_shared->slot.reset();  // prevent double-receive on second blocking_recv
-                return result;
-            }
-        }
-        return std::unexpected(ChannelError::Closed);
     }
 
 private:

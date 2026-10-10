@@ -44,7 +44,7 @@ ctest --preset conan-release -R PcieDecoder
 
 ## Sanitizer Builds
 
-A single `with_sanitize` Conan option (`none` | `asan` | `tsan`) controls the
+A single `with_sanitize` Conan option (`none` | `asan` | `tsan` | `ubsan`) controls the
 sanitizer for both the `coro` package and the `test/` package — it's plumbed
 through to a shared `WITH_SANITIZE` CMake cache variable (`cmake/Sanitize.cmake`)
 so the two builds can't end up with mismatched flags (ASan/TSan must cover the
@@ -68,6 +68,22 @@ ctest --preset conan-debug
 
 The same `-o with_sanitize=...` must also be passed to `conan install` inside
 `test/` (or rely on the env var below, which covers both automatically).
+
+### On a Pico
+
+A bare-metal build (`os=baremetal`) accepts only `none` and `ubsan`. ASan and TSan need
+a runtime library, shadow memory and threads, which a microcontroller does not have;
+run them on the desktop build, whose `test_pico_suite` covers the Pico configuration of
+the library.
+
+`ubsan` on a Pico is UBSan in trap mode (`-fsanitize-trap=undefined`, GCC 13 or later).
+It needs no runtime: undefined behaviour executes an undefined instruction and the
+firmware stops in a hard fault. Nothing is printed. Only coro's own sources are
+instrumented, not the Pico SDK or lwIP. An application linking a coro package built
+this way needs no extra flags.
+
+`CORO_SANITIZE=asan` or `tsan` in the environment counts as `none` for a bare-metal
+build, so one `.envrc` serves both. An explicit `-o with_sanitize=asan` is rejected.
 
 ### Setting it via .envrc instead of -o
 

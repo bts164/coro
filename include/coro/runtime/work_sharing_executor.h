@@ -70,6 +70,12 @@ public:
     /// True: an idle worker turns the runtime's IoDriver when no other worker holds it.
     bool turns_io_driver() const noexcept override { return true; }
 
+    /// Cancels every owned task; later schedule() calls cancel their task too.
+    void begin_shutdown() override;
+
+    /// True while a scheduled task has not finished.
+    bool has_tasks() const override;
+
 private:
     void worker_loop(int worker_index);
 
@@ -98,8 +104,10 @@ private:
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
-    std::mutex                                                               m_owned_mutex;
+    mutable std::mutex                                    m_owned_mutex;
     std::unordered_set<std::shared_ptr<detail::TaskBase>> m_owned_tasks;
+    /// Set by begin_shutdown(), never cleared. GUARDED BY m_owned_mutex.
+    bool                                                  m_closed{false};
 };
 
 } // namespace coro

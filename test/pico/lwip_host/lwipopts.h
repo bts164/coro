@@ -3,8 +3,8 @@
 /* ---------------------------------------------------------------------------
  * lwIP options for host-side NO_SYS testing.
  *
- * Used when building the lwIP TCP backend tests on Linux. The application
- * drives the poll loop manually: rt.poll() + sys_check_timeouts() + netif_poll_all().
+ * Used when building the lwIP backend tests on Linux. The Runtime drives lwIP
+ * (PicoNetwork::Lwip): sys_check_timeouts() + netif_poll_all() on every loop.
  * Only loopback networking is needed — no ARP, no real netif drivers.
  * ------------------------------------------------------------------------- */
 

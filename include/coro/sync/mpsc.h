@@ -54,7 +54,6 @@ struct MpscReceiverNode {
 template<typename T>
 struct MpscShared {
     detail::Mutex                   mutex;
-    detail::CondVar                 cv;              ///< Notified on every push, pop, and close; used by blocking_recv / blocking_send.
     std::deque<T>                   buffer;          ///< Bounded queue.
     size_t                          capacity;        ///< Maximum buffered values.
     size_t                          sender_count  = 0;
@@ -146,7 +145,6 @@ public:
             auto waker = std::move(m_shared->receiver_waiter->waker);
             m_shared->receiver_waiter.reset();
             m_shared->sender_waiters.remove(&m_node);
-            m_shared->cv.notify_all();
             lock.unlock();
             waker->wake();
             return OutputType{};
@@ -155,7 +153,6 @@ public:
         // Buffer has space.
         if (m_shared->buffer.size() < m_shared->capacity) {
             m_shared->buffer.push_back(std::move(*m_node.value));
-            m_shared->cv.notify_all();
             return OutputType{};
         }
 
@@ -225,7 +222,6 @@ public:
             T val = std::move(m_shared->buffer.front());
             m_shared->buffer.pop_front();
             auto waker = _tryPromoteSender();
-            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return std::optional<T>(std::move(val));
@@ -236,7 +232,6 @@ public:
             T val = std::move(*node->value);
             node->value.reset();  // mark consumed so MpscSendFuture::poll() returns Ready on re-poll
             auto waker = std::move(node->waker);
-            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return std::optional<T>(std::move(val));
@@ -337,47 +332,11 @@ public:
             return std::unexpected(TrySendError<T>(
                 TrySendError<T>::Kind::Full, std::move(value)));
         m_shared->buffer.push_back(std::move(value));
-        m_shared->cv.notify_all();
         if (m_shared->receiver_waiter.has_value()) {
             auto waker = std::move(m_shared->receiver_waiter->waker);
             m_shared->receiver_waiter.reset();
             lock.unlock();
             waker->wake();
-        }
-        return {};
-    }
-
-    /**
-     * @brief Blocks the calling OS thread until @p value can be sent or the receiver is dropped.
-     *
-     * Intended for use on threads created by `spawn_blocking`. **Do not call from a
-     * coroutine or executor thread** — it will block the thread and stall the executor.
-     *
-     * NOT ISR-SAFE: blocks on a condition variable and calls waker->wake(). Use
-     * IsrChannel<T>::send_from_isr() from ISR context instead.
-     *
-     * @return `{}` on success. `std::unexpected(value)` if the receiver was dropped
-     *         while waiting.
-     */
-    std::expected<void, T> blocking_send(T value) {
-        std::unique_lock lock(m_shared->mutex);
-        m_shared->cv.wait(lock, [this] {
-            return !m_shared->receiver_alive
-                || m_shared->buffer.size() < m_shared->capacity;
-        });
-
-        if (!m_shared->receiver_alive)
-            return std::unexpected(std::move(value));
-
-        m_shared->buffer.push_back(std::move(value));
-        if (m_shared->receiver_waiter.has_value()) {
-            auto waker = std::move(m_shared->receiver_waiter->waker);
-            m_shared->receiver_waiter.reset();
-            m_shared->cv.notify_all();
-            lock.unlock();
-            waker->wake();
-        } else {
-            m_shared->cv.notify_all();
         }
         return {};
     }
@@ -416,7 +375,6 @@ private:
             if (--m_shared->sender_count == 0) {
                 if (m_shared->receiver_waiter.has_value())
                     waker = std::move(m_shared->receiver_waiter->waker);
-                m_shared->cv.notify_all();
             }
         }
         if (waker) waker->wake();
@@ -486,47 +444,6 @@ public:
     }
 
     /**
-     * @brief Blocks the calling OS thread until an item is available or the channel closes.
-     *
-     * Intended for use on threads created by `spawn_blocking`. **Do not call from a
-     * coroutine or executor thread** — it will block the thread and stall the executor.
-     *
-     * @return The next item, or `std::nullopt` when all senders are dropped and the
-     *         buffer is drained.
-     */
-    std::optional<T> blocking_recv() {
-        std::unique_lock lock(m_shared->mutex);
-        m_shared->cv.wait(lock, [this] {
-            return !m_shared->buffer.empty()
-                || !m_shared->sender_waiters.empty()
-                || m_shared->sender_count == 0;
-        });
-
-        if (!m_shared->buffer.empty()) {
-            T val = std::move(m_shared->buffer.front());
-            m_shared->buffer.pop_front();
-            auto waker = _tryPromoteSender();
-            m_shared->cv.notify_all();
-            lock.unlock();
-            if (waker) waker->wake();
-            return val;
-        }
-
-        if (auto* raw = m_shared->sender_waiters.pop_front()) {
-            auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
-            T val = std::move(*node->value);
-            node->value.reset();  // mark consumed so MpscSendFuture::poll() returns Ready on re-poll
-            auto waker = std::move(node->waker);
-            m_shared->cv.notify_all();
-            lock.unlock();
-            if (waker) waker->wake();
-            return val;
-        }
-
-        return std::nullopt;
-    }
-
-    /**
      * @brief Attempts to receive a value without suspending.
      *
      * Returns:
@@ -540,7 +457,6 @@ public:
             T val = std::move(m_shared->buffer.front());
             m_shared->buffer.pop_front();
             auto waker = _tryPromoteSender();
-            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return val;
@@ -560,7 +476,6 @@ public:
             T val = std::move(m_shared->buffer.front());
             m_shared->buffer.pop_front();
             auto waker = _tryPromoteSender();
-            m_shared->cv.notify_all();
             lock.unlock();
             if (waker) waker->wake();
             return std::optional<T>(std::move(val));
@@ -608,7 +523,6 @@ private:
                 auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
                 if (node->waker) wakers.push_back(std::move(node->waker));
             }
-            m_shared->cv.notify_all();
         }
         for (auto& w : wakers) w->wake();
         m_shared = nullptr;

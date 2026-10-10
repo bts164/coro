@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
+#include <vector>
 
 #ifdef CORO_PICO
 #include <coro/detail/fiber_context.h>
@@ -38,6 +39,7 @@ CurrentThreadExecutor::CurrentThreadExecutor(Runtime* rt)
     : CurrentThreadExecutor(std::make_unique<IoDriverParker>(rt->io_driver()))
 {
     m_turns_io_driver = true;
+    m_runtime         = rt;
 }
 #endif
 
@@ -45,9 +47,17 @@ void CurrentThreadExecutor::schedule(detail::Rc<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
         detail::SchedulingState::Notified, std::memory_order_relaxed);
+    bool closed;
     {
         std::lock_guard lock(m_owned_mutex);
         m_owned_tasks.insert(task);
+        closed = m_closed;
+    }
+    if (closed) {
+        // Spawned during shutdown: born cancelled. The task is Notified, so
+        // cancel_task() only sets the flag; its first poll shuts the future down.
+        task->cancel_task();
+        notify_shutdown_progress();
     }
     // Through enqueue(), not a bare push: spawn() may run on another thread (e.g. a
     // blocking-pool thread driving a stream) while this executor is parked with no
@@ -121,10 +131,13 @@ bool CurrentThreadExecutor::poll_ready_tasks() {
         if (done) {
             task->scheduling_state.store(
                 detail::SchedulingState::Done, std::memory_order_relaxed);
+            bool closed;
             {
                 std::lock_guard lock(m_owned_mutex);
                 m_owned_tasks.erase(task);
+                closed = m_closed;
             }
+            if (closed) notify_shutdown_progress();
         } else {
             expected = detail::SchedulingState::Running;
             if (task->scheduling_state.compare_exchange_strong(
@@ -240,8 +253,45 @@ void CurrentThreadExecutor::check_isr_events() {
 }
 #endif // CORO_PICO
 
-void CurrentThreadExecutor::wait_for_completion(detail::TaskStateBase& state) {
+void CurrentThreadExecutor::begin_shutdown() {
+    std::vector<detail::Rc<detail::TaskBase>> tasks;
+    {
+        std::lock_guard lock(m_owned_mutex);
+        m_closed = true;
+        tasks.assign(m_owned_tasks.begin(), m_owned_tasks.end());
+    }
+    // Outside m_owned_mutex: cancel_task() wakes the task, which takes m_ready_mutex.
+    //
+    // RACE: a schedule() on another thread (a blocking-pool thread) either inserted
+    // its task before m_closed was set, and the task is in `tasks`, or after, and
+    // schedule() cancels it itself.
+    for (auto& task : tasks)
+        task->cancel_task();
+}
+
+bool CurrentThreadExecutor::has_tasks() const {
+    std::lock_guard lock(m_owned_mutex);
+    return !m_owned_tasks.empty();
+}
+
+void CurrentThreadExecutor::notify_shutdown_progress() noexcept {
+#ifndef CORO_PICO
+    if (m_runtime != nullptr) m_runtime->shutdown_progress();
+#endif
+}
+
+void CurrentThreadExecutor::recheck_run_until() noexcept {
+    // unpark() is remembered if the loop is not parked yet, so a call that lands
+    // between the loop's done() check and its park() is not lost.
+    m_parker->unpark();
+}
+
 #if defined(CORO_PICO) && defined(__arm__)
+namespace {
+// Called at the top of the event loop. A function of its own, not part of run_loop():
+// run_loop() is a template, and the `static` flag below must exist once, not once per
+// instantiation.
+void enable_psp_stack_once() {
     // One-time CONTROL/PSP switch, before this thread can ever switch_context()
     // into a fiber -- see doc/design/fiber.md's "Stack model (Pico backend)".
     // Everything before this point (SDK init, main()) ran on MSP and is never a
@@ -272,25 +322,38 @@ void CurrentThreadExecutor::wait_for_completion(detail::TaskStateBase& state) {
         detail::coro_pico_enable_psp_stack();
         psp_stack_enabled = true;
     }
+}
+} // namespace
+#endif
+
+template<typename Done>
+void CurrentThreadExecutor::run_loop(Done&& done) {
+#if defined(CORO_PICO) && defined(__arm__)
+    enable_psp_stack_once();
 #endif
     while (true) {
-        {
-            std::lock_guard lock(state.mutex);
-            if (state.terminated) break;
-        }
+        if (done()) break;
         poll_ready_tasks();
         check_expired_timers();
-        {
-            // The poll above may have finished the root task. Without this
-            // check an empty queue would park with no limit, forever.
-            std::lock_guard lock(state.mutex);
-            if (state.terminated) break;
-        }
+        // The poll above may have made done() true. Without this check an empty
+        // queue would park with no limit, forever.
+        if (done()) break;
         park_once();
 #ifdef CORO_PICO
         check_isr_events();
 #endif
     }
+}
+
+void CurrentThreadExecutor::wait_for_completion(detail::TaskStateBase& state) {
+    run_loop([&state] {
+        std::lock_guard lock(state.mutex);
+        return state.terminated;
+    });
+}
+
+void CurrentThreadExecutor::run_until(const std::function<bool()>& done) {
+    run_loop(done);
 }
 
 } // namespace coro

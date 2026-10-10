@@ -1,7 +1,7 @@
 #pragma once
 // Stub for pico/cyw43_arch.h — WiFi functions are no-ops on Linux test builds.
-// cyw43_arch_poll() is declared here and defined in cyw43_arch_stub.cpp.
-// In the executor-only target it is a no-op; in the TCP target it ticks lwIP.
+// cyw43_arch_poll() is declared here and defined in cyw43_arch_stub.cpp as a no-op.
+// The host tests that need lwIP driven build their runtime with PicoNetwork::Lwip.
 #include <cstdint>
 
 #define CYW43_AUTH_WPA2_AES_PSK 0x00400004

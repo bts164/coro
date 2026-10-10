@@ -1,5 +1,6 @@
 import os, sys
 from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
 from conan.tools.files import copy, update_conandata
@@ -34,7 +35,7 @@ class CoroRecipe(ConanFile):
         "fPIC": [True, False],
         "with_gperftools": [True, False],
         "with_local_run_queue": [True, False],
-        "with_sanitize": ["none", "asan", "tsan"],
+        "with_sanitize": ["none", "asan", "tsan", "ubsan"],
         # Pico-only (settings.os == "baremetal"); ignored/removed otherwise.
         # Drives both whether coro_pico_mqtt is built and whether the
         # bundled default lwipopts.h defines LWIP_MQTT — see
@@ -129,10 +130,22 @@ class CoroRecipe(ConanFile):
             self.options.with_local_run_queue = self._env_bool(
                 "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
 
+        # baremetal has only ubsan (cmake/Sanitize.cmake). An asan or tsan
+        # left in the environment for the desktop builds means none there,
+        # so one .envrc serves both; an explicit -o is rejected in validate().
         sanitize = os.environ.get("CORO_SANITIZE", "none").strip().lower()
-        if sanitize not in ("none", "asan", "tsan"):
+        allowed = (("none", "ubsan") if self.settings.os == "baremetal"
+                   else ("none", "asan", "tsan", "ubsan"))
+        if sanitize not in allowed:
             sanitize = "none"
         self.options.with_sanitize = sanitize
+
+    def validate(self):
+        if (self.settings.os == "baremetal"
+                and str(self.options.with_sanitize) in ("asan", "tsan")):
+            raise ConanInvalidConfiguration(
+                "with_sanitize on baremetal must be none or ubsan: ASan and "
+                "TSan need a runtime a microcontroller does not have")
 
     def configure(self):
         if self.settings.os != "baremetal" and self.options.shared:
@@ -226,7 +239,7 @@ class CoroRecipe(ConanFile):
         else:
             tc.cache_variables["WITH_GPERFTOOLS"] = self.options.with_gperftools
             tc.cache_variables["CORO_USE_LOCAL_RUN_QUEUE"] = self.options.with_local_run_queue
-            tc.cache_variables["WITH_SANITIZE"] = str(self.options.with_sanitize)
+        tc.cache_variables["WITH_SANITIZE"] = str(self.options.with_sanitize)
         tc.generate()
 
     def build(self):
@@ -254,7 +267,10 @@ class CoroRecipe(ConanFile):
     def package_info(self):
         if self.settings.os == "baremetal":
             self.cpp_info.components["pico"].libs = ["coro_pico"]
-            self.cpp_info.components["pico"].defines = ["CORO_PICO", "CORO_TCP_BACKEND_LWIP"]
+            # Must match coro_pico's PUBLIC definitions in cmake/platforms/pico.cmake:
+            # they select the lwIP branches of tcp_stream.h and udp_socket.h.
+            self.cpp_info.components["pico"].defines = [
+                "CORO_PICO", "CORO_TCP_BACKEND_LWIP", "CORO_UDP_BACKEND_LWIP"]
             self.cpp_info.components["pico"].set_property("cmake_target_name", "coro::pico")
             # lwipopts.h is installed to include/coro_pico_lwipopts/ by pico.cmake.
             # Must be listed explicitly because setting any includedirs replaces

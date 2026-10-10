@@ -482,6 +482,10 @@ public:
     // Returns a builder for configuring and submitting a stream as a background task.
     template<Stream S>
     [[nodiscard]] StreamSpawnBuilder<S> spawn(S stream);
+
+    // Cancels and drains every task, then stops the runtime's threads. Called by
+    // the destructor. See runtime_shutdown.md.
+    void shutdown() noexcept;
 };
 ```
 
@@ -491,8 +495,8 @@ to reach one of these from off the `Runtime` object itself (the free
 `spawn()`/`current_runtime()` thread-locals, `BlockingPool::worker_loop`'s
 `set_current_runtime` call) stores a raw `Runtime*` and relies on a *structural* lifetime
 guarantee rather than shared ownership: `block_on()` runs on a call stack that has
-`Runtime` alive by construction, and `BlockingPool`'s worker threads are joined by
-`~BlockingPool()` before the rest of `~Runtime()` runs, so the pointer is never read after
+`Runtime` alive by construction, and the executor's and the `BlockingPool`'s threads have
+all exited by the time `Runtime::shutdown()` returns, so the pointer is never read after
 the `Runtime` it points to is gone. This is cheaper than an extra allocation and
 indirection level — worthwhile as long as every consumer of the pointer is one the library
 itself controls the lifetime of.
@@ -784,9 +788,13 @@ other means — but any alternative requires careful reasoning, as the case stud
 
 #### Shutdown and detached tasks
 
-The executor tracks all spawned tasks, including detached ones. On shutdown it cancels all
-tracked tasks and drains them before returning from `block_on`. Because detached tasks obey
-the drain invariant, this always terminates.
+The executor tracks all spawned tasks, including detached ones. When the runtime shuts
+down, every tracked task is cancelled and drained. Because detached tasks obey the drain
+invariant, this always terminates.
+
+[runtime_shutdown.md](runtime_shutdown.md) describes how, for executor tasks and
+blocking tasks together. Tasks are not cancelled when `block_on()` returns; they belong
+to the runtime, not to the call.
 
 This differs from Tokio's approach (synchronous drop of all tasks on shutdown), which works
 in Rust because Rust futures are safe to drop at any await point without running destructor

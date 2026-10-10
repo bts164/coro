@@ -3,10 +3,13 @@
 #include <coro/coro_stream.h>
 #include <coro/stream.h>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace coro;
 using namespace coro::detail;
+
+namespace {
 
 class MockWaker : public detail::Waker {
 public:
@@ -79,6 +82,8 @@ static_assert(Stream<CoroStream<int, true>>);
 static_assert(Stream<CoroStream<std::string>>);
 static_assert(std::same_as<CoroStream<int>::ItemType, int>);
 static_assert(std::same_as<CoroStream<int, true>::ItemType, int>);
+
+}  // namespace
 
 // --- Construction and move tests ---
 

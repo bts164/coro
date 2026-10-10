@@ -146,7 +146,8 @@ ISR side and the executor side. See the updated primitives below.
 
 On the host test build there is no real SIO register or IRQ to disable;
 `test/pico/stub/hardware/sync.h` backs `spin_lock_blocking()`/`spin_unlock()` with a
-`std::mutex` instead, so that `test_isr_event.cpp`'s `std::thread`-simulated ISR — which
+`std::mutex` instead, so that `test_isr_event.cpp`'s thread-simulated ISR (`IsrTrigger` in
+`test/isr_trigger.h`, which on the board is a real timer interrupt instead) — which
 *is* genuinely concurrent on x86, unlike a real single-core interrupt — gets the same
 mutual-exclusion guarantee under TSan that the SIO register gives real hardware. A
 `std::mutex` would never be safe to take from a *real* ISR (it can block); the host stub

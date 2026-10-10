@@ -49,9 +49,13 @@ public:
         /// True if a thread is blocked in begin_wait()/end_wait() and the new deadline
         /// is earlier than the one it is waiting for, so the caller must unpark it.
         bool    unpark;
+        /// True if the queue has been closed: nothing was added and `id` names no
+        /// timer.
+        bool    closed = false;
     };
 
-    /// @brief Adds a timer that wakes `waker` once `deadline` has passed.
+    /// @brief Adds a timer that wakes `waker` once `deadline` has passed. Adds
+    /// nothing, and says so in the result, once the queue has been closed.
     Inserted insert(Instant deadline, Weak<Waker> waker);
 
     /**
@@ -96,6 +100,19 @@ public:
      * @return The number of wakers fired.
      */
     std::size_t end_wait_and_fire_expired();
+
+    /**
+     * @brief Closes the queue: removes every timer, wakes the live ones whatever
+     * their deadline, and makes every later insert() report `closed`.
+     *
+     * For a queue that nothing will fire again. A woken waiter finds its deadline not
+     * yet passed, so whoever owns the queue must give it a way to learn that the
+     * queue is closed (see IoDriver::is_shut_down()). Every id issued so far goes
+     * stale, so a later cancel() of one does nothing. Idempotent.
+     *
+     * @return The number of wakers fired.
+     */
+    std::size_t close_and_wake_all();
 
     /// Entries in the heap, including cancelled ones not yet popped or swept.
     std::size_t size() const;
@@ -145,6 +162,8 @@ private:
     std::size_t                m_cancelled = 0;
     // True between a blocking begin_wait() and end_wait().
     bool                       m_waiting   = false;
+    // Set by close_and_wake_all(); never cleared.
+    bool                       m_closed    = false;
 };
 
 } // namespace coro::detail

@@ -1,14 +1,22 @@
-// Desktop TcpStream / TcpListener on the IoDriver (doc/design/tcp_stream.md).
-// The lwIP backend has its own host-built test, test/pico/test_tcp_stream_real.cpp.
+// TcpStream / TcpListener, on every backend: the desktop sockets on the IoDriver
+// (doc/design/tcp_stream.md) and lwIP, built for the host and on the board. The tests
+// connect to 127.0.0.1, which on lwIP is its loopback interface.
+//
+// Most tests are shared. The desktop-only and lwIP-only ones are in their own
+// sections at the end.
 
 #include <gtest/gtest.h>
-#include <coro/io/lookup_host.h>
 #include <coro/io/tcp_listener.h>
 #include <coro/io/tcp_stream.h>
 #include <coro/runtime/runtime.h>
 #include <coro/coro.h>
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
+#include "net_runtime.h"
+#ifdef CORO_TCP_BACKEND_LWIP
+#include <lwip/opt.h>   // TCP_SND_BUF
+#else
+#include <coro/io/lookup_host.h>
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/parker.h>
@@ -16,12 +24,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cerrno>
-#include <chrono>
-#include <cstddef>
 #include <format>
 #include <memory>
+#endif
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -35,31 +48,24 @@ using namespace std::chrono_literals;
 
 static_assert(Future<Coro<TcpStream>>);
 static_assert(Future<Coro<TcpListener>>);
+// read and write are hand-written futures, not coroutines: no frame per transfer.
 static_assert(Future<TcpReadFuture<std::string, false>>);
 static_assert(Future<TcpReadFuture<std::string, true>>);
 static_assert(Future<TcpWriteFuture<std::string>>);
-static_assert(Future<TcpAcceptFuture>);
 // Leaf futures: safe to drop mid-wait, so they expose no cancel().
 static_assert(!Cancellable<TcpReadFuture<std::string, false>>);
 static_assert(!Cancellable<TcpReadFuture<std::string, true>>);
 static_assert(!Cancellable<TcpWriteFuture<std::string>>);
+#ifndef CORO_TCP_BACKEND_LWIP
+static_assert(Future<TcpAcceptFuture>);
 static_assert(!Cancellable<TcpAcceptFuture>);
+#endif
 
 namespace {
 
-bool ipv6_loopback_available() {
-    const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_addr   = in6addr_loopback;
-    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-    ::close(fd);
-    return ok;
-}
-
-// A listener plus both ends of one connection on it. The kernel completes the
-// handshake before accept(), so connect-then-accept works on one task.
+// A listener plus both ends of one connection on it. Every backend completes the
+// handshake and queues the connection before accept() is called, so
+// connect-then-accept works on one task.
 struct Connection {
     TcpListener listener;
     TcpStream   client;
@@ -99,12 +105,24 @@ Coro<std::string> echo_round_trip(uint16_t port, std::string msg) {
     co_return buf;
 }
 
+// The large transfer is sized to be several times what the send buffer holds, so
+// that one write() has to go out in pieces. The reader takes it a chunk at a time
+// and checks each chunk as it arrives: only the writer's copy of the data exists.
+// On a Pico every copy comes out of a heap that lwIP and the test framework share.
+#ifdef CORO_TCP_BACKEND_LWIP
+// From TCP_SND_BUF, because the host and firmware lwipopts.h set it differently.
+constexpr std::size_t kLargeTransfer = 2 * TCP_SND_BUF + 1024;
+constexpr std::size_t kReadChunk     = 2048;
+#else
+constexpr std::size_t kLargeTransfer = 8 * 1024 * 1024;
+constexpr std::size_t kReadChunk     = 64 * 1024;
+#endif
+
 std::byte pattern_at(std::size_t i) {
     return static_cast<std::byte>((i * 31) % 251);
 }
 
-// Accepts one connection and writes `bytes` of pattern in a single write(), far more
-// than the socket buffers hold, so the write goes out in pieces as the reader drains.
+// Accepts one connection and writes `bytes` of pattern in a single write().
 Coro<void> accept_and_write_pattern(TcpListener listener, std::size_t bytes) {
     auto stream = co_await listener.accept();
     std::vector<std::byte> data(bytes);
@@ -118,14 +136,182 @@ Coro<std::size_t> large_transfer(uint16_t port, std::size_t bytes) {
     auto writer = coro::spawn(accept_and_write_pattern(
         co_await TcpListener::bind("127.0.0.1", port), bytes));
     auto client = co_await TcpStream::connect("127.0.0.1", port);
-    auto [n, buf] = co_await client.read_exact(std::vector<std::byte>(bytes));
-    co_await writer;
+    std::size_t received = 0;
     std::size_t matching = 0;
-    for (std::size_t i = 0; i < n; ++i) matching += buf[i] == pattern_at(i) ? 1 : 0;
+    while (received < bytes) {
+        const std::size_t want = std::min(bytes - received, kReadChunk);
+        auto [n, buf] = co_await client.read_exact(std::vector<std::byte>(want));
+        for (std::size_t i = 0; i < n; ++i)
+            matching += buf[i] == pattern_at(received + i) ? 1 : 0;
+        received += n;
+        if (n < want) break;   // EOF before the end
+    }
+    co_await writer;
     co_return matching;
 }
 
-constexpr std::size_t kLargeTransfer = 8 * 1024 * 1024;
+// The backends report a refused connection differently: the desktop one as
+// std::system_error with ECONNREFUSED, the lwIP one as std::runtime_error naming the
+// connect.
+bool is_connect_failure(const std::exception& e) {
+#ifdef CORO_TCP_BACKEND_LWIP
+    return std::string_view(e.what()).find("connect") != std::string_view::npos;
+#else
+    const auto* se = dynamic_cast<const std::system_error*>(&e);
+    return se != nullptr && se->code() == std::errc::connection_refused;
+#endif
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Basics
+// ---------------------------------------------------------------------------
+
+TEST(TcpStreamTest, EchoRoundTrip) {
+    NetRuntime rt;
+    EXPECT_EQ(rt.block_on(echo_round_trip(31019, "hello over tcp")), "hello over tcp");
+}
+
+TEST(TcpStreamTest, MultipleMessagesInOrder) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto c = co_await connect_pair("127.0.0.1", 31004);
+        for (int i = 0; i < 10; ++i) {
+            const std::string msg = "message " + std::to_string(i);
+            co_await c.client.write(msg);
+            auto [n, buf] = co_await c.server.read_exact(std::string(msg.size(), '\0'));
+            buf.resize(n);
+            EXPECT_EQ(buf, msg);
+        }
+    }());
+}
+
+TEST(TcpStreamTest, ReadReturnsZeroAtEof) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto c = co_await connect_pair("127.0.0.1", 31005);
+        { TcpStream gone = std::move(c.client); }
+        auto [n, buf] = co_await c.server.read(std::string(16, '\0'));
+        (void)buf;
+        EXPECT_EQ(n, 0u);
+        // EOF is sticky.
+        auto [n2, buf2] = co_await c.server.read(std::string(16, '\0'));
+        (void)buf2;
+        EXPECT_EQ(n2, 0u);
+    }());
+}
+
+TEST(TcpStreamTest, ReadExactStopsShortAtEof) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto c = co_await connect_pair("127.0.0.1", 31006);
+        co_await c.client.write(std::string("abc"));
+        { TcpStream gone = std::move(c.client); }
+        auto [n, buf] = co_await c.server.read_exact(std::string(10, '\0'));
+        EXPECT_EQ(n, 3u);
+        EXPECT_EQ(buf.substr(0, n), "abc");
+    }());
+}
+
+// read() returns what has arrived, up to the buffer's size, and leaves the rest for
+// the next read.
+TEST(TcpStreamTest, ReadLeavesTheRestForTheNextRead) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto c = co_await connect_pair("127.0.0.1", 31021);
+        co_await c.server.write(std::string("hello world"));
+
+        auto [n1, buf1] = co_await c.client.read(std::string(5, '\0'));
+        buf1.resize(n1);
+        EXPECT_EQ(buf1, "hello");
+
+        auto [n2, buf2] = co_await c.client.read(std::string(32, '\0'));
+        buf2.resize(n2);
+        EXPECT_EQ(buf2, " world");
+    }());
+}
+
+// One write() far larger than the send buffer: it completes in pieces, each waiting
+// for room, and every byte arrives in order.
+TEST(TcpStreamTest, LargeWriteCompletesInPieces) {
+    NetRuntime rt;
+    EXPECT_EQ(rt.block_on(large_transfer(31020, kLargeTransfer)), kLargeTransfer);
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+TEST(TcpStreamTest, ConnectRefusedThrowsOnAwait) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        bool refused = false;
+        try {
+            auto s = co_await TcpStream::connect("127.0.0.1", 31010);   // nothing listening
+            (void)s;
+        } catch (const std::exception& e) {
+            refused = is_connect_failure(e);
+        }
+        EXPECT_TRUE(refused);
+    }());
+}
+
+// ---------------------------------------------------------------------------
+// Waiting and dropping
+// ---------------------------------------------------------------------------
+
+// An accept() that loses a race to a timer is dropped mid-wait; it accepted nothing,
+// so the next accept() gets the connection.
+TEST(TcpStreamTest, DroppedAcceptAcceptsNothing) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto listener = co_await TcpListener::bind("127.0.0.1", 31014);
+        auto timed = co_await coro::timeout(20ms, listener.accept());
+        EXPECT_EQ(timed.index(), 1u);   // timed out; the accept was dropped
+
+        auto client = co_await TcpStream::connect("127.0.0.1", 31014);
+        auto server = co_await listener.accept();
+        co_await client.write(std::string("after-drop"));
+        auto [n, buf] = co_await server.read_exact(std::string(10, '\0'));
+        EXPECT_EQ(n, 10u);
+        EXPECT_EQ(buf, "after-drop");
+    }());
+}
+
+// A read() dropped mid-wait consumed nothing; the next read() gets the data.
+TEST(TcpStreamTest, DroppedReadLosesNoData) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto c = co_await connect_pair("127.0.0.1", 31015);
+        auto timed = co_await coro::timeout(20ms, c.server.read(std::string(64, '\0')));
+        EXPECT_EQ(timed.index(), 1u);
+
+        co_await c.client.write(std::string("after-drop"));
+        auto [n, buf] = co_await c.server.read_exact(std::string(10, '\0'));
+        EXPECT_EQ(n, 10u);
+        EXPECT_EQ(buf, "after-drop");
+    }());
+}
+
+#ifndef CORO_TCP_BACKEND_LWIP
+// ===========================================================================
+// Desktop only: the other executors, IPv6, errno values, and behaviour the lwIP
+// backend does not have.
+// ===========================================================================
+
+namespace {
+
+bool ipv6_loopback_available() {
+    const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr   = in6addr_loopback;
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    ::close(fd);
+    return ok;
+}
 
 constexpr int kConcurrentMessages = 1000;
 
@@ -148,10 +334,6 @@ Coro<int> read_numbered(std::shared_ptr<TcpStream> stream, int n) {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Basics
-// ---------------------------------------------------------------------------
-
 TEST(TcpStreamTest, EchoRoundTripWorkStealing) {
     Runtime rt(4);
     EXPECT_EQ(rt.block_on(echo_round_trip(31001, "hello over tcp")), "hello over tcp");
@@ -165,47 +347,6 @@ TEST(TcpStreamTest, EchoRoundTripCurrentThread) {
 TEST(TcpStreamTest, EchoRoundTripWorkSharing) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>, 2);
     EXPECT_EQ(rt.block_on(echo_round_trip(31003, "hello over tcp")), "hello over tcp");
-}
-
-TEST(TcpStreamTest, MultipleMessagesInOrder) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        auto c = co_await connect_pair("127.0.0.1", 31004);
-        for (int i = 0; i < 10; ++i) {
-            const std::string msg = "message " + std::to_string(i);
-            co_await c.client.write(msg);
-            auto [n, buf] = co_await c.server.read_exact(std::string(msg.size(), '\0'));
-            buf.resize(n);
-            EXPECT_EQ(buf, msg);
-        }
-    }());
-}
-
-TEST(TcpStreamTest, ReadReturnsZeroAtEof) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        auto c = co_await connect_pair("127.0.0.1", 31005);
-        { TcpStream gone = std::move(c.client); }
-        auto [n, buf] = co_await c.server.read(std::string(16, '\0'));
-        (void)buf;
-        EXPECT_EQ(n, 0u);
-        // EOF is sticky.
-        auto [n2, buf2] = co_await c.server.read(std::string(16, '\0'));
-        (void)buf2;
-        EXPECT_EQ(n2, 0u);
-    }());
-}
-
-TEST(TcpStreamTest, ReadExactStopsShortAtEof) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        auto c = co_await connect_pair("127.0.0.1", 31006);
-        co_await c.client.write(std::string("abc"));
-        { TcpStream gone = std::move(c.client); }
-        auto [n, buf] = co_await c.server.read_exact(std::string(10, '\0'));
-        EXPECT_EQ(n, 3u);
-        EXPECT_EQ(buf.substr(0, n), "abc");
-    }());
 }
 
 // One write() far larger than the socket buffers: it completes in pieces, each waiting
@@ -229,24 +370,6 @@ TEST(TcpStreamTest, Ipv6Loopback) {
         auto [n, buf] = co_await c.server.read_exact(std::string(2, '\0'));
         EXPECT_EQ(n, 2u);
         EXPECT_EQ(buf, "v6");
-    }());
-}
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-TEST(TcpStreamTest, ConnectRefusedThrowsOnAwait) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        bool refused = false;
-        try {
-            auto s = co_await TcpStream::connect("127.0.0.1", 31010);   // nothing listening
-            (void)s;
-        } catch (const std::system_error& e) {
-            refused = e.code() == std::errc::connection_refused;
-        }
-        EXPECT_TRUE(refused);
     }());
 }
 
@@ -306,43 +429,6 @@ TEST(TcpStreamTest, ThrowsWithoutDriver) {
     EXPECT_THROW((void)rt.block_on(TcpStream::connect("127.0.0.1", 31013)), std::logic_error);
 }
 
-// ---------------------------------------------------------------------------
-// Waiting, dropping and concurrency
-// ---------------------------------------------------------------------------
-
-// An accept() that loses a race to a timer is dropped mid-wait; it accepted nothing,
-// so the next accept() gets the connection.
-TEST(TcpStreamTest, DroppedAcceptAcceptsNothing) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        auto listener = co_await TcpListener::bind("127.0.0.1", 31014);
-        auto timed = co_await coro::timeout(20ms, listener.accept());
-        EXPECT_EQ(timed.index(), 1u);   // timed out; the accept was dropped
-
-        auto client = co_await TcpStream::connect("127.0.0.1", 31014);
-        auto server = co_await listener.accept();
-        co_await client.write(std::string("after-drop"));
-        auto [n, buf] = co_await server.read_exact(std::string(10, '\0'));
-        EXPECT_EQ(n, 10u);
-        EXPECT_EQ(buf, "after-drop");
-    }());
-}
-
-// A read() dropped mid-wait consumed nothing; the next read() gets the data.
-TEST(TcpStreamTest, DroppedReadLosesNoData) {
-    Runtime rt;
-    rt.block_on([]() -> Coro<void> {
-        auto c = co_await connect_pair("127.0.0.1", 31015);
-        auto timed = co_await coro::timeout(20ms, c.server.read(std::string(64, '\0')));
-        EXPECT_EQ(timed.index(), 1u);
-
-        co_await c.client.write(std::string("after-drop"));
-        auto [n, buf] = co_await c.server.read_exact(std::string(10, '\0'));
-        EXPECT_EQ(n, 10u);
-        EXPECT_EQ(buf, "after-drop");
-    }());
-}
-
 // The pending read shares the stream's state, so destroying the TcpStream handle
 // neither closes the fd under it nor loses the wake.
 TEST(TcpStreamTest, StreamDroppedWhileReadPending) {
@@ -398,3 +484,21 @@ TEST(TcpStreamTest, ConcurrentReadAndWriteOnOneStream) {
     }());
     EXPECT_EQ(in_order, kConcurrentMessages);
 }
+
+#else
+// ===========================================================================
+// lwIP only
+// ===========================================================================
+
+// Returns at once, although the peer has sent nothing and never will.
+TEST(TcpStreamTest, EmptyBufferReadReturnsZeroAtOnce) {
+    NetRuntime rt;
+    rt.block_on([]() -> Coro<void> {
+        auto c = co_await connect_pair("127.0.0.1", 31022);
+        auto [n, buf] = co_await c.client.read(std::string());
+        (void)buf;
+        EXPECT_EQ(n, 0u);
+    }());
+}
+
+#endif // CORO_TCP_BACKEND_LWIP

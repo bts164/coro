@@ -1,0 +1,51 @@
+name: Pico tests (emulator)
+
+# Builds the on-target test firmware for the RP2040 and runs it in an emulator
+# (test/target/run_on_target.py --emulator). See doc/design/on_target_tests.md.
+#
+# This is a smoke check, not a validation of the Pico build: it shows that the
+# firmware still boots and its tests still pass on an emulated ARM core. A release
+# is gated on a run on the hardware.
+#
+# The job is ci/run-emulator-tests.sh, run in the primary platform's CI image
+# (PRIMARY_PLATFORM in docker/common.sh). docker/run-emulator-tests.sh runs the same
+# script in the same image on your own machine. The firmware is cross-compiled, so
+# one platform is enough.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  image:
+    uses: ./.github/workflows/ci_image.yml
+    permissions:
+      contents: read
+      packages: write
+
+  emulator:
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ fromJSON(needs.image.outputs.images)[needs.image.outputs.primary] }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # conan_version.py derives the package version from `git describe --tags`,
+          # which finds nothing in the default shallow, tagless checkout.
+          fetch-depth: 0
+
+      # ubsan: UBSan in trap mode, the one sanitizer a Pico build has (BUILD.md).
+      # The script also takes `none`, for a plain build; CI does not spend a second
+      # run on it, because the ubsan build runs the same tests and checks more.
+      - name: Build the firmware and run it in the emulator
+        run: ci/run-emulator-tests.sh ubsan

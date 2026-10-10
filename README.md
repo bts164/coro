@@ -254,7 +254,7 @@ Package options, set with `-o` on the Conan command line:
 | `shared` | `True` | Build a shared library; `False` builds a static one |
 | `with_gperftools` | `True` | Link gperftools (tcmalloc) |
 | `with_local_run_queue` | `True` | Lock-free per-worker run queue in `WorkStealingExecutor` |
-| `with_sanitize` | `none` | `asan` (AddressSanitizer, LeakSanitizer and UBSan) or `tsan` (ThreadSanitizer) |
+| `with_sanitize` | `none` | `asan` (AddressSanitizer, LeakSanitizer and UBSan), `tsan` (ThreadSanitizer) or `ubsan` (UBSan alone). A Pico build accepts only `ubsan`, which there stops the firmware at the fault and prints nothing |
 
 ## Building from source
 
@@ -287,10 +287,27 @@ conan build . --build=missing
 cd build/Release && ctest
 ```
 
-For a sanitizer build, set `CORO_SANITIZE=asan` or `CORO_SANITIZE=tsan` in the environment
+For a sanitizer build, set `CORO_SANITIZE=asan`, `tsan` or `ubsan` in the environment
 before those commands; it applies to both the library and the tests.
-`docker/run-sanitizer-build.sh asan|tsan` runs the same thing in an Ubuntu 24.04 container
-that mirrors CI.
+[test/README.md](test/README.md) describes how the tests are organised and how to run
+them on a Raspberry Pi Pico.
+
+A CI job is a script in [ci/](ci), run inside a platform's image. The scripts in
+[docker/](docker) run the same script in the same image on your machine
+([docker/README.md](docker/README.md)):
+
+| Script | Runs |
+|---|---|
+| `docker/run-tests.sh none\|asan\|tsan` | The desktop tests, plain or under a sanitizer. |
+| `docker/run-emulator-tests.sh none\|ubsan` | The Pico test firmware in an emulator. |
+| `docker/build-examples.sh` | A build of every desktop example. |
+| `docker/build-image.sh` | Builds the image. The scripts above do this themselves when it is missing. |
+
+The default image is Ubuntu 24.04 with GCC 13, built from
+`docker/Dockerfile.ubuntu2404` and the Conan profiles in `docker/profiles`. Its name
+includes a hash of those files, so editing one and running a script tests the change
+in a fresh image before you push. `CORO_PLATFORM=<platform>` in front of a script runs
+it on another platform, one per `docker/Dockerfile.<platform>`.
 
 ### The examples
 

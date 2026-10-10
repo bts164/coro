@@ -68,9 +68,9 @@ struct FileState {
  * The `_exact` variants loop inside one job, so they cost one thread hop, not one per
  * chunk.
  *
- * Operations start when called (they are `BlockingHandle`s, not lazy futures).
- * Dropping one doesn't stop it: the job runs to completion and its result is
- * discarded. For `read()`/`write()` at the file position that means the position
+ * Operations start when called (they are `BlockingHandle`s, not lazy futures), and
+ * the handles are returned already detached (`BlockingHandle::detach()`). Dropping one
+ * doesn't stop it: the job runs to completion and its result is discarded. For `read()`/`write()` at the file position that means the position
  * still moves.
  *
  * The fd is closed when the `File` and every operation started on it are gone, on

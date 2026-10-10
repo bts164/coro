@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace coro::detail {
 
@@ -33,8 +34,16 @@ namespace coro::detail {
  * `insert()` and `remove()` are safe from any thread. A task's shard is derived from
  * its address, which never changes, so both always take the same lock for a given task.
  *
- * Differences from tokio: there is no `closed` flag and no live-task counter, because
- * nothing in the executor reads either today.
+ * ### Closing
+ * `close_and_collect()` marks every shard closed and hands back the tasks linked at
+ * that moment, for runtime shutdown to cancel. From then on `insert()` and `remove()`
+ * report that the list is closed, so the executor can cancel a task spawned during
+ * shutdown and tell the runtime each time the list shrinks. The flag lives in the
+ * shard, under the shard mutex the caller already takes, so closing adds no shared
+ * state to the spawn and completion paths. See doc/design/runtime_shutdown.md.
+ *
+ * Differences from tokio: there is no live-task counter; `empty()` walks the shards,
+ * and only shutdown calls it.
  */
 class OwnedTasks {
 public:
@@ -72,7 +81,9 @@ public:
 
     /// @brief Takes a strong reference to `task` and links it into its shard.
     /// Must be called at most once per task, before the task is first enqueued.
-    void insert(std::shared_ptr<TaskBase> task) {
+    /// @return True if the list is closed. The task is linked all the same; the caller
+    ///         cancels it.
+    bool insert(std::shared_ptr<TaskBase> task) {
         TaskBase& t     = *task;
         Shard&    shard = shard_for(t);
         std::lock_guard lock(shard.mutex);
@@ -81,29 +92,65 @@ public:
         if (shard.head) shard.head->owned_prev = &t;
         shard.head   = &t;
         t.owned_self = std::move(task);
+        return shard.closed;
     }
 
-    /// @brief Unlinks `task` and returns the strong reference the list held, or null
-    /// if the task is not in the list.
-    ///
-    /// The reference is returned, not dropped here, so that the caller releases it
-    /// outside the shard lock.
-    [[nodiscard]] std::shared_ptr<TaskBase> remove(TaskBase& task) noexcept {
+    /// What remove() hands back.
+    struct Removed {
+        /// The strong reference the list held, or null if the task was not linked.
+        /// Returned, not dropped inside remove(), so that the caller releases it
+        /// outside the shard lock.
+        std::shared_ptr<TaskBase> task;
+        /// True if the list was closed when the task was unlinked.
+        bool closed = false;
+    };
+
+    /// @brief Unlinks `task`.
+    [[nodiscard]] Removed remove(TaskBase& task) noexcept {
         Shard& shard = shard_for(task);
         std::lock_guard lock(shard.mutex);
         // owned_self doubles as the "is linked" flag; it is only read or written
         // under this shard's mutex.
-        if (!task.owned_self) return nullptr;
+        if (!task.owned_self) return {nullptr, shard.closed};
         unlink(shard, task);
-        return std::move(task.owned_self);
+        return {std::move(task.owned_self), shard.closed};
+    }
+
+    /// @brief Closes the list and returns a strong reference to every task linked in
+    /// it. The tasks stay linked; each is removed as usual when it finishes.
+    ///
+    /// RACE: an insert() racing with this either links its task before its shard is
+    /// closed, and the task is in the returned vector, or after, and insert() returns
+    /// true. No task is in neither group.
+    [[nodiscard]] std::vector<std::shared_ptr<TaskBase>> close_and_collect() {
+        std::vector<std::shared_ptr<TaskBase>> tasks;
+        for (std::size_t i = 0; i <= m_shard_mask; ++i) {
+            std::lock_guard lock(m_shards[i].mutex);
+            m_shards[i].closed = true;
+            for (TaskBase* task = m_shards[i].head; task; task = task->owned_next)
+                tasks.push_back(task->owned_self);
+        }
+        return tasks;
+    }
+
+    /// @brief True if no task is linked. Locks each shard in turn, so the answer is a
+    /// snapshot only if the caller has stopped tasks from being inserted meanwhile;
+    /// see Runtime::shutdown().
+    [[nodiscard]] bool empty() const {
+        for (std::size_t i = 0; i <= m_shard_mask; ++i) {
+            std::lock_guard lock(m_shards[i].mutex);
+            if (m_shards[i].head) return false;
+        }
+        return true;
     }
 
 private:
     // One cache line per shard, so workers locking neighbouring shards do not
     // false-share.
     struct alignas(64) Shard {
-        std::mutex mutex;
-        TaskBase*  head = nullptr; ///< GUARDED BY mutex.
+        mutable std::mutex mutex;
+        TaskBase*          head   = nullptr; ///< GUARDED BY mutex.
+        bool               closed = false;   ///< GUARDED BY mutex. Set once, never cleared.
     };
 
     static std::size_t shard_count(std::size_t num_workers) {

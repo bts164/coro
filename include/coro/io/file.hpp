@@ -13,7 +13,8 @@ namespace coro {
 template <bool Write, bool Exact, ByteBuffer Buf>
 File::IoFuture<Buf> File::transfer(Buf buf, int64_t offset, const char* what) {
     // The job owns the buffer and a share of the fd. Neither borrows from the caller,
-    // so a dropped future just leaves the job to finish and discard its result.
+    // and the handle is detached, so a dropped future just leaves the job to finish and
+    // discard its result instead of asking it to cancel.
     return spawn_blocking(
         [state = state(what), buf = std::move(buf), offset, what]() mutable
             -> std::pair<std::size_t, Buf> {
@@ -36,7 +37,7 @@ File::IoFuture<Buf> File::transfer(Buf buf, int64_t offset, const char* what) {
                 if constexpr (!Exact) break;
             }
             return {done, std::move(buf)};
-        });
+        }).detach();
 }
 
 template <ByteBuffer Buf>

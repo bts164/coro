@@ -629,13 +629,16 @@ One thread-local is set on each worker at startup:
 
 ### Shutdown
 
-The destructor:
-1. Sets `m_stop = true` inside `m_mutex`
-2. Calls `m_cv.notify_all()` after releasing the lock
-3. Joins all worker threads
+Shutdown has two parts, and `Runtime::shutdown()` runs them in order (see
+[runtime_shutdown.md](runtime_shutdown.md)):
 
-It also unparks the driver if a worker holds it (see the driver handoff above).
-Outstanding tasks in the queues are dropped when their `shared_ptr`s destruct.
+1. `begin_shutdown()` closes the owned set and cancels every task in it, under
+   `m_owned_mutex`. The workers keep running and drain those tasks. A task scheduled
+   after this is born cancelled, and each removal from the closed set reports to the
+   runtime, which is how the thread in `shutdown()` learns that the set is empty.
+2. The destructor, which runs only once no task is left, sets `m_stop = true` inside
+   `m_mutex`, calls `m_cv.notify_all()` after releasing the lock, unparks the driver if
+   a worker holds it (see the driver handoff above), and joins the worker threads.
 
 ### Enqueue routing
 

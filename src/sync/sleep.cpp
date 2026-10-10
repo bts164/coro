@@ -14,6 +14,18 @@ PollResult<void> SleepFuture::poll(detail::Context& cx) {
 
     detail::Weak<detail::Waker> waker = cx.get_weak_waker();
     if (m_runtime) {
+        // Woken by the runtime shutting down, not by the timer: the queue is closed
+        // and nothing will fire. Only reachable when this future is polled by
+        // something the runtime does not own (a thread outside it, a task of another
+        // runtime); the runtime's own tasks have all finished by then.
+        //
+        // Race (handled): the flag is set before the queue wakes its timers, so the
+        // poll that follows that wake sees it. A poll that read it just before goes
+        // on to return pending, and is then woken.
+        if (m_runtime->io_shut_down()) {
+            cancel_timer();   // a stale id by now; just forgets the registration
+            return PollError(Runtime::shut_down_error());
+        }
         // Re-polled before the deadline. Nearly always by the same task, whose timer
         // is still in the queue: nothing to do, and no lock taken.
         if (detail::same_rc(m_waker, waker)) return PollPending;

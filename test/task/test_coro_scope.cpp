@@ -6,11 +6,18 @@
 #include <coro/coro.h>
 #include <coro/task/join_handle.h>
 #include <coro/runtime/runtime.h>
+#include <coro/detail/mutex.h>
+#include "executor_traits.h"
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <utility>
 
 using namespace coro;
 using namespace coro::detail;
+
+namespace {
 
 // coro::NeverFuture<T> (future.h) stays pending forever; it is used to create a
 // TaskImpl that looks pending from the scope's perspective.
@@ -24,13 +31,15 @@ struct NeverStream {
 
 // Helper: make a pending TaskImpl<NeverFuture<int>>. Returns the strong ref (caller
 // acts as the executor's owned map) and the aliased TaskState for completion control.
-static std::pair<std::shared_ptr<TaskBase>, std::shared_ptr<TaskState<int>>>
+std::pair<Rc<TaskBase>, Rc<TaskState<int>>>
 make_pending_int_task() {
-    auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
-    std::shared_ptr<TaskState<int>> state = impl;
-    std::shared_ptr<TaskBase> base = impl;
+    auto impl = make_rc<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
+    Rc<TaskState<int>> state = impl;
+    Rc<TaskBase> base = impl;
     return {std::move(base), std::move(state)};
 }
+
+}  // namespace
 
 // --- CoroutineScope unit tests ---
 
@@ -42,10 +51,10 @@ TEST(CoroutineScopeTest, EmptyScopeHasNoPending) {
 TEST(CoroutineScopeTest, AddCompletedChildShowsNoPending) {
     CoroutineScope scope;
     {
-        auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
+        auto impl = make_rc<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
         impl->setResult(42);
-        scope.add_child(std::weak_ptr<TaskBase>(impl));
-        // impl drops here → weak_ptr expires; has_pending() sweeps expired entries
+        scope.add_child(Weak<TaskBase>(impl));
+        // impl drops here → the weak reference expires; has_pending() sweeps expired entries
     }
     EXPECT_FALSE(scope.has_pending());
 }
@@ -53,7 +62,7 @@ TEST(CoroutineScopeTest, AddCompletedChildShowsNoPending) {
 TEST(CoroutineScopeTest, AddPendingChildShowsPending) {
     CoroutineScope scope;
     auto [base, state] = make_pending_int_task();
-    scope.add_child(std::weak_ptr<TaskBase>(base));
+    scope.add_child(Weak<TaskBase>(base));
     EXPECT_TRUE(scope.has_pending());
     // base kept alive until here — mirrors the executor's owned map
 }
@@ -61,7 +70,7 @@ TEST(CoroutineScopeTest, AddPendingChildShowsPending) {
 TEST(CoroutineScopeTest, PendingChildClearsAfterCompletion) {
     CoroutineScope scope;
     auto [base, state] = make_pending_int_task();
-    scope.add_child(std::weak_ptr<TaskBase>(base));
+    scope.add_child(Weak<TaskBase>(base));
 
     EXPECT_TRUE(scope.has_pending());
     state->setResult(99);
@@ -72,9 +81,9 @@ TEST(CoroutineScopeTest, PendingChildClearsAfterCompletion) {
 
 TEST(CoroutineScopeTest, JoinHandleDropRegistersWithCurrentScope) {
     CoroutineScope scope;
-    auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
-    std::shared_ptr<TaskState<int>> state = impl;
-    std::shared_ptr<TaskBase> base = impl;
+    auto impl = make_rc<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
+    Rc<TaskState<int>> state = impl;
+    Rc<TaskBase> base = impl;
     impl.reset();
 
     {
@@ -82,7 +91,7 @@ TEST(CoroutineScopeTest, JoinHandleDropRegistersWithCurrentScope) {
         // cancelOnDestroy(false) because this task has no owning_executor — the test
         // is checking scope registration only, not cancellation behaviour.
         t_current_coro = &scope;
-        JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        JoinHandle<int> handle(state, Weak<TaskBase>(base));
         handle.cancelOnDestroy(false);
         // destructor fires with t_current_coro set → adds weak_ptr to scope
     }
@@ -94,14 +103,14 @@ TEST(CoroutineScopeTest, JoinHandleDropRegistersWithCurrentScope) {
 
 TEST(CoroutineScopeTest, DetachedJoinHandleDoesNotRegister) {
     CoroutineScope scope;
-    auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
-    std::shared_ptr<TaskState<int>> state = impl;
-    std::shared_ptr<TaskBase> base = impl;
+    auto impl = make_rc<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
+    Rc<TaskState<int>> state = impl;
+    Rc<TaskBase> base = impl;
     impl.reset();
 
     {
         t_current_coro = &scope;
-        JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        JoinHandle<int> handle(state, Weak<TaskBase>(base));
         std::move(handle).detach();  // clears m_state/m_task_ref → destructor returns early
     }
     t_current_coro = nullptr;
@@ -112,16 +121,16 @@ TEST(CoroutineScopeTest, DetachedJoinHandleDoesNotRegister) {
 
 TEST(CoroutineScopeTest, JoinHandleDropWithNullCurrentCoroDoesNotRegister) {
     CoroutineScope scope;
-    auto impl = std::make_shared<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
-    std::shared_ptr<TaskState<int>> state = impl;
-    std::shared_ptr<TaskBase> base = impl;
+    auto impl = make_rc<TaskImpl<NeverFuture<int>>>(NeverFuture<int>{});
+    Rc<TaskState<int>> state = impl;
+    Rc<TaskBase> base = impl;
     impl.reset();
 
     {
         // t_current_coro is null — no scope to register with.
         // cancelOnDestroy(false) because this task has no owning_executor.
         ASSERT_EQ(t_current_coro, nullptr);
-        JoinHandle<int> handle(state, std::weak_ptr<TaskBase>(base));
+        JoinHandle<int> handle(state, Weak<TaskBase>(base));
         handle.cancelOnDestroy(false);
         // destructor: t_current_coro null → add_child not called
     }
@@ -141,7 +150,7 @@ TEST(TaskStateTest, MarkDoneFiresScopeWaker) {
         }
     };
 
-    auto state = std::make_shared<TaskState<int>>();
+    auto state = make_rc<TaskState<int>>();
     auto waker = make_rc<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
@@ -163,7 +172,7 @@ TEST(StreamTaskStateTest, MarkDoneFiresScopeWaker) {
         }
     };
 
-    auto state = std::make_shared<StreamTaskState<int>>(4);
+    auto state = make_rc<StreamTaskState<int>>(4);
     auto waker = make_rc<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
@@ -184,7 +193,7 @@ TEST(TaskStateTest, SetResultMarksDoneAndFiresScopeWaker) {
         }
     };
 
-    auto state = std::make_shared<TaskState<int>>();
+    auto state = make_rc<TaskState<int>>();
     auto waker = make_rc<TestWaker>();
     {
         std::lock_guard lock(state->mutex);
@@ -214,6 +223,8 @@ TEST(CoroScopeTest, CancelledCoroReturnsPollDropped) {
 }
 
 // --- Runtime integration: implicit scope drain ---
+
+namespace {
 
 // A future that completes immediately on the first poll, writing to a shared counter.
 struct WritingFuture {
@@ -255,7 +266,9 @@ private:
 class EventFuture
 {
     struct SharedState {
-        std::mutex m_mutex;
+        // detail::Mutex: std::mutex on the desktop, a no-op on the Pico build, which
+        // has no std::mutex and only the one thread.
+        detail::Mutex m_mutex;
         bool m_set = false;
         // weak_ptr, not shared_ptr: a leaf future must not hold a strong waker
         // across a suspension point (doc/design/task_ownership.md, Category 4) —
@@ -300,8 +313,10 @@ EventFuture rootEvent;
 EventFuture outerEvent;
 EventFuture innerEvent;
 
+}  // namespace
+
 TEST(CoroutineScopeIntegration, ScopeLifetimeSequence) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     rt.block_on([]() -> coro::Coro<void> {
         MarkExitSequence local(&scopeSequenceLocalRoot);
         auto handle = coro::spawn([](MarkExitSequence) -> coro::Coro<void> {
@@ -327,18 +342,20 @@ TEST(CoroutineScopeIntegration, ScopeLifetimeSequence) {
 }
 
 TEST(CoroutineScopeIntegration, CoroutineWaitsForDroppedChildBeforeCompleting) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto shared = std::make_shared<int>(0);
     rt.block_on(spawns_and_returns(shared, false));
     EXPECT_EQ(*shared, 42);
 }
 
 TEST(CoroutineScopeIntegration, CoroutineCancelsDroppedChildBeforeCompleting) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto shared = std::make_shared<int>(0);
     rt.block_on(spawns_and_returns(shared, true));
     EXPECT_EQ(*shared, 0);
 }
+
+namespace {
 
 // A future that completes immediately on the first poll, adding to a shared counter.
 struct AddingFuture {
@@ -356,8 +373,10 @@ Coro<void> spawns_multiple(std::shared_ptr<int> counter) {
     co_return;
 }
 
+}  // namespace
+
 TEST(CoroutineScopeIntegration, CoroutineWaitsForAllDroppedChildren) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto counter = std::make_shared<int>(0);
     // Each WritingFuture overwrites counter; last one to run wins.
     // We just verify all three ran (counter was touched), not the final value.
@@ -365,6 +384,8 @@ TEST(CoroutineScopeIntegration, CoroutineWaitsForAllDroppedChildren) {
     // All three children ran; counter was written at least once.
     EXPECT_EQ(*counter, 6);
 }
+
+namespace {
 
 // JoinHandle dropped inside a nested scope (child coroutine) — registers with the
 // child's scope, not the parent's.
@@ -388,8 +409,10 @@ Coro<void> inner_with_scope_child(std::shared_ptr<std::atomic<int>> counter,
     co_await blocker;
 }
 
+}  // namespace
+
 TEST(CoroutineScopeIntegration, NestedCoroutineDrainsItsOwnChildren) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto shared = std::make_shared<int>(0);
     rt.block_on(outer_calls_inner(shared));
     EXPECT_EQ(*shared, 99);
@@ -413,7 +436,7 @@ TEST(CoroutineScopeIntegration, NestedCoroutineDrainsItsOwnChildren) {
 // JoinHandle is destroyed.  Without a waker clone the wake() call is a no-op and
 // the scope drain would deadlock.
 TEST(CoroutineScopeIntegration, SleepingTaskWakesOnCancel) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto counter = std::make_shared<std::atomic<int>>(0);
     EventFuture started;
     EventFuture blocker; // never set
@@ -443,7 +466,7 @@ TEST(CoroutineScopeIntegration, ThreeLevelCooperativeCancelOrdering) {
     EventFuture innerBlocker; // never set
     EventFuture innerStarted;
 
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     rt.block_on([](std::atomic_int64_t* seqA, std::atomic_int64_t* seqB,
                    EventFuture innerBlocker, EventFuture innerStarted) -> Coro<void> {
         auto handle = spawn([](std::atomic_int64_t* seqA, std::atomic_int64_t* seqB,
@@ -470,7 +493,7 @@ TEST(CoroutineScopeIntegration, ThreeLevelCooperativeCancelOrdering) {
 // Test 3: When a coroutine is cancelled it must complete BOTH the cooperative
 // cancel of a co_awaited child AND the scope drain of a fire-and-forget child.
 TEST(CoroutineScopeIntegration, CooperativeCancelWithScopeDrain) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto coopCounter  = std::make_shared<std::atomic<int>>(0);
     auto scopeCounter = std::make_shared<std::atomic<int>>(0);
     EventFuture coopBlocker; // never set — blocks the co_awaited child
@@ -511,7 +534,7 @@ TEST(CoroutineScopeIntegration, CooperativeCancelWithScopeDrain) {
 // Test 4: A task whose JoinHandle is dropped (cancelled) before the executor
 // ever polls it must not execute its body and must not hang.
 TEST(CoroutineScopeIntegration, TaskCancelledBeforeFirstPoll) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto counter = std::make_shared<std::atomic<int>>(0);
 
     rt.block_on([](std::shared_ptr<std::atomic<int>> counter) -> Coro<void> {
@@ -532,7 +555,7 @@ TEST(CoroutineScopeIntegration, TaskCancelledBeforeFirstPoll) {
 // Test 5: A child spawned with cancelOnDestroy=false inside a cancelled parent
 // must run to completion via scope drain, not be cancelled with the parent.
 TEST(CoroutineScopeIntegration, NoCancelChildWithCancelOnDestroyFalse) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto counter = std::make_shared<std::atomic<int>>(0);
     EventFuture parentBlocker; // never set
     EventFuture parentStarted;
@@ -564,7 +587,7 @@ TEST(CoroutineScopeIntegration, NoCancelChildWithCancelOnDestroyFalse) {
 // the scope drain if incorrectly registered.  Reaching the SUCCEED() proves
 // the scope drained without waiting for the detached task.
 TEST(CoroutineScopeIntegration, DetachedTaskNotRegisteredInScope) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     EventFuture neverSet; // never set — would cause infinite scope drain if registered
 
     rt.block_on([](EventFuture neverSet) -> Coro<void> {
@@ -584,7 +607,7 @@ TEST(CoroutineScopeIntegration, DetachedTaskNotRegisteredInScope) {
 // that makes transfer_to unnecessary: a co_awaited inner Coro is always fully drained
 // via the cancel protocol before the outer frame is torn down.
 TEST(CoroutineScopeIntegration, CancelledOuterDrainsInnerCoroScopeChildren) {
-    Runtime rt(1);
+    SingleThreadRuntime rt;
     auto counter = std::make_shared<std::atomic<int>>(0);
     EventFuture started;
     EventFuture blocker; // never set

@@ -13,11 +13,20 @@
 
 #ifdef CORO_PICO
 
+// PicoNetwork::None: these tests never call cyw43_arch_init(), and on real
+// hardware the runtime must not then call cyw43_arch_poll() (see runtime.h). The
+// socket tests use NetRuntime (net_runtime.h) instead.
 struct CurrentThreadTraits {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::None};
 };
 
 using AllExecutors = testing::Types<CurrentThreadTraits>;
+
+// A single-threaded runtime for the tests that are not parameterised over the
+// executors. One name for both builds, since the constructors differ.
+struct SingleThreadRuntime : coro::Runtime {
+    SingleThreadRuntime() : coro::Runtime(coro::PicoNetwork::None) {}
+};
 
 #else  // --- desktop: all three executors ---
 
@@ -40,5 +49,11 @@ using AllExecutors = testing::Types<
     CurrentThreadTraits,
     WorkStealingTraits,
     WorkSharingTraits>;
+
+// A single-threaded runtime for the tests that are not parameterised over the
+// executors. One name for both builds, since the constructors differ.
+struct SingleThreadRuntime : coro::Runtime {
+    SingleThreadRuntime() : coro::Runtime(std::size_t{1}) {}
+};
 
 #endif  // CORO_PICO
