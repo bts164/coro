@@ -1,27 +1,24 @@
 # Versioning and Releases
 
-coro follows [Semantic Versioning](https://semver.org). Released versions are annotated
-git tags on `master` in the form `vX.Y.Z`, and there are no separate, persistent release
-branches. (Release-candidate tags are the one exception to the "on `master`" part — see
-[Cutting a release](#cutting-a-release) below.)
+coro follows [Semantic Versioning](https://semver.org). A released version is an annotated
+git tag of the form `vX.Y.Z`, and a release candidate is one of the form `vX.Y.Z-rc.N`.
+There are no separate, persistent release branches.
 
-A final `vX.Y.Z` release tag is a *record* that a release happened, not the trigger that
-starts one: it's created by a manually dispatched release workflow only after that
-workflow's build and test steps succeed, and it's pushed at the exact commit that was
-built and tested — never pushed up front and built against afterward. This means a
-final release tag that exists always corresponds to something that was actually
-validated, and a failed or aborted release attempt never burns a version number or
-leaves a tag with no build behind it. Release-candidate tags are unaffected by this and
-stay simple, ordinary git tags — see [Cutting a release](#cutting-a-release) below for
-why that distinction holds and how rc and final tags fit together.
+A release tag records that a release happened; it does not start one. Both kinds of tag
+are created by a manually dispatched release workflow, after its build and tests pass, at
+the commit it tested. A tag that exists therefore always marks a commit that passed, and
+a failed attempt leaves no tag and uses up no version number. See
+[Cutting a release](#cutting-a-release).
 
-The Conan recipe derives its version directly from git via `set_version()` rather than a
-hand-maintained version string:
+What a release publishes is source. The GitHub release for a tag carries the source
+archive of that commit, with the version recorded inside it. It builds with Conan or
+without, and needs no git history. See [Source archives](#source-archives) and
+[Non-Conan builds](#non-conan-builds).
 
-- On an exact `vX.Y.Z` release tag, the package version is the clean `X.Y.Z`.
-- On an exact `vX.Y.Z-rc.N` release-candidate tag — which can be cut on any branch, not
-  just `master`, to get a testable build before merging — the package version is the
-  clean `X.Y.Z-rc.N`. See [Cutting a release](#cutting-a-release) below.
+The version is derived from git, not from a hand-maintained string:
+
+- On an exact `vX.Y.Z` release tag, the version is the clean `X.Y.Z`.
+- On an exact `vX.Y.Z-rc.N` release-candidate tag, the version is the clean `X.Y.Z-rc.N`.
 - On any other commit — on any branch — the version is a SemVer
   [prerelease](https://semver.org/#spec-item-9) identifier derived from `git describe`:
   the next unreleased version (patch-bumped by default; see
@@ -31,7 +28,10 @@ hand-maintained version string:
   [How the version is derived on non-tagged commits](#how-the-version-is-derived-on-non-tagged-commits)
   for the exact format in each case.
 
-This means every commit — on `master` or any other branch — is a valid, individually
+The same string is the Conan package version and the `CORO_VERSION` compiled into the
+library, so a version seen anywhere names the commit it was built from.
+
+This means every commit — on `main` or any other branch — is a valid, individually
 addressable Conan package; there is no separate "nightly" or "bleeding edge" branch to
 maintain. Consumers who reference an exact version (`coro/X.Y.Z-dev.N+gSHA`) can always
 pull a specific prerelease build. Consumers who use a
@@ -71,15 +71,26 @@ and behaving the same — not binary interchangeability. A patch release may sti
 header-visible implementation details; only changes to the observable API surface
 (signatures, semantics) warrant a minor or major bump.
 
-Consumers who link coro as a shared library (`coro`'s default) never get a stale cached
-binary across a patch bump silently: the `coro` recipe sets
-`package_id_non_embed_mode = "patch_mode"`, so any version change — patch included —
-changes the `package_id` of anything depending on it and forces a rebuild. (This is
-distinct from Conan's global default of `minor_mode` for this scenario, which would
-otherwise treat patch bumps as binary-compatible and skip the rebuild — see
+Conan therefore rebuilds a consumer whenever the coro it requires changes at all. The
+`coro` recipe sets `package_id_non_embed_mode = "full_mode"`, which puts coro's whole
+version, its recipe revision and its own `package_id` into the `package_id` of anything
+that requires it. A change to any of them makes the consumer's existing binary a
+different package, so Conan builds it again and does not reuse the old one.
+
+This setting covers two kinds of consumer: one that links coro as a shared library
+(`coro`'s default), and a static library that requires a static coro, which is every
+library on a Pico. An executable or shared library that links coro statically gets the
+same treatment from Conan's own default for embedded dependencies, which is also
+`full_mode`. See
 [`package_id_embed_mode` / `package_id_non_embed_mode`](https://docs.conan.io/2/reference/conanfile/attributes.html#package-id-embed-non-embed-python-unknown-mode-build-mode).
-Consumers that embed coro statically or header-only already get this via Conan's
-`full_mode` default for embedded dependencies.)
+
+!!! warning "WARNING: the mode must compare the whole version"
+    Conan's default for this case, `minor_mode`, and the stricter `patch_mode` both
+    compare only the numeric part of the version. Every commit between two releases has
+    the same numeric part: the commits differ only in the `-dev.N+gSHA` suffix (see
+    below). Under either mode a consumer built before such a commit is reused against
+    the coro built after it. If that commit changed inline code in a header, the link
+    fails with undefined references to coro symbols, or succeeds and misbehaves.
 
 ## How the version is derived on non-tagged commits
 
@@ -109,7 +120,7 @@ automatically from git history via the recipe's `set_version()`, using
 - If the working tree has uncommitted changes, `.dirty` is appended to the identifier
   so two different uncommitted edits never collide on the same version string — this
   matters most for editable-mode local development, where an unchanged version despite
-  changed headers would defeat `package_id_non_embed_mode = "patch_mode"` above.
+  changed headers would defeat `package_id_non_embed_mode = "full_mode"` above.
 - If a branch name can be resolved (see
   [Metadata: branch name and dirty state](#metadata-branch-name-and-dirty-state) below),
   it's appended to the build-metadata component (the part after `+`) of either format
@@ -122,11 +133,13 @@ branches need no special-casing: branching from `v0.1.5`, committing a fix, and 
 `v0.1.6` there computes correctly even if a newer `v0.2.0` already exists elsewhere —
 it's simply not an ancestor of that branch.
 
-This does mean `set_version()` requires: (a) at least one reachable tag to exist at all
-(a one-time bootstrap requirement — the very first tag has to be created manually), and
-(b) enough git history to actually be present — a shallow clone (the default in many CI
-checkout actions, and possible locally too) can leave no tag reachable at all, in which
-case `set_version()` fails loudly rather than guessing a fallback version.
+This does mean `set_version()` requires, in a git checkout: (a) at least one reachable
+tag to exist at all (a one-time bootstrap requirement — the very first tag has to be
+created manually), and (b) enough git history to actually be present — a shallow clone
+(the default in many CI checkout actions, and possible locally too) can leave no tag
+reachable at all, in which case `set_version()` fails loudly rather than guessing a
+fallback version. A [source archive](#source-archives) needs neither: the result of
+`git describe` is already written into it.
 
 Conan also re-evaluates the recipe later against its own cache-exported copy (e.g. when a
 consumer resolves `coro/<version>` from the cache), which never has `.git` —
@@ -203,207 +216,225 @@ diagnostic/informational and never affects version precedence or Conan resolutio
 Exact tags (`vX.Y.Z` and `vX.Y.Z-rc.N`) never carry this metadata — a named, tagged
 checkpoint doesn't need it, the tag itself is the identifying information.
 
-## Cutting a release
+## Source archives
 
-Coro's release process has two steps: cut one or more release candidates against the
-commit you want to validate, then promote whichever candidate passes testing to the
-final release. Both steps produce a tag, but only the final one is created by CI — the
-release workflow, not a person, decides when a final tag is ready to exist.
+A source archive is what `git archive` produces, and what GitHub generates for every tag
+and release ("Source code (tar.gz)"). It has no `.git`, so nothing in it can ask git for
+the version. git records the version while it makes the archive:
 
-### Step 1: cut a release candidate
+- `.git_archival.txt` holds two placeholders. `.gitattributes` marks the file
+  `export-subst`, which makes git replace them, in an archive only, with the
+  `git describe` result and the full commit hash.
+- `conan_version.py` and `cmake/CoroVersion.cmake` read the `describe` line and derive the
+  version from it by the rules above.
 
-A release-candidate tag names a specific, already-CI-passing commit as a checkpoint
-worth testing more broadly — by hand, on real hardware, or by a consumer trying it out
-ahead of the real release. This step has no build/dispatch ceremony of its own; the
-commit already went through coro's normal CI to land where it is, so cutting the tag
-*is* the entire action:
-
-```bash
-git tag v1.2.3-rc.1
-git push origin v1.2.3-rc.1
-```
-
-- The commit can be on any branch, not just `master` — this is what makes it possible to
-  get a testable, pinnable build (`coro/1.2.3-rc.1`) out to a consumer before the branch
-  even merges.
-- Pick the target `X.Y.Z` the way you'd pick any release's version — based on what
-  actually changed since the last release (see
-  [Pre-1.0](#pre-10-minorpatch-discipline-is-relaxed-for-api-additions) and
-  [No ABI stability](#no-abi-stability-across-releases-including-patches) above for how
-  to judge that).
-- The rc's own tag never carries branch/dirty metadata — an exact tag is already a named
-  checkpoint, so there's nothing left for that metadata to add (see
-  [Metadata](#metadata-branch-name-and-dirty-state) above).
-- If testing turns up a problem, fix it on the same branch and cut `v1.2.3-rc.2` against
-  the new commit. There's no limit on how many candidates a release goes through, and no
-  cost to a candidate that doesn't pan out — unlike the final release below, nothing was
-  ever gated on this tag succeeding.
-
-### Step 2: promote a candidate to the final release
-
-Once a candidate has been tested enough to trust, promote it by manually dispatching the
-release workflow and giving it that candidate's tag (e.g. `v1.2.3-rc.2`) as input. The
-workflow checks out that exact commit, re-runs the build and test steps against it, and —
-only if they succeed — creates and pushes the final `vX.Y.Z` tag at that **same commit**:
+In an archive the file reads, for example:
 
 ```text
-1. Confirm v1.2.3-rc.2 is the candidate you want to ship (the latest one for this
-   release — see the note below on why it must be the latest).
-2. From the Actions tab, run the release workflow, providing v1.2.3-rc.2 as input.
-3. The workflow rebuilds and retests that exact commit.
-4. On success, it tags and pushes v1.2.3 at the rc.2 commit, and publishes the
-   GitHub Release (see "Embedding the version in the built binary" and
-   "Non-Conan builds" below for what that release carries).
-5. If the workflow fails, nothing is tagged — fix the problem, cut a new
-   candidate (v1.2.3-rc.3), and retry from step 1.
+describe: v0.1.1-29-ge6f8db2
+commit: e6f8db21f6801e4f275f003fe7120722a4485e4a
 ```
 
-Pinning the final tag to the rc's own commit — rather than to whatever the branch tip
-has moved on to by promotion time — is what makes "tested as a candidate" and "released
-as final" mean the *same* source, byte for byte: nothing new is compiled in between, so
-promotion is a stamp of approval on something already validated, not a rebuild of
-something merely similar to it. This is also why a release should always be promoted
-from its *most recent* rc: going back and promoting an older, superseded candidate would
-silently discard whatever changes later candidates picked up, and isn't a case this
-workflow is meant to support.
+In a git checkout it still holds the unexpanded placeholders, and is ignored.
 
-The existing exact-tag handling in `set_version()` (described above) picks up both the
-rc and final tags automatically, with no rc/final-specific logic of its own — as far as
-version derivation is concerned, an rc tag and a final tag are just two shapes of "exact
-tag."
+An archive differs from a checkout of the same commit in three ways:
 
-Ordinary commits on the branch between rc tags still get a version automatically — see
-[How the version is derived on non-tagged commits](#how-the-version-is-derived-on-non-tagged-commits)
-above for the `X.Y.Z-rc.N.dev.M+gSHA` case.
+- **No branch name and never `.dirty`.** An archive is of a commit, so the version above
+  is `0.1.2-dev.29+ge6f8db2`, with nothing after the hash.
+- **Repository-only files are left out.** `.gitattributes` marks `.github`, `.gitignore`
+  and itself `export-ignore`.
+- **A commit with two tags reports the final one.** Promoting a candidate puts `vX.Y.Z`
+  on the commit that already has `vX.Y.Z-rc.N`, and git names the newer annotated tag. A
+  candidate's archive downloaded after the promotion therefore carries the final
+  version. It is the same source.
+
+To make one locally:
+
+```bash
+mkdir /tmp/coro_src
+git archive HEAD | tar -x -C /tmp/coro_src
+```
+
+`git archive` packs a commit, not the working tree: uncommitted changes are not in it.
+
+## Where the version comes from
+
+The Conan recipes (`conanfile.py` and `test/conanfile.py`, through `conan_version.py`)
+take the version from the first of these that applies:
+
+| Order | Source | Applies to |
+|---|---|---|
+| 1 | `--version=` on the Conan command line | That command |
+| 2 | `.git_archival.txt` | A source archive |
+| 3 | `CORO_VERSION_OVERRIDE` in the environment | Every checkout the shell touches |
+| 4 | `.coro_version_override` in the repository root | That checkout |
+| 5 | `scm_version` in the exported `conandata.yml` | The recipe's copy in the Conan cache |
+| 6 | `git describe` | A git checkout |
+
+An archive's stamp comes before the two overrides because an archive knows its own
+version: an override left set for some other checkout must not replace it. The overrides
+are for editable mode; see
+[Developing against an unreleased coro](#developing-against-an-unreleased-coro).
+
+A build that Conan is not driving takes it from `-DCORO_VERSION=<version>`, then
+`.git_archival.txt`, then `git describe`, and reports `unknown` when none is available.
+See [Non-Conan builds](#non-conan-builds).
+
+!!! warning "WARNING: two implementations of one rule"
+    `cmake/CoroVersion.cmake` repeats the derivation in `conan_version.py`, so that both
+    kinds of build print the same string for the same source. A change to one must be
+    made in the other.
+
+## Cutting a release
+
+A release is cut by dispatching the release workflow by hand. The workflow releases
+**the commit it is dispatched on**: it builds and tests that commit, and only if that
+passes does it create the tag there and publish the GitHub release. If it fails, nothing
+is tagged.
+
+The workflow is `.github/workflows/release.yml`.
+
+It takes two inputs, the kind of release (`rc` or `final`) and the target version
+(`X.Y.Z`), and GitHub lets a workflow be dispatched from a branch or from a tag. That
+gives three ways to use it:
+
+| To cut | Dispatch from | Kind | Result on success |
+|---|---|---|---|
+| A release candidate | A branch | `rc` | Tags `vX.Y.Z-rc.N`, publishes a GitHub pre-release |
+| A final release, promoting a candidate | The tag `vX.Y.Z-rc.N` | `final` | Tags `vX.Y.Z` at the same commit, publishes the release |
+| A final release, with no candidate | A branch | `final` | Tags `vX.Y.Z`, publishes the release |
+
+In every case:
+
+- The tests run with the version the tag will give, so what is tested reports the same
+  version as what is released.
+- The tag is annotated.
+- The GitHub release carries the source archive of the tagged commit (see
+  [Source archives](#source-archives)). No binaries are published.
+
+Pick the target `X.Y.Z` by what changed since the last release; see
+[Pre-1.0](#pre-10-minorpatch-discipline-is-relaxed-for-api-additions) and
+[No ABI stability](#no-abi-stability-across-releases-including-patches).
+
+Before it runs any test, the workflow checks the request and stops if:
+
+- the version is not of the form `X.Y.Z`;
+- `vX.Y.Z` already exists;
+- the version is not the next patch, minor or major version after the latest release
+  reachable from the commit (after `v0.1.1`, only `0.1.2`, `0.2.0` and `1.0.0`);
+- for a final release, the version has candidates and the commit is not the latest one
+  (see [Final releases](#final-releases)).
+
+It does not check the branch.
+
+To try the workflow without releasing anything, set its `dry_run` input: the checks and
+the tests run, and no tag or release is created.
+
+### Release candidates
+
+A candidate is a checkpoint worth testing more widely than CI does: by hand, on real
+hardware, or by a consumer trying `coro/1.2.3-rc.1` ahead of the release.
+
+- The workflow picks `N`: one more than the highest existing `vX.Y.Z-rc.N`, or 1.
+- The branch need not be `main`. A candidate can be cut before its branch merges.
+- If testing finds a problem, fix it on the same branch and cut another candidate. There
+  is no limit on how many a release goes through.
+
+Commits after a candidate get `X.Y.Z-rc.N.dev.M+gSHA`; see
+[How the version is derived on non-tagged commits](#how-the-version-is-derived-on-non-tagged-commits).
+
+### Final releases
+
+Promoting a candidate tags `vX.Y.Z` on the candidate's own commit. Nothing new is
+compiled between "tested as a candidate" and "released": they are the same source.
+
+A candidate is optional. For a change that needs no wider testing, dispatch a `final`
+release straight from the branch.
+
+One rule ties the two together: if any `vX.Y.Z-rc.N` tag exists, a final `vX.Y.Z` must
+be cut on the commit that the latest of them names, and the workflow refuses any other.
+So a branch that has moved past its latest candidate cannot be released as it stands:
+cut another candidate, or dispatch from the candidate's tag. An older, superseded
+candidate cannot be promoted either.
+
+!!! note "NOTE: the dispatched commit must contain the workflow"
+    GitHub runs a dispatched workflow as it exists on the ref it is dispatched from. A
+    commit older than the release workflow cannot be released this way.
+
+!!! warning "WARNING: nothing restricts a final release to `main`"
+    Backport branches need to release, and a candidate may be cut before its branch
+    merges, so the workflow does not check the branch. Releasing from an unmerged feature
+    branch is not prevented.
 
 ## Developing against an unreleased coro
 
-For day-to-day development on a consumer alongside coro itself, the simplest and
-recommended approach is [editable mode](https://docs.conan.io/2/tutorial/developing_packages/editable_packages.html):
+For day-to-day development on a consumer alongside coro itself, use
+[editable mode](https://docs.conan.io/2/tutorial/developing_packages/editable_packages.html)
+with a fixed version:
 
 ```bash
-cd coro && conan editable add .
-```
-
-By default, this registers the editable package under whatever version `set_version()`
-currently computes for your working tree — the same prerelease derivation described
-above, `.dirty` included, since it still runs `git describe` against the real checkout.
-That's a problem: if the consumer requires coro via a version range (e.g.
-`coro/[>=1.0.0]`), Conan silently skips the editable package for that requirement —
-prereleases are excluded from range resolution by default, and the auto-derived dev
-version is always a prerelease. Without further configuration, Conan resolves the range
-against a cached or remote release instead, and your local edits are never built at all,
-with no error to flag that this happened. A consumer that pins coro to an exact version
-has the same problem unless that exact string happens to match the editable package's
-current derived version, which changes on every commit and any uncommitted edit — not a
-realistic thing to keep pinned to.
-
-**Recommended: register the package under an explicit version instead of the auto-derived
-one**, one patch ahead of whatever's actually published, with some build-metadata suffix
-appended to mark it as a dev build:
-
-```bash
-conan editable add . --version=0.1.3+dev   # if 0.1.2 is the latest real release
-```
-
-`+dev` here is just an example — the metadata string itself is arbitrary and doesn't matter
-to Conan at all (`+local`, `+abc123`, `+yourname` all work identically); the only thing that
-matters is that *some* metadata suffix is present, so the version doesn't read as a genuine
-release string (see the `+dev` discussion further below for why that distinction is worth
-keeping).
-
-This works because Conan pre-populates `self.version` with an explicit CLI-supplied version
-before calling `set_version()` — the recipe still has to defer to it explicitly, though:
-`derive_coro_version()` checks `conanfile.version is not None` first and returns it as-is
-before ever reaching the `git describe` logic. Build
-metadata (the part after `+`) also never affects SemVer precedence or Conan's version
-comparison, so `0.1.3+dev` is exactly as eligible for range resolution as a plain `0.1.3`
-would be — nothing about it looks like a prerelease. Conan picks the highest version
-satisfying a range among everything visible (editable + cache + remotes), so being one
-patch ahead guarantees this package wins over the real `0.1.2` for any `coro/[>=...]`-style
-requirement, with zero configuration needed on the consumer side — no `resolve_prereleases`,
-no lockfile changes, nothing. Removing the override (`conan editable remove .`, or simply
-not re-running `export`/`create` again) leaves only the real `0.1.2` to satisfy the range,
-and resolution falls back to it automatically.
-
-The same explicit-version override works identically outside editable mode, for
-`conan export` and `conan create`:
-
-```bash
-conan create . --version=0.1.3+dev
-```
-
-The difference is what it's pointing at: `conan editable add` registers a live pointer to
-your working tree, so every subsequent build picks up whatever you currently have on disk;
-`conan export`/`conan create` copies the source into the cache at that moment, a snapshot —
-new local edits aren't reflected until you re-run one of them, presumably bumping the
-version again (`0.1.4+dev`) each time. Use editable mode for the usual day-to-day
-inner loop; reach for `export`/`create` when you specifically want a real, buildable cache
-entry under a synthetic dev version — e.g. to hand a colleague a pinnable reference, or to
-test against what a consumer's build will actually resolve without a local coro checkout.
-
-Passing `--version=` on every command gets old fast once you're also building the test suite
-or examples against the same override — each of those is a separate Conan invocation with its
-own command line to remember. Set `CORO_VERSION_OVERRIDE` in the environment instead and every
-recipe in this repo (`conanfile.py` and `test/conanfile.py` both call `derive_coro_version()`)
-picks it up automatically, with no `--version=` needed anywhere:
-
-```bash
-export CORO_VERSION_OVERRIDE=0.1.3+dev
+cd coro
+echo "0.1.3+dev" > .coro_version_override   # if 0.1.2 is the latest real release
 conan editable add .
-cd test && conan install . --build=missing && conan build .
 ```
 
-It takes effect at exactly the same point the CLI override would — just below it in
-precedence, so an explicit `--version=` on a given command still wins if both are set.
+`.coro_version_override` is gitignored, holds one line, and applies to this checkout
+only. Every recipe in the repository reads it (`conanfile.py` and `test/conanfile.py`
+both call `derive_coro_version()`), so the library, its tests and a consumer all agree on
+the version with no `--version=` on any command. Conan prints a warning naming the file
+whenever it is in effect.
 
-The `+dev` suffix isn't load-bearing for any of that — it's purely a readability safeguard.
-Without it, a build registered as plain `coro/0.1.3` is indistinguishable from an eventual
-real `0.1.3` release if it ever ends up installed somewhere it shouldn't (a machine you
-forgot had editable mode on, a cache entry someone copied around) — nothing about the
-version string itself would tell you it wasn't the genuine release. `+dev` costs nothing
-and closes that gap.
+The fixed version is needed for two reasons:
+
+- **Conan identifies an editable package by its exact version.** The derived version
+  changes on every commit and on every uncommitted edit, and each change orphans the
+  registration until the old version is removed and the new one added.
+- **The derived version is a prerelease.** A consumer that requires coro by a version
+  range (e.g. `coro/[>=1.0.0]`) skips it, because Conan leaves prereleases out of range
+  resolution by default. It resolves a cached or remote release instead, and the local
+  edits are never built, with no error.
+
+`0.1.3+dev` avoids both. It is one patch ahead of the latest release, so it wins range
+resolution over that release. The `+dev` part is build metadata: Conan ignores it when
+comparing versions, so the version is as eligible for a range as a plain `0.1.3`. The
+text after `+` is arbitrary. It is there so that the version cannot be mistaken for the
+real `0.1.3` if the build ends up somewhere it should not.
 
 !!! warning "WARNING: keep the number ahead of whatever actually ships"
-    If `0.1.3` is later tagged for real while you're still mid-development, your override
-    needs to move to `0.1.4+dev` (or later) or it stops winning range resolution against
-    the new real release. This is manual upkeep, not something enforced — there's no error
-    if you forget, just a silent fall-back to the newly-published version the next time you
-    resolve.
+    If `0.1.3` is later released while you are still developing, move the override to
+    `0.1.4+dev`. Otherwise it stops winning range resolution against the new release.
+    Nothing reports this: the next resolve silently takes the published version.
 
-### Making every auto-derived build resolvable, without a manual override
+!!! note "NOTE: the override hides which commit a build came from"
+    With an override in effect the version no longer names a commit or shows `.dirty`.
+    That is the price of a version that stays put. Remove the file to get the derived
+    version back.
 
-The override above requires remembering to bump it by hand. `CORO_VERSION_DEV_AS_METADATA`
-gets the same range-resolvability out of the ordinary, no-override, `git describe`-derived
-dev version, automatically, for every commit:
+### Other ways to set the version
 
-```bash
-export CORO_VERSION_DEV_AS_METADATA=1
-```
+- **`CORO_VERSION_OVERRIDE` in the environment** does the same as the file, for every
+  checkout the shell touches. It suits CI. In a shell profile or `.envrc` it also applies
+  to checkouts it was not meant for, which is why the file is preferred for development.
+  It takes precedence over the file.
+- **`--version=` on a Conan command** overrides everything, for that command. Use it for
+  a one-off snapshot in the cache, for example to hand someone a pinnable reference:
 
-Normally, an auto-derived dev version puts the commit count in the *prerelease* part and the
-commit sha in *build metadata* — `0.1.3-dev.5+g1a2b3c4`, say. The `-dev.5` there is what makes
-it a prerelease, and thus excluded from range resolution by default (see below). With this
-env var set, `derive_coro_version()` moves that same information entirely into build metadata
-instead: `0.1.3+dev.5.g1a2b3c4`. Same coordinates — you can still tell at a glance which commit
-and how many commits past the last tag a given build came from — but now there's no prerelease
-part at all, so the version resolves against ranges exactly like a real `0.1.3` would, with no
-override, no `resolve_prereleases`, nothing to remember to bump.
+    ```bash
+    conan create . --version=0.1.3+dev
+    ```
 
-The tradeoff is exactly the one this section has been managing throughout: every commit's dev
-build now silently satisfies a range as if it *were* the pending `0.1.3` release, whether or
-not it actually behaves like one. That's fine for your own local inner loop where you know
-what you're building against, which is why this is opt-in rather than the default — flip it
-on in your own shell/`.envrc`, not in a shared CI profile where a consumer might resolve a
-half-finished commit's build without realizing it isn't the tagged release.
+    Unlike an editable package, this copies the source as it is now. Later edits are not
+    reflected until it is run again.
 
-This only helps consumers using a version range, though — a consumer pinning an *exact*
-coro version still needs that exact string to match, same as the auto-derived case above.
-For that case, or for CI, or for any consumer without a local coro checkout to point at,
-fall back to enabling prereleases directly instead:
+A source archive ignores both overrides and honours only `--version=`; see
+[Where the version comes from](#where-the-version-comes-from).
 
-To opt in without editing any recipe, set the `core.version_ranges:resolve_prereleases`
-conf, either directly on the command line:
+### Consuming a derived prerelease version
+
+A consumer without a local checkout, or CI, can use a derived version directly. Pinned
+exactly (`coro/0.1.3-dev.5+g1a2b3c4`), it needs nothing more. To let a version range
+match prereleases, set the `core.version_ranges:resolve_prereleases` conf, either on the
+command line:
 
 ```bash
 conan install . -c core.version_ranges:resolve_prereleases=True
@@ -421,48 +452,71 @@ core.version_ranges:resolve_prereleases=True
 conan install . -pr default -pr allow-prereleases
 ```
 
-This conf is global — it affects prerelease resolution for every version range in the
-graph, not just coro's — but since it only changes behavior for packages that actually
-have prerelease versions available, it has no effect on dependencies that never publish
-one. (A [lockfile](https://docs.conan.io/2/tutorial/versioning/lockfiles.html)-based
-partial override can scope this to coro specifically if that global effect is ever a
-problem, but the synthetic-version approach above already covers the common case well
-enough that this is rarely worth reaching for.)
+This conf is global: it affects every version range in the graph, not only coro's. It
+changes nothing for a dependency that publishes no prerelease versions.
 
 ## Embedding the version in the built binary
 
-The version is also made available to the C++ build itself (e.g. for a `--version`
-output), but not via a required Conan-only CLI flag — the root `CMakeLists.txt` stays
-agnostic to whether `find_package()` is resolving dependencies through Conan, system
-packages, or anything else, and that same policy extends to the version. The conanfile's
-`generate()` passes `self.version` through as the `CORO_VERSION` cache variable;
-`CMakeLists.txt` configures `cmake/coro_version.h.in` into a generated
-`include/coro/version.h` (installed alongside the rest of the package), falling back to
-`"unknown"` if `CORO_VERSION` isn't defined — so a plain `cmake` configure never
-hard-fails just because Conan wasn't involved in producing it:
+The version is available to C++ code, for example for a `--version` output:
 
 ```cpp
 #include <coro/version.h>
-std::puts(CORO_VERSION);  // "0.1.1-dev.3+gabc123.mybranch", or "unknown" outside Conan
+std::puts(CORO_VERSION);  // "0.1.2-dev.3+gabc123.mybranch"
 ```
+
+`CMakeLists.txt` generates `coro/version.h` from `cmake/coro_version.h.in` and installs
+it with the other headers. The value is the CMake variable `CORO_VERSION`:
+
+- A Conan build passes it in. The recipe's `generate()` sets it to the package version.
+- Any other build derives it in `cmake/CoroVersion.cmake`, from the source archive's
+  stamp or from git, and prints it at configure time. See
+  [Where the version comes from](#where-the-version-comes-from).
+
+The numeric part (`X.Y.Z`) also becomes the CMake project version.
 
 ## Non-Conan builds
 
-Building coro without Conan is not currently a supported workflow, but the CMake files
-are kept Conan-agnostic deliberately (plain `find_package()` calls throughout) so that
-door isn't closed off. Directly cloning the git repo and building the source outside of
-Conan is not expected to work — there is no path that starts from a raw clone. Instead,
-`conan install --deploy=...` is the one underlying mechanism, fully resolving and
-materializing coro *and* its transitive dependencies as a self-contained, already-built
-folder (including any generated version/config files) — used two ways:
+Building coro with plain CMake is partly in place and not yet a supported workflow. A
+release's source archive is the starting point: it needs neither git nor Conan to know
+its version.
 
-- Run by the release workflow against the exact release tag it just created (see
-  [Cutting a release](#cutting-a-release) above) and published as a tarball on the
-  GitHub Release, for consumers who'd rather just download a finished, non-Conan copy of
-  a specific version than run Conan themselves.
-- Run locally by a consumer who wants a non-Conan copy of a version that doesn't have a
-  published release tarball, or who has some other specific reason not to use one of
-  the published tarballs.
+What works today:
 
-Either way, the deploy step only ever runs where Conan (and coro's actual dependencies)
-are available — what comes out the other side is Conan-free, not the process producing it.
+- **The version.** A plain `cmake` configure of an archive or a checkout reports the
+  same version a Conan build would.
+- **The options.** They are ordinary CMake options: `WITH_GPERFTOOLS`,
+  `CORO_USE_LOCAL_RUN_QUEUE`, `WITH_SANITIZE`, `CORO_PLATFORM`. The recipe's `shared` and
+  `fPIC` options correspond to CMake's own `BUILD_SHARED_LIBS` and
+  `CMAKE_POSITION_INDEPENDENT_CODE`.
+- **Where each dependency comes from.** Each has a script in `cmake/deps/` and a
+  `CORO_<DEPENDENCY>_PROVIDER` option, set one dependency at a time. The only provider
+  so far is `package`: the script calls `find_package()`, and the environment must
+  already make the dependency findable. A Conan build uses this provider.
+
+| Dependency | Option | Needed | Version |
+|---|---|---|---|
+| libwebsockets | `CORO_LIBWEBSOCKETS_PROVIDER` | Always | 4.3.5 or later, below 5, built without libuv |
+| gperftools | `CORO_GPERFTOOLS_PROVIDER` | With `WITH_GPERFTOOLS` | 2.17.2 |
+
+What is missing:
+
+!!! tip "TODO: a provider that fetches and builds a dependency"
+    A second provider would download and build a pinned version with CMake's
+    `FetchContent`, for a build with no prepared environment. It goes in the same
+    `cmake/deps/` script as a second branch.
+
+!!! tip "TODO: the C++ standard"
+    The desktop target does not state the standard it needs; a Conan profile supplies
+    it. A plain CMake build gets the compiler's default.
+
+!!! tip "TODO: a CMake package for consumers"
+    There is no `install(EXPORT)` and no package config file, so another CMake project
+    cannot find an installed coro with `find_package(coro)`. Conan generates that file
+    for its own consumers. The tests and examples use `find_package(coro)`, so they
+    build only under Conan.
+
+!!! tip "TODO: Pico"
+    A Pico consumer gets its targets through build modules that Conan loads. Nothing
+    replaces them in a plain CMake build yet.
+
+None of this has been exercised: no CI job builds coro without Conan.

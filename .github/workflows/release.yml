@@ -1,0 +1,171 @@
+name: Release
+
+# Cuts a release candidate or a final release of the commit this is dispatched on.
+# See doc/versioning.md, "Cutting a release".
+#
+# It checks the request, runs the tests with the version the tag will give, and only
+# if they pass creates the tag at that commit and publishes the GitHub release. A
+# failed run tags nothing. The release carries the source archive GitHub generates
+# for the tag; nothing is built for it.
+#
+#   A release candidate:              dispatch from a branch,       kind rc
+#   A final release from a candidate: dispatch from the vX.Y.Z-rc.N tag, kind final
+#   A final release, no candidate:    dispatch from a branch,       kind final
+#
+# The tag is pushed with the workflow's own token, which starts no other workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: What to cut
+        type: choice
+        options: [rc, final]
+        required: true
+      version:
+        description: The target version, X.Y.Z (no "v", no "-rc.N")
+        type: string
+        required: true
+      dry_run:
+        description: Check and test only; create no tag and no release
+        type: boolean
+        default: false
+
+# One release at a time: two runs could otherwise choose the same candidate number.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Every tag, and the history that says which are reachable from here.
+          fetch-depth: 0
+
+      - name: Check the request and name the tag
+        id: plan
+        env:
+          KIND: ${{ inputs.kind }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || fail "'$VERSION' is not a version of the form X.Y.Z"
+
+          if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null; then
+            fail "v$VERSION has already been released"
+          fi
+
+          # The target must be the next patch, minor or major version after the
+          # latest release reachable from this commit. Reachable, not newest: a
+          # backport branch continues from its own last release.
+          last="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' \
+                    --exclude '*-rc.*' HEAD 2> /dev/null || true)"
+          if [ -n "$last" ]; then
+            IFS=. read -r major minor patch <<< "${last#v}"
+            next_patch="$major.$minor.$((patch + 1))"
+            next_minor="$major.$((minor + 1)).0"
+            next_major="$((major + 1)).0.0"
+            if [ "$VERSION" != "$next_patch" ] && [ "$VERSION" != "$next_minor" ] \
+                && [ "$VERSION" != "$next_major" ]; then
+              fail "$VERSION does not follow $last: expected $next_patch, $next_minor or $next_major"
+            fi
+          fi
+
+          # The highest candidate number already cut for this version; 0 for none.
+          latest_rc=0
+          for tag in $(git tag --list "v$VERSION-rc.*"); do
+            n="${tag##*-rc.}"
+            if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt "$latest_rc" ]; then
+              latest_rc="$n"
+            fi
+          done
+
+          if [ "$KIND" = rc ]; then
+            version="$VERSION-rc.$((latest_rc + 1))"
+            prerelease=true
+          else
+            # A final release of a version that has candidates is the latest
+            # candidate, unchanged.
+            if [ "$latest_rc" -gt 0 ]; then
+              rc_tag="v$VERSION-rc.$latest_rc"
+              if [ "$(git rev-list -n 1 "$rc_tag")" != "$(git rev-parse HEAD)" ]; then
+                fail "$VERSION has candidates, and this commit is not the latest one ($rc_tag). Dispatch from that tag, or cut another candidate."
+              fi
+            fi
+            version="$VERSION"
+            prerelease=false
+          fi
+
+          {
+            echo "tag=v$version"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release \`v$version\` at \`$(git rev-parse HEAD)\` (previous release: ${last:-none})" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    needs: plan
+    uses: ./.github/workflows/tests.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
+
+  emulator:
+    needs: plan
+    uses: ./.github/workflows/pico_emulator.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
+
+  release:
+    needs: [plan, tests, emulator]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Annotated, so that when a candidate and its final release share a commit,
+      # `git describe` names the newer of the two (doc/versioning.md, "Source
+      # archives"). Pushing fails if the tag appeared while the tests ran.
+      - name: Tag the commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "coro $VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+
+      # If this step fails the tag is already pushed: run the same command by hand
+      # instead of dispatching again.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          args=("$TAG" --verify-tag --title "coro $VERSION" --generate-notes)
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"

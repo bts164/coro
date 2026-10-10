@@ -1,4 +1,4 @@
-# Read by conanfile.py's set_version() — see README.md's "Signaling a
+# Read by conanfile.py's set_version() — see doc/versioning.md's "Signaling a
 # minor/major dev-build bump". Only affects the version *string* of
 # not-yet-tagged dev builds; ignored for exact release/rc tags.
 #

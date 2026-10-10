@@ -4,6 +4,7 @@ build
 **.envrc
 **.venv
 **.envrcma
+.coro_version_override
 **CMakeUserPresets.json
 **CMakeCache.txt
 **/build

@@ -3,7 +3,7 @@
 # pin its `coro/<version>` requirement to exactly the version this same
 # checkout would produce), so the two recipes can never silently drift out
 # of sync the way a hand-maintained/hardcoded pin or a `coro/[*]` range
-# requirement can -- see README.md's "Versioning and Releases".
+# requirement can -- see doc/versioning.md's "Versioning and Releases".
 #
 # Deliberately a plain importable module, not a Conan `python_requires`
 # package: python_requires exists for sharing recipe logic *across*
@@ -54,21 +54,35 @@ def derive_coro_version(conanfile, folder, conandata=None):
         )
         return conanfile.version
 
-    # CORO_VERSION_OVERRIDE mirrors the CLI `--version=` override for
-    # commands where passing it explicitly every time is inconvenient (e.g.
-    # building tests/examples against a dev version registered via
-    # `conan editable add . --version=...` — see doc/versioning.md's
-    # "Developing against an unreleased coro"). Same effect as the CLI
-    # override, just settable once in the environment.
-    env_override = os.environ.get("CORO_VERSION_OVERRIDE")
-    if env_override:
-        conanfile.output.info(
-            f"coro: version '{env_override}' set via CORO_VERSION_OVERRIDE "
-            "-- skipping git-based derivation"
-        )
-        return env_override
+    # A source archive (`git archive`, or the one GitHub generates for a tag
+    # or release) has no .git, but git wrote its `git describe` result into
+    # .git_archival.txt while making it. It is checked before the overrides
+    # below, because an archive knows its own version: an override left set
+    # for some other checkout must not replace it. It is also checked before
+    # git, so an archive unpacked inside some other repository is not
+    # described by that repository's tags.
+    describe = _archived_describe(conanfile, folder)
 
-    cached = (conandata or {}).get("scm_version")
+    if describe is None:
+        # A version that stays the same from one commit to the next, for a
+        # checkout registered with `conan editable add` -- see
+        # doc/versioning.md's "Developing against an unreleased coro". Conan
+        # identifies an editable package by its exact version, so without
+        # this each commit would orphan the registration.
+        #
+        # The .coro_version_override file (gitignored, one line) applies to
+        # this checkout only. The CORO_VERSION_OVERRIDE environment variable
+        # applies to every checkout the shell touches, which suits CI, and
+        # takes precedence over the file.
+        override, origin = _version_override(folder)
+        if override:
+            conanfile.output.warning(
+                f"coro: version '{override}' set via {origin} "
+                "-- skipping git-based derivation"
+            )
+            return override
+
+    cached = (conandata or {}).get("scm_version") if describe is None else None
     if cached:
         conanfile.output.info(
             f"coro: version '{cached}' read from conandata.yml's scm_version "
@@ -76,14 +90,9 @@ def derive_coro_version(conanfile, folder, conandata=None):
         )
         return cached
 
-    # A source archive (`git archive`, or the one GitHub generates for a tag
-    # or release) has no .git, but git wrote its `git describe` result into
-    # .git_archival.txt while making it. That is checked before git, so an
-    # archive unpacked inside some other repository is not described by that
-    # repository's tags. `git` stays None in that case: an archive is of a
-    # commit, so it has no branch and is never dirty.
+    # `git` stays None for a source archive: an archive is of a commit, so it
+    # has no branch and is never dirty.
     git = None
-    describe = _archived_describe(conanfile, folder)
     if describe is None:
         git = Git(conanfile, folder=folder)
         try:
@@ -133,7 +142,7 @@ def derive_coro_version(conanfile, folder, conandata=None):
 
     if rc is not None:
         # rc tags already name the pending release, so the patch is not
-        # bumped again — see README.md's "Release candidates".
+        # bumped again — see doc/versioning.md's "Cutting a release".
         version = f"{major}.{minor}.{patch}-rc.{rc}"
         if not exact:
             version += f".dev.{count}+g{sha}"
@@ -141,7 +150,7 @@ def derive_coro_version(conanfile, folder, conandata=None):
         if exact:
             version = f"{major}.{minor}.{patch}"
         else:
-            # See README.md's "Signaling a minor/major dev-build bump" —
+            # See doc/versioning.md's "Signaling a minor/major dev-build bump" —
             # patch is only a safe-for-ordering default, not a claim that
             # the pending change is actually patch-compatible.
             next_bump = (conandata or {}).get("next_bump", "patch")
@@ -156,26 +165,11 @@ def derive_coro_version(conanfile, folder, conandata=None):
                     f"coro: conandata.yml's next_bump is '{next_bump}', "
                     "expected 'patch', 'minor', or 'major'"
                 )
-            # CORO_VERSION_DEV_AS_METADATA moves "dev.{count}" from the
-            # prerelease part to build metadata (X.Y.Z+dev.N.gSHA instead of
-            # X.Y.Z-dev.N+gSHA) -- see doc/versioning.md's "Developing
-            # against an unreleased coro". Same coordinate information
-            # (commit count, sha, branch, dirty below), but since build
-            # metadata never affects SemVer precedence or Conan's prerelease
-            # filtering, every commit's auto-derived dev build becomes
-            # resolvable against a version range with no per-build
-            # `--version=`/CORO_VERSION_OVERRIDE and no `resolve_prereleases`
-            # needed -- at the cost of every such build now satisfying
-            # ranges as if it *were* the pending X.Y.Z release, so this is
-            # opt-in, not the default.
-            if os.environ.get("CORO_VERSION_DEV_AS_METADATA"):
-                version = f"{major}.{minor}.{patch}+dev.{count}.g{sha}"
-            else:
-                version = f"{major}.{minor}.{patch}-dev.{count}+g{sha}"
+            version = f"{major}.{minor}.{patch}-dev.{count}+g{sha}"
 
     if not exact:
         # Build metadata only — never affects SemVer precedence or Conan
-        # resolution. See README.md's "Metadata: branch name and dirty
+        # resolution. See doc/versioning.md's "Metadata: branch name and dirty
         # state". Exact tags (release or rc) carry none of this.
         branch = _branch_metadata(git) if git is not None else None
         if branch:
@@ -189,6 +183,22 @@ def derive_coro_version(conanfile, folder, conandata=None):
         + (", dirty working tree" if dirty else "")
     )
     return version
+
+
+# Returns (version, where it was set) for a version override that applies to
+# the checkout at `folder`, or (None, None). See derive_coro_version().
+def _version_override(folder):
+    env_override = os.environ.get("CORO_VERSION_OVERRIDE")
+    if env_override:
+        return env_override, "CORO_VERSION_OVERRIDE"
+    path = os.path.join(folder, ".coro_version_override")
+    if os.path.isfile(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return line, f"'{path}'"
+    return None, None
 
 
 # Returns the `git describe` result recorded in `folder`'s .git_archival.txt,
@@ -213,7 +223,7 @@ def _archived_describe(conanfile, folder):
         raise ConanException(
             f"coro: '{path}' records no `git describe` result: this source "
             "archive was made from a commit with no reachable vX.Y.Z tag. "
-            "Pass the version explicitly (--version=, or CORO_VERSION_OVERRIDE)."
+            "Pass the version explicitly (--version=)."
         )
     conanfile.output.info(
         f"coro: '{describe}' read from .git_archival.txt "
@@ -223,7 +233,7 @@ def _archived_describe(conanfile, folder):
 
 
 # Best-effort branch name for build metadata, resolved in the order
-# documented in README.md: the CI-provided ref first (coro is hosted on
+# documented in doc/versioning.md: the CI-provided ref first (coro is hosted on
 # GitHub, so only GitHub Actions' env vars need handling), then a local
 # git query. Returns None (metadata omitted, not guessed) if neither
 # resolves, e.g. a detached-HEAD checkout of a bare commit with no CI

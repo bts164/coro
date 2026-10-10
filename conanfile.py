@@ -15,17 +15,26 @@ class CoroRecipe(ConanFile):
     name = "coro"
     package_type = "library"
 
-    # coro is header/template-heavy: consumers compile against its headers
-    # regardless of whether the library binary itself is statically embedded
-    # or dynamically linked, so no patch release can be assumed ABI/API-safe
-    # to drop in without a consumer rebuild. The embed-mode default
-    # ("full_mode") already forces a rebuild on any change for the
-    # static/header-embedding case; non_embed_mode's default ("minor_mode")
-    # is the gap — it's what applies to the common desktop case (an
-    # executable dynamically linking coro as a shared library, coro's
-    # default_options), and it otherwise treats patch bumps as compatible
-    # and skips the consumer rebuild. See README.md's Versioning and
-    # Releases section.
+    # coro is header/template-heavy: a consumer compiles coro's inline code
+    # into its own object files, however it links the library. So no two
+    # versions of coro are interchangeable under an already-built consumer,
+    # and any change to coro must rebuild everything that requires it.
+    #
+    # Conan's embed-mode default ("full_mode") already does that where the
+    # consumer is an executable or shared library linking coro statically.
+    # The non-embed mode covers the rest: anything linking coro as a shared
+    # library (coro's default_options), and a static library that requires a
+    # static coro (every library on a Pico). Its default ("minor_mode") would
+    # reuse the consumer's binary across patch bumps.
+    #
+    # It must be "full_mode", not "patch_mode": patch_mode compares only
+    # X.Y.Z, and every commit between two releases has the same X.Y.Z, since
+    # the commits differ only in the -dev.N+gSHA part (set_version()). A
+    # consumer built before such a commit would then be linked, unrebuilt,
+    # against the library built after it. full_mode compares the whole
+    # version, the recipe revision and coro's own package_id.
+    #
+    # See doc/versioning.md.
     package_id_non_embed_mode = "full_mode"
 
     # Binary configuration
@@ -64,7 +73,7 @@ class CoroRecipe(ConanFile):
     exports = "conan_version.py"
 
     # Derives the version from git instead of a hand-maintained string — see
-    # README.md's "How the version is derived on non-tagged commits" and
+    # doc/versioning.md's "How the version is derived on non-tagged commits" and
     # conan_version.py (the actual derivation logic, shared with
     # test/conanfile.py). Requires at least one reachable vX.Y.Z tag (a
     # one-time bootstrap requirement) and enough git history to reach it; a
@@ -223,7 +232,7 @@ class CoroRecipe(ConanFile):
         deps.generate()
         tc = CMakeToolchain(self)
         # Single source of truth for the version embedded in the built binary
-        # (see README.md's "Embedding the version in the built binary") —
+        # (see doc/versioning.md's "Embedding the version in the built binary") —
         # CMakeLists.txt generates include/coro/version.h from this rather
         # than trying to independently re-derive it via git itself.
         tc.cache_variables["CORO_VERSION"] = str(self.version)

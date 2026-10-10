@@ -9,6 +9,23 @@ cmake_minimum_required(VERSION 3.21)
 set(CORO_PLATFORM "desktop" CACHE STRING "Target platform: desktop or pico")
 set_property(CACHE CORO_PLATFORM PROPERTY STRINGS desktop pico)
 
+# CORO_VERSION is the version embedded in the built binary (coro/version.h). A
+# Conan build passes it in: conanfile.py's generate() sets it to the package
+# version. Any other build derives it here, from the source archive's stamp or
+# from git, and gets "unknown" when neither is there. -DCORO_VERSION=<version>
+# sets it by hand. See doc/versioning.md.
+if(NOT DEFINED CORO_VERSION)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/CoroVersion.cmake)
+    coro_derive_version(CORO_VERSION)
+endif()
+message(STATUS "coro version: ${CORO_VERSION}")
+# project(VERSION) takes only the numeric part.
+if(CORO_VERSION MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)")
+    set(CORO_NUMERIC_VERSION "${CMAKE_MATCH_1}")
+else()
+    set(CORO_NUMERIC_VERSION "0.0.0")
+endif()
+
 if(CORO_PLATFORM STREQUAL "pico")
     # pico_sdk_init() must run before project() — see doc/design/pico_port.md.
     if(NOT DEFINED ENV{PICO_SDK_PATH} OR "$ENV{PICO_SDK_PATH}" STREQUAL "")
@@ -17,22 +34,15 @@ if(CORO_PLATFORM STREQUAL "pico")
             "[buildenv] in the Conan host profile.")
     endif()
     include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
-    project(coro VERSION 0.1.0 LANGUAGES CXX C ASM)
+    project(coro VERSION ${CORO_NUMERIC_VERSION} LANGUAGES CXX C ASM)
     set(PICO_CXX_ENABLE_EXCEPTIONS 1)
     pico_sdk_init()
 else()
-    project(coro VERSION 0.1.0 LANGUAGES CXX)
+    project(coro VERSION ${CORO_NUMERIC_VERSION} LANGUAGES CXX)
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# CORO_VERSION is set via conanfile.py's generate() (cache_variables), which
-# derives it from git — see README.md's "Embedding the version in the built
-# binary". Falls back to "unknown" so a plain non-Conan `cmake` configure
-# never hard-fails just because Conan wasn't involved in producing it.
-if(NOT DEFINED CORO_VERSION)
-    set(CORO_VERSION "unknown")
-endif()
 set(CORO_GENERATED_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/coro_version.h.in
@@ -104,10 +114,13 @@ else()
 
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Sanitize.cmake)
 
+    # Each dependency has a script in cmake/deps/ that provides it and names
+    # the target to link. CORO_<DEPENDENCY>_PROVIDER selects how, one
+    # dependency at a time.
     if(WITH_GPERFTOOLS)
-        find_package(gperftools REQUIRED)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/deps/gperftools.cmake)
     endif()
-    find_package(Libwebsockets REQUIRED)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/deps/libwebsockets.cmake)
 
     file(GLOB_RECURSE CORO_PUBLIC_HEADERS "include/coro/*.h" "include/coro/*.hpp")
     message(STATUS ${CORO_PUBLIC_HEADERS})
@@ -159,8 +172,8 @@ else()
     endif()
     target_include_directories(coro PUBLIC include ${CORO_GENERATED_INCLUDE_DIR})
     target_link_libraries(coro PUBLIC
-        $<$<BOOL:${WITH_GPERFTOOLS}>:gperftools::gperftools>
-        websockets)
+        $<$<BOOL:${WITH_GPERFTOOLS}>:${CORO_GPERFTOOLS_TARGET}>
+        ${CORO_LIBWEBSOCKETS_TARGET})
 
     install(TARGETS coro)
     install(FILES ${CORO_GENERATED_INCLUDE_DIR}/coro/version.h DESTINATION include/coro)

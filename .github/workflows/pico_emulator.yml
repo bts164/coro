@@ -17,6 +17,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # release.yml runs this before it tags, with the version the tag will give.
+  workflow_call:
+    inputs:
+      version:
+        description: Build as this version, not the one derived from git. Empty to derive it.
+        type: string
+        default: ''
 
 jobs:
   image:
@@ -32,13 +39,16 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # Empty unless release.yml called this; conan_version.py then ignores it.
+    env:
+      CORO_VERSION_OVERRIDE: ${{ inputs.version }}
     container:
       image: ${{ fromJSON(needs.image.outputs.images)[needs.image.outputs.primary] }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # conan_version.py derives the package version from `git describe --tags`,
           # which finds nothing in the default shallow, tagless checkout.
