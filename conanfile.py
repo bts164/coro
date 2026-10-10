@@ -26,7 +26,7 @@ class CoroRecipe(ConanFile):
     # default_options), and it otherwise treats patch bumps as compatible
     # and skips the consumer rebuild. See README.md's Versioning and
     # Releases section.
-    package_id_non_embed_mode = "patch_mode"
+    package_id_non_embed_mode = "full_mode"
 
     # Binary configuration
     settings = "os", "compiler", "build_type", "arch"
