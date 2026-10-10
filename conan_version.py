@@ -76,25 +76,34 @@ def derive_coro_version(conanfile, folder, conandata=None):
         )
         return cached
 
-    git = Git(conanfile, folder=folder)
-    try:
-        describe = git.run(
-            "describe --tags --long --dirty --match v[0-9]*.[0-9]*.[0-9]*"
-        ).strip()
-    except Exception as e:
-        conanfile.output.warning(
-            f"coro: `git describe` against '{folder}' failed -- no version "
-            "could be derived"
-        )
-        raise ConanException(
-            "coro: `git describe` could not find a reachable vX.Y.Z tag "
-            f"({e}). Either no such tag exists yet in this history (create "
-            "one, e.g. `git tag v0.1.0`), or this is a shallow clone that "
-            "doesn't include it — fetch full history/tags (e.g. "
-            "`git fetch --unshallow --tags`, or `fetch-depth: 0` / "
-            "`GIT_DEPTH: 0` in CI)."
-        )
-    conanfile.output.info(f"coro: `git describe` reported '{describe}'")
+    # A source archive (`git archive`, or the one GitHub generates for a tag
+    # or release) has no .git, but git wrote its `git describe` result into
+    # .git_archival.txt while making it. That is checked before git, so an
+    # archive unpacked inside some other repository is not described by that
+    # repository's tags. `git` stays None in that case: an archive is of a
+    # commit, so it has no branch and is never dirty.
+    git = None
+    describe = _archived_describe(conanfile, folder)
+    if describe is None:
+        git = Git(conanfile, folder=folder)
+        try:
+            describe = git.run(
+                "describe --tags --long --dirty --match v[0-9]*.[0-9]*.[0-9]*"
+            ).strip()
+        except Exception as e:
+            conanfile.output.warning(
+                f"coro: `git describe` against '{folder}' failed -- no version "
+                "could be derived"
+            )
+            raise ConanException(
+                "coro: `git describe` could not find a reachable vX.Y.Z tag "
+                f"({e}). Either no such tag exists yet in this history (create "
+                "one, e.g. `git tag v0.1.0`), or this is a shallow clone that "
+                "doesn't include it — fetch full history/tags (e.g. "
+                "`git fetch --unshallow --tags`, or `fetch-depth: 0` / "
+                "`GIT_DEPTH: 0` in CI)."
+            )
+        conanfile.output.info(f"coro: `git describe` reported '{describe}'")
 
     dirty = describe.endswith("-dirty")
     if dirty:
@@ -103,8 +112,14 @@ def derive_coro_version(conanfile, folder, conandata=None):
     # The --match glob above also matches "vX.Y.Z-rc.N" tags (the trailing
     # "*" absorbs the "-rc.N" suffix), so a release-candidate tag can be
     # the "nearest reachable tag" here just like a plain release tag.
-    tag, count, _sha_with_g = describe.rsplit("-", 2)
-    sha = _sha_with_g[1:]  # strip git describe's "g" prefix on the short hash
+    #
+    # `git describe --long` always appends "-<count>-g<sha>". The archived
+    # form has no --long, so on a tagged commit it is the bare tag.
+    long_form = re.fullmatch(r"(.+)-(\d+)-g([0-9a-f]+)", describe)
+    if long_form:
+        tag, count, sha = long_form.groups()
+    else:
+        tag, count, sha = describe, "0", ""
 
     match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?", tag)
     if not match:
@@ -162,7 +177,7 @@ def derive_coro_version(conanfile, folder, conandata=None):
         # Build metadata only — never affects SemVer precedence or Conan
         # resolution. See README.md's "Metadata: branch name and dirty
         # state". Exact tags (release or rc) carry none of this.
-        branch = _branch_metadata(git)
+        branch = _branch_metadata(git) if git is not None else None
         if branch:
             version += f".{branch}"
         if dirty:
@@ -174,6 +189,37 @@ def derive_coro_version(conanfile, folder, conandata=None):
         + (", dirty working tree" if dirty else "")
     )
     return version
+
+
+# Returns the `git describe` result recorded in `folder`'s .git_archival.txt,
+# or None when `folder` is not an unpacked source archive: the file is absent,
+# or it still holds the unexpanded "$Format:...$" placeholder, as it does in a
+# git checkout. (.gitattributes marks the file export-subst, which is what
+# makes git fill it in.)
+def _archived_describe(conanfile, folder):
+    path = os.path.join(folder, ".git_archival.txt")
+    if not os.path.isfile(path):
+        return None
+    describe = None
+    with open(path) as f:
+        for line in f:
+            key, _, value = line.partition(":")
+            if key.strip() == "describe":
+                describe = value.strip()
+    if describe is None or describe.startswith("$Format:"):
+        return None
+    if not describe:
+        # git expands the placeholder to nothing when no tag is reachable.
+        raise ConanException(
+            f"coro: '{path}' records no `git describe` result: this source "
+            "archive was made from a commit with no reachable vX.Y.Z tag. "
+            "Pass the version explicitly (--version=, or CORO_VERSION_OVERRIDE)."
+        )
+    conanfile.output.info(
+        f"coro: '{describe}' read from .git_archival.txt "
+        "-- this is a source archive, not a git checkout"
+    )
+    return describe
 
 
 # Best-effort branch name for build metadata, resolved in the order

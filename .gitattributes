@@ -1,0 +1,12 @@
+# Applies to `git archive`, and so to the source archives GitHub generates for
+# a tag or a release. See doc/versioning.md.
+
+# git fills in this file's $Format:...$ placeholders in an archive, recording
+# the `git describe` result and the commit. conan_version.py reads the version
+# from it, since an archive has no .git to ask.
+.git_archival.txt export-subst
+
+# Left out of an archive: they only mean something inside the repository.
+.gitattributes export-ignore
+.gitignore     export-ignore
+.github        export-ignore
