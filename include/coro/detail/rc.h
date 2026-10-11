@@ -4,7 +4,7 @@
 //
 //   Multi-threaded platforms (non-CORO_PICO):
 //     Task ownership and waker plumbing are shared across threads (a
-//     spawn_blocking worker, an lws service thread, or any external thread
+//     spawn_blocking worker, another Runtime's worker, or any external thread
 //     that receives a waker), so the standard atomic-refcount std::shared_ptr
 //     / std::weak_ptr is required.
 //

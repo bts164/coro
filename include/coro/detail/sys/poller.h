@@ -10,9 +10,14 @@
 //   Linux: epoll (src/detail/sys/poller_epoll.cpp)
 //
 // Contract every backend must provide:
-//   - Edge-triggered delivery. An event is only guaranteed after readiness *changes*,
-//     so a consumer may only wait after it has observed EAGAIN. (A level-triggered
-//     backend still satisfies this; it just reports extra events.)
+//   - Edge-triggered delivery (Trigger::Edge, the default). An event is only
+//     guaranteed after readiness *changes*, so a consumer may only wait after it has
+//     observed EAGAIN. (A level-triggered backend still satisfies this; it just
+//     reports extra events.)
+//   - Level-triggered delivery (Trigger::Level). Every poll() reports the fd for as
+//     long as it is ready in a direction the registration is interested in. For a
+//     consumer that cannot promise to drain the fd, such as a foreign library's
+//     socket (see IoRegistration's level-triggered mode).
 //   - Thread-safe registration. Any thread may register_fd()/reregister_fd()/
 //     deregister_fd() while another thread is blocked in poll().
 //   - A nanosecond-resolution poll() timeout, honored as precisely as the OS allows.
@@ -49,6 +54,9 @@ struct Interest {
     static constexpr Interest read_write() { return {true, true}; }
 };
 
+/// How a registration's readiness is reported. See the backend contract above.
+enum class Trigger { Edge, Level };
+
 /// One readiness notification returned by Poller::poll().
 struct Event {
     /// The opaque key the fd was registered with (IoDriver passes a ScheduledIo*).
@@ -79,15 +87,19 @@ public:
     Poller(Poller&&)                 = delete;
     Poller& operator=(Poller&&)      = delete;
 
-    /// Starts edge-triggered monitoring of `fd`. `key` is returned in each Event for
-    /// this fd and must remain valid until the fd is deregistered AND the poll() batch
-    /// that might still hold it has been processed (see IoDriver's pending-release list).
+    /// Starts monitoring `fd`, edge-triggered unless `trigger` says otherwise. `key` is
+    /// returned in each Event for this fd and must remain valid until the fd is
+    /// deregistered AND the poll() batch that might still hold it has been processed
+    /// (see IoDriver's pending-release list).
+    ///
+    /// An error or hang-up on the fd is reported whatever `interest` is, even an
+    /// empty one.
     /// @throws std::system_error on failure.
-    void register_fd(RawFd fd, void* key, Interest interest);
+    void register_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
 
-    /// Replaces the key and interest of an already registered fd.
+    /// Replaces the key, interest and trigger of an already registered fd.
     /// @throws std::system_error on failure.
-    void reregister_fd(RawFd fd, void* key, Interest interest);
+    void reregister_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
 
     /// Stops monitoring `fd`. Must be called BEFORE the fd is closed: epoll watches the
     /// open file, not the fd number, so if the fd was closed while a dup of it is

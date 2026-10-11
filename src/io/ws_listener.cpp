@@ -1,9 +1,10 @@
-// WsListener on libwebsockets, with its own lws context and service thread
-// (ws_service.h). See doc/design/websocket_stream.md.
+// WsListener on libwebsockets, with its own lws context, serviced inside the turns
+// of the Runtime's IoDriver (ws_service.h). See doc/design/websocket_stream.md.
 
 #include <coro/io/ws_listener.h>
 #include <coro/io/lookup_host.h>
 #include <coro/io/socket_address.h>
+#include <coro/detail/socket_state.h>
 #include <coro/detail/sys/tcp.h>
 #include "ws_service.h"
 #include <cctype>
@@ -107,6 +108,26 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
     auto* state = slot ? static_cast<ConnectionState*>(*slot) : nullptr;
 
     switch (reason) {
+
+    // LwsService::post() woke the context: run what was posted.
+    case LWS_CALLBACK_EVENT_WAIT_CANCELLED:
+        LwsService::run_commands(lws_get_context(wsi));
+        break;
+
+    // The context is going: the last reference to it was dropped, or its Runtime
+    // shut down with the WsListener still alive. In the second case an accept()
+    // waiting in another Runtime would otherwise wait for good.
+    case LWS_CALLBACK_PROTOCOL_DESTROY: {
+        auto& listener = listener_of(wsi);
+        Weak<Waker> waker;
+        {
+            std::lock_guard lk(listener.accept_mutex);
+            listener.closed = true;
+            waker = listener.accept_waker;
+        }
+        wake(waker);
+        break;
+    }
 
     // Before the 101 response. Return -1 to reject, 0 to accept.
     case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION: {
@@ -255,8 +276,9 @@ void WsListener::close() noexcept {
     detail::ws::wake(waker);
     for (auto& conn : pending) detail::ws::post_close(*m_service, std::move(conn));
     m_state.reset();
-    // If no accepted stream holds the service, this destroys the context (closing the
-    // listening socket) and joins its thread, after the closes above have run.
+    // If no accepted stream holds the service, a later turn of the driver destroys
+    // the context (closing the listening socket), after it has run the closes above.
+    // Nothing here blocks.
     m_service.reset();
 }
 
@@ -265,6 +287,9 @@ Coro<WsListener> WsListener::bind(std::string host, uint16_t port) {
 }
 
 Coro<WsListener> WsListener::bind(std::string host, uint16_t port, Options options) {
+    // lws is serviced by this Runtime's IoDriver, so the Runtime must turn it.
+    IoDriver& driver = detail::socket_io_driver("WsListener::bind");
+
     // nullopt: every interface (lws's iface = nullptr).
     std::vector<std::optional<SocketAddress>> candidates;
     if (host.empty()) {
@@ -297,7 +322,7 @@ Coro<WsListener> WsListener::bind(std::string host, uint16_t port, Options optio
 
         // Synchronous: the socket is bound and listening when this returns.
         std::string lws_errors;
-        if (auto service = detail::ws::LwsService::create(info, state, &lws_errors))
+        if (auto service = detail::ws::LwsService::listen(info, state, driver, &lws_errors))
             co_return WsListener(std::move(state), std::move(service));
 
         const SocketAddress local = candidate ? *candidate : SocketAddress{Ipv4Address{}, port};

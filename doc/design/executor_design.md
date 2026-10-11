@@ -39,7 +39,7 @@ Runtime::Runtime(std::size_t num_threads) {
 
 ## Local Wake vs. Remote Wake
 
-When a blocking-pool thread, an lws service thread, or another executor's worker calls
+When a blocking-pool thread, a thread the application started, or another executor's worker calls
 `Waker::wake()`, it originates from a thread that is not the poll loop.
 Every executor must therefore handle wakeups from threads it does not own.
 

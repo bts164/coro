@@ -174,8 +174,9 @@ class CoroRecipe(ConanFile):
             self.requires("gperftools/2.17.2",
                 transitive_headers = True,
                 transitive_libs = True)
-        # lws runs its own poll() loop on a dedicated thread (doc/design/websocket_stream.md,
-        # "Service threads"), so its libuv event-lib backend stays off; coro doesn't use libuv.
+        # lws is serviced by coro's IoDriver through a custom event loop
+        # (doc/design/websocket_stream.md, "lws on the I/O driver"), so its libuv
+        # event-lib backend stays off; coro doesn't use libuv.
         self.requires("libwebsockets/[>=4.3.5 <5]",
             options={"with_libuv": False},
             transitive_headers = True,

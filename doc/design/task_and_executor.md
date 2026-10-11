@@ -779,7 +779,7 @@ other means — but any alternative requires careful reasoning, as the case stud
 
 !!! note "NOTE: Executor shutdown ordering"
     A non-trivially drainable future whose `cancel()` submits work to an external subsystem
-    (such as a close request posted to an lws service thread) is only as good as the
+    (such as a close request posted to libwebsockets) is only as good as the
     guarantee that the subsystem remains operational during the drain phase. If the
     executor stops the event loop before draining such a future, the completion callback
     never fires, `poll()` returns `PollPending` forever, and the drain deadlocks. The

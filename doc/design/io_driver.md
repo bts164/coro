@@ -59,7 +59,8 @@ The readiness model avoids both:
   and container runtimes disable it) and its uneven availability across Linux platforms.
 - **A completion (proactor) model, and resuming tasks inline from the driver.** Wakes go
   through the executor. The same-thread queue round trip is cheap, and it avoids
-  re-entrancy hazards.
+  re-entrancy hazards. The one exception is a library that must be driven from an event
+  loop; see [Level-triggered registrations](#level-triggered-registrations).
 - **A dedicated driver thread.** See [Who turns the driver](#who-turns-the-driver).
 
 ---
@@ -99,6 +100,7 @@ using RawFd = int;  // SOCKET on Windows, if that platform is ever added
 bool would_block(int err) noexcept;  // EAGAIN or EWOULDBLOCK
 
 struct Interest { bool readable = false; bool writable = false; /* read(), write(), read_write() */ };
+enum class Trigger { Edge, Level };
 
 struct Event {
     void* key;       // the ScheduledIo* the fd was registered with
@@ -110,8 +112,9 @@ struct Event {
 
 class Poller {
 public:
-    void register_fd(RawFd fd, void* key, Interest interest);    // thread-safe
-    void reregister_fd(RawFd fd, void* key, Interest interest);  // thread-safe
+    // thread-safe; trigger defaults to Trigger::Edge
+    void register_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
+    void reregister_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
     bool deregister_fd(RawFd fd) noexcept;                       // thread-safe
     /// Waits up to timeout (nullopt = forever) and appends events to out.
     void poll(std::vector<Event>& out, std::optional<std::chrono::nanoseconds> timeout);
@@ -138,6 +141,12 @@ Semantics every backend must provide:
   consumer may only wait after it has seen `EAGAIN`. This is the strictest contract, and
   the handshake below follows it. A level-triggered backend still works under it; it just
   reports extra events.
+- **Level-triggered delivery on request** (`Trigger::Level`; planned, see
+  [Level-triggered registrations](#level-triggered-registrations)). The fd is reported
+  by every `poll()` while it is ready for something in its interest set. On epoll that
+  is a registration without `EPOLLET`; on kqueue, one without `EV_CLEAR`. The interest
+  set must be kept exact: an fd left registered for writing while nobody writes makes
+  every `poll()` return at once.
 - **Thread-safe registration.** Any thread may register or deregister while another
   thread is blocked in `poll()`. `epoll_ctl` and `kevent` both allow this.
 - **High-resolution timeout.** `poll()`'s timeout is in nanoseconds. On Linux this is
@@ -356,6 +365,9 @@ registration's lifetime and never per operation. This is tokio's `RegistrationSe
 4. Closes the timer queue, which removes every timer and wakes its waker
    (`TimerQueue::close_and_wake_all()`).
 
+Steps 3 and 4 are to run with the turn held (planned, see
+[Level-triggered registrations](#level-triggered-registrations)).
+
 Afterwards:
 
 | Call | Result |
@@ -476,6 +488,58 @@ never blocks, so Pico busy-polls.
     reaches its `event_interval` turn. Edge-triggered events wait in the kernel meanwhile,
     so nothing is lost, but a long-running task on the holder delays I/O and timer
     delivery while every other worker sleeps. Tokio has the same property.
+
+---
+
+## Level-triggered registrations
+
+Some libraries own their sockets and want an event loop to drive them: call them when an
+fd is ready, and never from two threads at once. libwebsockets is the one coro has (see
+[WebSocket Stream](websocket_stream.md)). Such a library does the reads and writes
+itself and expects `poll()` semantics, so the edge-triggered handshake does not fit: it
+may stop reading before `EAGAIN` and still expect to be called again.
+
+It needs no second mechanism in the driver, only a registration that behaves like
+`poll()` and a waker that does the work instead of scheduling a task:
+
+```cpp
+// IoRegistration
+IoRegistration(IoDriver& driver, sys::RawFd fd, sys::Interest interest, sys::Trigger trigger);
+void set_interest(sys::Interest interest);          // level-triggered only
+void set_waker(detail::Weak<detail::Waker> waker);  // level-triggered only; both directions
+IoLevelReady take_ready();                          // {readable, writable, shutdown} since the last call; clears it
+```
+
+- **The waker stays.** `dispatch()` takes an edge-triggered registration's waker out of
+  its slot when it wakes it. A level-triggered registration's waker is set once with
+  `set_waker()` and is woken on every turn in which the fd is ready, with no call to
+  put it back and no allocation per event.
+- **`take_ready()` tells the waker why it was woken.** `wake()` has no arguments, so
+  `dispatch()` records the directions on the `ScheduledIo` as it already does (an error
+  or hang-up counts as both), and the waker collects and clears them.
+- **`set_interest()`** re-registers the fd. The owner must keep the interest exact (see
+  [The `sys` layer](#the-sys-layer)).
+- **The waker does the work inside `wake()`**, on the thread that holds the turn. That
+  is where the library's mutual exclusion comes from: one thread turns at a time, and
+  nothing else calls the library.
+- **`shutdown()` wakes with the turn held.** Its wakes reach these wakers too, with
+  `shutdown` set in `take_ready()`, and they must not overlap a turn made by a thread outside the
+  runtime. The executor's threads have stopped by then, so the turn is free or about to
+  be.
+- **Lifetime is unchanged.** The registration's owner holds the waker; the driver holds
+  it weakly and upgrades it for the duration of `wake()`. A waker may therefore drop its
+  own registration from inside `wake()`, and an event for a registration dropped earlier
+  in the same batch finds no waker (see
+  [Registration lifetime and stale events](#registration-lifetime-and-stale-events)).
+- **The same waker can go on the timer queue** (`add_timer()`), which also fires inside
+  the turn. A library's own timers need nothing else.
+
+!!! danger "WARNING: a waker that works inline must not block, turn the driver, or run a task"
+    It runs with the turn held: while it runs, no I/O event and no timer is delivered to
+    anything. It may fill queues and wake other wakers. It must not wait on a lock that
+    a task can hold across a suspension, call `turn()` or `try_turn()`, or resume a
+    coroutine. Task wakers stay as they are; this is for a library that cannot be driven
+    any other way.
 
 ---
 
@@ -727,7 +791,7 @@ never early: `SleepFuture` checks the clock itself.
 | `signal()`, `signal_stream()` | A self-pipe written by the signal handler; each watcher reads it through the driver | [Signal Handling](signal_handling.md) |
 | `sleep_for`, `sleep_until`, `timeout`, `IntervalTimer` | The driver's timer queue | [Timers](timers.md) |
 | `File`, `lookup_host()` | Not on the driver: regular files are always "ready", and `getaddrinfo()` blocks, so both run on the blocking pool | [File I/O](file_io.md) |
-| `WsStream`, `WsListener` | Not on the driver: libwebsockets runs its own poll loop on a service thread | [WebSocket Stream](websocket_stream.md) |
+| `WsStream`, `WsListener` | A [level-triggered registration](#level-triggered-registrations) per libwebsockets socket, whose waker calls lws inside the turn; lws's timers on the timer queue | [WebSocket Stream](websocket_stream.md) |
 
 ---
 
@@ -754,6 +818,9 @@ never early: `SleepFuture` checks the clock itself.
 | `TimerQueue.CloseWakesLiveTimersAndEmptiesTheQueue`, `InsertAfterCloseIsRefused`, `CancelAfterCloseIsIgnored` | Closing the queue wakes every live timer, refuses later inserts and leaves old ids stale. |
 | `IoDriver.ShutdownWakesWaitersAndFailsPollIo`, `ShutdownIsReportedOnAReadyDirection`, `ShutdownRefusesNewRegistrations` | Shutdown wakes both directions once; `poll_io()` then fails without running the operation; a new registration throws. |
 | `IoDriver.DeregisterAfterShutdownIsSafe`, `ShutdownSkipsDeregisteredRegistrations`, `ShutdownWakesTimersAndRefusesNewOnes` | The registration list across deregistration in any order; timers woken, refused and cancelled after shutdown. |
+| `Poller.LevelTriggeredReportsUntilDrained`, `LevelTriggeredFollowsInterestChange` | A level-triggered fd is reported by every poll while readable; dropping an interest stops its reports. |
+| `IoDriver.LevelWakerStaysStored`, `TakeReadyReportsAndClearsBothDirections`, `SetInterestStopsWritableWakes` | A level-triggered registration: its waker is woken on every turn while the fd is ready, `take_ready()` says which directions fired, and `set_interest()` reaches the poller. |
+| `IoDriver.WakerMayDeregisterItselfDuringWake`, `ShutdownWakesLevelWakerAndReportsIt`, `ShutdownWakesWithTheTurnHeld` | A waker that drops its own registration from `wake()`; shutdown wakes a level-triggered waker, which then reads `shutdown`; a shutdown wake can't overlap a turn on another thread. |
 
 ---
 

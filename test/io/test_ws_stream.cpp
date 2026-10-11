@@ -1,5 +1,5 @@
-// WsStream / WsListener on the lws service threads (doc/design/websocket_stream.md).
-// Each test uses its own port in 30201-30299.
+// WsStream / WsListener, with lws serviced by the Runtime's IoDriver
+// (doc/design/websocket_stream.md). Each test uses its own port in 30201-30299.
 
 #include <gtest/gtest.h>
 #include <coro/io/lookup_host.h>
@@ -12,13 +12,16 @@
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
 #include <coro/coro.h>
+#include <coro/future.h>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -81,6 +84,37 @@ Coro<std::error_code> bind_error(std::string host, uint16_t port) {
         co_return e.code();
     }
     co_return std::error_code{};
+}
+
+// Binds `port` as soon as it is free, and returns the last error if that takes more
+// than 2 s. A dropped listener's port is released by a later turn of the driver,
+// not by the drop itself.
+Coro<std::error_code> bind_when_free(uint16_t port) {
+    std::error_code code;
+    for (int i = 0; i < 200; ++i) {
+        code = co_await bind_error("127.0.0.1", port);
+        if (!code) break;
+        co_await sleep_for(10ms);
+    }
+    co_return code;
+}
+
+// One message each way, each within 2 s.
+Coro<void> round_trip(WsStream& client, WsStream& server, std::string word) {
+    co_await client.send(word);
+    EXPECT_EQ(text(co_await receive(server)), word);
+    co_await server.send(word);
+    EXPECT_EQ(text(co_await receive(client)), word);
+}
+
+// What receive() on a closed connection throws, or "" if it returned a message.
+Coro<std::string> receive_error(WsStream& ws) {
+    try {
+        (void)co_await receive(ws);
+    } catch (const std::runtime_error& e) {
+        co_return std::string(e.what());
+    }
+    co_return std::string();
 }
 
 // Waits on the server end forever; the Runtime destroys it at shutdown.
@@ -329,9 +363,21 @@ TEST(WsListenerTest, PortReleasedWhenLastStreamDrops) {
             Connection c = co_await connect_pair(30216);
             (void)c;
         }
-        WsListener again = co_await WsListener::bind("127.0.0.1", 30216);
-        (void)again;
+        auto code = co_await bind_when_free(30216);
+        EXPECT_FALSE(code) << code.message();
     }());
+}
+
+// The last reference may go on a thread that has nothing to do with the Runtime.
+// The drop doesn't block, and the driver still destroys the context.
+TEST(WsListenerTest, LastHandleDroppedOnAnotherThread) {
+    Runtime rt;
+    Connection c = rt.block_on(connect_pair(30226));
+    std::thread other([](Connection) {}, std::move(c));
+    other.join();
+
+    auto code = rt.block_on(bind_when_free(30226));
+    EXPECT_FALSE(code) << code.message();
 }
 
 TEST(WsListenerTest, BindAddressInUseThrowsEaddrinuse) {
@@ -378,18 +424,92 @@ TEST(WsStreamTest, RuntimeShutdownWithOpenStreams) {
     SUCCEED();
 }
 
-// lws runs on its own thread, so WS needs no IoDriver. No timeouts or sleeps here: timers
-// need the IoDriver.
-TEST(WsStreamTest, WorksWithoutDriver) {
+// lws is serviced by the IoDriver, so a Runtime whose executor doesn't turn it can't
+// host a WebSocket. Reported up front rather than by a connect that never finishes.
+TEST(WsStreamTest, ConnectWithoutDriverThrowsLogicError) {
     Runtime rt(std::in_place_type<CurrentThreadExecutor>,
                std::make_unique<PollingParker>([] {}));
-    auto echoed = rt.block_on([]() -> Coro<std::string> {
-        WsListener listener = co_await WsListener::bind("127.0.0.1", 30214);
-        auto [server, client] = co_await join(listener.accept(),
-                                              WsStream::connect(url(30214)));
-        co_await client.send("no driver");
-        auto msg = co_await server.receive();
-        co_return std::string(msg.as_text());
+    EXPECT_THROW(rt.block_on(WsStream::connect(url(30214))), std::logic_error);
+    EXPECT_THROW(rt.block_on(WsListener::bind("127.0.0.1", 30214)), std::logic_error);
+}
+
+// One thread both runs the tasks and turns the driver, so every lws callback runs
+// between two polls of the task it wakes.
+TEST(WsStreamTest, RoundTripOnSingleThreadRuntime) {
+    Runtime rt(1);
+    rt.block_on([]() -> Coro<void> {
+        Connection c = co_await connect_pair(30219);
+        co_await round_trip(c.client, c.server, "one thread");
     }());
-    EXPECT_EQ(echoed, "no driver");
+}
+
+// A connection lives only as long as the Runtime that made it. A stream that
+// outlives it finds the connection closed, and can still be dropped.
+TEST(WsStreamTest, StreamOutlivingRuntimeIsClosed) {
+    std::optional<Connection> kept;
+    {
+        Runtime rt;
+        kept.emplace(rt.block_on(connect_pair(30220)));
+    }
+
+    Runtime rt;
+    rt.block_on([](Connection& c) -> Coro<void> {
+        EXPECT_EQ(co_await receive_error(c.client), "WsStream::receive: connection closed");
+        EXPECT_EQ(co_await receive_error(c.server), "WsStream::receive: connection closed");
+        bool accept_threw = false;
+        try {
+            (void)co_await accept(c.listener);
+        } catch (const std::runtime_error& e) {
+            accept_threw = std::string(e.what()) == "WsListener::accept: listener is closed";
+        }
+        EXPECT_TRUE(accept_threw);
+    }(*kept));
+    kept.reset();
+}
+
+// Client contexts are pooled: the second Runtime gets the first one's, with the
+// first one's connections gone from it.
+TEST(WsStreamTest, SecondRuntimeReusesClientContext) {
+    for (uint16_t port : {uint16_t{30221}, uint16_t{30222}}) {
+        Runtime rt;
+        rt.block_on([](uint16_t port) -> Coro<void> {
+            Connection c = co_await connect_pair(port);
+            co_await round_trip(c.client, c.server, "again");
+            (void)spawn(hold(std::move(c))).detach();   // still open at shutdown
+            co_await sleep_for(20ms);
+        }(port));
+    }
+}
+
+// Two Runtimes with WebSocket clients at the same time: each has its own client
+// context, serviced by its own driver.
+TEST(WsStreamTest, TwoRuntimesConnectAtOnce) {
+    Runtime a;
+    Runtime b;
+    Connection ca = a.block_on(connect_pair(30223));
+    Connection cb = b.block_on(connect_pair(30224));
+    a.block_on(round_trip(ca.client, ca.server, "a"));
+    b.block_on(round_trip(cb.client, cb.server, "b"));
+    a.block_on(round_trip(ca.client, ca.server, "a again"));
+    // Both connections are dropped here, on a thread of neither Runtime.
+}
+
+// A stream may be used from a Runtime other than the one servicing its connection:
+// the sends are posted to that one's driver, and its callbacks wake tasks here.
+TEST(WsStreamTest, UsedFromAnotherRuntime) {
+    Runtime owner;
+    Connection c = owner.block_on(connect_pair(30225));
+
+    Runtime other;
+    other.block_on(round_trip(c.client, c.server, "from elsewhere"));
+}
+
+// A thread the Runtime doesn't own sends, while the Runtime's workers are parked in
+// the driver: the post has to wake one of them.
+TEST(WsStreamTest, SendFromOutsideTheRuntime) {
+    Runtime rt;
+    Connection c = rt.block_on(connect_pair(30227));
+
+    blocking_wait(c.client.send("outside"));
+    EXPECT_EQ(text(blocking_wait(c.server.receive())), "outside");
 }

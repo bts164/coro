@@ -15,8 +15,8 @@ namespace coro::detail {
  * **Ownership:** `Waker` is reference-counted via `Rc` (`shared_ptr` off Pico). A leaf future
  * typically stores a clone (`clone()`) so the executor retains the original.
  *
- * **Thread safety:** `wake()` must be safe to call from any thread, including lws
- * service threads and blocking-pool threads.
+ * **Thread safety:** `wake()` must be safe to call from any thread, including
+ * blocking-pool threads and another Runtime's workers.
  *
  * Implementors: `TaskBase` is the concrete `Waker` — tasks are their own wakers.
  */

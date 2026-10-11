@@ -61,8 +61,8 @@ private:
 namespace coro::detail::ws {
 
 // ---------------------------------------------------------------------------
-// ListenerState — shared by WsListener and its AcceptFutures (executor threads) and
-// server_protocol_cb (the listener's lws service thread), which finds it through
+// ListenerState — shared by WsListener and its AcceptFutures (in their tasks) and
+// server_protocol_cb (in a turn of the IoDriver), which finds it through
 // lws_context_user(). The listener's LwsService keeps it alive until its context is
 // destroyed.
 // ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ struct ListenerState {
     std::mutex                                        accept_mutex;
     std::deque<std::shared_ptr<ConnectionState>>      pending;        // accepted, awaiting accept()
     detail::Weak<detail::Waker>                       accept_waker;   // woken when a connection arrives
-    bool                                              closed = false; // the WsListener was dropped
+    bool                                              closed = false; // the WsListener was dropped, or its context destroyed
 
     // lws_context stores a raw pointer into the protocols array — it does NOT copy it.
     // Both must outlive the context, which the LwsService's keep-alive ensures.
@@ -115,9 +115,11 @@ namespace coro {
  * @brief Async WebSocket server listener.
  *
  * Binds a TCP port and performs the WebSocket handshake for each incoming
- * connection. Built on libwebsockets: each listener has its own lws context and lws
- * service thread (see doc/design/websocket_stream.md, "Service threads"), shared by the
- * streams it accepts.
+ * connection. Built on libwebsockets: each listener has its own lws context, shared
+ * by the streams it accepts and serviced by the IoDriver of the Runtime that called
+ * `bind()` (see doc/design/websocket_stream.md, "lws on the I/O driver"). When that
+ * Runtime shuts down the listening socket and every accepted connection are closed,
+ * and `accept()` fails.
  *
  * Obtain a `WsListener` via `co_await WsListener::bind(host, port)`.
  * Call `co_await listener.accept()` in a loop to receive connections as
@@ -202,8 +204,9 @@ public:
     WsListener(const WsListener&)            = delete;
     WsListener& operator=(const WsListener&) = delete;
 
-    /// Stops accepting (see the class comment). Does not block, unless no accepted
-    /// stream is left: then it destroys the context and joins its service thread.
+    /// Stops accepting (see the class comment). Never blocks. If no accepted stream
+    /// is left, a later turn of the driver destroys the context, which is when the
+    /// port is released.
     ~WsListener();
 
     /**
@@ -217,6 +220,8 @@ public:
      *        which accepts whatever the client requests) and upgrade hooks.
      * @throws std::system_error with `dns_error_category()` if `host` doesn't resolve,
      *         or the last address's bind error (e.g. `EADDRINUSE`) if none binds.
+     * @throws std::logic_error if the calling Runtime's executor doesn't turn the
+     *         IoDriver.
      */
     [[nodiscard]] static Coro<WsListener> bind(std::string host, uint16_t port);
     [[nodiscard]] static Coro<WsListener> bind(std::string host, uint16_t port, Options options);

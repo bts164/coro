@@ -31,10 +31,13 @@ namespace coro {
 /**
  * @brief Async WebSocket client stream.
  *
- * Built on libwebsockets. Every lws call runs on a dedicated lws service thread (see
- * doc/design/websocket_stream.md, "Service threads"), so WsStream needs neither the
- * IoDriver nor any particular executor. Obtain one via `co_await WsStream::connect(url)`
- * or `co_await listener.accept()`.
+ * Built on libwebsockets, which has no thread of its own here: its sockets are
+ * registered with the Runtime's IoDriver, and every lws call runs inside a turn of
+ * that driver (see doc/design/websocket_stream.md, "lws on the I/O driver"). So the
+ * Runtime that calls `connect()` or `WsListener::bind()` must turn its IoDriver, and
+ * the connection lives only as long as that Runtime: once it shuts down, the stream
+ * is closed. The stream itself may be used from any Runtime. Obtain one via
+ * `co_await WsStream::connect(url)` or `co_await listener.accept()`.
  *
  * **Frame modes:**
  * - `FrameMode::Full` (default) — `receive()` returns after the complete message is assembled.
@@ -114,8 +117,7 @@ public:
 
     private:
         std::shared_ptr<detail::ws::ConnectionState> m_state;
-        // Unused by poll(); held so the service, and the thread that wakes this
-        // future, outlive it.
+        // Unused by poll(); held so the service outlives this future.
         std::shared_ptr<detail::ws::LwsService>      m_service;
     };
 
@@ -123,11 +125,11 @@ public:
      * @brief Future<void> returned by @ref WsStream::send().
      *
      * Owns a heap-allocated `SendSubState`. On first poll, pushes it onto the connection's
-     * send queue and posts `lws_callback_on_writable()` to the lws service thread. The
+     * send queue and posts `lws_callback_on_writable()` to the lws service. The
      * WRITEABLE callback pops the entry, calls `lws_write()`, and wakes the future.
      *
-     * Dropping this future sets `cancelled` on the `SendSubState`; the service thread
-     * skips the write if the flag is set when WRITEABLE fires.
+     * Dropping this future sets `cancelled` on the `SendSubState`; the WRITEABLE
+     * callback skips the write if the flag is set when it fires.
      *
      * @note The caller's data span must remain valid until the future resolves.
      */
@@ -164,9 +166,9 @@ public:
     WsStream(const WsStream&)            = delete;
     WsStream& operator=(const WsStream&) = delete;
 
-    /// Posts a graceful close (Close frame + echo) to the lws service thread. Does not
-    /// block, unless this drops the last reference to the service: then it waits for
-    /// the service thread to exit, which closes the remaining connections abruptly.
+    /// Posts a graceful close (Close frame + echo) to the lws service. Never blocks.
+    /// If this drops the last reference to a listener's service, a later turn of the
+    /// driver destroys its context.
     ~WsStream();
 
     /**
@@ -181,6 +183,8 @@ public:
      * @param options Frame mode, advertised subprotocols (none by default, which
      *        accepts any server) and the largest message accepted.
      * @throws std::invalid_argument if the URL cannot be parsed.
+     * @throws std::logic_error if the calling Runtime's executor doesn't turn the
+     *         IoDriver.
      * @throws std::system_error with `dns_error_category()` if the host doesn't
      *         resolve, or the last address's failure (e.g. `ECONNREFUSED`) if none
      *         connects.
@@ -232,15 +236,16 @@ namespace coro::detail::ws {
 // ---------------------------------------------------------------------------
 // Sub-states — one per operation type, embedded in ConnectionState.
 //
-// Each is shared between a future (on an executor thread) and the lws callbacks (on
-// the lws service thread), under its own mutex. Wakers are stored weak, as the
-// IoDriver stores them: the executor's task list owns a waiting task, and a task
-// that has gone away is simply not woken. They are fired outside the mutex.
+// Each is shared between a future (polled by its task) and the lws callbacks (in a
+// turn of the IoDriver, possibly on another thread), under its own mutex. Wakers
+// are stored weak, as the IoDriver stores them: the executor's task list owns a
+// waiting task, and a task that has gone away is simply not woken. They are fired
+// outside the mutex.
 // ---------------------------------------------------------------------------
 
 struct ConnectSubState {
-    // mutex guards everything here. Both the client callback (service thread) and
-    // ConnectAttempt (executor thread) hold it.
+    // mutex guards everything here. Both the client callback (in a driver turn) and
+    // ConnectAttempt (in its task) hold it.
     std::mutex                       mutex;
     detail::Weak<detail::Waker>      waker;
     bool                             complete  = false;
@@ -259,14 +264,14 @@ struct ReceivedMessage {
 };
 
 struct ReceiveSubState {
-    // mutex guards everything here. Both the receive callbacks (service thread) and
-    // ReceiveFuture::poll (executor thread) hold it.
+    // mutex guards everything here. Both the receive callbacks (in a driver turn)
+    // and ReceiveFuture::poll (in its task) hold it.
     std::mutex                       mutex;
     detail::Weak<detail::Waker>      waker;
     std::vector<std::byte>           buffer;              // message being assembled
     std::size_t                      message_size = 0;    // bytes of it so far, for max_message_size
     bool                             discarding   = false;  // dropping the rest of an oversized message
-    // Filled by the service thread, drained in order by receive().
+    // Filled by the receive callbacks, drained in order by receive().
     // FIXME: unbounded -- rx flow control isn't applied, so a peer sending faster than the
     // application receives grows this without limit.
     std::deque<ReceivedMessage>      ready;
@@ -296,8 +301,8 @@ struct SendSubState {
 // ---------------------------------------------------------------------------
 
 struct ConnectionState {
-    // Service thread only: the callbacks and posted commands read and write these,
-    // and nothing else does.
+    // Driver turns only: the callbacks and posted commands read and write these,
+    // and nothing else does. The turn orders the accesses.
     lws*                             wsi     = nullptr;  // owned by the lws context
     std::shared_ptr<ConnectionState> self;
     // Set by a posted close; checked in the WRITEABLE callback, which calls
@@ -311,7 +316,7 @@ struct ConnectionState {
     ReceiveSubState              receive;
     std::mutex                   send_queue_mutex;
     std::deque<std::shared_ptr<SendSubState>> send_queue;  // shared_ptr keeps sub-state alive
-    // Written by the service thread, read by the futures. Atomic rather than under a
+    // Written in a driver turn, read by the futures. Atomic rather than under a
     // mutex: it only ever goes false -> true, and each reader re-checks it under the
     // sub-state mutex that close_connection() takes before waking (see there).
     std::atomic<bool>            closed{false};
@@ -333,7 +338,8 @@ struct ParsedUrl {
 ParsedUrl parse_ws_url(std::string_view url);
 
 // ---------------------------------------------------------------------------
-// The lws callback logic. All of it runs on the lws service thread.
+// The lws callback logic. All of it runs inside a turn of the IoDriver that
+// services the connection's lws context.
 // ---------------------------------------------------------------------------
 
 /// The client protocol callback, registered by LwsService::client().

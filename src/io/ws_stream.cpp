@@ -1,9 +1,10 @@
-// WsStream on libwebsockets, with every lws call on the lws service thread
-// (ws_service.h). See doc/design/websocket_stream.md.
+// WsStream on libwebsockets, with every lws call made inside a turn of the Runtime's
+// IoDriver (ws_service.h). See doc/design/websocket_stream.md.
 
 #include <coro/io/ws_stream.h>
 #include <coro/io/lookup_host.h>
 #include <coro/io/socket_address.h>
+#include <coro/detail/socket_state.h>
 #include "ws_service.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -26,6 +27,13 @@ namespace detail::ws {
 
 int protocol_cb(lws* wsi, lws_callback_reasons reason,
                 void* user, void* in, std::size_t len) {
+    // LwsService::post() woke the context: run what was posted. A context-level
+    // callback, so it comes with no connection and is handled before the check below.
+    if (reason == LWS_CALLBACK_EVENT_WAIT_CANCELLED) {
+        LwsService::run_commands(lws_get_context(wsi));
+        return 0;
+    }
+
     // The wsi user pointer: the ConnectionState the connect command passed as
     // userdata. Cleared before close_connection() drops the state, so callbacks after
     // that (and the context-level ones, which have no connection) see null.
@@ -211,7 +219,7 @@ void close_connection(ConnectionState& state, int connect_error, std::string rea
 }
 
 void post_close(LwsService& service, std::shared_ptr<ConnectionState> state) {
-    service.post([state = std::move(state)] {
+    service.post([state = std::move(state)](lws_context*) {
         // wsi is null once lws has reported the connection gone.
         if (!state->wsi) return;
         state->closing = true;
@@ -338,9 +346,8 @@ public:
 
 private:
     void post_connect() {
-        // Captures the raw context, never the service: see LwsService::post().
-        m_service->post([state = m_state, ctx = m_service->context(), address = m_address,
-                         url = m_url, protocols = m_protocols] {
+        m_service->post([state = m_state, address = m_address, url = m_url,
+                         protocols = m_protocols](lws_context* ctx) {
             {
                 std::lock_guard lk(state->connect.mutex);
                 if (state->connect.cancelled) return;
@@ -396,8 +403,9 @@ WsStream& WsStream::operator=(WsStream&& other) noexcept {
 
 WsStream::~WsStream() {
     if (m_state) detail::ws::post_close(*m_service, std::move(m_state));
-    // m_service is released after this body; if it's the last reference, that joins
-    // the service thread, which runs the close first.
+    // m_service is released after this body. Nothing here blocks: if that was a
+    // listener's last reference, a later turn destroys its context, after running
+    // the close.
 }
 
 Coro<WsStream> WsStream::connect(std::string url) {
@@ -406,6 +414,8 @@ Coro<WsStream> WsStream::connect(std::string url) {
 
 Coro<WsStream> WsStream::connect(std::string url, Options options) {
     const detail::ws::ParsedUrl parsed = detail::ws::parse_ws_url(url);
+    // lws is serviced by this Runtime's IoDriver, so the Runtime must turn it.
+    IoDriver& driver = detail::socket_io_driver("WsStream::connect");
     const std::vector<SocketAddress> peers = co_await lookup_host(parsed.host, parsed.port);
 
     // Comma-separated Sec-WebSocket-Protocol; empty sends no header.
@@ -415,7 +425,7 @@ Coro<WsStream> WsStream::connect(std::string url, Options options) {
         protocols += p;
     }
 
-    auto service = detail::ws::LwsService::client();
+    auto service = detail::ws::LwsService::client(driver);
     // Each address in the resolver's order; the first to complete the handshake wins,
     // else the last failure is thrown (as TcpStream::connect does).
     std::exception_ptr last_error;
@@ -531,7 +541,7 @@ PollResult<void> WsStream::SendFuture::poll(detail::Context& ctx) {
             m_state->send_queue.push_back(m_sub_state);
         }
         m_started = true;
-        m_service->post([state = m_state] {
+        m_service->post([state = m_state](lws_context*) {
             if (state->wsi) lws_callback_on_writable(state->wsi);
         });
     }

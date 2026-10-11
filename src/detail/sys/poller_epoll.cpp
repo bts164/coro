@@ -25,15 +25,15 @@ namespace coro::detail::sys {
 namespace {
 
 // Events fetched per epoll_wait() call. More than this many ready fds are simply
-// returned by the next poll(); with edge triggering nothing is lost.
+// returned by the next poll(): nothing is lost, with either trigger.
 constexpr int kMaxEventsPerPoll = 256;
 
 [[noreturn]] void throw_errno(const char* what) {
     throw std::system_error(errno, std::generic_category(), what);
 }
 
-uint32_t to_epoll_events(Interest interest) {
-    uint32_t ev = EPOLLET;
+uint32_t to_epoll_events(Interest interest, Trigger trigger) {
+    uint32_t ev = trigger == Trigger::Edge ? EPOLLET : 0;
     if (interest.readable) ev |= EPOLLIN | EPOLLRDHUP;
     if (interest.writable) ev |= EPOLLOUT;
     return ev;
@@ -150,16 +150,16 @@ Poller::~Poller() {
     if (m_fd >= 0) ::close(m_fd);
 }
 
-void Poller::register_fd(RawFd fd, void* key, Interest interest) {
+void Poller::register_fd(RawFd fd, void* key, Interest interest, Trigger trigger) {
     epoll_event ev{};
-    ev.events   = to_epoll_events(interest);
+    ev.events   = to_epoll_events(interest, trigger);
     ev.data.ptr = key;
     if (::epoll_ctl(m_fd, EPOLL_CTL_ADD, fd, &ev) < 0) throw_errno("epoll_ctl(ADD)");
 }
 
-void Poller::reregister_fd(RawFd fd, void* key, Interest interest) {
+void Poller::reregister_fd(RawFd fd, void* key, Interest interest, Trigger trigger) {
     epoll_event ev{};
-    ev.events   = to_epoll_events(interest);
+    ev.events   = to_epoll_events(interest, trigger);
     ev.data.ptr = key;
     if (::epoll_ctl(m_fd, EPOLL_CTL_MOD, fd, &ev) < 0) throw_errno("epoll_ctl(MOD)");
 }

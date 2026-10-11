@@ -86,6 +86,11 @@ std::size_t IoDriver::turn_locked(std::optional<std::chrono::nanoseconds> timeou
         released.clear();  // destroy outside m_release_mutex
     }
 
+    // After shutdown() nothing can end a wait: no event wakes anyone who would then
+    // unpark, and every timer is gone. So a turn only collects what is ready. It is
+    // also what lets shutdown() take the turn: see there.
+    if (m_shut_down.load(std::memory_order_acquire)) timeout = std::chrono::nanoseconds{0};
+
     m_events.clear();
     // The earliest timer bounds the wait. From here to end_wait_and_fire_expired()
     // below, an add_timer() with an earlier deadline unparks this poll; see
@@ -110,6 +115,23 @@ void IoDriver::unpark() noexcept {
 }
 
 void IoDriver::shutdown() noexcept {
+    // Before any wake below, and before the timers are woken: a waiter that
+    // shutdown() wakes must find the flag set when it polls again.
+    m_shut_down.store(true, std::memory_order_release);
+
+    // Everything else runs with the turn held, so that a waker woken here runs under
+    // the same mutual exclusion as one woken by turn(). A level-triggered
+    // registration's waker does its work inline and depends on it.
+    //
+    // Race (handled): a thread may be blocked in turn(), holding the mutex. The
+    // unpark makes that poll return. A turn that starts afterwards reads the flag
+    // set above and does not block, so the mutex is released again promptly however
+    // often that thread turns. (If it read the flag just before the store, its poll
+    // still finds the unpark.) Runtime::shutdown() calls this with its executor
+    // threads already stopped, so there the lock is free.
+    unpark();
+    std::lock_guard turn_lock(m_turn_mutex);
+
     // An allocation failure below terminates (noexcept), as it would in the
     // destructor path this runs on.
     std::vector<detail::Rc<detail::Waker>> wakers;
@@ -117,9 +139,6 @@ void IoDriver::shutdown() noexcept {
         std::lock_guard lock(m_registrations_mutex);
         if (m_closed) return;
         m_closed = true;
-        // Before any wake below, and before the timers are woken: a waiter that
-        // shutdown() wakes must find the flag set when it polls again.
-        m_shut_down.store(true, std::memory_order_release);
 
         // Race (handled): a deregister() on another thread unlinks under
         // m_registrations_mutex before it gives up its reference, so every node
@@ -131,13 +150,21 @@ void IoDriver::shutdown() noexcept {
             // It either stored before this and is woken below, or runs after and
             // sees m_shutdown.
             io->m_shutdown = true;
+            if (io->m_level) {
+                // A persistent waker stays in its slot, as in dispatch().
+                if (auto waker = io->m_reader.lock()) wakers.push_back(std::move(waker));
+                continue;
+            }
             if (auto reader = std::exchange(io->m_reader, {}).lock())
                 wakers.push_back(std::move(reader));
             if (auto writer = std::exchange(io->m_writer, {}).lock())
                 wakers.push_back(std::move(writer));
         }
     }
-    // Wake outside both locks, as dispatch() does.
+    // Wake outside m_registrations_mutex and the ScheduledIo mutexes, as dispatch()
+    // does: a level-triggered waker deregisters fds from inside wake(), which takes
+    // both. The strong references keep every waker alive through the loop, so one
+    // that drops the owner of a later one does not leave it dangling.
     for (const auto& waker : wakers) waker->wake();
 
     m_timers.close_and_wake_all();
@@ -174,11 +201,22 @@ void IoDriver::dispatch(const detail::sys::Event& event) {
     detail::Rc<detail::Waker> writer;
     {
         std::lock_guard lock(io->m_mutex);
-        if (readable) {
+        if (io->m_level) {
+            // Level-triggered: record what was seen for take_ready(), and wake the
+            // one waker without taking it out of its slot. It runs inline below,
+            // inside this turn.
+            //
+            // Race (handled): the registration may have been deregistered after
+            // this turn fetched the event. deregister() cleared the waker under
+            // this mutex, so nothing is woken.
+            io->m_readable = io->m_readable || readable;
+            io->m_writable = io->m_writable || writable;
+            reader = io->m_reader.lock();
+        } else if (readable) {
             io->m_readable = true;
             reader = std::exchange(io->m_reader, {}).lock();
         }
-        if (writable) {
+        if (!io->m_level && writable) {
             io->m_writable = true;
             writer = std::exchange(io->m_writer, {}).lock();
         }
@@ -195,8 +233,16 @@ void IoDriver::dispatch(const detail::sys::Event& event) {
     if (writer) writer->wake();
 }
 
-detail::Rc<detail::ScheduledIo> IoDriver::add(detail::sys::RawFd fd, detail::sys::Interest interest) {
+detail::Rc<detail::ScheduledIo> IoDriver::add(detail::sys::RawFd fd, detail::sys::Interest interest,
+                                              detail::sys::Trigger trigger) {
     auto io = detail::make_rc<detail::ScheduledIo>();
+    if (trigger == detail::sys::Trigger::Level) {
+        // Nothing has been reported yet; see ScheduledIo. Written before the poller
+        // can name `io`, so no lock is needed.
+        io->m_level    = true;
+        io->m_readable = false;
+        io->m_writable = false;
+    }
     // Held across register_fd() so that shutdown() sees either no registration or a
     // linked one. Once per registration, so the syscall under the lock is no concern.
     std::lock_guard lock(m_registrations_mutex);
@@ -208,7 +254,7 @@ detail::Rc<detail::ScheduledIo> IoDriver::add(detail::sys::RawFd fd, detail::sys
     // touches it. epoll_ctl() happens before the epoll_wait() that returns it; this
     // annotation only makes that visible to TSan.
     publish_to_poller(io.get());
-    m_poller.register_fd(fd, io.get(), interest);   // may throw: nothing linked yet
+    m_poller.register_fd(fd, io.get(), interest, trigger);   // may throw: nothing linked yet
     io->m_next = m_registrations;
     if (m_registrations != nullptr) m_registrations->m_prev = io.get();
     m_registrations = io.get();
@@ -266,9 +312,14 @@ void IoDriver::deregister(detail::sys::RawFd fd, detail::Rc<detail::ScheduledIo>
 // ---------------------------------------------------------------------------
 
 IoRegistration::IoRegistration(IoDriver& driver, detail::sys::RawFd fd, detail::sys::Interest interest)
+    : IoRegistration(driver, fd, interest, detail::sys::Trigger::Edge)
+{}
+
+IoRegistration::IoRegistration(IoDriver& driver, detail::sys::RawFd fd,
+                               detail::sys::Interest interest, detail::sys::Trigger trigger)
     : m_driver(&driver)
     , m_fd(fd)
-    , m_io(driver.add(fd, interest))
+    , m_io(driver.add(fd, interest, trigger))
 {}
 
 IoRegistration::~IoRegistration() {
@@ -294,6 +345,7 @@ IoRegistration& IoRegistration::operator=(IoRegistration&& other) noexcept {
 std::optional<IoReadyEvent> IoRegistration::poll_ready(IoDirection direction,
                                                        detail::Context& ctx) {
     assert(m_io && "poll_ready() on an empty IoRegistration");
+    assert(!m_io->m_level && "poll_ready() on a level-triggered IoRegistration");
     std::lock_guard lock(m_io->m_mutex);
     if (m_io->m_shutdown)
         return IoReadyEvent{direction, m_io->m_tick, true};
@@ -330,6 +382,35 @@ void IoRegistration::deregister() noexcept {
     m_io     = nullptr;
     m_driver = nullptr;
     m_fd     = -1;
+}
+
+void IoRegistration::set_interest(detail::sys::Interest interest) {
+    assert(m_io && "set_interest() on an empty IoRegistration");
+    assert(m_io->m_level && "set_interest() on an edge-triggered IoRegistration");
+    // Race (benign): a turn on another thread may already hold an event for a
+    // direction this removes, and dispatches it afterwards. The waker tolerates
+    // that; see set_interest() in the header.
+    m_driver->m_poller.reregister_fd(m_fd, m_io.get(), interest, detail::sys::Trigger::Level);
+}
+
+void IoRegistration::set_waker(detail::Weak<detail::Waker> waker) {
+    assert(m_io && "set_waker() on an empty IoRegistration");
+    assert(m_io->m_level && "set_waker() on an edge-triggered IoRegistration");
+    // Under the mutex dispatch() reads the slot with: an event dispatched on
+    // another thread wakes either the old waker or this one, never a torn value.
+    std::lock_guard lock(m_io->m_mutex);
+    m_io->m_reader = std::move(waker);
+}
+
+IoLevelReady IoRegistration::take_ready() {
+    assert(m_io && "take_ready() on an empty IoRegistration");
+    assert(m_io->m_level && "take_ready() on an edge-triggered IoRegistration");
+    std::lock_guard lock(m_io->m_mutex);
+    IoLevelReady ready;
+    ready.readable = std::exchange(m_io->m_readable, false);
+    ready.writable = std::exchange(m_io->m_writable, false);
+    ready.shutdown = m_io->m_shutdown;
+    return ready;
 }
 
 // ---------------------------------------------------------------------------

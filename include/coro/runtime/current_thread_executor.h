@@ -55,7 +55,7 @@ class Runtime;
  * this executor's queue serves Pico and a standalone executor. On Pico it is a @ref PollingParker around `cyw43_arch_poll()`, which
  * never blocks, so the loop busy-polls.
  *
- * `enqueue()` may be called from other threads (blocking pool, lws service threads) or
+ * `enqueue()` may be called from other threads (the blocking pool, another Runtime's workers) or
  * from an ISR on Pico. It pushes under `m_ready_mutex`, and unparks the
  * executor if it is parked. See doc/design/executor_design.md, "Parking and its races".
  */

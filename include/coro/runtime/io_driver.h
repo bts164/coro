@@ -51,6 +51,20 @@ struct IoReadyEvent {
     bool        shutdown = false;
 };
 
+/**
+ * @brief What IoRegistration::take_ready() reports for a level-triggered
+ * registration: the readiness the driver has seen since the previous call.
+ *
+ * An error or hang-up on the fd sets both directions, as it wakes both waiters of an
+ * edge-triggered registration.
+ */
+struct IoLevelReady {
+    bool readable = false;
+    bool writable = false;
+    /// The driver has been shut down: this registration will never report again.
+    bool shutdown = false;
+};
+
 namespace detail {
 
 /**
@@ -66,13 +80,22 @@ private:
     friend class coro::IoRegistration;
 
     std::mutex   m_mutex;
-    // Readiness starts true, so the first operation is a plain syscall attempt;
-    // the "wait" only happens after a real EAGAIN. GUARDED BY m_mutex.
+    // Set once by IoDriver::add(), before the poller can report this registration.
+    // True for a level-triggered registration, which uses the fields below
+    // differently: see each one.
+    bool         m_level = false;
+    // Edge-triggered: readiness starts true, so the first operation is a plain
+    // syscall attempt; the "wait" only happens after a real EAGAIN.
+    // Level-triggered: starts false, and holds what the driver has reported since
+    // the last take_ready(). GUARDED BY m_mutex.
     bool         m_readable = true;
     bool         m_writable = true;
     // Bumped by every driver event for this registration. GUARDED BY m_mutex.
     uint64_t     m_tick = 0;
-    // One waiter per direction (one recv and one send in flight at a time).
+    // Edge-triggered: one waiter per direction (one recv and one send in flight at
+    // a time), taken out of its slot when woken.
+    // Level-triggered: m_reader is the one waker set by set_waker(). It is woken
+    // for either direction and stays in the slot; m_writer is unused.
     // Weak: the task owns the future that owns the registration, so a strong
     // reference here would form a cycle. GUARDED BY m_mutex.
     Weak<Waker>  m_reader;
@@ -175,14 +198,20 @@ public:
      *
      *  - Every registration is marked shut down and its waiters are woken. From then
      *    on IoRegistration::poll_io() fails with `sys::kDriverShutDown`, without
-     *    running the operation.
+     *    running the operation, and take_ready() reports `shutdown`.
      *  - Every timer is removed and its waker woken. is_shut_down() tells the woken
      *    waiter why; add_timer() throws from then on.
      *  - Registering a new fd throws.
      *
+     * It holds the turn throughout, so a waker it wakes runs under the same mutual
+     * exclusion as one woken by turn(). A level-triggered registration's waker, which
+     * does its work inline, relies on that. It first makes a thread blocked in turn()
+     * return; from then on turn() never blocks, since nothing could end the wait.
+     *
      * turn(), unpark(), cancel_timer() and deregistering keep working, so futures
      * and sockets that outlive the shutdown are destroyed as usual. Thread-safe and
-     * idempotent.
+     * idempotent. Must not be called from inside a turn (from a waker that turn() or
+     * shutdown() is waking): it would wait for itself.
      */
     void shutdown() noexcept;
 
@@ -219,7 +248,8 @@ private:
 
     /// Registers `fd`; returns the state its IoRegistration will share.
     /// @throws std::runtime_error if the driver has been shut down.
-    detail::Rc<detail::ScheduledIo> add(detail::sys::RawFd fd, detail::sys::Interest interest);
+    detail::Rc<detail::ScheduledIo> add(detail::sys::RawFd fd, detail::sys::Interest interest,
+                                        detail::sys::Trigger trigger);
 
     /// Deregisters `fd` and defers releasing `io` until the start of the next turn().
     void deregister(detail::sys::RawFd fd, detail::Rc<detail::ScheduledIo> io) noexcept;
@@ -235,8 +265,11 @@ private:
     char           m_unpark_key = 0;
     detail::sys::PollWaker m_unpark;
 
-    // Serializes turn() callers. Held for the whole turn, including while blocked
-    // in poll(); other threads never take it except to turn.
+    // Serializes turn() callers, and shutdown() against them. Held for the whole
+    // turn, including while blocked in poll(); other threads never take it except
+    // to turn or to shut down.
+    //
+    // Lock order: m_turn_mutex, then m_registrations_mutex.
     std::mutex     m_turn_mutex;
     // Reused event buffer. GUARDED BY m_turn_mutex.
     std::vector<detail::sys::Event> m_events;
@@ -274,10 +307,10 @@ private:
     bool                 m_closed = false;
 
     // m_closed for readers that must not take a lock: SleepFuture checks it on a
-    // re-poll that would otherwise touch nothing shared. Written once, by shutdown(),
-    // before it wakes anyone, so a waiter woken by shutdown() sees it. An atomic
-    // rather than a mutex because that re-poll is on the hot path of every timeout
-    // raced against a busy future.
+    // re-poll that would otherwise touch nothing shared, and every turn checks it
+    // before blocking. Written once, by shutdown(), before it takes the turn and so
+    // before it wakes anyone: a waiter woken by shutdown() sees it. An atomic rather
+    // than a mutex because both readers are on a hot path.
     std::atomic<bool>    m_shut_down{false};
 };
 
@@ -301,6 +334,22 @@ private:
  *
  * Dropping a future mid-wait is always safe: the only state it left behind is a
  * weak waker in this registration, which a later poll_ready() overwrites.
+ *
+ * **Level-triggered mode** is for an fd that someone else reads and writes: a
+ * library that asks to be called whenever its socket is ready, and cannot promise
+ * to drain it. Such a registration has no handshake. Instead:
+ *
+ *  - set_waker() stores one waker, which stays stored. The driver wakes it, inside
+ *    the turn, every time the fd is ready for something in the interest set.
+ *  - The waker does the work inline: it calls take_ready() to learn which
+ *    directions, then calls into the library. Because it runs inside the turn, it
+ *    must not block, turn the driver, or resume a coroutine.
+ *  - set_interest() keeps the interest set exact. An fd left registered for writing
+ *    while nothing is waiting to write makes every turn return at once.
+ *
+ * poll_ready(), clear_ready() and poll_io() are for edge-triggered registrations
+ * only; set_interest(), set_waker() and take_ready() for level-triggered ones.
+ * See doc/design/io_driver.md, "Level-triggered registrations".
  */
 class IoRegistration {
 public:
@@ -312,6 +361,13 @@ public:
     /// @throws std::runtime_error if `driver` has been shut down.
     IoRegistration(IoDriver& driver, detail::sys::RawFd fd,
                    detail::sys::Interest interest = detail::sys::Interest::read_write());
+
+    /// Registers `fd` with `driver` with the given trigger. With `Trigger::Level`,
+    /// nothing is woken until set_waker() has been called.
+    /// @throws std::system_error if the OS rejects the registration.
+    /// @throws std::runtime_error if `driver` has been shut down.
+    IoRegistration(IoDriver& driver, detail::sys::RawFd fd,
+                   detail::sys::Interest interest, detail::sys::Trigger trigger);
 
     ~IoRegistration();
 
@@ -341,7 +397,46 @@ public:
     void clear_ready(IoReadyEvent event);
 
     /// Deregisters the fd; afterwards the fd may be closed. Idempotent.
+    ///
+    /// A level-triggered registration's waker may call this on its own
+    /// registration, or on another one, while the driver is waking it.
     void deregister() noexcept;
+
+    /**
+     * @brief Replaces the interest set. Level-triggered registrations only.
+     *
+     * Takes effect for the next poll. A turn that has already fetched its events may
+     * still report a direction that was just removed, so the waker must tolerate a
+     * wake for a direction it no longer wants. An error or hang-up is reported
+     * whatever the interest set is.
+     *
+     * @throws std::system_error if the OS rejects the change.
+     */
+    void set_interest(detail::sys::Interest interest);
+
+    /**
+     * @brief Sets the waker the driver wakes each time the fd is ready.
+     * Level-triggered registrations only.
+     *
+     * One waker serves both directions, and it stays set until replaced or until the
+     * fd is deregistered. It is woken inside the turn, and once more by
+     * IoDriver::shutdown(), after which take_ready() reports `shutdown`.
+     *
+     * Race (for the caller to handle): a shutdown that began between the
+     * constructor and this call has already collected the wakers it will wake, and
+     * does not wake this one. A caller that is not itself inside a turn must check
+     * `take_ready().shutdown` after setting the waker.
+     */
+    void set_waker(detail::Weak<detail::Waker> waker);
+
+    /**
+     * @brief Returns the readiness reported since the previous call, and clears it.
+     * Level-triggered registrations only.
+     *
+     * Nothing is lost by the clearing: while the fd stays ready, the next turn
+     * reports it again.
+     */
+    IoLevelReady take_ready();
 
     /**
      * @brief Runs the readiness handshake around one non-blocking operation.

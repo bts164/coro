@@ -14,8 +14,10 @@
 #include <cerrno>
 #include <chrono>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -766,4 +768,168 @@ TEST(IoDriver, ShutdownWakesTimersAndRefusesNewOnes) {
     driver.cancel_timer(id);
     EXPECT_EQ(driver.turn(0ms), 0u);
     EXPECT_EQ(task.wakes(), 1);
+}
+
+// --- Level-triggered registrations ---
+
+namespace {
+
+using detail::sys::Interest;
+using detail::sys::Trigger;
+
+void read_byte(int fd) {
+    char c = 0;
+    ASSERT_EQ(::read(fd, &c, 1), 1);
+}
+
+// A waker that runs a function inline, as a level-triggered registration's does.
+class InlineWaker : public detail::Waker, public std::enable_shared_from_this<InlineWaker> {
+public:
+    explicit InlineWaker(std::function<void()> fn) : m_fn(std::move(fn)) {}
+    void wake() override { m_fn(); }
+    detail::Rc<detail::Waker> clone() override { return shared_from_this(); }
+private:
+    std::function<void()> m_fn;
+};
+
+} // namespace
+
+// The waker is not consumed by a wake: while the fd stays readable, every turn
+// wakes it again.
+TEST(IoDriver, LevelWakerStaysStored) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a, Interest::read(), Trigger::Level);
+    TestTask task;
+    reg.set_waker(task.waker);
+
+    driver.turn(0ms);
+    EXPECT_EQ(task.wakes(), 0);   // nothing to read yet, and writing isn't asked for
+
+    write_byte(sp.b);
+    driver.turn(0ms);
+    EXPECT_EQ(task.wakes(), 1);
+    driver.turn(0ms);
+    EXPECT_EQ(task.wakes(), 2);
+
+    read_byte(sp.a);
+    driver.turn(0ms);
+    EXPECT_EQ(task.wakes(), 2);
+}
+
+TEST(IoDriver, TakeReadyReportsAndClearsBothDirections) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a, Interest::read_write(), Trigger::Level);
+    TestTask task;
+    reg.set_waker(task.waker);
+
+    write_byte(sp.b);
+    driver.turn(0ms);
+    ASSERT_GE(task.wakes(), 1);
+
+    const IoLevelReady first = reg.take_ready();
+    EXPECT_TRUE(first.readable);
+    EXPECT_TRUE(first.writable);
+    EXPECT_FALSE(first.shutdown);
+
+    const IoLevelReady second = reg.take_ready();
+    EXPECT_FALSE(second.readable);
+    EXPECT_FALSE(second.writable);
+    EXPECT_FALSE(second.shutdown);
+}
+
+// A socket is almost always writable, so interest in writing must be droppable:
+// otherwise every turn would wake the waker.
+TEST(IoDriver, SetInterestStopsWritableWakes) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a, Interest::read_write(), Trigger::Level);
+    TestTask task;
+    reg.set_waker(task.waker);
+
+    driver.turn(0ms);
+    ASSERT_EQ(task.wakes(), 1);
+    EXPECT_TRUE(reg.take_ready().writable);
+
+    reg.set_interest(Interest::read());
+    driver.turn(0ms);
+    driver.turn(0ms);
+    EXPECT_EQ(task.wakes(), 1);
+
+    write_byte(sp.b);
+    driver.turn(0ms);
+    EXPECT_EQ(task.wakes(), 2);
+    const IoLevelReady ready = reg.take_ready();
+    EXPECT_TRUE(ready.readable);
+    EXPECT_FALSE(ready.writable);
+
+    // And back on again.
+    reg.set_interest(Interest::read_write());
+    driver.turn(0ms);
+    EXPECT_EQ(task.wakes(), 3);
+    EXPECT_TRUE(reg.take_ready().writable);
+}
+
+// The waker's work may end with the fd being closed, so it may deregister the
+// registration that is waking it.
+TEST(IoDriver, WakerMayDeregisterItselfDuringWake) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a, Interest::read(), Trigger::Level);
+    int wakes = 0;
+    auto waker = std::make_shared<InlineWaker>([&] {
+        ++wakes;
+        reg.deregister();
+    });
+    reg.set_waker(waker);
+
+    write_byte(sp.b);
+    driver.turn(0ms);
+    EXPECT_EQ(wakes, 1);
+    EXPECT_FALSE(reg);
+
+    // Still readable, but no longer registered.
+    driver.turn(0ms);
+    EXPECT_EQ(wakes, 1);
+}
+
+TEST(IoDriver, ShutdownWakesLevelWakerAndReportsIt) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a, Interest::read(), Trigger::Level);
+    TestTask task;
+    reg.set_waker(task.waker);
+
+    driver.shutdown();
+    EXPECT_EQ(task.wakes(), 1);
+    EXPECT_TRUE(reg.take_ready().shutdown);
+}
+
+// shutdown() wakes under the same exclusion as a turn: while a waker it woke is
+// running, no other thread can get the turn. Checked from a second thread, since a
+// thread may not try a mutex it already holds.
+TEST(IoDriver, ShutdownWakesWithTheTurnHeld) {
+    IoDriver driver;
+    SocketPair sp;
+    IoRegistration reg(driver, sp.a, Interest::read(), Trigger::Level);
+
+    int  wakes       = 0;
+    bool got_a_turn  = false;
+    auto check = [&] {
+        ++wakes;
+        std::thread other([&] { got_a_turn = got_a_turn || driver.try_turn(0ms).has_value(); });
+        other.join();
+    };
+    auto socket_waker = std::make_shared<InlineWaker>(check);
+    auto timer_waker  = std::make_shared<InlineWaker>(check);
+    reg.set_waker(socket_waker);
+    driver.add_timer(Clock::now() + 1h, timer_waker);
+
+    driver.shutdown();
+    EXPECT_EQ(wakes, 2);
+    EXPECT_FALSE(got_a_turn);
+
+    // The turn is free again afterwards, and no longer blocks.
+    EXPECT_TRUE(driver.try_turn(std::nullopt).has_value());
 }

@@ -153,6 +153,63 @@ TEST(Poller, IsEdgeTriggered) {
     EXPECT_NE(find_key(events, &g_key_a), nullptr);
 }
 
+TEST(Poller, LevelTriggeredReportsUntilDrained) {
+    Poller poller;
+    SocketPair sp;
+    poller.register_fd(sp.a, &g_key_a, Interest::read(), Trigger::Level);
+    write_byte(sp.b);
+
+    // Unread data is reported by every poll, not only the first.
+    std::vector<Event> events;
+    for (int i = 0; i < 3; ++i) {
+        events.clear();
+        poller.poll(events, 1s);
+        const Event* e = find_key(events, &g_key_a);
+        ASSERT_NE(e, nullptr) << "poll " << i;
+        EXPECT_TRUE(e->readable);
+    }
+
+    drain(sp.a);
+    events.clear();
+    poller.poll(events, 0ns);
+    EXPECT_EQ(find_key(events, &g_key_a), nullptr);
+}
+
+TEST(Poller, LevelTriggeredFollowsInterestChange) {
+    Poller poller;
+    SocketPair sp;
+    // An idle socket is always writable, so write interest reports on every poll.
+    poller.register_fd(sp.a, &g_key_a, Interest::read_write(), Trigger::Level);
+    std::vector<Event> events;
+    for (int i = 0; i < 2; ++i) {
+        events.clear();
+        poller.poll(events, 1s);
+        const Event* e = find_key(events, &g_key_a);
+        ASSERT_NE(e, nullptr) << "poll " << i;
+        EXPECT_TRUE(e->writable);
+        EXPECT_FALSE(e->readable);
+    }
+
+    // Without write interest it is quiet until there is something to read.
+    poller.reregister_fd(sp.a, &g_key_a, Interest::read(), Trigger::Level);
+    events.clear();
+    poller.poll(events, 0ns);
+    EXPECT_EQ(find_key(events, &g_key_a), nullptr);
+
+    write_byte(sp.b);
+    poller.poll(events, 1s);
+    const Event* e = find_key(events, &g_key_a);
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->readable);
+    EXPECT_FALSE(e->writable);
+
+    // No interest at all: unread data is not reported.
+    poller.reregister_fd(sp.a, &g_key_a, Interest{}, Trigger::Level);
+    events.clear();
+    poller.poll(events, 0ns);
+    EXPECT_EQ(find_key(events, &g_key_a), nullptr);
+}
+
 TEST(Poller, DeregisterStopsEvents) {
     Poller poller;
     SocketPair sp;

@@ -101,7 +101,7 @@ private:
 Notes:
 - The waker is read and cleared under the lock — this prevents a missed-wakeup race where
   `set()` reads a null waker just before `poll()` stores a new one.
-- If the waker may be stored across threads (e.g. an lws callback on its service thread),
+- If the waker may be stored across threads (e.g. a callback run by another Runtime's I/O driver),
   use `std::atomic<std::shared_ptr<detail::Waker>>` instead.
 
 ### Usage

@@ -80,7 +80,7 @@ thread.
     - **`broadcast`** — every receiver sees every message; multiple senders, multiple receivers.
 - **Concurrent combinators** — `join` (wait for all), `select` (first wins), `timeout` (deadline), `sleep_for` (non-blocking sleep).
 - **`spawn_blocking()`** — run blocking code on a dedicated thread pool without starving the executor.
-- **Async I/O** — `File`, `TcpStream`, `TcpListener`, `WsStream`, and `WsListener` for async file, TCP, and WebSocket I/O. TCP, UDP, pipes and signals run on coro's own epoll I/O driver; files and DNS (`lookup_host`) run on the blocking pool; WebSockets run libwebsockets on its own service threads.
+- **Async I/O** — `File`, `TcpStream`, `TcpListener`, `WsStream`, and `WsListener` for async file, TCP, and WebSocket I/O. TCP, UDP, pipes and signals run on coro's own epoll I/O driver; files and DNS (`lookup_host`) run on the blocking pool; WebSockets run libwebsockets on the same I/O driver.
 - **Multi-threaded executor** — tasks are distributed across worker threads automatically.
 - **MCU support** — `CurrentThreadExecutor` runs the full task graph on the calling thread; ships with a working Raspberry Pi Pico port.
 

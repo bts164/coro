@@ -43,9 +43,8 @@ Dependencies are managed with Conan.
   nearest deadline bounds the driver's wait (nanosecond resolution on desktop)
 - **`TcpStream`** — async connect, read, write
 - **`File` / `lookup_host()`** — blocking syscalls run as jobs on the blocking pool
-- **`WsStream` / `WsListener`** — async WebSocket client and server via libwebsockets, each
-  lws context on its own service thread; full and partial frame modes, TLS, subprotocol
-  negotiation
+- **`WsStream` / `WsListener`** — async WebSocket client and server via libwebsockets,
+  driven by the I/O driver; full and partial frame modes, TLS, subprotocol negotiation
 - **`coro::signal()` / `coro::signal_stream()`** — async OS signal delivery via a self-pipe
   on the IoDriver; one-shot `Future<void>` and a coalesced `Stream<SignalEvent>` variant;
   see [Signal Handling](signal_handling.md)
@@ -487,11 +486,12 @@ outnumber live ones). `poll()` checks the clock itself, so it is never ready ear
 ### `WsStream` / `WsListener`
 
 Built on [libwebsockets](https://libwebsockets.org/), built without libuv. Each
-`lws_context` runs on its own service thread (`detail::ws::LwsService`) running lws's
-built-in `poll()` loop: one process-wide client context shared by every
+`lws_context` is driven by the I/O driver (`detail::ws::LwsService`): each lws socket is
+registered with it, and the socket's waker calls lws from the thread that is turning the
+driver, so lws has no thread of its own. There is one client context per `Runtime`, shared by every
 `WsStream::connect()`, and one per `WsListener`. Other threads reach lws only by posting
-commands to that thread, which `lws_cancel_service()` wakes. See
-[WebSocket Stream, "Service threads"](websocket_stream.md#service-threads).
+commands, which the next turn runs. See
+[WebSocket Stream, "lws on the I/O driver"](websocket_stream.md#lws-on-the-io-driver).
 
 A single `protocol_cb` C function dispatches all events (`ESTABLISHED`, `RECEIVE`,
 `WRITEABLE`, `CLOSED`, `CONNECTION_ERROR`) to the appropriate sub-state in
