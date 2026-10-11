@@ -477,7 +477,7 @@ on the blocking pool.
 
 Deadlines are `Instant`s on `coro::Clock` (`steady_clock` on desktop). The first pending
 `poll()` registers the deadline and a weak waker with the driver's `TimerQueue` and keeps
-the `TimerId` it gets back; the nearest deadline bounds the driver's `epoll_pwait2` at
+the `TimerId` it gets back; the nearest deadline bounds the driver's wait at
 nanosecond resolution. Nothing is allocated per sleep. Later pending polls do nothing
 unless the waker has changed. Dropping the future cancels the timer by id, and the entry
 is later removed without a wake (lazy cancellation, with a sweep once cancelled entries

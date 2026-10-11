@@ -40,8 +40,9 @@ The readiness model avoids both:
 - **Any syscall.** The driver reports only readiness, so a primitive can use whatever call
   it needs once the fd is ready (`recvmsg()` with control messages, `sendmmsg()`,
   `accept4()`), with no wrapper API in between.
-- **Precise timers.** The driver blocks in `epoll_pwait2()`, whose timeout is in
-  nanoseconds, so the timer queue's earliest deadline bounds the wait directly.
+- **Precise timers.** The driver blocks with a timeout in nanoseconds (`ppoll()` on
+  the epoll descriptor), so the timer queue's earliest deadline bounds the wait
+  directly.
 
 ## Goals
 
@@ -140,9 +141,13 @@ Semantics every backend must provide:
 - **Thread-safe registration.** Any thread may register or deregister while another
   thread is blocked in `poll()`. `epoll_ctl` and `kevent` both allow this.
 - **High-resolution timeout.** `poll()`'s timeout is in nanoseconds. On Linux this is
-  `epoll_pwait2()` (5.11 and later), falling back to `epoll_wait()` with the timeout
-  rounded up to whole milliseconds when the kernel lacks it. kqueue takes a `timespec`
-  natively. Timer precision is the backend's job, not the timer queue's.
+  `ppoll()` on the epoll descriptor, which takes a `timespec` where `epoll_wait()`
+  takes whole milliseconds, followed by a non-blocking `epoll_wait()` to collect the
+  events. `epoll_pwait2()` (5.11 and later) would do it in one call, but Rocky Linux
+  8's kernel lacks it, and one path that every platform's tests run is worth more
+  than the saved call; its code is kept in `poller_epoll.cpp`, not compiled, in case
+  profiling says otherwise. kqueue takes a `timespec` natively. Timer precision is
+  the backend's job, not the timer queue's.
 
 !!! tip "TODO: prove the boundary with a second backend"
     A kqueue backend is small (a few hundred lines), and writing it is the cheapest way to
@@ -609,7 +614,7 @@ sequenceDiagram
     participant Q as TimerQueue
     participant H as Driver holder
     H->>Q: begin_wait(max_wait) → timeout to earliest deadline
-    H->>H: epoll_pwait2(timeout)
+    H->>H: poll(timeout)
     T->>Q: insert(earlier deadline) → true
     T->>H: driver.unpark()
     H->>H: poll returns (eventfd), dispatches I/O events
@@ -662,7 +667,7 @@ never early: `SleepFuture` checks the clock itself.
   mutex. Either the holder's `begin_wait()` sees the new entry, or `insert()` sees the
   recorded waiter and returns true. In the second case, `unpark()` writes the eventfd,
   which stays readable until the holder's poll consumes it, so an unpark made between
-  `begin_wait()` and `epoll_pwait2()` is not lost.
+  `begin_wait()` and the poll is not lost.
 - **Sweep while the holder is blocked (benign).** A sweep can remove the entry the
   holder computed its timeout from, leaving a later one at the front. `insert()` compares
   against the current front, so it may now ask for an unpark the holder didn't need, and
@@ -682,7 +687,7 @@ never early: `SleepFuture` checks the clock itself.
   `insert()` took the slot. The generation check keeps it from cancelling that other
   timer.
 - **Clock read after the poll.** `fire_expired()` reads `Clock::now()` after
-  `epoll_pwait2` returns. Rounding the timeout up guarantees the earliest deadline has
+  the poll returns. Rounding the timeout up guarantees the earliest deadline has
   passed by then, so a timer-only wake always fires something.
 
 ---

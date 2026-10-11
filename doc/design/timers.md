@@ -10,7 +10,7 @@ timers are part of the driver's design: see [I/O Driver](io_driver.md), "Timers"
 ## Goals
 
 - **One implementation for every platform.** No `#ifdef`: on desktop the timer goes to
-  the `IoDriver`, whose earliest deadline bounds `epoll_pwait2`; on Pico it goes to the
+  the `IoDriver`, whose earliest deadline bounds its wait; on Pico it goes to the
   `CurrentThreadExecutor`'s own queue.
 - **Nanosecond resolution, no thread hop.** A sleep is a heap entry on the thread that
   already blocks in the driver. It is not rounded to milliseconds and costs no

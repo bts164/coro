@@ -9,12 +9,12 @@
 
 #include <atomic>
 #include <cerrno>
-#include <climits>
 #include <cstdint>
 #include <ctime>
 #include <system_error>
 
 #include <csignal>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
@@ -39,22 +39,87 @@ uint32_t to_epoll_events(Interest interest) {
     return ev;
 }
 
-// epoll_pwait2() (Linux 5.11+) takes a timespec, giving sub-millisecond timeouts.
-// It is called through syscall() so coro doesn't depend on a glibc new enough to
-// wrap it (2.35+). Older kernels return ENOSYS; we then fall back to epoll_wait()
-// with the timeout rounded UP to whole milliseconds (never wake early).
+// A timed wait, with the timeout at nanosecond resolution. epoll_wait() takes its
+// timeout in whole milliseconds, but an epoll instance is itself pollable (readable
+// while it has events to report) and ppoll() takes a timespec. So: wait in ppoll()
+// on the epoll fd, then collect the events without blocking. ppoll() is on every
+// kernel coro runs on, so this is the one path, and every platform's tests run it.
 //
+// Only a thread about to sleep until a timer gets here; see wait_with_timeout().
+//
+// Nothing is lost between the two calls: Poller::poll() is called by one thread at a
+// time, so no one else can take the events ppoll() saw.
+int wait_ppoll(int epfd, epoll_event* events, std::chrono::nanoseconds timeout) {
+    const auto ns = timeout.count();
+    timespec ts{};
+    ts.tv_sec  = static_cast<time_t>(ns / 1'000'000'000);
+    ts.tv_nsec = static_cast<long>(ns % 1'000'000'000);
+    pollfd pfd{};
+    pfd.fd     = epfd;
+    pfd.events = POLLIN;
+    const int rc = ::ppoll(&pfd, 1, &ts, nullptr);
+    if (rc <= 0) return rc;  // 0: timed out. < 0: errno is set, as for epoll_wait().
+    return ::epoll_wait(epfd, events, kMaxEventsPerPoll, 0);
+}
+
+// Not compiled: nothing defines CORO_USE_EPOLL_PWAIT2. epoll_pwait2() (Linux 5.11+)
+// does the timed wait in one system call where wait_ppoll() takes two when events
+// arrive. It is kept in case profiling shows that second call to cost something;
+// consider enabling it again then. It was set aside because it cannot be the only
+// path (Rocky Linux 8's kernel does not have it), and the path taken without it
+// would then run only on kernels CI does not have.
+#ifdef CORO_USE_EPOLL_PWAIT2
+
+// Called through syscall() so coro doesn't depend on a glibc new enough to wrap it
+// (2.35+). Headers older than the call (Rocky Linux 8's) do not name its number
+// either, though the kernel the program then runs on may have it. The number is
+// kernel ABI: 441 on the architectures listed, which share the generic syscall
+// numbering here.
+#if !defined(SYS_epoll_pwait2) && (defined(__x86_64__) || defined(__aarch64__))
+#define SYS_epoll_pwait2 441
+#endif
+
 // One-way capability flag: only ever flips true → false, and a stale `true` read
 // just costs one more ENOSYS. A mutex would buy nothing here, hence the atomic.
 std::atomic<bool> g_have_epoll_pwait2{true};
 
-int wait_ms(int epfd, epoll_event* events, std::chrono::nanoseconds timeout) {
-    using namespace std::chrono;
-    const auto ms = ceil<milliseconds>(timeout).count();
-    const int clamped = ms > INT_MAX ? INT_MAX : static_cast<int>(ms);
-    return ::epoll_wait(epfd, events, kMaxEventsPerPoll, clamped);
+// Returns false, with nothing waited for, when the kernel lacks the call (ENOSYS);
+// the caller then uses wait_ppoll(). Otherwise sets `result` as epoll_wait() would.
+bool try_epoll_pwait2(int epfd, epoll_event* events, std::chrono::nanoseconds timeout,
+                      int& result) {
+#ifdef SYS_epoll_pwait2
+    if (g_have_epoll_pwait2.load(std::memory_order_relaxed)) {
+        const auto ns = timeout.count();
+        timespec ts{};
+        ts.tv_sec  = static_cast<time_t>(ns / 1'000'000'000);
+        ts.tv_nsec = static_cast<long>(ns % 1'000'000'000);
+        // sigmask == nullptr: the kernel ignores sigsetsize, but pass the real size.
+        const long rc = ::syscall(SYS_epoll_pwait2, epfd, events, kMaxEventsPerPoll,
+                                  &ts, nullptr, _NSIG / 8);
+        if (rc >= 0 || errno != ENOSYS) {
+            result = static_cast<int>(rc);
+            return true;
+        }
+        g_have_epoll_pwait2.store(false, std::memory_order_relaxed);
+    }
+#endif
+    return false;
 }
 
+#endif  // CORO_USE_EPOLL_PWAIT2
+
+// The three waits a caller can ask for. Only the last takes the two-call path:
+//
+//   no timeout    Block until an event. One epoll_wait(). A thread with nothing to
+//                 run and no timer pending.
+//   zero or less  Collect what is ready and return at once. One epoll_wait(). A
+//                 thread that still has tasks to run and is only checking for I/O
+//                 between them, or one whose earliest timer is already due.
+//   positive      Block until an event or the timeout. wait_ppoll(). A thread with
+//                 nothing to run, about to sleep until its earliest timer.
+//
+// So a busy thread never pays for the second system call: it is the cost of waking
+// from a sleep that a timer bounded, and only when an event ended that sleep early.
 int wait_with_timeout(int epfd, epoll_event* events,
                       std::optional<std::chrono::nanoseconds> timeout) {
     if (!timeout)
@@ -62,21 +127,12 @@ int wait_with_timeout(int epfd, epoll_event* events,
     if (timeout->count() <= 0)
         return ::epoll_wait(epfd, events, kMaxEventsPerPoll, 0);
 
-#ifdef SYS_epoll_pwait2
-    if (g_have_epoll_pwait2.load(std::memory_order_relaxed)) {
-        const auto ns = timeout->count();
-        timespec ts{};
-        ts.tv_sec  = static_cast<time_t>(ns / 1'000'000'000);
-        ts.tv_nsec = static_cast<long>(ns % 1'000'000'000);
-        // sigmask == nullptr: the kernel ignores sigsetsize, but pass the real size.
-        const long rc = ::syscall(SYS_epoll_pwait2, epfd, events, kMaxEventsPerPoll,
-                                  &ts, nullptr, _NSIG / 8);
-        if (rc >= 0 || errno != ENOSYS)
-            return static_cast<int>(rc);
-        g_have_epoll_pwait2.store(false, std::memory_order_relaxed);
-    }
+#ifdef CORO_USE_EPOLL_PWAIT2
+    int result = 0;
+    if (try_epoll_pwait2(epfd, events, *timeout, result))
+        return result;
 #endif
-    return wait_ms(epfd, events, *timeout);
+    return wait_ppoll(epfd, events, *timeout);
 }
 
 } // namespace

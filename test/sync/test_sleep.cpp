@@ -159,7 +159,7 @@ Coro<void> poll_briefly(CoroStream<int>& stream) {
 
 #ifndef CORO_PICO
 
-// The driver's epoll_pwait2 timeout is nanosecond-resolution, so short sleeps are not
+// The driver's timed wait is nanosecond-resolution, so short sleeps are not
 // rounded up to a millisecond (libuv's timers were). 1000 x 200 us is 0.2 s of sleep;
 // at 1 ms per sleep it would take over a second.
 TEST(SleepTest, SubMillisecondPrecisionCurrentThread) {

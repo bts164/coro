@@ -17,7 +17,7 @@ class Runtime;
  *
  * Satisfies @ref Future<void>. The first pending `poll()` adds a timer to the
  * current runtime's queue: the IoDriver's on desktop, where the deadline bounds the
- * driver's `epoll_pwait2` at nanosecond resolution, or the CurrentThreadExecutor's
+ * driver's wait at nanosecond resolution, or the CurrentThreadExecutor's
  * on Pico. The timer is an entry in the queue's own storage; the future holds only
  * its id, and nothing is allocated.
  *

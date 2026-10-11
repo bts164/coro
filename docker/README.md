@@ -35,7 +35,7 @@ docker/build-examples.sh               # build every desktop example
 Those run on the primary platform, Ubuntu 24.04. To run on another, name it:
 
 ```sh
-CORO_PLATFORM=rocky10 docker/run-tests.sh none
+CORO_PLATFORM=rocky8 docker/run-tests.sh none
 ```
 
 The first run on a platform builds its image, which takes a while and about 4 GB of
@@ -46,9 +46,9 @@ disk. Later runs reuse it.
 | File | What it is |
 |---|---|
 | `Dockerfile.ubuntu2404` | The primary platform's image: Ubuntu 24.04, GCC 13, the ARM toolchain, Conan, CMake, the Pico SDK and `picotool`. |
-| `Dockerfile.rocky10` | Rocky Linux 10. Not finished: it does not build yet, and no workflow uses it. |
+| `Dockerfile.rocky8` | Rocky Linux 8.10 with GCC 15 from `gcc-toolset-15`. Desktop tests only: it has no Pico SDK or Node.js. |
 | `profiles/<platform>` | That platform's Conan profile: desktop builds, and the build-machine side of Pico builds. Copied into its image as the `default` profile. |
-| `profiles/rp2040_pico_w` | Conan host profile for the RP2040 on a Pico W board. The same in every image. |
+| `profiles/rp2040_pico_w` | Conan host profile for the RP2040 on a Pico W board. The same in every image that has the Pico SDK. |
 | `build-image.sh` | Builds a platform's image on this machine. |
 | `run-tests.sh` | Runs `ci/run-tests.sh` in a container: builds the library and its tests, plain or with a sanitizer, and runs them. CI: `tests.yml`. |
 | `run-emulator-tests.sh` | Runs `ci/run-emulator-tests.sh` in a container: builds the on-target test firmware and runs it in the emulator. CI: `pico_emulator.yml`. |
@@ -114,7 +114,7 @@ To build ahead of time, or to see the name:
 ```sh
 docker/build-image.sh                  # build it
 docker/build-image.sh --print-name     # print coro-ci-ubuntu2404:<hash>, build nothing
-CORO_PLATFORM=rocky10 docker/build-image.sh
+CORO_PLATFORM=rocky8 docker/build-image.sh
 ```
 
 Old images stay until you remove them. `docker image ls 'coro-ci-*'` lists them and
@@ -193,8 +193,8 @@ runner, so the job builds straight into it, and nothing is kept between runs.
 3. Push. CI sees a hash it has no image for, builds and publishes one, and runs the
    tests in it.
 
-A change to `profiles/rp2040_pico_w` renames every platform's image, because they
-all copy it. A change to a platform's own profile renames only that platform's.
+A change to `profiles/rp2040_pico_w` renames every platform's image, whether or not
+the image copies it. A change to a platform's own profile renames only that platform's.
 
 ## Changing a job
 

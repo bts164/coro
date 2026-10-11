@@ -1,0 +1,75 @@
+# The Rocky Linux 8 CI image: Rocky 8.10 with GCC 15 from gcc-toolset-15, and the
+# Conan profile docker/profiles/rocky8 as the default profile. It is the old end of
+# what coro supports: glibc 2.28 and the headers of a 4.18 kernel.
+#
+# It runs the desktop tests only (docker/run-tests.sh). It has no Pico SDK, ARM C
+# library or Node.js, so the emulator job and the Pico builds need the primary
+# platform's image.
+#
+# Build it with docker/build-image.sh. The image's tag is a hash of this file and
+# the profiles (docker/common.sh), so any change here makes a new image.
+#
+# rockylinux/rockylinux, not the official "rockylinux" image, which stopped at 8.9.
+FROM rockylinux/rockylinux:8.10
+
+# Conan's home is otherwise under $HOME, which a GitHub container job points
+# somewhere else; the profile and the configuration below would then not be found.
+ENV CONAN_HOME=/root/.conan2
+
+# The distribution's own GCC is 8.5, which has no C++20 coroutines, so the compiler
+# is gcc-toolset-15. The sanitizer packages are what -fsanitize links against; the
+# toolset's compiler does not bring them in.
+#
+# libcap-devel is here for the same reason it's in conanfile.py's
+# system_requirements(): libwebsockets' own CMakeLists.txt probes for it via
+# find_path/find_library at its own (Conan-driven) build time.
+#
+# perl is the full distribution, not perl-interpreter: OpenSSL, which Conan builds
+# from source here, configures itself with modules the interpreter alone lacks.
+#
+# arm-none-eabi-gcc and its binutils come from EPEL. The desktop test suite needs
+# them: test/cmake/host_pico_support.cmake cross-assembles fiber_context_pico.S for
+# test_switch_context_pico, which runs it in an ARM emulator on the host.
+#
+# The distribution's CMake is 3.26 and test/CMakeLists.txt requires >=3.31, and its
+# default Python is 3.6, too old for Conan. So Python is 3.12, and CMake comes from
+# pip below.
+RUN dnf install -y epel-release && dnf install -y \
+        gcc-toolset-15-gcc \
+        gcc-toolset-15-gcc-c++ \
+        gcc-toolset-15-libasan-devel \
+        gcc-toolset-15-libtsan-devel \
+        gcc-toolset-15-libubsan-devel \
+        arm-none-eabi-gcc-cs \
+        arm-none-eabi-binutils-cs \
+        make \
+        git \
+        pkgconf-pkg-config \
+        perl \
+        python3.12 \
+        python3.12-pip \
+        libcap-devel \
+        ca-certificates \
+        diffutils \
+        which \
+    && dnf clean all
+
+# What `scl enable gcc-toolset-15` (/opt/rh/gcc-toolset-15/enable) sets. It is set
+# here because neither `docker run <command>` nor a GitHub container job starts a
+# shell that would source that file.
+ENV PATH=/opt/rh/gcc-toolset-15/root/usr/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/rh/gcc-toolset-15/root/usr/lib64:/opt/rh/gcc-toolset-15/root/usr/lib
+ENV PKG_CONFIG_PATH=/opt/rh/gcc-toolset-15/root/usr/lib64/pkgconfig
+
+RUN python3.12 -m pip install --no-cache-dir conan "cmake>=3.31"
+
+# The build context is docker/ (see docker/build-image.sh), so this is docker/profiles.
+# This platform's own profile becomes the image's default, so a conan command that
+# names no profile uses it.
+COPY profiles/rocky8 /root/.conan2/profiles/default
+
+COPY <<EOF /root/.conan2/global.conf
+tools.build:jobs=4
+EOF
+
+WORKDIR /workspace

@@ -14,6 +14,16 @@
 
 #ifdef __linux__
 #include <netinet/udp.h>
+// An older glibc (Rocky Linux 8 has 2.28) does not name these two options, though
+// the kernel it runs on may well have them. The numbers are kernel ABI and never
+// change. On a kernel without the option, setsockopt() fails and the caller sees
+// the error.
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
 #endif
 
 namespace coro::detail::sys {

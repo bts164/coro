@@ -33,8 +33,7 @@ jobs:
     uses: ./.github/workflows/ci_image.yml
     with:
       # Every platform named in the test job's list, separated by spaces.
-      # Not yet rocky10: docker/Dockerfile.rocky10 is unfinished.
-      platforms: ubuntu2404
+      platforms: ubuntu2404 rocky8
     permissions:
       contents: read
       packages: write
@@ -50,7 +49,7 @@ jobs:
           - { platform: ubuntu2404, sanitizer: asan }
           - { platform: ubuntu2404, sanitizer: tsan }
           # Every other platform: once, plain.
-          # - { platform: rocky10, sanitizer: none }
+          - { platform: rocky8, sanitizer: none }
     runs-on: ubuntu-24.04
     permissions:
       contents: read
