@@ -269,17 +269,42 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     const int    max_search   = std::max(1, n / 2);
     // Task polls since this worker last tried a non-blocking driver turn.
     unsigned     polls_since_turn = 0;
+    // Passes of the loop below; decides when the injection queue goes first.
+    unsigned     tick = 0;
 
     while (true) {
         std::shared_ptr<detail::TaskBase> task;
 
+        // --- Periodic injection-queue check ---
+        // Step 2 is reached only with an empty local queue. Tasks that keep each
+        // other runnable, or keep spending their budget, never leave it empty, so on
+        // every kGlobalQueueInterval-th pass one task is taken from the injection
+        // queue first.
+        //
+        // Race (benign): the read of m_injection_len is lock-free and a zero may be
+        // stale. Nothing is lost: the task is found at the next interval, or by
+        // Step 2 or Step 4 of whichever worker runs dry first. This check plays no
+        // part in parking.
+        if (++tick % kGlobalQueueInterval == 0 &&
+                m_injection_len.load(std::memory_order_acquire) != 0) {
+            std::lock_guard lock(m_mutex);
+            if (!m_injection_queue.empty()) {
+                task = m_injection_queue.front()->shared_from_this();
+                m_injection_queue.pop_front();
+                m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
+            }
+        }
+
         // --- Step 1: own local queue ---
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
-        if (auto t = m_worker_queues[worker_index].local.pop())
-            task = t->shared_from_this();
+        if (!task) {
+            if (auto t = m_worker_queues[worker_index].local.pop())
+                task = t->shared_from_this();
+        }
 #else
-        if (auto t = m_local_queues[worker_index].pop()) {
-            task = (*t)->shared_from_this();
+        if (!task) {
+            if (auto t = m_local_queues[worker_index].pop())
+                task = (*t)->shared_from_this();
         }
 #endif
 
@@ -452,7 +477,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 
         task->last_worker_index = worker_index;
 
-        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task));
+        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task), task_budget());
         detail::TaskBase::current = task.get();
         const bool done = task->poll(ctx);
         detail::TaskBase::current = nullptr;
@@ -506,7 +531,11 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         // could starve while every worker is busy. Edge-triggered events wait in the
         // kernel until then. If another worker holds the driver, try_turn() returns
         // at once; that worker is handling events anyway.
-        if (++polls_since_turn >= kEventInterval) {
+        //
+        // A poll that yielded (its budget ran out, or it called yield_now()) brings
+        // the turn forward: the task is asking for I/O, timers and signals to be
+        // looked at before it runs again.
+        if (++polls_since_turn >= kEventInterval || ctx.yielded()) {
             polls_since_turn = 0;
             std::optional<std::size_t> dispatched;
             {

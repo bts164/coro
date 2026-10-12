@@ -2,6 +2,7 @@
 
 #include <coro/detail/waker.h>
 #include <coro/detail/rc.h>
+#include <cstdint>
 #include <memory>
 
 namespace coro::detail {
@@ -15,13 +16,43 @@ namespace coro::detail {
  * Leaf futures (I/O, timers, channels) call `getWaker()`, store the result, and call
  * `wake()` from their completion callback to move the task back into the ready queue.
  *
+ * It also carries the task's budget for this poll: how many `co_await`s the task may
+ * still pass before it must yield to the executor. An executor sets it when it builds
+ * the `Context`; a `Context` built anywhere else (`blocking_wait()`, a test) has no
+ * limit. See doc/design/task_budget.md.
+ *
  * Concrete executor implementations may subclass `Context` to carry additional
  * scheduler-specific state without changing the `poll()` signature.
  */
 class Context {
 public:
-    explicit Context(Rc<Waker> waker);
+    /// The budget of a `Context` that never asks its task to yield.
+    static constexpr std::uint32_t kUnlimitedBudget = UINT32_MAX;
+
+    explicit Context(Rc<Waker> waker, std::uint32_t budget = kUnlimitedBudget);
     virtual ~Context();
+
+    /// @brief Takes one unit of the task's budget. Returns false when none is left:
+    /// the caller should then call yield_to_executor() and return pending without
+    /// doing its work.
+    ///
+    /// `co_await` and `fiber_await()` call this for every future, so most futures
+    /// never need to. A hand-written future that loops inside its own `poll()` can
+    /// call it once per item to bound the loop.
+    bool try_consume_budget() noexcept {
+        if (m_budget == 0) return false;
+        if (m_budget != kUnlimitedBudget) --m_budget;
+        return true;
+    }
+
+    /// @brief Wakes the task and marks this poll as yielded, so that the executor
+    /// polls its other tasks and turns the I/O driver before this one runs again.
+    /// The caller must then return pending.
+    void yield_to_executor();
+
+    /// @brief True once yield_to_executor() has been called in this poll. Read by
+    /// the executor after the task's `poll()` returns.
+    bool yielded() const noexcept { return m_yielded; }
 
     /// @brief Returns the waker for the current task. Store this and call `wake()` when ready.
     /// For leaf futures that store the waker for later notification, prefer get_weak_waker()
@@ -36,7 +67,10 @@ public:
     Weak<Waker>   get_weak_waker() const;
 
 private:
-    Rc<Waker> m_waker;
+    Rc<Waker>     m_waker;
+    // Both are touched only by the thread polling the task, during that poll.
+    std::uint32_t m_budget;
+    bool          m_yielded = false;
 };
 
 } // namespace coro::detail

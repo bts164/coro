@@ -543,36 +543,36 @@ TEST(IoDriver, PollIoPassesThroughOtherErrors) {
     EXPECT_TRUE(reg.poll_ready(IoDirection::Read, task.ctx).has_value());
 }
 
-TEST(IoDriverParker, ZeroWaitTurnsOnlyEveryNthCall) {
+TEST(IoDriverParker, ZeroWaitTurnsEveryCall) {
+    // How often a busy executor parks is the executor's decision; the parker turns
+    // the driver whenever it is asked.
     IoDriver driver;
-    IoDriverParker parker(driver, /*event_interval=*/3);
+    IoDriverParker parker(driver);
     SocketPair sp;
     IoRegistration reg(driver, sp.a);
     TestTask task;
     observe_eagain(reg, IoDirection::Read, task);
     ASSERT_FALSE(reg.poll_ready(IoDirection::Read, task.ctx).has_value());  // stores waker
 
-    write_byte(sp.b);
-    parker.park(0ns);  // 1st zero wait: skipped
-    parker.park(0ns);  // 2nd: skipped
+    parker.park(0ns);  // nothing to dispatch
     EXPECT_EQ(task.wakes(), 0);
-    parker.park(0ns);  // 3rd: turns
+    write_byte(sp.b);
+    parker.park(0ns);
     EXPECT_EQ(task.wakes(), 1);
 }
 
-TEST(IoDriverParker, NonZeroWaitAlwaysTurns) {
+TEST(IoDriverParker, NonZeroWaitReturnsOnEvent) {
     IoDriver driver;
-    IoDriverParker parker(driver, /*event_interval=*/100);
+    IoDriverParker parker(driver);
     SocketPair sp;
     IoRegistration reg(driver, sp.a);
     TestTask task;
     observe_eagain(reg, IoDirection::Read, task);
     ASSERT_FALSE(reg.poll_ready(IoDirection::Read, task.ctx).has_value());
 
-    parker.park(0ns);  // skipped, counts toward the interval
     write_byte(sp.b);
     const auto start = std::chrono::steady_clock::now();
-    parker.park(1s);   // turns despite the count; returns on the event, not the timeout
+    parker.park(1s);   // returns on the event, not the timeout
     EXPECT_EQ(task.wakes(), 1);
     EXPECT_LT(std::chrono::steady_clock::now() - start, 500ms);
 }

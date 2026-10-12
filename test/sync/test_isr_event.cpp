@@ -122,6 +122,49 @@ TYPED_TEST(IsrEventTest, ConcurrentWaitersBothResolveOnOneSignal) {
     EXPECT_TRUE(b_done);
 }
 
+namespace {
+// Wakes itself on every poll until *m_stop is set, so the executor's local queue
+// never runs empty. Gives up (false) after five seconds instead of hanging.
+struct SpinUntilFuture {
+    using OutputType = bool;
+    const bool*                           m_stop;
+    std::chrono::steady_clock::time_point m_deadline = std::chrono::steady_clock::now() + 5s;
+
+    PollResult<bool> poll(detail::Context& ctx) {
+        if (*m_stop) return true;
+        if (std::chrono::steady_clock::now() > m_deadline) return false;
+        ctx.getWaker()->wake();
+        return PollPending;
+    }
+};
+} // namespace
+
+TYPED_TEST(IsrEventTest, SignalSeenWhileATaskKeepsTheLoopBusy) {
+    // The root task is runnable all the time and never yields, so the executor
+    // never finds its queue empty. The signal must still reach the waiter: the loop
+    // looks for interrupt events after every batch of polls, not only when it has
+    // run out of work.
+    IsrEvent ev;
+    bool waiter_done = false;
+    bool seen = false;
+
+    {
+        IsrTrigger isr(5ms, 1, [&ev](int) { ev.signal_from_isr(); });
+
+        seen = this->traits.rt.block_on(
+            [](IsrEvent& ev, bool& waiter_done) -> Coro<bool> {
+                auto waiter = spawn([](IsrEvent& ev, bool& done) -> Coro<void> {
+                    co_await ev.wait();
+                    done = true;
+                }(ev, waiter_done));
+                const bool seen = co_await SpinUntilFuture{&waiter_done};
+                if (seen) co_await waiter;
+                co_return seen;
+            }(ev, waiter_done));
+    }
+    EXPECT_TRUE(seen);
+}
+
 // ---------------------------------------------------------------------------
 // IsrChannel tests
 // ---------------------------------------------------------------------------

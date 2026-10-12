@@ -35,13 +35,14 @@ coro_test(test_co_invoke.cpp                     DESKTOP PICO_STUB ON_TARGET cor
 coro_test(runtime/test_runtime.cpp               DESKTOP PICO_STUB ON_TARGET runtime)
 coro_test(runtime/test_runtime_shutdown.cpp      DESKTOP)
 coro_test(runtime/test_executor_task.cpp         DESKTOP PICO_STUB ON_TARGET runtime)
-coro_test(runtime/test_current_thread_executor.cpp DESKTOP)
+coro_test(runtime/test_current_thread_executor.cpp DESKTOP PICO_STUB ON_TARGET runtime)
 coro_test(runtime/test_work_sharing_executor.cpp DESKTOP)
 coro_test(runtime/test_work_stealing_executor.cpp DESKTOP)
 coro_test(runtime/test_work_stealing_io.cpp      DESKTOP)
 coro_test(runtime/test_spawn_on.cpp              DESKTOP)
 coro_test(runtime/test_local_run_queue.cpp       DESKTOP)
 coro_test(runtime/test_io_driver.cpp             DESKTOP)
+coro_test(runtime/test_task_budget.cpp           DESKTOP PICO_STUB ON_TARGET runtime)
 
 # task/
 coro_test(task/test_join_handle.cpp              DESKTOP PICO_STUB ON_TARGET runtime)

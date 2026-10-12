@@ -461,7 +461,16 @@ auto result = co_await timeout(5s, long_running_task());
 runs a tight loop without ever suspending will ignore cancellation for the entire duration
 of that loop, defeating the purpose of the scope drain mechanism and causing tasks to
 linger long after they are supposed to have stopped. Periodic `co_await yield_now()` calls
-give the executor a chance to observe the flag and drive the task to `PollDropped`.
+(`<coro/task/yield_now.h>`) give the executor a chance to observe the flag and drive the
+task to `PollDropped`.
+
+The same loop also keeps its thread from every other task, timer and I/O event for as
+long as it runs. A loop that does `co_await` something on each pass does not need this:
+after 128 awaits in one poll the task yields by itself, even when every awaited future
+was ready (the task budget, `Runtime::set_task_budget()`). The budget counts awaits, so
+it cannot see work done between them, and it cannot see a loop inside a hand-written
+future's own `poll()`; such a future should bound its loop or call
+`ctx.try_consume_budget()` per item.
 
 ```cpp
 // BAD — cancellation not observed until the loop finishes

@@ -479,30 +479,23 @@ private:
 /**
  * @brief Parks an executor thread by turning an IoDriver.
  *
- * park(max_wait) is `driver.turn(max_wait)`, with one exception: a zero wait (the
- * executor still has ready tasks) only turns on every `event_interval`-th call. A busy
- * loop thus polls I/O every N batches rather than paying an epoll_wait per batch;
- * edge-triggered events wait in the kernel meanwhile. Any non-zero wait always turns and
- * restarts the count.
+ * park(max_wait) is `driver.turn(max_wait)`, every time. How often a busy executor
+ * gets here is the executor's business: CurrentThreadExecutor parks once per batch
+ * of `event_interval` task polls.
  *
  * Not thread-safe except unpark(): one executor thread owns park().
  */
 class IoDriverParker final : public Parker {
 public:
-    /// tokio's `event_interval` default.
-    static constexpr unsigned kDefaultEventInterval = 61;
+    explicit IoDriverParker(IoDriver& driver) : m_driver(driver) {}
 
-    explicit IoDriverParker(IoDriver& driver, unsigned event_interval = kDefaultEventInterval)
-        : m_driver(driver), m_event_interval(event_interval == 0 ? 1 : event_interval) {}
-
-    void park(std::optional<std::chrono::nanoseconds> max_wait) override;
+    void park(std::optional<std::chrono::nanoseconds> max_wait) override {
+        m_driver.turn(max_wait);
+    }
     void unpark() noexcept override { m_driver.unpark(); }
 
 private:
     IoDriver& m_driver;
-    unsigned  m_event_interval;
-    // Zero-wait park() calls since the last turn. Owner thread only.
-    unsigned  m_skipped = 0;
 };
 
 } // namespace coro

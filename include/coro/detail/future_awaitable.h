@@ -63,7 +63,18 @@ public:
         , m_promise(promise) {}
 
     // Poll once eagerly. If the future completes synchronously, skip suspension entirely.
+    //
+    // Each call takes one unit of the task's budget. With none left the future is not
+    // polled at all: the task wakes itself and suspends, and poll() below makes the
+    // first poll of the future on the task's next turn. Not polling means nothing has
+    // been taken from a socket or channel that a cancel could then lose.
+    // See doc/design/task_budget.md.
     bool await_ready() noexcept{
+        detail::Context& ctx = *m_promise->m_ctx;
+        if (!ctx.try_consume_budget()) {
+            ctx.yield_to_executor();
+            return false;
+        }
         try {
             m_result = m_future.poll(*m_promise->m_ctx);
         } catch (...) {
@@ -99,6 +110,9 @@ public:
         }
     }
 
+    // The re-poll before resume. Takes nothing from the budget and never refuses:
+    // the coroutine is already suspended on this future, so skipping the poll would
+    // leave it with no waker registered.
     bool poll() noexcept override {
         try {
             m_result = m_future.poll(*m_promise->m_ctx);

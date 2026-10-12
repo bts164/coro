@@ -58,8 +58,62 @@ priority order:
 ```
 
 Step 2 is checked before stealing so that tasks enqueued from outside the executor
-(timer wakeups, channel wakeups from non-worker threads) are not starved behind local
-work.
+(timer wakeups, channel wakeups from non-worker threads) are not starved behind
+stealing. It does not protect them from a worker whose own queue never empties; the
+periodic check below does.
+
+### Periodic injection-queue check
+
+A worker reaches Step 2 only when its local queue is empty. Tasks that keep each other
+runnable, or that keep spending their budget and being re-queued, keep it non-empty. If
+every worker is in that state, nothing takes from the injection queue: wakes from
+threads outside the executor, tasks scheduled from outside it, and tasks spilled from a
+full local queue all wait until some worker runs dry. The driver is not affected; busy
+workers already turn it every `kEventInterval` polls.
+
+The fix is Tokio's `global_queue_interval`. Each worker counts the passes of its loop,
+and on every `kGlobalQueueInterval`-th one it looks at the injection queue before its
+own:
+
+```
+tick = 0
+loop:
+    ++tick
+    if tick % kGlobalQueueInterval == 0 and m_injection_len != 0:
+        task = pop one from the injection queue         // under m_mutex
+    if no task: Step 1 (own local queue)
+    if no task: Step 2 (injection queue, in a batch)    // unchanged
+    ...
+```
+
+- **`kGlobalQueueInterval` is 61,** the value Tokio's multi-thread scheduler starts
+  from. It is a constant next to `kEventInterval`.
+- **One task is taken,** not a batch. The worker has local work already; the other
+  workers reach the same check on their own counts.
+- **The emptiness test is the lock-free read of `m_injection_len`** that Step 2 uses. A
+  stale zero costs nothing: the next interval, or Step 2 or Step 4, finds the task.
+- **Parking is untouched.** The check only changes which queue a busy worker pops
+  first. The lost-wakeup argument in "Parking and its races" depends on what a worker
+  re-checks before it parks, and that is the same.
+
+The [task budget](task_budget.md) adds two things to the same loop: the `Context` for
+each poll is built with the runtime's budget, and after a poll that yielded the worker
+does its non-blocking driver turn at once, without waiting for `kEventInterval`.
+
+!!! tip "PERF: tune the interval from the mean poll time, later"
+    Tokio's multi-thread scheduler does not keep 61. It tracks a moving average of how
+    long a task poll takes and picks the count that makes the interval about 200 µs,
+    between 2 and 127 polls. That costs two clock reads per interval, not per poll.
+    Add it only if a workload shows remote wakes waiting too long behind slow polls,
+    or the lock being taken too often behind fast ones.
+
+Tests, in `test/runtime/test_work_stealing_executor.cpp`:
+
+| Test | Proves |
+|---|---|
+| `InjectedTaskRunsWhileEveryWorkerIsBusy` | With several times more self-waking tasks than workers, so that no local queue empties, a task woken from a thread outside the executor still runs promptly. |
+| `SpawnFromOutsideRunsWhileEveryWorkerIsBusy` | The same for a task scheduled by a blocking-pool thread. |
+| `OverflowedTasksRunWhileEveryWorkerIsBusy` | Tasks spilled to the injection queue by a full local queue are polled although the local queues stay non-empty. |
 
 ### Victim Selection
 

@@ -242,6 +242,19 @@ public:
      */
     void shutdown() noexcept;
 
+    /**
+     * @brief Sets how many `co_await`s a task may pass in one poll before it yields
+     * to the executor. 0 means no limit. The default is `Executor::kDefaultTaskBudget`.
+     *
+     * A task that reaches the limit is put behind the other runnable tasks, so a loop
+     * whose awaited futures are always ready cannot keep its thread to itself. Meant
+     * to be set before `block_on()`; a later change applies to the task polls that
+     * follow. Does nothing after shutdown(). See doc/design/task_budget.md.
+     */
+    void set_task_budget(std::uint32_t budget) noexcept {
+        if (m_executor) m_executor->set_task_budget(budget);
+    }
+
     /// @brief The exception a future fails with when the runtime it waits on has
     /// shut down: the `std::runtime_error` that spawn() throws then. Internal.
     static std::exception_ptr shut_down_error();

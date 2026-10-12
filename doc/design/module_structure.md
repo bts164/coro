@@ -33,7 +33,8 @@ include/coro/
 │   ├── join_set.h          JoinSet<T> — dynamic collection of homogeneous tasks
 │   ├── stream_handle.h     StreamHandle<T> — consumer end of a spawned stream
 │   ├── spawn_blocking.h    spawn_blocking() + BlockingHandle + BlockingPool
-│   └── spawn_builder.h     SpawnBuilder + StreamSpawnBuilder
+│   ├── spawn_builder.h     SpawnBuilder + StreamSpawnBuilder
+│   └── yield_now.h         yield_now() — give the executor the thread back once
 │
 ├── sync/               tokio::sync — synchronization primitives and channels
 │   ├── broadcast.h         broadcast_channel — multi-producer, multi-consumer, lag-detecting
@@ -126,6 +127,7 @@ configure and submit tasks. This includes:
 - `StreamHandle<T>` — consumer end of the bounded channel that backs `spawn(stream)`
 - `SpawnBuilder` — returned by `build_task()`, configure name/buffer before calling `.spawn(f)`
 - `BlockingHandle<T>` / `spawn_blocking()` — run blocking code on a dedicated thread pool
+- `yield_now()` — `co_await` to let other tasks, timers and I/O run before continuing
 
 ### `sync/` — synchronization primitives and channels
 

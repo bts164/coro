@@ -192,8 +192,13 @@ private:
     /// executor, so it outlives every worker.
     IoDriver& m_driver;
 
-    /// Busy workers try a non-blocking turn every this many task polls.
-    static constexpr unsigned kEventInterval = IoDriverParker::kDefaultEventInterval;
+    /// Busy workers try a non-blocking turn every this many task polls. tokio's
+    /// `event_interval` default.
+    static constexpr unsigned kEventInterval = 61;
+    /// A worker looks at the injection queue before its own on every this many task
+    /// polls, so that tasks which keep the local queues non-empty cannot shut out
+    /// the ones waiting there. The value tokio's multi-thread scheduler starts from.
+    static constexpr unsigned kGlobalQueueInterval = 61;
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), removed after poll() returns true (task reached terminal state).

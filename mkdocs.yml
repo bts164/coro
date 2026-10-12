@@ -99,6 +99,7 @@ nav:
       - Runtime, Tasks, and Executors: design/task_and_executor.md
       - Executor Scheduling Design: design/executor_design.md
       - Work-Stealing Scheduler: design/work_stealing_executor.md
+      - Task Budget: design/task_budget.md
       - Runtime Shutdown: design/runtime_shutdown.md
       - Blocking Thread Pool: design/spawn_blocking.md
       - blocking_wait / blocking_next: design/blocking_wait.md

@@ -179,6 +179,9 @@ void fiber_yield();
  * ready, yielding back to the caller (via `detail::fiber_yield()`) between
  * polls so other coro tasks keep making progress in the meantime.
  *
+ * Takes one unit of the task's budget, as `co_await` does: with none left the fiber
+ * yields to the executor once before it polls `future` (doc/design/task_budget.md).
+ *
  * Must be called from inside a fiber body (i.e. inside the callable passed to
  * `spawn_fiber()`, or something it calls) — throws std::logic_error otherwise.
  */
@@ -186,6 +189,10 @@ template<Future F>
 typename F::OutputType fiber_await(F future) {
     if (!detail::t_current_fiber_ctx)
         throw std::logic_error("fiber_await() called outside a fiber");
+    if (!detail::t_current_fiber_ctx->try_consume_budget()) {
+        detail::t_current_fiber_ctx->yield_to_executor();
+        detail::fiber_yield(); // resumes on the task's next poll, with a fresh Context
+    }
     for (;;) {
         auto r = future.poll(*detail::t_current_fiber_ctx);
         if (!r.isPending()) {

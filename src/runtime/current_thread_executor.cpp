@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 #ifdef CORO_PICO
@@ -16,20 +17,60 @@
 namespace coro {
 
 namespace {
-// The executor whose loop is inside park() on this thread, if any. Lets
-// enqueue() tell a wake fired by the parker itself (an I/O event dispatched
-// inside IoDriver::turn() on this thread) from a wake by another thread: only
-// the latter needs unpark(). Plain static on Pico, like runtime.cpp's
+// The executor whose loop is running on this thread, if any. enqueue() uses it to
+// tell a wake made by the loop's own thread (a task being polled, a timer fired by
+// the loop, an I/O event dispatched inside park()) from any other: only the former
+// may push onto the unlocked local queue. Plain static on Pico, like runtime.cpp's
 // t_current_runtime: single core, no threads.
 #ifdef CORO_PICO
-CurrentThreadExecutor* t_parked_executor = nullptr;
+CurrentThreadExecutor* t_running_executor = nullptr;
 #else
-thread_local CurrentThreadExecutor* t_parked_executor = nullptr;
+thread_local CurrentThreadExecutor* t_running_executor = nullptr;
 #endif
+
 } // namespace
 
-CurrentThreadExecutor::CurrentThreadExecutor(std::unique_ptr<Parker> parker)
+// Puts the previous running executor back on the way out, so that a nested
+// block_on() (on this executor or on another one) is handled.
+class CurrentThreadExecutor::LoopScope {
+public:
+    explicit LoopScope(CurrentThreadExecutor& ex) : m_ex(ex), m_prev(t_running_executor) {
+#ifndef CORO_PICO
+        std::lock_guard lock(m_ex.m_inject_mutex);
+        if (m_ex.m_loop_depth != 0 && m_ex.m_loop_thread != std::this_thread::get_id()) {
+            // Two threads in the loop would both use m_local, which has no lock.
+            throw std::logic_error(
+                "coro: CurrentThreadExecutor is already being run by another thread "
+                "(block_on() from a second thread on a single-threaded Runtime)");
+        }
+        m_ex.m_loop_thread = std::this_thread::get_id();
+        ++m_ex.m_loop_depth;
+#endif
+        t_running_executor = &m_ex;
+    }
+
+    ~LoopScope() {
+        t_running_executor = m_prev;
+#ifndef CORO_PICO
+        std::lock_guard lock(m_ex.m_inject_mutex);
+        --m_ex.m_loop_depth;
+#endif
+    }
+
+    LoopScope(const LoopScope&)            = delete;
+    LoopScope& operator=(const LoopScope&) = delete;
+
+private:
+    CurrentThreadExecutor& m_ex;
+    CurrentThreadExecutor* m_prev;
+};
+
+CurrentThreadExecutor::CurrentThreadExecutor(std::unique_ptr<Parker> parker,
+                                             unsigned event_interval,
+                                             unsigned global_queue_interval)
     : m_parker(std::move(parker))
+    , m_event_interval(event_interval == 0 ? 1 : event_interval)
+    , m_global_queue_interval(global_queue_interval == 0 ? 1 : global_queue_interval)
 {
     assert(m_parker && "CurrentThreadExecutor needs a Parker");
 }
@@ -61,24 +102,33 @@ void CurrentThreadExecutor::schedule(detail::Rc<detail::TaskBase> task) {
     }
     // Through enqueue(), not a bare push: spawn() may run on another thread (e.g. a
     // blocking-pool thread driving a stream) while this executor is parked with no
-    // limit, and only enqueue() unparks it. A bare push here was a lost wake-up.
+    // limit, and only enqueue() routes it to the inject queue and unparks. A bare
+    // push here was a lost wake-up, and would now also be an unlocked push onto
+    // m_local from the wrong thread.
     enqueue(std::move(task));
 }
 
-// May be called from outside the executor thread: an ISR on Pico or an
-// external thread on multi-threaded platforms. m_ready_mutex provides the
-// appropriate serialisation for the current platform (see detail/mutex.h).
 void CurrentThreadExecutor::enqueue(detail::Rc<detail::TaskBase> task) {
+    if (t_running_executor == this) {
+        // The loop's own thread: no lock, and no unpark, because the loop looks at
+        // m_local again before it next blocks (a wake fired from inside park() is
+        // found as soon as park() returns).
+        //
+        // RACE (by contract, not by lock): this is safe only because one thread
+        // runs the loop at a time and nothing else reaches this branch. On Pico an
+        // interrupt handler would reach it; see the WARNING on enqueue() in the
+        // header.
+        m_local.push_back(std::move(task));
+        return;
+    }
     bool unpark;
     {
-        std::lock_guard lock(m_ready_mutex);
-        m_ready.push(std::move(task));
+        std::lock_guard lock(m_inject_mutex);
+        m_inject.push_back(std::move(task));
         // m_parked is set under this lock together with park_once()'s empty
         // check, so either that check sees this task (and parks with a zero
-        // wait), or we see m_parked and unpark. A wake fired from inside park()
-        // on the executor's own thread needs no unpark: the loop runs again as
-        // soon as park() returns.
-        unpark = m_parked && t_parked_executor != this;
+        // wait), or we see m_parked and unpark.
+        unpark = m_parked;
     }
     // Race (benign): the executor may leave park() for another reason between
     // the unlock above and this call. The unpark then makes its NEXT park()
@@ -87,91 +137,114 @@ void CurrentThreadExecutor::enqueue(detail::Rc<detail::TaskBase> task) {
 }
 
 bool CurrentThreadExecutor::empty() const {
-    std::lock_guard lock(m_ready_mutex);
-    return m_ready.empty();
+    std::lock_guard lock(m_inject_mutex);
+    // m_local is not protected by the lock; see the header.
+    return m_local.empty() && m_inject.empty();
 }
 
 bool CurrentThreadExecutor::poll_ready_tasks() {
-    // Snapshot count under the lock, then pop one task at a time.
-    // Holding the lock only for the pop (not across the poll) keeps the
-    // ISR-disable window as short as possible.
-    std::size_t count;
+    LoopScope running(*this);
+    return run_batch();
+}
+
+bool CurrentThreadExecutor::run_batch() {
+    bool polled = false;
+    for (unsigned i = 0; i < m_event_interval; ++i) {
+        detail::Rc<detail::TaskBase> task = next_task();
+        if (!task) break;
+        polled = true;
+        // A poll that yielded (its budget ran out, or it called yield_now()) ends
+        // the batch: the task is asking for timers, I/O and wakes from other
+        // threads to be looked at before it runs again.
+        if (poll_task(std::move(task))) break;
+    }
+    return polled;
+}
+
+detail::Rc<detail::TaskBase> CurrentThreadExecutor::next_task() {
+    // Tasks that keep each other runnable never let m_local run empty, so the
+    // inject queue is also looked at every m_global_queue_interval-th poll.
+    ++m_tick;
+    if (m_local.empty() || m_tick % m_global_queue_interval == 0)
+        take_injected();
+    if (m_local.empty()) return nullptr;
+    detail::Rc<detail::TaskBase> task = std::move(m_local.front());
+    m_local.pop_front();
+    return task;
+}
+
+void CurrentThreadExecutor::take_injected() {
+    // All of them under one lock, in order, behind the local tasks already queued.
+    std::lock_guard lock(m_inject_mutex);
+    while (!m_inject.empty()) {
+        m_local.push_back(std::move(m_inject.front()));
+        m_inject.pop_front();
+    }
+}
+
+bool CurrentThreadExecutor::poll_task(detail::Rc<detail::TaskBase> task) {
+    auto expected = detail::SchedulingState::Notified;
+    if (!task->scheduling_state.compare_exchange_strong(
+            expected, detail::SchedulingState::Running,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed))
     {
-        std::lock_guard lock(m_ready_mutex);
-        count = m_ready.size();
+        std::cerr << "[coro] CurrentThreadExecutor: unexpected scheduling_state "
+                  << static_cast<int>(expected)
+                  << " during Notified→Running transition\n";
+        std::abort();
     }
-    if (count == 0) return false;
 
-    for (std::size_t i = 0; i < count; ++i) {
-        detail::Rc<detail::TaskBase> task;
+    detail::Context ctx(task, task_budget());
+    detail::TaskBase::current = task.get();
+    bool done = task->poll(ctx);
+    detail::TaskBase::current = nullptr;
+
+    if (done) {
+        task->scheduling_state.store(
+            detail::SchedulingState::Done, std::memory_order_relaxed);
+        bool closed;
         {
-            std::lock_guard lock(m_ready_mutex);
-            if (m_ready.empty()) break;
-            task = std::move(m_ready.front());
-            m_ready.pop();
+            std::lock_guard lock(m_owned_mutex);
+            m_owned_tasks.erase(task);
+            closed = m_closed;
         }
-
-        auto expected = detail::SchedulingState::Notified;
-        if (!task->scheduling_state.compare_exchange_strong(
-                expected, detail::SchedulingState::Running,
-                std::memory_order_acq_rel,
-                std::memory_order_relaxed))
-        {
-            std::cerr << "[coro] CurrentThreadExecutor: unexpected scheduling_state "
-                      << static_cast<int>(expected)
-                      << " during Notified→Running transition\n";
-            std::abort();
-        }
-
-        detail::Context ctx(task);
-        detail::TaskBase::current = task.get();
-        bool done = task->poll(ctx);
-        detail::TaskBase::current = nullptr;
-
-        if (done) {
-            task->scheduling_state.store(
-                detail::SchedulingState::Done, std::memory_order_relaxed);
-            bool closed;
-            {
-                std::lock_guard lock(m_owned_mutex);
-                m_owned_tasks.erase(task);
-                closed = m_closed;
-            }
-            if (closed) notify_shutdown_progress();
-        } else {
-            expected = detail::SchedulingState::Running;
-            if (task->scheduling_state.compare_exchange_strong(
-                    expected, detail::SchedulingState::Idle,
-                    std::memory_order_acq_rel,
-                    std::memory_order_relaxed))
-            {
-                task.reset(); // executor's owned map keeps the task alive while parked
-            } else {
-                // wake() fired during poll() — RunningAndNotified → Notified, re-enqueue
-                if (expected != detail::SchedulingState::RunningAndNotified) {
-                    std::cerr << "[coro] CurrentThreadExecutor: unexpected scheduling_state "
-                              << static_cast<int>(expected)
-                              << " after Running→Idle CAS failure\n";
-                    std::abort();
-                }
-                if (!task->scheduling_state.compare_exchange_strong(
-                        expected, detail::SchedulingState::Notified,
-                        std::memory_order_acq_rel,
-                        std::memory_order_relaxed))
-                {
-                    std::cerr << "[coro] CurrentThreadExecutor: unexpected scheduling_state "
-                              << static_cast<int>(expected)
-                              << " during RunningAndNotified→Notified transition\n";
-                    std::abort();
-                }
-                {
-                    std::lock_guard lock(m_ready_mutex);
-                    m_ready.push(std::move(task));
-                }
-            }
-        }
+        if (closed) notify_shutdown_progress();
+        return ctx.yielded();
     }
-    return true;
+
+    expected = detail::SchedulingState::Running;
+    if (task->scheduling_state.compare_exchange_strong(
+            expected, detail::SchedulingState::Idle,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+    {
+        // The executor's owned set keeps the task alive while it is idle. A wake
+        // from another thread after this CAS goes through enqueue().
+        return ctx.yielded();
+    }
+
+    // wake() fired during poll() — RunningAndNotified → Notified, re-enqueue
+    if (expected != detail::SchedulingState::RunningAndNotified) {
+        std::cerr << "[coro] CurrentThreadExecutor: unexpected scheduling_state "
+                  << static_cast<int>(expected)
+                  << " after Running→Idle CAS failure\n";
+        std::abort();
+    }
+    if (!task->scheduling_state.compare_exchange_strong(
+            expected, detail::SchedulingState::Notified,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+    {
+        std::cerr << "[coro] CurrentThreadExecutor: unexpected scheduling_state "
+                  << static_cast<int>(expected)
+                  << " during RunningAndNotified→Notified transition\n";
+        std::abort();
+    }
+    // Behind every task already on m_local, whichever thread made the wake: this
+    // is the loop's thread doing the push.
+    m_local.push_back(std::move(task));
+    return ctx.yielded();
 }
 
 detail::TimerId CurrentThreadExecutor::add_timer(Instant deadline,
@@ -192,8 +265,12 @@ void CurrentThreadExecutor::cancel_timer(detail::TimerId id) noexcept {
 void CurrentThreadExecutor::park_once() {
     std::optional<std::chrono::nanoseconds> max_wait;
     {
-        std::lock_guard lock(m_ready_mutex);
-        if (!m_ready.empty()) {
+        std::lock_guard lock(m_inject_mutex);
+        // m_local is read here only because "is anything ready" is one decision;
+        // the lock does not protect it. Nothing can push onto it between this check
+        // and park(): this thread is the only one that does, and it wakes no task
+        // on the way there.
+        if (!m_local.empty() || !m_inject.empty()) {
             max_wait = std::chrono::nanoseconds::zero();
         } else {
             // From here until end_wait(), an add_timer() with an earlier deadline
@@ -203,12 +280,12 @@ void CurrentThreadExecutor::park_once() {
             m_parked = true;
         }
     }
-    t_parked_executor = this;
+    // Wakes fired by the parker on this thread (the driver dispatching inside
+    // turn()) go onto m_local without an unpark; see enqueue().
     m_parker->park(max_wait);
-    t_parked_executor = nullptr;
     m_timers.end_wait();
     {
-        std::lock_guard lock(m_ready_mutex);
+        std::lock_guard lock(m_inject_mutex);
         m_parked = false;
     }
 }
@@ -260,7 +337,8 @@ void CurrentThreadExecutor::begin_shutdown() {
         m_closed = true;
         tasks.assign(m_owned_tasks.begin(), m_owned_tasks.end());
     }
-    // Outside m_owned_mutex: cancel_task() wakes the task, which takes m_ready_mutex.
+    // Outside m_owned_mutex: cancel_task() wakes the task, which may take
+    // m_inject_mutex.
     //
     // RACE: a schedule() on another thread (a blocking-pool thread) either inserted
     // its task before m_closed was set, and the task is in `tasks`, or after, and
@@ -331,13 +409,18 @@ void CurrentThreadExecutor::run_loop(Done&& done) {
 #if defined(CORO_PICO) && defined(__arm__)
     enable_psp_stack_once();
 #endif
+    // For the whole loop, not per batch: timers fired by check_expired_timers() and
+    // wakers fired inside park() are local wakes too.
+    LoopScope running(*this);
     while (true) {
         if (done()) break;
-        poll_ready_tasks();
+        run_batch();
         check_expired_timers();
-        // The poll above may have made done() true. Without this check an empty
-        // queue would park with no limit, forever.
+        // The batch above may have made done() true. Without this check empty
+        // queues would park with no limit, forever.
         if (done()) break;
+        // Always reaches the parker, with a zero wait while tasks are queued: a
+        // batch is the unit between two looks at outside events.
         park_once();
 #ifdef CORO_PICO
         check_isr_events();

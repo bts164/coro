@@ -23,12 +23,18 @@ Dependencies are managed with Conan.
 ## What Is Implemented
 
 ### Runtime & Scheduling
-- **Single-threaded executor** — deterministic, used for testing
-- **Work-sharing executor** — shared injection queue, multiple worker threads
-- **Work-stealing executor** — per-worker `WorkStealingDeque` with CAS-based
-  `SchedulingState` transitions; Tokio-style injection budget enforcement
-- **`CurrentThreadExecutor`** — polling loop on the calling thread; no extra threads;
-  interleaves task scheduling with an injected `PollFn`; primary executor on MCU targets
+- **`CurrentThreadExecutor`** — runs its loop on the calling thread, with no threads of
+  its own; an unlocked local ready queue plus a locked inject queue for wakes from
+  other threads; waits for outside events through an injected `Parker`. `Runtime(1)` on
+  desktop, and the only executor on MCU targets
+- **`WorkStealingExecutor`** — the default multi-threaded executor: per-worker local
+  queues, a shared injection queue, stealing between workers, CAS-based
+  `SchedulingState` transitions
+- **`WorkSharingExecutor`** — per-worker queues and a shared injection queue, no
+  stealing; kept as a simpler executor for debugging
+- **Task budget** — a task may pass 128 `co_await`s per poll and then yields, so a task
+  whose awaits are always ready cannot shut out other tasks, timers and I/O;
+  `yield_now()` does the same on request (see `task_budget.md`)
 - `Runtime` selects executor by thread count at construction; `block_on()` drives the
   top-level coroutine to completion
 
@@ -190,8 +196,9 @@ children — safe to discard.
 
 `Context` carries a `Waker` into each `poll()` call. The future stores the waker and,
 when the operation completes (on an I/O callback thread, a blocking thread, or another
-task's completion), calls `waker->wake()`. This enqueues the owning `Task` into the
-executor's injection queue, where it will be re-polled.
+task's completion), calls `waker->wake()`. This enqueues the owning `Task` on one of
+its executor's ready queues, where it will be re-polled: a queue local to the thread
+when the wake is made by a thread of that executor, the injection queue otherwise.
 
 `Waker` holds a `shared_ptr<Task>` internally. Calling `wake()` on a waker for a dead
 task is a safe no-op — the `shared_ptr` reference count keeps the Task control block
@@ -225,49 +232,77 @@ services without passing them through call stacks.
 
 ### `CurrentThreadExecutor`
 
-A polling executor that runs its task loop directly on the calling thread with no extra
-threads of its own. Its `wait_for_completion()` loop alternates between draining the task
-ready queue and calling an injected `PollFn`:
+Runs its task loop directly on the calling thread, with no threads of its own.
+`block_on()` loops:
 
 ```
 loop:
-  poll_ready_tasks()      // drain ready coroutines
-  check_expired_timers()  // fire sleep_for / timeout wakers
-  m_poll()                // cyw43_arch_poll() on Pico W; no-op elsewhere
+  run a batch             // poll up to event_interval (61) ready tasks
+  check_expired_timers()  // fire sleep_for / timeout wakers in the executor's own queue
+  parker.park(max_wait)   // wait for outside events
+  check_isr_events()      // Pico only: wake tasks an interrupt handler signalled
 ```
 
-The `ClockFn` and `PollFn` are injected at construction, making the scheduling loop
-platform-agnostic. This is the executor for MCU targets, where a dedicated I/O thread
-is undesirable and the I/O poll function (`cyw43_arch_poll()`) must interleave with task
-scheduling on a single thread.
+- **Two ready queues.** A wake made on the thread that is running the loop goes onto a
+  local queue that has no lock. A wake from any other thread goes onto an inject queue
+  under a mutex, and unparks the executor if it is parked. The loop moves the inject
+  queue onto the local one when the local one is empty, and on every 31st task poll
+  otherwise, so tasks that keep each other runnable cannot shut out remote wakes.
+- **A batch ends early** when nothing is runnable, or when a task poll yielded (its
+  task budget ran out, or it awaited `yield_now()`). Timers and outside events are then
+  looked at before that task runs again.
+- **`max_wait`** is zero while a task is ready; otherwise the time until the executor's
+  next timer, or no limit.
+- **The `Parker` is the platform-specific part.** On desktop it is an `IoDriverParker`:
+  an idle executor blocks in `epoll_wait`, and I/O events and timers are dispatched on
+  this thread. On Pico it is a `PollingParker` around the network poll function, which
+  never blocks, so the loop busy-polls.
+- **One thread runs the loop at a time.** The same thread may nest `block_on()`; a
+  second thread that tries gets `std::logic_error`.
 
-### Single-threaded executor
-
-Simple round-robin queue with condition-variable idle sleep. Deterministic and useful for
-unit tests.
-
-### Work-sharing executor
-
-Shared injection queue protected by a mutex. Multiple worker threads drain it cooperatively.
-Lower latency than single-threaded; simpler than work-stealing. Used as a stepping stone
-in the implementation.
+See `executor_design.md`, "CurrentThreadExecutor", for the queues, the loop and the
+parking races.
 
 ### Work-stealing executor
 
-The primary production executor. Modelled on Tokio's scheduler:
+The default multi-threaded executor, modelled on Tokio's scheduler:
 
-- Each worker has a fixed-capacity `WorkStealingDeque` (local run queue).
-- A shared `InjectionQueue` accepts tasks from non-worker threads (e.g. waker calls from
-  the I/O thread or blocking threads).
-- Each poll cycle, a worker:
-  1. Drains up to a budget (default 64) tasks from its local queue.
-  2. Checks the injection queue (drains up to budget tasks, distributing to other workers).
-  3. Attempts to steal from a randomly chosen peer's deque.
-  4. Parks on a `std::binary_semaphore` if no work is found.
-- Tasks are woken via `waker->wake()` which calls `executor->enqueue(task)` — thread-safe
-  injection from any thread.
+- Each worker has a fixed-capacity local run queue that other workers can steal from.
+- A shared injection queue accepts tasks from threads outside the executor (blocking
+  threads, another runtime's workers) and tasks spilled from a full local queue.
+- Each pass of its loop, a worker looks for a task in this order:
+  1. On every 61st pass, one task from the injection queue, so that workers whose local
+     queues never empty cannot shut it out.
+  2. Its own local queue.
+  3. The injection queue, taking a batch: one task to run now, the rest onto its local
+     queue.
+  4. A peer's local queue (stealing), with the number of searching workers bounded.
+  5. Nothing found: it parks. The first idle worker parks in the `IoDriver`
+     (`epoll_wait`); the others park on their own condition variable.
+- A busy worker turns the `IoDriver` without blocking every 61 task polls, and at once
+  after a poll that yielded, so I/O and timers are not starved when no worker is idle.
+- Tasks are woken via `waker->wake()`, which calls `executor->enqueue(task)`. A wake
+  from a worker goes onto that worker's local queue; a wake from any other thread goes
+  onto the injection queue and wakes a parked worker.
 
-#### `SchedulingState` CAS machine
+See `work_stealing_executor.md`.
+
+### Work-sharing executor
+
+Per-worker queues and a shared injection queue, with no stealing: a worker whose queue
+is empty waits for the injection queue. It came before the work-stealing executor and is
+kept as a simpler one for debugging. Select it with
+`Runtime(std::in_place_type<WorkSharingExecutor>, n)`.
+
+### Task budget
+
+Every executor polls a task with a budget of 128 `co_await`s. At the next one the task
+yields: it suspends without polling the awaited future, goes to the back of the run
+queue, and the executor looks at timers and I/O before it runs again.
+`co_await coro::yield_now()` does the same on request. The budget is counted in awaits,
+not in time, and can be changed per `Runtime`. See `task_budget.md`.
+
+### `SchedulingState` CAS machine
 
 Each `Task` has an atomic `SchedulingState`:
 
@@ -729,12 +764,15 @@ poll-driven model that requires no RTOS, no epoll driver, and no blocking pool.
 ### `Runtime` on Pico
 
 `Runtime` owns only a `CurrentThreadExecutor`. There is no `IoDriver` and no
-`BlockingPool`. Networking I/O (TCP, if used) is
-handled by lwIP + CYW43, polled by `cyw43_arch_poll()` injected as the executor's
-`PollFn`.
+`BlockingPool`. Networking I/O (TCP, if used) is handled by lwIP + CYW43, polled by
+`cyw43_arch_poll()` from the executor's `Parker` once per pass of its loop.
 
-The firmware main loop drives the executor by calling `rt.poll()` alongside the
-platform's own event dispatchers:
+`rt.block_on(coro)` is the entry point: it runs tasks, fires timers, polls the network
+and checks the ISR events until the given coroutine completes.
+
+Firmware that must keep its own main loop can call `rt.poll()` in it. That runs one
+batch of ready tasks and nothing else: it fires no timers and polls no network, so the
+loop has to do those itself.
 
 ```cpp
 coro::Runtime rt;
@@ -746,9 +784,6 @@ while (true) {
 }
 ```
 
-`rt.block_on(coro)` is an alternative entry point that loops until the given coroutine
-completes.
-
 ### ISR safety
 
 The `CORO_PICO` build adds `IsrEvent` and `IsrChannel<T>` (`coro/sync/isr_event.h`) —
@@ -758,7 +793,7 @@ on Cortex-M0+ all route through the `pico_atomic` global spin-lock — ISR-deadl
 
 The design keeps the ISR path minimal: the ISR writes a `volatile` flag (and for
 `IsrChannel<T>`, a value with a `__DMB()` release fence) and returns immediately. The
-executor discovers the signal once per poll iteration and wakes the waiting coroutine
+executor discovers the signal once per pass of its loop (after each park) and wakes the waiting coroutine
 from safe executor context.
 
 See `doc/isr_safety.md` for the complete policy and implementation details.

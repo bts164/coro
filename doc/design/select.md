@@ -80,6 +80,15 @@ SelectFuture<Fs...> select(Fs&&... futures);
    by one each poll. Branches are polled starting from `m_poll_start % N`, wrapping around.
    No RNG needed; this is fair and deterministic.
 
+    !!! note "NOTE: the rotation is per `SelectFuture`, so a new one starts at branch 0"
+        A loop that builds its `select()` anew in each iteration, usually over
+        `coro::ref()` branches, polls branch 0 first every time. If that branch is
+        always ready, the later ones never win, however long they have been ready. The
+        [task budget](task_budget.md) keeps such a loop from starving other tasks, but
+        not its own later branches. Tokio's `select!` picks a random first branch for
+        this reason. Until that is decided here, put the branch that must not be
+        missed (a timer, a cancellation) first.
+
 5. **select over streams** — Out of scope; addressed separately if needed.
 
 ## Cancellation and drain

@@ -1,8 +1,11 @@
 #pragma once
 
+#include <coro/detail/context.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/rc.h>
+#include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -75,6 +78,30 @@ public:
     /// @brief Makes a run_until() in progress on another thread evaluate `done()`
     /// again soon. Thread-safe. The default does nothing.
     virtual void recheck_run_until() noexcept {}
+
+    // --- Task budget. See doc/design/task_budget.md. --------------------------------
+
+    /// How many `co_await`s a task may pass in one poll before it yields. Tokio's value.
+    static constexpr std::uint32_t kDefaultTaskBudget = 128;
+
+    /// @brief Sets the budget given to each task poll from now on. 0 means no limit.
+    /// Thread-safe.
+    void set_task_budget(std::uint32_t budget) noexcept {
+        m_task_budget.store(budget == 0 ? detail::Context::kUnlimitedBudget : budget,
+                            std::memory_order_relaxed);
+    }
+
+protected:
+    /// @brief The budget to build the next task poll's `Context` with.
+    std::uint32_t task_budget() const noexcept {
+        return m_task_budget.load(std::memory_order_relaxed);
+    }
+
+private:
+    // An atomic, not a mutex: a single word of configuration that every worker reads
+    // once per task poll. No other state depends on it, so relaxed ordering is enough;
+    // a poll that races with set_task_budget() gets the old value or the new one.
+    std::atomic<std::uint32_t> m_task_budget{kDefaultTaskBudget};
 };
 
 } // namespace coro

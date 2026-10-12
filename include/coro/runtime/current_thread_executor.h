@@ -19,11 +19,14 @@
 #include <coro/detail/timer_queue.h>
 #include <coro/runtime/clock.h>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
+#ifndef CORO_PICO
+#include <thread>
+#endif
 #include <unordered_set>
 #include <vector>
 
@@ -42,10 +45,14 @@ class Runtime;
  *
  * @code
  * loop:
- *   poll_ready_tasks()      // poll all runnable coroutines once
+ *   run a batch             // poll up to event_interval runnable tasks
  *   check_expired_timers()  // fire sleep_for / timeout wakers
  *   parker.park(max_wait)   // wait for outside events (see below)
  * @endcode
+ *
+ * A batch ends early when nothing is runnable, or when a task poll yielded (its
+ * task budget ran out, or it awaited `yield_now()`), so that timers and outside
+ * events are looked at before that task runs again.
  *
  * `max_wait` is zero while tasks are ready, otherwise the time until the next
  * timer in this executor's own queue, otherwise unlimited. On desktop the parker
@@ -55,20 +62,44 @@ class Runtime;
  * this executor's queue serves Pico and a standalone executor. On Pico it is a @ref PollingParker around `cyw43_arch_poll()`, which
  * never blocks, so the loop busy-polls.
  *
- * `enqueue()` may be called from other threads (the blocking pool, another Runtime's workers) or
- * from an ISR on Pico. It pushes under `m_ready_mutex`, and unparks the
- * executor if it is parked. See doc/design/executor_design.md, "Parking and its races".
+ * There are two ready queues. A wake made on the thread that is running the loop
+ * goes onto the local queue, which only that thread touches and which has no lock.
+ * A wake from anywhere else (the blocking pool, another Runtime's workers) goes onto
+ * the inject queue under `m_inject_mutex`, and unparks the executor if it is parked.
+ * The loop moves the inject queue onto the local one when the local one is empty,
+ * and on every `global_queue_interval`-th task poll otherwise. See
+ * doc/design/executor_design.md, "The loop" and "Parking and its races".
+ *
+ * WARNING: only one thread may run the loop (wait_for_completion(), run_until(),
+ * poll_ready_tasks()) at a time. The same thread may nest them. A second thread
+ * that tries, for example a blocking callable that calls `block_on()` on the
+ * `Runtime(1)` it belongs to, gets `std::logic_error`.
  */
 class CurrentThreadExecutor : public Executor {
 public:
+    /// Task polls in one batch, between two parks. tokio's `event_interval` default.
+    static constexpr unsigned kDefaultEventInterval = 61;
+    /// Task polls between two looks at the inject queue while the local queue has
+    /// work. tokio's current-thread `global_queue_interval` default.
+    static constexpr unsigned kDefaultGlobalQueueInterval = 31;
+
     /// @param parker How the loop waits for outside events; must not be null.
-    explicit CurrentThreadExecutor(std::unique_ptr<Parker> parker);
+    /// @param event_interval The most task polls in one batch; after a batch the
+    ///        timers are checked and the parker is called. 0 is taken as 1.
+    /// @param global_queue_interval How many task polls may pass before the inject
+    ///        queue is looked at although the local queue has work. 0 is taken as 1.
+    explicit CurrentThreadExecutor(std::unique_ptr<Parker> parker,
+                                   unsigned event_interval        = kDefaultEventInterval,
+                                   unsigned global_queue_interval = kDefaultGlobalQueueInterval);
 
     // Overload for Runtime(std::in_place_type<CurrentThreadExecutor>, parker).
     // The Runtime passes itself as the first argument; it is kept only to report
     // shutdown progress to.
-    CurrentThreadExecutor(Runtime* rt, std::unique_ptr<Parker> parker)
-        : CurrentThreadExecutor(std::move(parker)) { m_runtime = rt; }
+    CurrentThreadExecutor(Runtime* rt, std::unique_ptr<Parker> parker,
+                          unsigned event_interval        = kDefaultEventInterval,
+                          unsigned global_queue_interval = kDefaultGlobalQueueInterval)
+        : CurrentThreadExecutor(std::move(parker), event_interval, global_queue_interval)
+    { m_runtime = rt; }
 
 #ifndef CORO_PICO
     /// Desktop default, used by `Runtime(1)` and
@@ -87,16 +118,20 @@ public:
     /// Takes ownership of `task` and enqueues it for its first poll.
     void schedule(detail::Rc<detail::TaskBase> task) override;
 
-    /// Re-enqueues a woken task. May be called from a context other than the
-    /// executor thread — an IRQ handler on Pico (e.g. DMA completion ISR) or
-    /// an external thread on multi-threaded platforms. m_ready_mutex serialises
-    /// access appropriately for the current platform (see detail/mutex.h).
-    /// Unparks the executor if it is parked and the caller is another thread.
+    /// Re-enqueues a woken task. On the thread that is running this executor's loop
+    /// the task goes onto the local queue, with no lock and no unpark. From any
+    /// other thread it goes onto the inject queue under m_inject_mutex, and the
+    /// executor is unparked if it is parked.
+    ///
+    /// WARNING: not callable from an interrupt handler on Pico. An interrupt taken
+    /// while the loop runs would pass the "is this the loop's thread" test and push
+    /// onto the local queue in the middle of the loop's own use of it. Interrupt
+    /// handlers set an IsrEvent/IsrChannel flag instead; see doc/design/isr_safety.md.
     void enqueue(detail::Rc<detail::TaskBase> task) override;
 
     /// @brief Runs the event loop until `state.terminated`.
     ///
-    /// Alternates between draining the coroutine ready queue, firing expired
+    /// Alternates between running a batch of ready tasks, firing expired
     /// timers, and parking. Whether parking blocks depends on the Parker: on
     /// Pico (PollingParker) it never does, so the loop busy-polls.
     void wait_for_completion(detail::TaskStateBase& state) override;
@@ -121,11 +156,14 @@ public:
     /// Unparks the loop so that it evaluates its exit condition again.
     void recheck_run_until() noexcept override;
 
-    /// @brief Drains the ready queue: polls each task once in FIFO order.
+    /// @brief Runs one batch: polls ready tasks in FIFO order until none is left,
+    /// `event_interval` polls were made, or a poll yielded. A task that wakes itself
+    /// may be polled more than once in one call.
     /// @return `true` if at least one task was polled.
     bool poll_ready_tasks();
 
-    /// @brief Returns `true` if no task is waiting in the ready queue.
+    /// @brief Returns `true` if no task is waiting in either ready queue. For the
+    /// thread that runs the loop: it reads the local queue, which has no lock.
     bool empty() const;
 
     /// @brief Adds a timer to this executor's own queue: `waker` fires once
@@ -164,9 +202,29 @@ public:
 #endif // CORO_PICO
 
 private:
+    /// Held for as long as a thread runs the loop: claims the loop for that thread
+    /// (see m_loop_thread) and marks the executor as the one running on it, which
+    /// is what routes enqueue() to the local queue. Defined in the .cpp.
+    class LoopScope;
+
     /// Picks the wait (zero / until next timer / unlimited), marks the executor
     /// parked, and parks once.
     void park_once();
+
+    /// Polls up to m_event_interval tasks; stops early when none is ready or a poll
+    /// yielded. Returns true if any task was polled. Loop thread only.
+    bool run_batch();
+
+    /// The next task to poll, or null. Moves the inject queue onto the local one
+    /// first if the local one is empty or the inject queue is due a look.
+    detail::Rc<detail::TaskBase> next_task();
+
+    /// Moves every task in m_inject onto the back of m_local, in order.
+    void take_injected();
+
+    /// Polls `task` once and files it by the outcome (done, idle, or woken during
+    /// the poll and so back onto m_local). Returns true if the poll yielded.
+    bool poll_task(detail::Rc<detail::TaskBase> task);
 
     /// The event loop behind wait_for_completion() and run_until(). Defined in the
     /// .cpp, its only user.
@@ -184,21 +242,41 @@ private:
     std::unique_ptr<Parker> m_parker;
     bool                    m_turns_io_driver = false;  // set once in the constructor
 
-    // Internally synchronized. Lock order: m_ready_mutex, then the queue's mutex
-    // (park_once() calls begin_wait() under m_ready_mutex).
+    // Set once in the constructor, never zero.
+    unsigned m_event_interval;
+    unsigned m_global_queue_interval;
+    // Task polls so far; decides when the inject queue is due a look. Loop thread only.
+    unsigned m_tick = 0;
+
+    // Internally synchronized. Lock order: m_inject_mutex, then the queue's mutex
+    // (park_once() calls begin_wait() under m_inject_mutex).
     //
-    // Declared before m_ready and m_owned_tasks so that it is destroyed after them:
-    // destroying an unfinished task destroys its futures, and a SleepFuture cancels
-    // its timer in this queue from its destructor.
+    // Declared before the ready queues and m_owned_tasks so that it is destroyed
+    // after them: destroying an unfinished task destroys its futures, and a
+    // SleepFuture cancels its timer in this queue from its destructor.
     detail::TimerQueue m_timers;
 
-    // m_ready_mutex serialises m_ready access against ISR preemption (Pico) or
-    // concurrent thread wakers (multi-threaded platforms). See detail/mutex.h.
-    mutable detail::Mutex m_ready_mutex;
-    std::queue<detail::Rc<detail::TaskBase>> m_ready;
-    // True from park_once()'s empty-queue check until park() returns. Read by
-    // enqueue() to decide whether to unpark. GUARDED BY m_ready_mutex.
+    // Tasks made runnable on the thread that is running the loop. NOT GUARDED: only
+    // that thread touches it, and only enqueue()'s `t_running_executor == this`
+    // test lets a push through. See the WARNING on the class.
+    std::deque<detail::Rc<detail::TaskBase>> m_local;
+
+    // Tasks made runnable from anywhere else. GUARDED BY m_inject_mutex. On Pico
+    // the mutex does nothing (see detail/mutex.h): there is one thread, and
+    // interrupt handlers do not enqueue.
+    mutable detail::Mutex m_inject_mutex;
+    std::deque<detail::Rc<detail::TaskBase>> m_inject;
+    // True from park_once()'s empty-queue check until park() returns. Read by a
+    // remote enqueue() to decide whether to unpark. GUARDED BY m_inject_mutex.
     bool m_parked = false;
+
+#ifndef CORO_PICO
+    // The thread running the loop and how deeply it has nested it (a block_on()
+    // inside a task). Only there to refuse a second thread, which would otherwise
+    // share m_local unlocked. GUARDED BY m_inject_mutex. Pico has one thread.
+    std::thread::id m_loop_thread;
+    unsigned        m_loop_depth = 0;
+#endif
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), erased after poll() returns true (task reached terminal state).

@@ -413,16 +413,4 @@ IoLevelReady IoRegistration::take_ready() {
     return ready;
 }
 
-// ---------------------------------------------------------------------------
-// IoDriverParker
-// ---------------------------------------------------------------------------
-
-void IoDriverParker::park(std::optional<std::chrono::nanoseconds> max_wait) {
-    if (max_wait && max_wait->count() <= 0) {
-        if (++m_skipped < m_event_interval) return;
-    }
-    m_skipped = 0;
-    m_driver.turn(max_wait);
-}
-
 } // namespace coro

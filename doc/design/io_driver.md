@@ -439,9 +439,10 @@ Each executor turns the driver from its scheduling loop:
 
 - **When idle,** a thread blocks in `turn(nullopt)` (bounded by the earliest timer)
   instead of on a condition variable. A wake from another thread calls `unpark()`.
-- **When busy,** the executor turns with a zero timeout every N tasks, as tokio does with
-  its `event_interval` (61). This keeps I/O from starving behind a long ready queue.
-  Because events are edge-triggered, they wait safely in the kernel until then.
+- **When busy,** the executor turns with a zero timeout every N task polls, as tokio
+  does with its `event_interval` (61), and at once after a task poll that yielded (see
+  [Task Budget](task_budget.md)). This keeps I/O from starving behind a long ready
+  queue. Because events are edge-triggered, they wait safely in the kernel until then.
 
 Dispatch calls `wake()` on the thread that is turning. If the woken task belongs to that
 thread, it is a plain local enqueue: no lock on a shared queue, no hop.
@@ -465,14 +466,15 @@ public:
 
 | Parker | `park(max_wait)` | `unpark()` | Used by |
 |---|---|---|---|
-| `IoDriverParker` | `driver.turn(max_wait)`, but a zero wait only turns every `event_interval`-th call | `driver.unpark()` | desktop `Runtime(1)` |
+| `IoDriverParker` | `driver.turn(max_wait)` | `driver.unpark()` | desktop `Runtime(1)` |
 | `PollingParker` | calls a function once (`cyw43_arch_poll()`), ignores `max_wait` | nothing | Pico `Runtime` |
 
-The executor picks the wait: zero when its ready queue isn't empty, otherwise no limit
-(the driver bounds it by the earliest timer itself). `IoDriverParker` keeps the
-`event_interval` counter, so a task that keeps re-waking itself doesn't pay an
-`epoll_wait()` per batch, and the executor loop stays platform-neutral. `PollingParker`
-never blocks, so Pico busy-polls.
+The executor picks the wait: zero when a ready queue isn't empty, otherwise no limit
+(the driver bounds it by the earliest timer itself). It also decides how often it
+parks while busy: once per batch of `event_interval` task polls, so a task that keeps
+re-waking itself doesn't pay an `epoll_wait()` per poll (see
+[Executor Scheduling Design](executor_design.md#the-loop)). The parkers keep no count
+of their own. `PollingParker` never blocks, so Pico busy-polls.
 
 ### Per-executor integration
 
@@ -698,7 +700,7 @@ sequenceDiagram
 tasks were woken either way.
 
 `begin_wait()` records a waiter only for a non-zero `effective`. A zero-timeout turn (a
-busy worker's `try_turn(0)`, or `IoDriverParker`'s every-61st turn) still fires expired
+busy worker's `try_turn(0)`, or `CurrentThreadExecutor`'s park after a batch) still fires expired
 timers, but `insert()` never unparks it. `IoDriver::add_timer(deadline, waker)` calls
 `insert()`, then `unpark()` if told to, and returns the `TimerId`.
 `IoDriver::cancel_timer(id)` is `cancel()`.
