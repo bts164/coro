@@ -84,5 +84,55 @@ jobs:
             echo 28 > /proc/sys/vm/mmap_rnd_bits
           fi
 
+      # The third-party packages, built once and then kept in the Actions cache: a
+      # sanitizer build compiles every one of them from source, and no remote has
+      # libunicorn at all. coro itself is never in it.
+      #
+      # The key names the image, whose tag changes with the profiles and the
+      # compiler. That matters: a profile's compiler flags are not part of a package
+      # ID, so binaries built with other flags would be taken as they are. The
+      # recipes are the rest of the key; when only they change, the previous cache is
+      # restored (restore-keys) and only what is new gets built.
+      - name: Look for cached Conan packages
+        id: conan-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/conan-packages.tgz
+          key: conan-${{ matrix.sanitizer }}-${{ fromJSON(needs.image.outputs.images)[matrix.platform] }}-${{ hashFiles('conanfile.py', 'conandata.yml', 'test/conanfile.py', 'test/libunicorn/**') }}
+          restore-keys: |
+            conan-${{ matrix.sanitizer }}-${{ fromJSON(needs.image.outputs.images)[matrix.platform] }}-
+
+      - name: Restore the cached Conan packages
+        run: |
+          if [ -f "$RUNNER_TEMP/conan-packages.tgz" ]; then
+            conan cache restore "$RUNNER_TEMP/conan-packages.tgz"
+            rm "$RUNNER_TEMP/conan-packages.tgz"
+          fi
+
       - name: Build and run the tests
         run: ci/run-tests.sh ${{ matrix.sanitizer }}
+
+      # Also after a failed test run: the packages were built all the same. Not when
+      # the key was found, since a cache cannot be replaced under the same key.
+      #
+      # The --lru lines drop what this run did not use (binaries first, then recipes
+      # left without a use), so that packages of old versions and old package IDs are
+      # not carried from one cache to the next for ever. Restoring a cache does not
+      # count as a use. The limit only has to be longer than the job, or packages used
+      # at its start would go too.
+      - name: Collect the Conan packages to cache
+        id: conan-save
+        if: ${{ !cancelled() && steps.conan-cache.outputs.cache-hit != 'true' }}
+        run: |
+          conan remove "coro/*" --confirm
+          conan remove "*/*#*:*#*" --lru=6h --confirm
+          conan remove "*/*#*" --lru=6h --confirm
+          conan cache clean "*" --source --build --download
+          conan cache save "*/*:*" --file "$RUNNER_TEMP/conan-packages.tgz"
+
+      - name: Cache the Conan packages
+        if: ${{ !cancelled() && steps.conan-save.outcome == 'success' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/conan-packages.tgz
+          key: ${{ steps.conan-cache.outputs.cache-primary-key }}

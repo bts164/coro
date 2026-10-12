@@ -1,10 +1,10 @@
 # The primary platform's CI image, and the one the scripts in this directory run in
 # unless CORO_PLATFORM names another: Ubuntu 24.04 with GCC 13, the ARM toolchain, the
 # Pico SDK and picotool, and the Conan profiles docker/profiles/ubuntu2404 (as the
-# default profile) and docker/profiles/rp2040_pico_w.
+# default profile), docker/profiles/rp2040_pico_w and the sanitizer profiles.
 #
-# Build it with docker/build-image.sh. The image's tag is a hash of this file and
-# those profiles (docker/common.sh), so any change here makes a new image; CI publishes it
+# Build it with docker/build-image.sh. The image's tag is a hash of this file, those
+# profiles and settings_user.yml (docker/common.sh), so any change here makes a new image; CI publishes it
 # from .github/workflows/ci_image.yml.
 FROM ubuntu:24.04
 
@@ -69,6 +69,10 @@ RUN git clone --depth 1 --branch "$PICO_SDK_VERSION" \
 # names no profile uses it. The Pico profile is the same on every platform.
 COPY profiles/ubuntu2404 /root/.conan2/profiles/default
 COPY profiles/rp2040_pico_w /root/.conan2/profiles/rp2040_pico_w
+# The sanitizer profiles, each named after one of the two above, and the definition
+# of the setting they set (settings_user.yml says what it is).
+COPY profiles/asan profiles/tsan profiles/ubsan /root/.conan2/profiles/
+COPY settings_user.yml /root/.conan2/settings_user.yml
 
 COPY <<EOF /root/.conan2/global.conf
 tools.build:jobs=4

@@ -157,7 +157,7 @@ ppb.writeUint32 = (offset, value) => {
 };
 
 // The SDK's panic() and a failed assert end in a breakpoint instruction, and so
-// does its hard fault handler. A UBSan trap (with_sanitize=ubsan) is an undefined
+// does its hard fault handler. A UBSan trap is an undefined
 // instruction, which the emulator reports the same way.
 mcu.onBreak = (code) => stop(`the firmware stopped at a breakpoint or trap (${code}) ` +
                              `near pc 0x${(mcu.core.PC >>> 0).toString(16)}: a panic, a ` +

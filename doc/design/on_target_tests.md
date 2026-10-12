@@ -259,7 +259,7 @@ RAM:
 | Check | When | What it catches | Where |
 |---|---|---|---|
 | Stack guard (`PICO_USE_STACK_GUARDS`) | Always | A write to the 32 bytes below the main stack. The stack is the full 4 KB of its linker region | Board only: the emulator has no memory protection unit, and its launcher only stores the MPU registers so that the firmware boots |
-| UBSan in trap mode (`with_sanitize=ubsan`) | On request | Undefined behaviour in the library, the tests and the runner: signed overflow, bad shifts, misaligned or null access, out-of-bounds array indexing, a missing return | Board and emulator |
+| UBSan in trap mode (the `ubsan` Conan profile) | On request | Undefined behaviour in the library, the tests and the runner: signed overflow, bad shifts, misaligned or null access, out-of-bounds array indexing, a missing return | Board and emulator |
 
 Both end in a hard fault, which the host script reports as the device stopping during
 the test that was running. UBSan is an option, like ASan and TSan on the desktop, because

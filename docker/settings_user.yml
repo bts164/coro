@@ -1,0 +1,18 @@
+# Conan has no setting for a sanitizer, so this adds one: compiler.sanitizer. Conan
+# merges this file into its own settings.yml; each CI image has it in its Conan home.
+#
+# A profile then names the sanitizer (profiles/asan, tsan, ubsan), which makes it part
+# of the package ID of everything built with that profile: a sanitizer build and a
+# plain one never share a binary. The setting is only a name: Conan derives no flags
+# from it, and no recipe of coro's reads it. The flags are in the same profiles.
+#
+# To use the setting outside the images, copy this to your own Conan home:
+#   conan config install docker/settings_user.yml
+#
+# The values are the ones Conan's documentation uses:
+# https://docs.conan.io/2/security/sanitizers.html
+compiler:
+  gcc:
+    sanitizer: [null, Address, Leak, Thread, UndefinedBehavior, KernelAddress, AddressUndefinedBehavior, ThreadUndefinedBehavior]
+  clang:
+    sanitizer: [null, Address, Leak, Thread, Memory, UndefinedBehavior, HardwareAssistanceAddress, KernelAddress, AddressUndefinedBehavior, ThreadUndefinedBehavior]

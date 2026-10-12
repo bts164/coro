@@ -114,20 +114,9 @@ int server_protocol_cb(lws* wsi, lws_callback_reasons reason,
         LwsService::run_commands(lws_get_context(wsi));
         break;
 
-    // The context is going: the last reference to it was dropped, or its Runtime
-    // shut down with the WsListener still alive. In the second case an accept()
-    // waiting in another Runtime would otherwise wait for good.
-    case LWS_CALLBACK_PROTOCOL_DESTROY: {
-        auto& listener = listener_of(wsi);
-        Weak<Waker> waker;
-        {
-            std::lock_guard lk(listener.accept_mutex);
-            listener.closed = true;
-            waker = listener.accept_waker;
-        }
-        wake(waker);
-        break;
-    }
+    // Not LWS_CALLBACK_PROTOCOL_DESTROY, to learn that the context is going: lws
+    // sends it only if it got as far as initializing the vhost's protocols, which it
+    // does on the first service, not at creation. bind() has LwsService report it.
 
     // Before the 101 response. Return -1 to reject, 0 to accept.
     case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION: {
@@ -320,9 +309,23 @@ Coro<WsListener> WsListener::bind(std::string host, uint16_t port, Options optio
         // Without this, an address lws can't bind yet is deferred instead of failing.
         info.options   = LWS_SERVER_OPTION_FAIL_UPON_UNABLE_TO_BIND;
 
+        // The context is gone: the last reference to it was dropped, or its Runtime
+        // shut down with the WsListener still alive. In the second case an accept()
+        // waiting in another Runtime would otherwise wait for good.
+        auto on_destroyed = [state] {
+            detail::Weak<detail::Waker> waker;
+            {
+                std::lock_guard lk(state->accept_mutex);
+                state->closed = true;
+                waker = state->accept_waker;
+            }
+            detail::ws::wake(waker);
+        };
+
         // Synchronous: the socket is bound and listening when this returns.
         std::string lws_errors;
-        if (auto service = detail::ws::LwsService::listen(info, state, driver, &lws_errors))
+        if (auto service = detail::ws::LwsService::listen(info, state, std::move(on_destroyed),
+                                                          driver, &lws_errors))
             co_return WsListener(std::move(state), std::move(service));
 
         const SocketAddress local = candidate ? *candidate : SocketAddress{Ipv4Address{}, port};

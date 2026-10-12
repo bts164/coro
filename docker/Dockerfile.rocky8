@@ -6,8 +6,8 @@
 # library or Node.js, so the emulator job and the Pico builds need the primary
 # platform's image.
 #
-# Build it with docker/build-image.sh. The image's tag is a hash of this file and
-# the profiles (docker/common.sh), so any change here makes a new image.
+# Build it with docker/build-image.sh. The image's tag is a hash of this file, the
+# profiles and settings_user.yml (docker/common.sh), so any change here makes a new image.
 #
 # rockylinux/rockylinux, not the official "rockylinux" image, which stopped at 8.9.
 FROM rockylinux/rockylinux:8.10
@@ -67,6 +67,11 @@ RUN python3.12 -m pip install --no-cache-dir conan "cmake>=3.31"
 # This platform's own profile becomes the image's default, so a conan command that
 # names no profile uses it.
 COPY profiles/rocky8 /root/.conan2/profiles/default
+# The sanitizer profiles, each named after the one above, and the definition of the
+# setting they set (settings_user.yml says what it is). No ubsan: here it is only for
+# the Pico firmware, which this image cannot build.
+COPY profiles/asan profiles/tsan /root/.conan2/profiles/
+COPY settings_user.yml /root/.conan2/settings_user.yml
 
 COPY <<EOF /root/.conan2/global.conf
 tools.build:jobs=4

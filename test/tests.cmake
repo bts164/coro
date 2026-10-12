@@ -84,6 +84,8 @@ coro_test(io/test_signal.cpp                     DESKTOP)
 coro_test(io/test_tcp_stream.cpp                 DESKTOP HOST_LINK coro_lwip_tcp ON_TARGET net)
 coro_test(io/test_udp_socket.cpp                 DESKTOP HOST_LINK coro_lwip_udp ON_TARGET net)
 coro_test(io/test_ws_stream.cpp                  DESKTOP)
+# lws itself, without coro: the assumption the client contexts rest on.
+coro_test(io/test_lws_context_recreate.cpp       DESKTOP)
 
 # pico/ — Pico-only code, on the host: the HAL against stubbed hardware (a thread
 # stands in for the interrupt), the MQTT client against lwIP built for the host.

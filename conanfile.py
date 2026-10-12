@@ -1,6 +1,5 @@
 import os, sys
 from conan import ConanFile
-from conan.errors import ConanInvalidConfiguration
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
 from conan.tools.files import copy, update_conandata
@@ -44,7 +43,6 @@ class CoroRecipe(ConanFile):
         "fPIC": [True, False],
         "with_gperftools": [True, False],
         "with_local_run_queue": [True, False],
-        "with_sanitize": ["none", "asan", "tsan", "ubsan"],
         # Pico-only (settings.os == "baremetal"); ignored/removed otherwise.
         # Drives both whether coro_pico_mqtt is built and whether the
         # bundled default lwipopts.h defines LWIP_MQTT — see
@@ -58,7 +56,6 @@ class CoroRecipe(ConanFile):
         "fPIC": True,
         "with_gperftools": True,
         "with_local_run_queue": True,
-        "with_sanitize": "none",
         "with_mqtt": False,
     }
     exports_sources = (
@@ -139,23 +136,6 @@ class CoroRecipe(ConanFile):
             self.options.with_local_run_queue = self._env_bool(
                 "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
 
-        # baremetal has only ubsan (cmake/Sanitize.cmake). An asan or tsan
-        # left in the environment for the desktop builds means none there,
-        # so one .envrc serves both; an explicit -o is rejected in validate().
-        sanitize = os.environ.get("CORO_SANITIZE", "none").strip().lower()
-        allowed = (("none", "ubsan") if self.settings.os == "baremetal"
-                   else ("none", "asan", "tsan", "ubsan"))
-        if sanitize not in allowed:
-            sanitize = "none"
-        self.options.with_sanitize = sanitize
-
-    def validate(self):
-        if (self.settings.os == "baremetal"
-                and str(self.options.with_sanitize) in ("asan", "tsan")):
-            raise ConanInvalidConfiguration(
-                "with_sanitize on baremetal must be none or ubsan: ASan and "
-                "TSan need a runtime a microcontroller does not have")
-
     def configure(self):
         if self.settings.os != "baremetal" and self.options.shared:
             self.options.rm_safe("fPIC")
@@ -176,8 +156,10 @@ class CoroRecipe(ConanFile):
                 transitive_libs = True)
         # lws is serviced by coro's IoDriver through a custom event loop
         # (doc/design/websocket_stream.md, "lws on the I/O driver"), so its libuv
-        # event-lib backend stays off; coro doesn't use libuv.
-        self.requires("libwebsockets/[>=4.3.5 <5]",
+        # event-lib backend stays off; coro doesn't use libuv. Held to one minor
+        # version: the integration relies on lws internals, which are re-read before
+        # moving on ("Open points" in the same document).
+        self.requires("libwebsockets/[>=4.5.8 <4.6]",
             options={"with_libuv": False},
             transitive_headers = True,
             transitive_libs = True)
@@ -249,7 +231,6 @@ class CoroRecipe(ConanFile):
         else:
             tc.cache_variables["WITH_GPERFTOOLS"] = self.options.with_gperftools
             tc.cache_variables["CORO_USE_LOCAL_RUN_QUEUE"] = self.options.with_local_run_queue
-        tc.cache_variables["WITH_SANITIZE"] = str(self.options.with_sanitize)
         tc.generate()
 
     def build(self):

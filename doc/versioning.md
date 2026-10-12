@@ -485,7 +485,7 @@ What works today:
 - **The version.** A plain `cmake` configure of an archive or a checkout reports the
   same version a Conan build would.
 - **The options.** They are ordinary CMake options: `WITH_GPERFTOOLS`,
-  `CORO_USE_LOCAL_RUN_QUEUE`, `WITH_SANITIZE`, `CORO_PLATFORM`. The recipe's `shared` and
+  `CORO_USE_LOCAL_RUN_QUEUE`, `CORO_PLATFORM`. The recipe's `shared` and
   `fPIC` options correspond to CMake's own `BUILD_SHARED_LIBS` and
   `CMAKE_POSITION_INDEPENDENT_CODE`.
 - **Where each dependency comes from.** Each has a script in `cmake/deps/` and a
@@ -495,7 +495,7 @@ What works today:
 
 | Dependency | Option | Needed | Version |
 |---|---|---|---|
-| libwebsockets | `CORO_LIBWEBSOCKETS_PROVIDER` | Always | 4.3.5 or later, below 5, built without libuv |
+| libwebsockets | `CORO_LIBWEBSOCKETS_PROVIDER` | Always | 4.5.8 or later, below 4.6, built without libuv |
 | gperftools | `CORO_GPERFTOOLS_PROVIDER` | With `WITH_GPERFTOOLS` | 2.17.2 |
 
 What is missing:

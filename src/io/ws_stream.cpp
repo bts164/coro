@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <algorithm>
+#include <cassert>
 #include <cerrno>
 #include <exception>
 #include <stdexcept>
@@ -140,36 +141,44 @@ int on_writeable(ConnectionState& state, lws* wsi) {
         return -1;
     }
 
-    std::shared_ptr<SendSubState> sub;
+    // The front send's frame becomes this thread's, and the node is remembered as in
+    // flight. The mutex is not held across lws_write(): a send being queued or
+    // dropped on another thread never waits for the write, and nothing lws calls
+    // back from inside it can meet the mutex held.
+    //
+    // Race: once the mutex is released the SendFuture may be dropped, and the node
+    // with it. ~SendFuture clears send_in_flight under the mutex, so the node is
+    // only reached again through that pointer, under the mutex.
+    std::unique_ptr<std::byte[]> frame;
+    std::size_t                  size    = 0;
+    bool                         is_text = false;
     {
         std::lock_guard lk(state.send_queue_mutex);
-        if (state.send_queue.empty()) return 0;
-        sub = std::move(state.send_queue.front());
-        state.send_queue.pop_front();
+        auto* node = static_cast<SendNode*>(state.send_queue.pop_front());
+        if (!node) return 0;
+        frame                = std::move(node->frame);
+        size                 = node->size;
+        is_text              = node->is_text;
+        state.send_in_flight = node;
     }
 
+    const int r = lws_write(wsi, reinterpret_cast<unsigned char*>(frame.get() + LWS_PRE), size,
+                            is_text ? LWS_WRITE_TEXT : LWS_WRITE_BINARY);
+
     Weak<Waker> waker;
+    bool        more;
     {
-        std::lock_guard lk(sub->mutex);
-        if (!sub->cancelled) {
-            // Copied under the lock: once it's released, ~SendFuture may run and the
-            // caller may free the buffer. lws_write needs LWS_PRE bytes of headroom.
-            std::vector<std::byte> buf(LWS_PRE + sub->data.size());
-            std::copy(sub->data.begin(), sub->data.end(), buf.begin() + LWS_PRE);
-            const auto flags = sub->opcode == WsStream::OpCode::Binary ? LWS_WRITE_BINARY
-                                                                       : LWS_WRITE_TEXT;
-            const int r = lws_write(wsi, reinterpret_cast<unsigned char*>(buf.data() + LWS_PRE),
-                                    sub->data.size(), flags);
-            sub->error = r < 0 ? EIO : 0;
-            sub->data  = {};
+        std::lock_guard lk(state.send_queue_mutex);
+        if (auto* node = std::exchange(state.send_in_flight, nullptr)) {
+            node->error    = r < 0 ? EIO : 0;
+            node->complete = true;
+            waker          = node->waker;
         }
-        sub->complete = true;
-        waker = sub->waker;
+        more = !state.send_queue.empty();
     }
     wake(waker);
 
-    std::lock_guard lk(state.send_queue_mutex);
-    if (!state.send_queue.empty()) lws_callback_on_writable(wsi);
+    if (more) lws_callback_on_writable(wsi);
     return 0;
 }
 
@@ -201,13 +210,12 @@ void close_connection(ConnectionState& state, int connect_error, std::string rea
     std::vector<Weak<Waker>> send_wakers;
     {
         std::lock_guard lk(state.send_queue_mutex);
-        for (auto& sub : state.send_queue) {
-            std::lock_guard slk(sub->mutex);
-            sub->error    = ENOTCONN;
-            sub->complete = true;
-            send_wakers.push_back(sub->waker);
+        // A send in flight is not in the queue: on_writeable() completes it.
+        while (auto* node = static_cast<SendNode*>(state.send_queue.pop_front())) {
+            node->error    = ENOTCONN;
+            node->complete = true;
+            send_wakers.push_back(node->waker);
         }
-        state.send_queue.clear();
     }
 
     wake(connect_waker);
@@ -219,12 +227,14 @@ void close_connection(ConnectionState& state, int connect_error, std::string rea
 }
 
 void post_close(LwsService& service, std::shared_ptr<ConnectionState> state) {
-    service.post([state = std::move(state)](lws_context*) {
-        // wsi is null once lws has reported the connection gone.
-        if (!state->wsi) return;
-        state->closing = true;
-        lws_callback_on_writable(state->wsi);
-    });
+    service.post({[](lws_context*, void* target) {
+                      auto& state = *static_cast<ConnectionState*>(target);
+                      // wsi is null once lws has reported the connection gone.
+                      if (!state.wsi) return;
+                      state.closing = true;
+                      lws_callback_on_writable(state.wsi);
+                  },
+                  std::move(state)});
 }
 
 ParsedUrl parse_ws_url(std::string_view url) {
@@ -345,30 +355,45 @@ public:
     }
 
 private:
+    // What the connect command needs: the target of the command post_connect() posts.
+    struct Request {
+        std::shared_ptr<detail::ws::ConnectionState> state;
+        std::string                                  address;
+        detail::ws::ParsedUrl                        url;
+        std::string                                  protocols;
+    };
+
     void post_connect() {
-        m_service->post([state = m_state, address = m_address, url = m_url,
-                         protocols = m_protocols](lws_context* ctx) {
-            {
-                std::lock_guard lk(state->connect.mutex);
-                if (state->connect.cancelled) return;
-            }
-            lws_client_connect_info ci{};
-            ci.context        = ctx;
-            ci.address        = address.c_str();     // numeric: lws resolves synchronously
-            ci.host           = url.host.c_str();    // Host header and TLS SNI
-            ci.port           = url.port;
-            ci.path           = url.path.c_str();
-            ci.ssl_connection = url.tls ? LCCSCF_USE_SSL : 0;
-            ci.protocol       = protocols.empty() ? nullptr : protocols.c_str();
-            ci.userdata       = state.get();
-            state->self = state;
-            // Not kept: ESTABLISHED records the wsi. A failure may already have been
-            // reported through CONNECTION_ERROR before this returns, and the wsi
-            // freed, so the return value is only a success flag.
-            if (!lws_client_connect_via_info(&ci))
-                detail::ws::close_connection(*state, ECONNREFUSED,
-                                             "lws_client_connect_via_info failed");
-        });
+        auto request = std::make_shared<Request>(Request{m_state, m_address, m_url, m_protocols});
+        m_service->post({[](lws_context* ctx, void* target) {
+                             auto& request = *static_cast<Request*>(target);
+                             auto& state   = request.state;
+                             {
+                                 std::lock_guard lk(state->connect.mutex);
+                                 if (state->connect.cancelled) return;
+                             }
+                             lws_client_connect_info ci{};
+                             ci.context = ctx;
+                             // numeric: lws resolves synchronously
+                             ci.address = request.address.c_str();
+                             // Host header and TLS SNI
+                             ci.host           = request.url.host.c_str();
+                             ci.port           = request.url.port;
+                             ci.path           = request.url.path.c_str();
+                             ci.ssl_connection = request.url.tls ? LCCSCF_USE_SSL : 0;
+                             ci.protocol =
+                                 request.protocols.empty() ? nullptr : request.protocols.c_str();
+                             ci.userdata = state.get();
+                             state->self = state;
+                             // Not kept: ESTABLISHED records the wsi. A failure may
+                             // already have been reported through CONNECTION_ERROR
+                             // before this returns, and the wsi freed, so the return
+                             // value is only a success flag.
+                             if (!lws_client_connect_via_info(&ci))
+                                 detail::ws::close_connection(*state, ECONNREFUSED,
+                                                              "lws_client_connect_via_info failed");
+                         },
+                         std::move(request)});
     }
 
     std::shared_ptr<detail::ws::LwsService>      m_service;
@@ -503,48 +528,68 @@ WsStream::SendFuture::SendFuture(std::shared_ptr<detail::ws::ConnectionState> st
                                  OpCode                                        opcode,
                                  std::shared_ptr<detail::ws::LwsService>       service)
     : m_state(std::move(state))
-    , m_sub_state(std::make_shared<detail::ws::SendSubState>())
-    , m_service(std::move(service)) {
-    m_sub_state->data   = data;
-    m_sub_state->opcode = opcode;
+    , m_service(std::move(service))
+    , m_data(data) {
+    m_node.is_text = opcode == OpCode::Text;
+}
+
+WsStream::SendFuture::SendFuture(SendFuture&& other) noexcept
+    : m_state(std::move(other.m_state))
+    , m_service(std::move(other.m_service))
+    , m_data(other.m_data)
+    , m_node(std::move(other.m_node))
+    , m_started(other.m_started) {
+    assert(!m_started && "SendFuture moved after poll() — undefined behaviour");
 }
 
 WsStream::SendFuture::~SendFuture() {
-    if (m_sub_state) {
-        std::lock_guard lk(m_sub_state->mutex);
-        if (!m_sub_state->complete)
-            m_sub_state->cancelled = true;
-    }
+    // Moved from, or never polled: the node was never linked.
+    if (!m_state || !m_started) return;
+    std::lock_guard lk(m_state->send_queue_mutex);
+    // Still queued: it is not sent. A no-op if the node is not in the queue.
+    m_state->send_queue.remove(&m_node);
+    // Being written by on_writeable() right now: it has the frame already, and now
+    // has no one to tell.
+    if (m_state->send_in_flight == &m_node) m_state->send_in_flight = nullptr;
 }
 
 PollResult<void> WsStream::SendFuture::poll(detail::Context& ctx) {
-    {
-        std::lock_guard lk(m_sub_state->mutex);
-        if (m_sub_state->complete) {
-            if (m_sub_state->error != 0)
-                throw std::system_error(m_sub_state->error, std::system_category(),
-                                        "WsStream::send");
+    if (m_started) {
+        std::lock_guard lk(m_state->send_queue_mutex);
+        if (m_node.complete) {
+            if (m_node.error != 0)
+                throw std::system_error(m_node.error, std::system_category(), "WsStream::send");
             return PollReady;
         }
-        m_sub_state->waker = ctx.get_weak_waker();
+        m_node.waker = ctx.get_weak_waker();
+        return PollPending;
     }
 
-    if (!m_started) {
-        // Not under the sub-state mutex: close_connection() takes the queue mutex and
-        // then each sub-state's, so taking them in the other order could deadlock.
-        {
-            std::lock_guard lk(m_state->send_queue_mutex);
-            // Under the queue mutex: close_connection() sets closed before draining
-            // the queue, so a send queued here is always either written or failed.
-            if (m_state->closed.load(std::memory_order_acquire))
-                throw std::runtime_error("WsStream::send: connection closed");
-            m_state->send_queue.push_back(m_sub_state);
-        }
-        m_started = true;
-        m_service->post([state = m_state](lws_context*) {
-            if (state->wsi) lws_callback_on_writable(state->wsi);
-        });
+    // Checked again under the queue mutex below; here it only saves the copy.
+    if (m_state->closed.load(std::memory_order_acquire))
+        throw std::runtime_error("WsStream::send: connection closed");
+
+    // The copy lws_write() needs anyway (it wants LWS_PRE bytes of headroom), made
+    // here, on the sender's thread and before any lock, rather than in the turn.
+    // The node is not shared yet.
+    m_node.size  = m_data.size();
+    m_node.frame = std::make_unique_for_overwrite<std::byte[]>(LWS_PRE + m_data.size());
+    std::copy(m_data.begin(), m_data.end(), m_node.frame.get() + LWS_PRE);
+    m_node.waker = ctx.get_weak_waker();
+    {
+        std::lock_guard lk(m_state->send_queue_mutex);
+        // Under the queue mutex: close_connection() sets closed before failing the
+        // queue, so a send queued here is always either written or failed.
+        if (m_state->closed.load(std::memory_order_acquire))
+            throw std::runtime_error("WsStream::send: connection closed");
+        m_state->send_queue.push_back(&m_node);
     }
+    m_started = true;
+    m_service->post({[](lws_context*, void* target) {
+                         auto& state = *static_cast<detail::ws::ConnectionState*>(target);
+                         if (state.wsi) lws_callback_on_writable(state.wsi);
+                     },
+                     m_state});
     return PollPending;
 }
 

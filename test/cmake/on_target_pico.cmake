@@ -77,7 +77,7 @@ function(coro_add_on_target_images)
         get_property(sources GLOBAL PROPERTY CORO_ON_TARGET_SOURCES_${image})
 
         add_executable(${target} ${CORO_TEST_ROOT}/target/pico/main.cpp ${sources})
-        # with_sanitize=ubsan: the tests and the runner, like the library itself.
+        # A UBSan build: the tests and the runner, like the library itself.
         # On the sources, not the target, which would also instrument the SDK
         # sources compiled into the image. See cmake/Sanitize.cmake.
         if(CORO_SANITIZE_OPTIONS)

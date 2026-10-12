@@ -9,7 +9,7 @@
 #   tsan   ThreadSanitizer
 #
 # Written to run inside a CI image (docker/Dockerfile.<platform>): it uses the
-# image's default Conan profile and changes the global git configuration. To run it
+# image's Conan profiles and changes the global git configuration. To run it
 # that way on your own machine, use docker/run-tests.sh.
 set -xeuo pipefail
 
@@ -18,7 +18,15 @@ case "$SANITIZER" in
     none|asan|tsan) ;;
     *) echo "error: SANITIZER must be 'none', 'asan' or 'tsan', got '$SANITIZER'" >&2; exit 1 ;;
 esac
-export CORO_SANITIZE=$SANITIZER
+
+# The image's default profile is the platform's own. A sanitizer is a second profile
+# named after it, which carries the flags for every package (docker/profiles/asan,
+# tsan). Only the host side gets it: the build machine's tools stay plain.
+PROFILES=(-pr:h default)
+if [ "$SANITIZER" != none ]; then
+    PROFILES+=(-pr:h "$SANITIZER")
+fi
+PROFILES+=(-pr:b default)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -47,8 +55,8 @@ conan export test/libunicorn
 
 cd test
 mkdir -p build
-conan install . --build=missing -f json > build/graph.json
-conan build . --build=missing
+conan install . "${PROFILES[@]}" --build=missing -f json > build/graph.json
+conan build . "${PROFILES[@]}" --build=missing
 
 # halt_on_error=1 is essential here — without it the first
 # sanitizer hit repeats across the whole suite instead of stopping,
@@ -57,7 +65,9 @@ if [ "$SANITIZER" = asan ]; then
     export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
     export UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1
 elif [ "$SANITIZER" = tsan ]; then
-    export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1
+    # The suppressions are reports in third-party code; the file gives the reasoning
+    # for each.
+    export TSAN_OPTIONS="halt_on_error=1:abort_on_error=1:second_deadlock_stack=1:suppressions=$REPO_ROOT/ci/sanitizers/tsan.supp"
 fi
 
 cd build/Release && ctest --stop-on-failure -V

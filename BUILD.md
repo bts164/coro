@@ -44,55 +44,74 @@ ctest --preset conan-release -R PcieDecoder
 
 ## Sanitizer Builds
 
-A single `with_sanitize` Conan option (`none` | `asan` | `tsan` | `ubsan`) controls the
-sanitizer for both the `coro` package and the `test/` package — it's plumbed
-through to a shared `WITH_SANITIZE` CMake cache variable (`cmake/Sanitize.cmake`)
-so the two builds can't end up with mismatched flags (ASan/TSan must cover the
-whole linked binary, not just one side).
+A sanitizer build is a Conan profile, not an option of the package. The profile passes
+`-fsanitize` to every package built with it: `coro`, the `test/` package, their
+dependencies and an application. Neither recipe and none of the desktop CMake files
+look at the sanitizer.
 
-Set it explicitly with `-o`:
+`docker/profiles` has the profiles CI uses. Each is named after a platform's own
+profile, which it adds to:
 
-```bash
-# AddressSanitizer + LeakSanitizer + UBSan
-conan install . --build=missing -s:h build_type=Debug -o with_sanitize=asan
-cmake --preset conan-debug
-cmake --build --preset conan-debug
-ctest --preset conan-debug
+| Profile | Built with |
+|---|---|
+| `asan` | AddressSanitizer, LeakSanitizer and UBSan |
+| `tsan` | ThreadSanitizer |
+| `ubsan` | UBSan in trap mode, for a Pico (below) |
 
-# ThreadSanitizer
-conan install . --build=missing -s:h build_type=Debug -o with_sanitize=tsan
-cmake --preset conan-debug
-cmake --build --preset conan-debug
-ctest --preset conan-debug
+A sanitizer profile has two parts. This is `tsan`:
+
+```ini
+[settings]
+compiler.sanitizer=Thread
+
+[conf]
+tools.build:cflags+=["-fsanitize=thread", "-g"]
+tools.build:cxxflags+=["-fsanitize=thread", "-g"]
+tools.build:exelinkflags+=["-fsanitize=thread"]
+tools.build:sharedlinkflags+=["-fsanitize=thread"]
 ```
 
-The same `-o with_sanitize=...` must also be passed to `conan install` inside
-`test/` (or rely on the env var below, which covers both automatically).
+The `[conf]` lines are the sanitizer. The setting adds no flags: it makes the sanitizer
+part of every package ID, so a sanitizer build and a plain one never share a binary in
+the Conan cache. Conan has no such setting of its own, so define it once per Conan
+home, and copy the profiles there too:
+
+```bash
+conan config install docker/settings_user.yml
+conan config install docker/profiles/asan -tf profiles
+conan config install docker/profiles/tsan -tf profiles
+```
+
+Then name one after your own host profile:
+
+```bash
+conan build . -pr:h default -pr:h tsan -pr:b default --build=missing
+```
+
+The first such build compiles every dependency again, with the sanitizer.
+
+A profile without the setting and the flags builds plain, and needs no change to work
+with coro.
+
+### The whole program must be built with the same sanitizer
+
+Use the same profile for an application that links coro. An executable built without
+`-fsanitize=thread` that loads a coro built with it crashes at start-up inside the
+sanitizer's runtime, with no report.
 
 ### On a Pico
 
-A bare-metal build (`os=baremetal`) accepts only `none` and `ubsan`. ASan and TSan need
-a runtime library, shadow memory and threads, which a microcontroller does not have;
-run them on the desktop build, whose `test_pico_suite` covers the Pico configuration of
-the library.
+ASan and TSan need a runtime library, shadow memory and threads, which a
+microcontroller does not have; run them on the desktop build, whose `test_pico_suite`
+covers the Pico configuration of the library.
 
-`ubsan` on a Pico is UBSan in trap mode (`-fsanitize-trap=undefined`, GCC 13 or later).
+UBSan on a Pico is UBSan in trap mode (`-fsanitize-trap=undefined`, GCC 13 or later).
 It needs no runtime: undefined behaviour executes an undefined instruction and the
 firmware stops in a hard fault. Nothing is printed. Only coro's own sources are
-instrumented, not the Pico SDK or lwIP. An application linking a coro package built
-this way needs no extra flags.
-
-`CORO_SANITIZE=asan` or `tsan` in the environment counts as `none` for a bare-metal
-build, so one `.envrc` serves both. An explicit `-o with_sanitize=asan` is rejected.
-
-### Setting it via .envrc instead of -o
-
-Copy `.envrc.sample` to `.envrc`, uncomment a `CORO_SANITIZE` line, and run
-`direnv allow`. Both conanfiles read `CORO_SANITIZE` from the environment in
-their `init()` hook and use it as the default for `with_sanitize` — so a
-plain `conan install .` (in both the root and `test/` directories) picks it
-up automatically, no `-o` needed. An explicit `-o with_sanitize=...` still
-overrides the environment if you pass one.
+instrumented, not the Pico SDK or lwIP, so the `ubsan` profile does not pass compiler
+flags to every package. It sets a CMake variable, `CORO_SANITIZE_OPTIONS`, which
+coro's Pico build puts on its own sources (`cmake/Sanitize.cmake`). An application
+linking a coro package built this way needs no extra flags.
 
 ### Recommended environment variables when running sanitizer builds
 
@@ -100,7 +119,7 @@ Set these before running `ctest` or a single test binary. Without
 `halt_on_error=1`, a low-level error common to every test repeats across the
 entire suite and makes the output unreadably long.
 
-**AddressSanitizer + LeakSanitizer + UBSan (`with_sanitize=asan`)**
+**AddressSanitizer + LeakSanitizer + UBSan (`Address`, `AddressUndefinedBehavior`)**
 
 ```bash
 export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
@@ -118,12 +137,17 @@ ctest --preset conan-debug --stop-on-failure   # -x for short
 | `detect_stack_use_after_return=1` | Catch stack variable references that outlive their stack frame |
 | `UBSAN_OPTIONS=print_stacktrace=1` | Print a full stack trace on every UBSan violation |
 
-**ThreadSanitizer (`with_sanitize=tsan`)**
+**ThreadSanitizer (`Thread`)**
 
 ```bash
-export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1
+export TSAN_OPTIONS=halt_on_error=1:abort_on_error=1:second_deadlock_stack=1:suppressions=$PWD/ci/sanitizers/tsan.supp
 ctest --preset conan-debug --stop-on-failure
 ```
+
+`ci/sanitizers/tsan.supp` lists the reports in third-party code that are known and
+believed harmless, with the reasoning for each. Dependencies are instrumented too, so
+an application that links coro and runs under ThreadSanitizer meets the same reports
+and needs the same file.
 
 | Variable / Option | Effect |
 |---|---|

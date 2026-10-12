@@ -16,7 +16,14 @@ case "$SANITIZER" in
     none|ubsan) ;;
     *) echo "error: SANITIZER must be 'none' or 'ubsan', got '$SANITIZER'" >&2; exit 1 ;;
 esac
-export CORO_SANITIZE=$SANITIZER
+
+# ubsan is a second host profile named after the Pico one, which carries
+# the flags (docker/profiles/ubsan).
+PROFILES=(-pr:h rp2040_pico_w)
+if [ "$SANITIZER" != none ]; then
+    PROFILES+=(-pr:h "$SANITIZER")
+fi
+PROFILES+=(-pr:b default)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -38,7 +45,7 @@ conan export .
 
 cd test
 mkdir -p build
-conan build . -pr:h rp2040_pico_w -pr:b default --build=missing -f json > build/graph.json
+conan build . "${PROFILES[@]}" --build=missing -f json > build/graph.json
 
 # --work-dir: run_on_target.py installs the emulator (npm) and downloads the boot
 # ROM the first time, by default next to itself. docker/run-emulator-tests.sh mounts

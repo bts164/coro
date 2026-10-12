@@ -11,8 +11,9 @@ compiler.cppstd=gnu23
 
 [conf]
 # "cppstd" must stay in this list: without it compiler.cppstd above is ignored and
-# GCC 13 falls back to C++17, which has no coroutines.
-tools.cmake.cmaketoolchain:enabled_blocks=["cppstd", "user_toolchain", "find_paths"]
+# GCC 13 falls back to C++17, which has no coroutines. "extra_variables" is how
+# profiles/ubsan passes its flags.
+tools.cmake.cmaketoolchain:enabled_blocks=["cppstd", "extra_variables", "user_toolchain", "find_paths"]
 # Conan renders a profile as a Jinja2 template. The image sets PICO_SDK_PATH.
 tools.cmake.cmaketoolchain:user_toolchain=["{{ os.getenv("PICO_SDK_PATH", "/opt/pico-sdk") }}/cmake/preload/toolchains/pico_arm_cortex_m0plus_gcc.cmake"]
 tools.build:cxxflags=["-fcoroutines"]

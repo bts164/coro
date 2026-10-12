@@ -1,0 +1,57 @@
+# ThreadSanitizer suppressions: reports in third-party code that are not coro's to
+# fix. ci/run-tests.sh passes this file in TSAN_OPTIONS; an application that links
+# coro and runs under TSan needs it as well (BUILD.md, "Sanitizer Builds").
+#
+# An entry hides every report that has the named function in either stack, so each
+# one says what it is for and why it is believed harmless. Re-check them all when the
+# libwebsockets requirement in conanfile.py moves.
+
+# libwebsockets 4.5.8: lws_cancel_service() against lws_protocol_init().
+#
+# The report:
+#   read   lws_cancel_service()   lib/core-net/vhost.c:1114
+#            if (context->service_no_longer_possible) return;
+#          from LwsService::post() (src/io/ws_service.cpp), on any thread, under the
+#          service's own mutex.
+#   write  lws_protocol_init()    lib/core-net/vhost.c:505
+#            context->doing_protocol_init = 1;
+#          from lws_service_adjust_timeout(), on whichever thread holds the
+#          IoDriver's turn. It runs on a context's first service turn, so the report
+#          comes with the first command posted to a new context (the first connect).
+# The two mutexes are different ones, so nothing orders the two accesses.
+#
+# Why it is a race at all: service_no_longer_possible and doing_protocol_init are
+# two of a run of adjacent 1-bit fields in struct lws_context
+# (lib/core/private-lib-core.h). C counts a run of adjacent bit-fields as a single
+# memory location, so a write to one flag and a read of another are a data race,
+# although no flag is shared.
+#
+# Why it is believed harmless:
+#   - coro uses lws as documented. lws_cancel_service() is the one call lws allows
+#     from a thread other than the one servicing the context.
+#   - That thread only reads. The write rewrites the word the flags share but leaves
+#     service_no_longer_possible as it was, so the read gets the right value before,
+#     during and after it. The harmful form of this race is two writers, one losing
+#     the other's update, and no two threads write these flags at once. Every
+#     assignment to one of them in lib/ is in one of:
+#       * lws_create_context() (max_fds_unrelated_to_ulimit), before any other
+#         thread has the context;
+#       * lws_protocol_init() and the netlink role (nl_initial_done), on the
+#         servicing thread;
+#       * lws_context_destroy() and what it calls, covered below;
+#       * lws_context_deprecate(), lws_context_default_loop_run_destroy() (and its
+#         signal handler), the libuv event library and the secure-streams policy
+#         fetch, none of which coro calls or builds a context with.
+#   - lws_context_destroy(), which does set service_no_longer_possible, can't
+#     overlap the read: post() calls lws_cancel_service() under the service's mutex
+#     and only while m_destroying is unset, and the destroy starts after
+#     m_destroying is set under the same mutex.
+#
+# What this rests on: the two stacks of the report, and a search of the 4.5.8 source
+# for assignments to these flags through a context pointer. It was reasoned from the
+# source, not tested. And the standard gives a compiler no duty to keep such a read
+# correct; the argument is about what GCC and Clang generate for a bit-field read.
+#
+# What would remove the need for it: coro waking the IoDriver itself and calling
+# into lws from the servicing thread only.
+race:lws_cancel_service

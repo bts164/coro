@@ -254,7 +254,12 @@ Package options, set with `-o` on the Conan command line:
 | `shared` | `True` | Build a shared library; `False` builds a static one |
 | `with_gperftools` | `True` | Link gperftools (tcmalloc) |
 | `with_local_run_queue` | `True` | Lock-free per-worker run queue in `WorkStealingExecutor` |
-| `with_sanitize` | `none` | `asan` (AddressSanitizer, LeakSanitizer and UBSan), `tsan` (ThreadSanitizer) or `ubsan` (UBSan alone). A Pico build accepts only `ubsan`, which there stops the firmware at the fault and prints nothing |
+
+A sanitizer is not an option of the package. It is a Conan profile, which passes
+`-fsanitize` to everything built with it: coro, its dependencies and your application.
+[docker/profiles](docker/profiles) has the ones CI uses (`asan`, `tsan`, and `ubsan`
+for a Pico); [BUILD.md](BUILD.md#sanitizer-builds) says how to use them. coro's recipe
+does not look at the sanitizer, so a profile without one needs nothing added.
 
 ## Building from source
 
@@ -287,8 +292,8 @@ conan build . --build=missing
 cd build/Release && ctest
 ```
 
-For a sanitizer build, set `CORO_SANITIZE=asan`, `tsan` or `ubsan` in the environment
-before those commands; it applies to both the library and the tests.
+For a sanitizer build, add a sanitizer profile to the `conan build` line
+([BUILD.md](BUILD.md#sanitizer-builds)); it applies to both the library and the tests.
 [test/README.md](test/README.md) describes how the tests are organised and how to run
 them on a Raspberry Pi Pico.
 

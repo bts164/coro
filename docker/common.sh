@@ -11,7 +11,7 @@
 # left unset, it is PRIMARY_PLATFORM.
 #
 # The image's tag is a hash of what the image is built from, so a change to the
-# Dockerfile or a profile gives a new name and an old image is never used by mistake.
+# Dockerfile, a profile or settings_user.yml gives a new name and an old image is never used by mistake.
 #
 # CORO_IMAGE, if set, names the image to use instead, and nothing is built: for
 # running in the image CI published, say. Left unset, the name has no registry in it,
@@ -41,13 +41,15 @@ fi
 VOLUME_PREFIX="coro-$PLATFORM"
 
 # Hashes the names and contents of the files the image is built from: the platform's
-# Dockerfile, its own profile (profiles/<platform>, the image's default profile) and
-# the profiles that are not any platform's, which every image gets. Another platform's
-# profile is left out, so editing it does not rename this platform's image.
+# Dockerfile, settings_user.yml, the platform's own profile (profiles/<platform>, the
+# image's default profile) and the profiles that are not any platform's, which every
+# image may copy. Another platform's profile is left out, so editing it does not
+# rename this platform's image.
 image_hash() {
     (cd "$DOCKER_DIR" &&
         {
             echo "$IMAGE_DOCKERFILE"
+            echo settings_user.yml
             for profile in profiles/*; do
                 name="${profile#profiles/}"
                 if [ "$name" = "$PLATFORM" ] || [ ! -f "Dockerfile.$name" ]; then

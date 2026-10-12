@@ -25,9 +25,11 @@ if(CORO_PLATFORM STREQUAL "pico")
 else()
     project(coro_unit_tests LANGUAGES CXX C)
 endif()
-# Desktop: adds the sanitizer's flags to everything below. Pico: only sets
-# CORO_SANITIZE_OPTIONS, which cmake/on_target_pico.cmake puts on the test sources.
-include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Sanitize.cmake)
+# Pico only: CORO_SANITIZE_OPTIONS, which cmake/on_target_pico.cmake puts on the test
+# sources. A desktop sanitizer build gets its flags from the Conan profile.
+if(CORO_PLATFORM STREQUAL "pico")
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Sanitize.cmake)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CORO_TEST_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
@@ -55,8 +57,9 @@ coro_add_pico_stub_suite()
 # test_skynet's coroutine-count is large enough that under TSan's
 # per-thread/per-allocation shadow memory overhead it exhausts memory
 # and locks up the host — still built (so it doesn't bitrot), just
-# excluded from the run.
-if(WITH_SANITIZE STREQUAL "tsan")
+# excluded from the run. The flag comes from the Conan profile, so that is where
+# to look for it.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=[^ ]*thread")
     set_tests_properties(test_skynet PROPERTIES DISABLED TRUE)
 endif()
 

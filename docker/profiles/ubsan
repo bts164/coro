@@ -1,0 +1,15 @@
+# UBSan for the Pico firmware. Not a profile to use alone: it is named after the Pico
+# one, which it adds to (ci/run-emulator-tests.sh):
+#   conan build . -pr:h rp2040_pico_w -pr:h ubsan -pr:b default
+#
+# Trap mode, and on coro's own code only, which is why this is a CMake variable and
+# not compiler flags for every package: see cmake/Sanitize.cmake. vptr is left out:
+# it needs RTTI and a runtime, and cannot trap.
+#
+# The setting adds no flags; it keeps these binaries apart from plain ones in the
+# Conan cache (docker/settings_user.yml).
+[settings]
+compiler.sanitizer=UndefinedBehavior
+
+[conf]
+tools.cmake.cmaketoolchain:extra_variables={"CORO_SANITIZE_OPTIONS": "-fsanitize=undefined;-fno-sanitize=vptr;-fsanitize-trap=undefined"}

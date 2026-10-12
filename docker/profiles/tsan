@@ -1,0 +1,22 @@
+# ThreadSanitizer. Not a profile to use alone: it is named after a platform's own,
+# which it adds to (ci/run-tests.sh):
+#   conan build . -pr:h default -pr:h tsan
+#
+# The flags reach every package built with this profile, coro's dependencies
+# included. The setting adds no flags; it keeps these binaries apart from plain ones
+# in the Conan cache (docker/settings_user.yml).
+[settings]
+compiler.sanitizer=Thread
+
+[conf]
+tools.build:cflags+=["-fsanitize=thread", "-g"]
+tools.build:cxxflags+=["-fsanitize=thread", "-g"]
+tools.build:exelinkflags+=["-fsanitize=thread"]
+tools.build:sharedlinkflags+=["-fsanitize=thread"]
+# libunicorn is QEMU, which relies on behaviour UBSan reports (left shifts of
+# negative values; upstream builds with -fwrapv). It is a test tool, not code under
+# test, so it is built plain under every sanitizer.
+libunicorn/*:tools.build:cflags=!
+libunicorn/*:tools.build:cxxflags=!
+libunicorn/*:tools.build:exelinkflags=!
+libunicorn/*:tools.build:sharedlinkflags=!

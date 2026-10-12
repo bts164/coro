@@ -81,9 +81,9 @@ ctest -R test_oneshot
 ./test_oneshot --gtest_filter='OneshotTest/*.SenderIsMovable'
 ```
 
-For a sanitizer build, set `CORO_SANITIZE=asan`, `tsan` or `ubsan` in the environment
-before those commands. It applies to both the library and the tests; see
-[BUILD.md](../BUILD.md).
+For a sanitizer build, add a sanitizer profile to the `conan build` line, for instance
+`-pr:h default -pr:h tsan`. It applies to the library, the tests and their
+dependencies; see [BUILD.md](../BUILD.md#sanitizer-builds).
 
 ## Running on a Pico
 
@@ -172,13 +172,13 @@ two checks of its own:
 - **A stack guard, always on.** A write below the main stack is a hard fault instead of
   silent corruption. Only the board enforces it; the emulator has no memory protection
   unit. Fiber stacks are not covered.
-- **UBSan, on request.** Set `CORO_SANITIZE=ubsan` (or pass `-o with_sanitize=ubsan`)
+- **UBSan, on request.** Add the `ubsan` profile ([docker/profiles](../docker/profiles))
   when building. The library and the tests are then compiled with UBSan in trap mode:
   undefined behaviour stops the firmware where it happens. It works on the board and in
   the emulator.
 
   ```bash
-  CORO_SANITIZE=ubsan conan build . -pr:h rp2040_pico_w -pr:b default --build=missing
+  conan build . -pr:h rp2040_pico_w -pr:h ubsan -pr:b default --build=missing
   ./target/run_on_target.py --emulator build/baremetal/Release/coro_target_*.uf2
   ```
 
@@ -228,5 +228,5 @@ If the peak is close to the total, move files to another image.
 | `the device never announced CORO_TEST_READY` | The firmware did not reach `main()`, or another program has the serial port open |
 | `--emulator`: `run_rp2040: the firmware stopped at a breakpoint` | The firmware panicked or failed an assert. The panic message is the last line of output before it |
 | `--emulator`: `run_rp2040: [<component>] ...`, then `the emulator exited with status 3` | The firmware did something the emulator does not model or rejects, such as reading an unmapped address. Run `node target/emulator/run_rp2040.mjs --verbose --bootrom target/emulator/.cache/b1.elf <image>.uf2` to see the emulator's warnings as well, and check the same image on a board |
-| `the device stopped during: <test>` with no panic message, or in the emulator `stopped at a breakpoint or trap` | A hard fault: a stack overflow caught by the stack guard, or undefined behaviour in a `with_sanitize=ubsan` build. See [Memory checks in the firmware](#memory-checks-in-the-firmware) |
+| `the device stopped during: <test>` with no panic message, or in the emulator `stopped at a breakpoint or trap` | A hard fault: a stack overflow caught by the stack guard, or undefined behaviour in a UBSan build. See [Memory checks in the firmware](#memory-checks-in-the-firmware) |
 | `--emulator`: `no output for 30s` | The emulated firmware hung. An image normally finishes in about a second, so a slow machine is an unlikely cause; `--idle-timeout` rules it out |

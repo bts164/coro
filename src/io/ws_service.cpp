@@ -5,10 +5,12 @@
 
 #include <coro/runtime/io_driver.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cstdlib>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -33,11 +35,52 @@ void capture_lws_log(int /*level*/, const char* line) {
     *t_lws_errors += text;
 }
 
-void init_lws_logging() {
+// lws's allocator (lws_set_allocator()): realloc() with a size, free() without one.
+// It is lws's own default without the bookkeeping.
+//
+// Race (the reason): the default also keeps the total it has allocated in one counter
+// for the whole process, with no lock. Contexts here are serviced by the threads of
+// different Runtimes, and every allocation of theirs raced on that counter. Only
+// lws_get_allocated_heap() reads it, so it was harmless, but it was a data race.
+void* lws_allocator(void* ptr, std::size_t size, const char* /*reason*/) {
+    if (size) return std::realloc(ptr, size);
+    std::free(ptr);
+    return nullptr;
+}
+
+// Once, before the first context is created. Both settings are for the whole process.
+void init_lws() {
     static std::once_flag once;
-    // Process-wide. Lines logged off a create() call (from a turn) go nowhere, as
-    // with logging off.
-    std::call_once(once, [] { lws_set_log_level(LLL_ERR | LLL_WARN, capture_lws_log); });
+    std::call_once(once, [] {
+        // Lines logged off a create() call (from a turn) go nowhere, as with logging
+        // off.
+        lws_set_log_level(LLL_ERR | LLL_WARN, capture_lws_log);
+        // For a program that also uses lws itself: lws_get_allocated_heap() stops
+        // counting from here on, and an allocator of its own that it installed
+        // earlier is replaced.
+        //
+        // Potential race: lws reads the allocator with no lock, so this must not
+        // overlap another thread's use of lws. None of coro's can, since no context
+        // of coro's exists yet. A program's own lws threads could.
+        lws_set_allocator(lws_allocator);
+    });
+}
+
+// The log context of one lws context, with the levels and the sink of
+// init_lws(). Each context gets its own (info.log_cx); the context, its
+// vhost and its connections then all use it.
+//
+// Race (the reason): a context given none shares lws's process-wide default, and lws
+// counts in it, with no lock, every context, vhost and connection that is created or
+// freed. Contexts here are serviced by the threads of different Runtimes, so two of
+// them freeing a connection at once raced on that count. With one per context the
+// count is only touched by the thread that has the context. Nothing reads the count
+// in a release build of lws; a debug build asserts on it.
+lws_log_cx_t make_log_cx() {
+    lws_log_cx_t cx{};
+    cx.u.emit    = capture_lws_log;
+    cx.lll_flags = LLL_ERR | LLL_WARN;
+    return cx;
 }
 
 // What lws_service_adjust_timeout() is asked to shorten: it comes back unchanged
@@ -48,6 +91,72 @@ constexpr int kNoLwsTimer = INT_MAX;
 // before it lets the rest of the turn run. See after_lws().
 constexpr int kMaxForcedPasses = 4;
 
+// Held across every lws_create_context() and lws_context_destroy().
+//
+// Race (the reason): a context is otherwise touched by one thread at a time, but
+// creating and destroying one also touches state lws keeps for the whole process
+// with no lock of its own: the count of contexts that asked for the SSL global init
+// (lws 4.5). Contexts here are created and destroyed on the threads of whichever
+// Runtimes use them, so two can be in those calls at once.
+//
+// Taken after the client registry's mutex and never the other way round. lws calls
+// back while it is held (the event-loop ops, the protocol callbacks); those only
+// record, deregister and wake, and never create or destroy a context.
+std::mutex g_lws_lifecycle;
+
+int anchor_cb(lws*, lws_callback_reasons, void*, void*, std::size_t) { return 0; }
+
+// Creates, once per process, an lws context that is never serviced and never
+// destroyed, before the first client context.
+//
+// lws 4.5.3 to 4.5.8 count the contexts created with
+// LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT and call OPENSSL_cleanup() when the last one
+// is destroyed. OpenSSL can't be initialized again after that: every later digest
+// fails, and with it every later client context ("lws_context_init_client_ssl
+// failed", nothing in OpenSSL's error queue). Client contexts come and go with
+// their Runtimes, so this one holds the count above zero. It costs two descriptors
+// and an SSL_CTX with no certificates in it. Other lws versions don't need it and
+// aren't harmed by it.
+//
+// @throws std::system_error if it can't be created; the next call tries again.
+void ensure_ssl_anchor() {
+    // Kept in a static so that leak checkers see the context as reachable. Volatile
+    // because nothing reads it: an optimizing compiler otherwise drops the store, and
+    // LeakSanitizer then reports the context. C++ serializes the initialization, and
+    // runs it again if it threw.
+    static lws_context* volatile anchor = [] {
+        // lws keeps the pointer.
+        static const lws_protocols protocols[] = {
+            {"coro-ws-anchor", anchor_cb, 0, 0, 0, nullptr, 0},
+            {nullptr, nullptr, 0, 0, 0, nullptr, 0},
+        };
+        // lws keeps this pointer too. See make_log_cx().
+        static lws_log_cx_t log_cx = make_log_cx();
+        lws_context_creation_info info{};
+        info.log_cx    = &log_cx;
+        info.port      = CONTEXT_PORT_NO_LISTEN;
+        info.protocols = protocols;
+        // Without the OS's CA certificates: nothing ever connects through it.
+        info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
+                         LWS_SERVER_OPTION_DISABLE_OS_CA_CERTS;
+
+        init_lws();
+        std::string  errors;
+        lws_context* ctx;
+        {
+            std::lock_guard lifecycle(g_lws_lifecycle);
+            t_lws_errors = &errors;
+            ctx          = lws_create_context(&info);
+            t_lws_errors = nullptr;
+        }
+        if (!ctx)
+            throw std::system_error(EIO, std::system_category(),
+                                    "WsStream::connect: lws_create_context failed (" +
+                                        errors + ")");
+        return ctx;
+    }();
+}
+
 } // namespace
 
 // =============================================================================
@@ -57,10 +166,10 @@ constexpr int kMaxForcedPasses = 4;
 // One registered lws socket: the level-triggered registration and the waker the
 // driver wakes, inside its turn, whenever the fd is ready.
 //
-// A Socket belongs to one attachment. When the context leaves its driver the Socket
-// is marked dead and dropped, so a wake the old driver still delivers (its
-// shutdown() collects the wakers first, then wakes them) touches nothing but `dead`.
-// `dead` needs no lock: it is written and read only inside that driver's turns.
+// When lws lets go of the socket, or the context is destroyed, the Socket is marked
+// dead and dropped, so a wake the driver still delivers (its shutdown() collects
+// the wakers first, then wakes them) touches nothing but `dead`. `dead` needs no
+// lock: it is written and read only inside the driver's turns.
 struct LwsService::Socket final : Waker, std::enable_shared_from_this<Socket> {
     Socket(std::weak_ptr<LwsService> service_, lws* wsi_)
         : service(std::move(service_)), wsi(wsi_) {}
@@ -87,7 +196,7 @@ struct LwsService::Socket final : Waker, std::enable_shared_from_this<Socket> {
 };
 
 // The waker of the driver timer that stands for lws's next internal timer. Like
-// Socket, one per attachment, with the same `dead` rule.
+// Socket, with the same `dead` rule.
 struct LwsService::TimerWaker final : Waker, std::enable_shared_from_this<TimerWaker> {
     explicit TimerWaker(std::weak_ptr<LwsService> service_) : service(std::move(service_)) {}
 
@@ -168,60 +277,72 @@ const lws_plugin_evlib_t LwsService::Ops::kEventLoop = {
 };
 
 // =============================================================================
-// Creation, the client pool, release
+// Creation, the client contexts, release
 // =============================================================================
 
-LwsService::LwsService(Kind kind, std::shared_ptr<void> keep_alive)
-    : m_kind(kind), m_keep_alive(std::move(keep_alive)) {}
+LwsService::LwsService(std::shared_ptr<void> keep_alive, std::move_only_function<void()> on_destroyed)
+    : m_keep_alive(std::move(keep_alive)), m_on_destroyed(std::move(on_destroyed)) {}
 
 LwsService::~LwsService() {
-    // release() destroyed the context, directly or through a turn, or creating it
-    // failed. A context still attached at static destruction keeps this object alive
-    // (m_self) and is never destroyed.
+    // release() destroyed the context, directly or through a turn, or the driver's
+    // shutdown did, or creating it failed. A context still attached at static
+    // destruction keeps this object alive (m_self) and is never destroyed.
     assert(m_ctx == nullptr);
 }
 
-std::shared_ptr<LwsService> LwsService::create(lws_context_creation_info info, Kind kind,
-                                               std::shared_ptr<void> keep_alive,
-                                               std::string*          lws_errors) {
-    init_lws_logging();
+std::shared_ptr<LwsService> LwsService::create(lws_context_creation_info       info,
+                                               std::shared_ptr<void>           keep_alive,
+                                               std::move_only_function<void()> on_destroyed,
+                                               IoDriver&                       driver,
+                                               std::string*                    lws_errors) {
+    init_lws();
     // Before the context: lws calls the event-loop ops while it creates it, and
     // again while it tears a failed one down.
     // Not make_shared: the constructor is private.
-    std::shared_ptr<LwsService> core(new LwsService(kind, std::move(keep_alive)));
+    std::shared_ptr<LwsService> core(
+        new LwsService(std::move(keep_alive), std::move(on_destroyed)));
 
     // Read only during lws_create_context(), which hands the entry to init_pt().
     void* foreign_loops[1] = {core.get()};
     info.event_lib_custom  = &Ops::kEventLoop;
     info.foreign_loops     = foreign_loops;
+    // lws keeps the pointer for as long as the context lives, which this object
+    // outlives.
+    core->m_log_cx         = make_log_cx();
+    info.log_cx            = &core->m_log_cx;
 
-    std::string errors;
-    t_lws_errors     = &errors;
-    core->m_creating = true;
-    lws_context* ctx = lws_create_context(&info);
-    core->m_creating = false;
-    t_lws_errors     = nullptr;
+    std::string  errors;
+    lws_context* ctx;
+    {
+        std::lock_guard lifecycle(g_lws_lifecycle);
+        t_lws_errors = &errors;
+        ctx          = lws_create_context(&info);
+        t_lws_errors = nullptr;
+    }
     if (!ctx) {
         if (lws_errors) *lws_errors = std::move(errors);
         return nullptr;
     }
-    std::lock_guard lk(core->m_mutex);
-    core->m_ctx = ctx;
+    {
+        std::lock_guard lk(core->m_mutex);
+        core->m_ctx = ctx;
+    }
+    try {
+        core->attach(driver);
+    } catch (...) {
+        release(std::move(core));   // no driver: destroys the context here
+        throw;
+    }
     return core;
 }
 
 std::shared_ptr<LwsService> LwsService::listen(const lws_context_creation_info& info,
                                                std::shared_ptr<void>            keep_alive,
+                                               std::move_only_function<void()>  on_destroyed,
                                                IoDriver&                        driver,
                                                std::string*                     lws_errors) {
-    auto core = create(info, Kind::Listener, std::move(keep_alive), lws_errors);
+    auto core = create(info, std::move(keep_alive), std::move(on_destroyed), driver, lws_errors);
     if (!core) return nullptr;
-    try {
-        core->try_attach(driver);
-    } catch (...) {
-        release(std::move(core));   // no driver yet: destroys the context here
-        throw;
-    }
     // What the caller holds is a handle: dropping its last copy does not destroy
     // this object, which a turn may be inside, but asks a turn to destroy the
     // context. The object goes once that turn is done with it.
@@ -230,69 +351,54 @@ std::shared_ptr<LwsService> LwsService::listen(const lws_context_creation_info& 
         raw, [core = std::move(core)](LwsService*) mutable { release(std::move(core)); });
 }
 
-// Client contexts, kept for the life of the process and handed from one Runtime's
-// driver to the next, never destroyed when unused. Destroying a client context and
-// creating another made the second one fail in lws_context_init_client_ssl() (seen
-// under ASan in the Ubuntu 24.04 container: its client SSL_CTX setup fails without
-// logging why, likely at the SHA-256 config hash). Root cause not found; keeping
-// them sidesteps it, and an idle context costs nothing: it has no thread, and
-// without a driver nothing services it.
-//
-// More than one exists only while more than one Runtime has WebSocket clients at the
-// same time.
-struct LwsService::ClientPool {
-    // Creates the first context, so this object's destructor is registered after the
-    // atexit handler OpenSSL registers during that create, and runs before OpenSSL
-    // cleans up. If it throws, the next client() tries again (C++ retries a
-    // function-local static whose initialization threw), and the initialization is
-    // serialized across threads.
-    ClientPool() { services.push_back(create_client()); }
-
-    ~ClientPool() {
-        // A WsStream still alive at static destruction holds its own reference to
-        // the object; the context goes here, which closes that stream's connection.
+// The client contexts: one per IoDriver that has connected, from its first connect
+// until it shuts down.
+struct LwsService::Clients {
+    ~Clients() {
+        // At static destruction. A context whose Runtime is already gone was
+        // destroyed with it and this does nothing. One whose Runtime is still alive
+        // is destroyed only if that Runtime turns its driver again.
         for (auto& service : services) release(std::move(service));
     }
 
-    static std::shared_ptr<LwsService> create_client() {
-        // lws keeps the pointer, so the array must outlive every client context.
-        static const lws_protocols protocols[] = {
-            {"coro-ws", protocol_cb, 0, 4096, 0, nullptr, 0},
-            {nullptr, nullptr, 0, 0, 0, nullptr, 0},
-        };
-        lws_context_creation_info info{};
-        info.port      = CONTEXT_PORT_NO_LISTEN;
-        info.protocols = protocols;
-        // Client TLS (wss://) needs the global SSL init and a client SSL_CTX on the vhost.
-        info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-
-        std::string lws_errors;
-        auto service = create(info, Kind::Client, nullptr, &lws_errors);
-        if (!service)
-            throw std::system_error(EIO, std::system_category(),
-                                    "WsStream::connect: lws_create_context failed (" +
-                                        lws_errors + ")");
-        return service;
-    }
-
-    // Guards `services`, and serializes attaching: two Runtimes asking at once never
-    // both take the same free context.
+    // Guards `services`, and makes finding or creating a driver's context one step:
+    // two tasks connecting at once on a new Runtime get the same context.
     std::mutex                               mutex;
     std::vector<std::shared_ptr<LwsService>> services;
 };
 
 std::shared_ptr<LwsService> LwsService::client(IoDriver& driver) {
-    static ClientPool pool;
-    std::lock_guard lk(pool.mutex);
-    for (auto& service : pool.services)
+    // In this order: the anchor's create is what makes OpenSSL register its atexit
+    // handler, so `clients`, constructed after it, is destroyed before OpenSSL
+    // cleans up.
+    ensure_ssl_anchor();
+    static Clients clients;
+
+    std::lock_guard lk(clients.mutex);
+    // The contexts of drivers that have shut down. Before the search: a new driver
+    // may have the address of one of those.
+    std::erase_if(clients.services, [](const auto& service) { return !service->alive(); });
+    for (auto& service : clients.services)
         if (service->attached_to(driver)) return service;
-    // Race (benign): a context whose driver shuts down between the loop above and
-    // this one is simply found free here.
-    for (auto& service : pool.services)
-        if (service->try_attach(driver)) return service;
-    auto service = ClientPool::create_client();
-    pool.services.push_back(service);
-    service->try_attach(driver);
+
+    // lws keeps the pointer, so the array must outlive every client context.
+    static const lws_protocols protocols[] = {
+        {"coro-ws", protocol_cb, 0, 4096, 0, nullptr, 0},
+        {nullptr, nullptr, 0, 0, 0, nullptr, 0},
+    };
+    lws_context_creation_info info{};
+    info.port      = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = protocols;
+    // Client TLS (wss://) needs the global SSL init and a client SSL_CTX on the vhost.
+    info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+
+    std::string lws_errors;
+    auto service = create(info, nullptr, nullptr, driver, &lws_errors);
+    if (!service)
+        throw std::system_error(EIO, std::system_category(),
+                                "WsStream::connect: lws_create_context failed (" +
+                                    lws_errors + ")");
+    clients.services.push_back(service);
     return service;
 }
 
@@ -301,11 +407,15 @@ bool LwsService::attached_to(const IoDriver& driver) {
     return m_driver == &driver;
 }
 
-bool LwsService::try_attach(IoDriver& driver) {
+bool LwsService::alive() {
+    std::lock_guard lk(m_mutex);
+    return m_ctx && !m_destroying && !m_destroy_requested;
+}
+
+void LwsService::attach(IoDriver& driver) {
     std::shared_ptr<TimerWaker> waker;
     {
         std::lock_guard lk(m_mutex);
-        if (m_driver || !m_ctx || m_destroying || m_destroy_requested) return false;
         // Before m_driver: from the moment that is set, the turn-only state belongs
         // to the driver's turns.
         waker = m_timer_waker = std::make_shared<TimerWaker>(weak_from_this());
@@ -328,10 +438,8 @@ bool LwsService::try_attach(IoDriver& driver) {
         std::lock_guard lk(m_mutex);
         m_driver = nullptr;
         m_timer_waker.reset();
-        m_commands.clear();   // posted since m_driver was set; nothing will run them
         throw;
     }
-    return true;
 }
 
 void LwsService::release(std::shared_ptr<LwsService> core) noexcept {
@@ -353,20 +461,16 @@ void LwsService::release(std::shared_ptr<LwsService> core) noexcept {
             lws_cancel_service(self.m_ctx);
             return;
         }
-        // No driver, so no turn can reach the context: this thread has it.
+        // No driver (attaching failed), so no turn can reach the context: this
+        // thread has it.
         self.m_destroying = true;
         ctx               = self.m_ctx;
     }
-    lws_context_destroy(ctx);
-    self.drop_wakers();
-    self.m_table.clear();
-    std::shared_ptr<void> keep_alive;
     {
-        std::lock_guard lk(self.m_mutex);
-        self.m_ctx = nullptr;
-        keep_alive = std::move(self.m_keep_alive);
+        std::lock_guard lifecycle(g_lws_lifecycle);
+        lws_context_destroy(ctx);
     }
-    // The context is gone, so nothing points into what this kept alive.
+    self.finish_destroy();
 }
 
 // =============================================================================
@@ -375,31 +479,41 @@ void LwsService::release(std::shared_ptr<LwsService> core) noexcept {
 
 void LwsService::post(Command command) {
     std::lock_guard lk(m_mutex);
-    if (!m_ctx || !m_driver || m_destroying) return;
+    if (!m_ctx || m_destroying) return;
+    // One wake per batch. A queue that already holds a command has a wake on its
+    // way: the post that found it empty sent one, and run_commands() takes the
+    // whole queue, under this mutex, each time lws reports a wake. (lws reports it
+    // to every protocol of the context, initialized or not.)
+    const bool wake = m_commands.empty();
     m_commands.push_back(std::move(command));
     // Makes the wake pipe readable, which stays so until a turn services it: the
     // command is never stranded, whether a thread is blocked in the turn, between
     // turns, or (the pipe not yet registered) before the first one. Called under the
     // mutex so it can't overlap lws_context_destroy(), which only runs once
     // m_destroying is set under the same mutex.
-    lws_cancel_service(m_ctx);
+    if (wake) lws_cancel_service(m_ctx);
 }
 
 void LwsService::run_commands(lws_context* context) {
     LwsService* self = Ops::service_of(context);
     if (!self) return;
-    std::deque<Command> commands;
+    // Taken out of the object while it is in use, so that a call made from inside a
+    // command would find an empty one of its own rather than this batch.
+    std::vector<Command> running = std::move(self->m_running);
     {
         std::lock_guard lk(self->m_mutex);
-        commands.swap(self->m_commands);
+        running.swap(self->m_commands);
     }
-    for (auto& command : commands) {
+    for (auto& command : running) {
         // This runs inside an lws callback: nothing may unwind through lws.
         try {
-            command(context);
+            command.run(context, command.target.get());
         } catch (...) {
         }
     }
+    // Drops the targets, which may free them, and keeps the storage.
+    running.clear();
+    self->m_running = std::move(running);
 }
 
 // =============================================================================
@@ -411,7 +525,6 @@ int LwsService::socket_added(lws* wsi) noexcept {
         // The wsi may be known already: lws gives one a new socket after a failed
         // connect attempt.
         Entry& entry = m_table[wsi];
-        if (m_creating) entry.permanent = true;
         const sys::RawFd fd = lws_get_socket_fd(wsi);
         if (entry.socket && entry.fd != fd) drop_registration(entry);
         entry.fd = fd;
@@ -435,7 +548,6 @@ void LwsService::socket_io(lws* wsi, unsigned int flags) noexcept {
             return;
         }
         Entry& entry = m_table[wsi];
-        if (m_creating) entry.permanent = true;
         if (flags & LWS_EV_READ) entry.read = start;
         if (flags & LWS_EV_WRITE) entry.write = start;
         sync_registration(wsi, entry);
@@ -453,8 +565,8 @@ void LwsService::socket_freed(lws* wsi) noexcept {
 }
 
 void LwsService::sync_registration(lws* wsi, Entry& entry) {
-    // Before the first turn after attaching, and while leaving a driver, sockets are
-    // only recorded.
+    // Before the first turn after attaching, and while the context is destroyed,
+    // sockets are only recorded.
     if (!m_registered) return;
 
     const sys::RawFd fd = lws_get_socket_fd(wsi);
@@ -597,8 +709,7 @@ bool LwsService::leave_if_driver_shut_down() {
     // sees it. It may also be seen by an ordinary turn just before shutdown() gets
     // the turn; leaving then is as good.
     if (!m_driver->is_shut_down()) return false;
-    if (m_kind == Kind::Listener) destroy_in_turn();
-    else                          detach_in_turn();
+    destroy_in_turn();
     return true;
 }
 
@@ -614,10 +725,10 @@ void LwsService::drop_wakers() noexcept {
 
 // Destroys the context. In a turn, and never from inside lws_service_fd(). The
 // caller holds a reference to this object (the waker locked one), since m_self is
-// dropped here.
+// dropped by finish_destroy().
 void LwsService::destroy_in_turn() {
-    lws_context*        ctx;
-    std::deque<Command> dropped;
+    lws_context*         ctx;
+    std::vector<Command> dropped;
     {
         std::lock_guard lk(m_mutex);
         if (m_destroying || !m_ctx) return;
@@ -629,55 +740,40 @@ void LwsService::destroy_in_turn() {
 
     // No new registrations while lws closes everything.
     m_registered = false;
-    // Closes every connection and the listening socket. lws reports each through
-    // the protocol callback (which wakes whoever waits on it) and through the
+    // Closes every connection and the listening socket. lws reports each connection
+    // through the protocol callback (which wakes whoever waits on it), including one
+    // it holds without a socket, between two connect attempts; and through the
     // event-loop ops, which drop the registrations before the fds are closed.
-    lws_context_destroy(ctx);
+    {
+        std::lock_guard lifecycle(g_lws_lifecycle);
+        lws_context_destroy(ctx);
+    }
+    finish_destroy();
+}
+
+void LwsService::finish_destroy() noexcept {
     drop_wakers();
     m_table.clear();
 
-    std::shared_ptr<LwsService> self;
-    std::shared_ptr<void>       keep_alive;
+    std::shared_ptr<LwsService>     self;
+    std::shared_ptr<void>           keep_alive;
+    std::move_only_function<void()> on_destroyed;
     {
         std::lock_guard lk(m_mutex);
-        m_ctx      = nullptr;
-        m_driver   = nullptr;
-        self       = std::move(m_self);
-        keep_alive = std::move(m_keep_alive);
+        m_ctx        = nullptr;
+        m_driver     = nullptr;
+        self         = std::move(m_self);
+        keep_alive   = std::move(m_keep_alive);
+        on_destroyed = std::move(m_on_destroyed);
     }
-    // The context is gone, so nothing points into what keep_alive held.
-}
-
-// A client context's driver has shut down: close its connections and leave the
-// context free for the next Runtime.
-void LwsService::detach_in_turn() {
-    m_registered = false;
-
-    // Each close reaches its stream through the protocol callback, so a WsStream
-    // that outlives its Runtime finds its connection closed. Over a copy: closing
-    // one erases its entry, and may free others.
-    //
-    // A connection lws holds without a socket (between two connect attempts) is not
-    // in the table and is not closed here. It fails by itself once the context is
-    // serviced again.
-    std::vector<lws*> connections;
-    for (const auto& [wsi, entry] : m_table)
-        if (!entry.permanent) connections.push_back(wsi);
-    for (lws* wsi : connections)
-        if (m_table.contains(wsi))
-            lws_set_timeout(wsi, PENDING_TIMEOUT_KILLED_BY_PARENT, LWS_TO_KILL_SYNC);
-
-    // The wake pipe keeps its entry, and is registered again by the next driver.
-    drop_wakers();
-
-    std::deque<Command> dropped;
-    {
-        std::lock_guard lk(m_mutex);
-        m_driver = nullptr;
-        dropped.swap(m_commands);
+    // In a turn, or under whoever dropped a context that never had one: nothing may
+    // escape.
+    try {
+        if (on_destroyed) on_destroyed();
+    } catch (...) {
     }
-    // Nothing of this object may be touched from here on: with m_driver cleared,
-    // another Runtime's thread may attach the context at once.
+    // The context is gone, so nothing points into what keep_alive held. The caller
+    // holds a reference to this object, so dropping `self` here is safe.
 }
 
 } // namespace coro::detail::ws

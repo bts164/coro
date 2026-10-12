@@ -49,6 +49,8 @@ disk. Later runs reuse it.
 | `Dockerfile.rocky8` | Rocky Linux 8.10 with GCC 15 from `gcc-toolset-15`. Desktop tests only: it has no Pico SDK or Node.js. |
 | `profiles/<platform>` | That platform's Conan profile: desktop builds, and the build-machine side of Pico builds. Copied into its image as the `default` profile. |
 | `profiles/rp2040_pico_w` | Conan host profile for the RP2040 on a Pico W board. The same in every image that has the Pico SDK. |
+| `profiles/asan`, `tsan`, `ubsan` | A sanitizer each: its flags, for every package built with the profile, and the `compiler.sanitizer` setting. Named after one of the profiles above, which it adds to. `ubsan` is for the Pico firmware, so only in an image that has the Pico SDK. |
+| `settings_user.yml` | Defines `compiler.sanitizer`, which Conan does not have on its own. It keeps sanitizer binaries apart from plain ones in the Conan cache. Copied into each image's Conan home. |
 | `build-image.sh` | Builds a platform's image on this machine. |
 | `run-tests.sh` | Runs `ci/run-tests.sh` in a container: builds the library and its tests, plain or with a sanitizer, and runs them. CI: `tests.yml`. |
 | `run-emulator-tests.sh` | Runs `ci/run-emulator-tests.sh` in a container: builds the on-target test firmware and runs it in the emulator. CI: `pico_emulator.yml`. |
@@ -88,7 +90,8 @@ the script needs.
 1. Add `profiles/<platform>`, the Conan profile for that platform's own compiler.
 2. Add `Dockerfile.<platform>`. `docker/` is the build context. For `run-tests.sh` the
    image needs a C++ compiler, Git, Python, Conan and CMake 3.31 or later, and it
-   copies `profiles/<platform>` to `/root/.conan2/profiles/default`.
+   copies `profiles/<platform>` to `/root/.conan2/profiles/default`, `profiles/asan`
+   and `profiles/tsan` next to it, and `settings_user.yml` to `/root/.conan2/`.
 3. Run `CORO_PLATFORM=<platform> docker/run-tests.sh none` until it passes.
 4. Name the platform in both lists in `.github/workflows/tests.yml`: the one the
    images are published from, and the one the test jobs are made from, with
@@ -100,8 +103,8 @@ sanitizer rows in `tests.yml` to it. Its image must be able to run the emulator 
 ## The image
 
 A platform's image is named `coro-ci-<platform>:<hash>`. The hash covers
-`Dockerfile.<platform>`, `profiles/<platform>` and the profiles that belong to no
-platform (`profiles/rp2040_pico_w`), so:
+`Dockerfile.<platform>`, `settings_user.yml`, `profiles/<platform>` and the profiles
+that belong to no platform (`profiles/rp2040_pico_w` and the sanitizer ones), so:
 
 - You never type the name. The scripts work it out.
 - Editing the Dockerfile or a profile gives a new name. The next script you run
@@ -193,8 +196,8 @@ runner, so the job builds straight into it, and nothing is kept between runs.
 3. Push. CI sees a hash it has no image for, builds and publishes one, and runs the
    tests in it.
 
-A change to `profiles/rp2040_pico_w` renames every platform's image, whether or not
-the image copies it. A change to a platform's own profile renames only that platform's.
+A change to `settings_user.yml`, or to a profile that belongs to no platform, renames
+every platform's image, whether or not the image copies it. A change to a platform's own profile renames only that platform's.
 
 ## Changing a job
 

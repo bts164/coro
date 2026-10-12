@@ -2,6 +2,7 @@
 
 #include <coro/coro.h>
 #include <coro/detail/context.h>
+#include <coro/detail/intrusive_list.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
@@ -22,8 +23,27 @@
 // can hold shared_ptr<> to it without requiring the full definition here.
 namespace coro::detail::ws {
     struct ConnectionState;
-    struct SendSubState;
     class LwsService;
+
+    // One send, from the first poll of its SendFuture until lws_write() has taken the
+    // frame. It lives inside the future, so a send allocates nothing but its frame.
+    //
+    // Linked into ConnectionState::send_queue by that first poll. From then on
+    // everything here is guarded by ConnectionState::send_queue_mutex, and
+    // ~SendFuture takes it to unlink the node, so a callback holding the mutex can
+    // rely on a node it found.
+    struct SendNode : detail::IntrusiveListNode {
+        detail::Weak<detail::Waker>  waker;
+        // LWS_PRE bytes of headroom, which lws_write() needs, then the payload: a
+        // copy, made by the first poll. Not a std::vector, which would zero the bytes
+        // before they are overwritten. The WRITEABLE callback takes it from the
+        // node, so the write itself needs neither the node nor the mutex.
+        std::unique_ptr<std::byte[]> frame;
+        std::size_t                  size     = 0;      // of the payload
+        bool                         is_text  = false;
+        bool                         complete = false;
+        int                          error    = 0;      // errno; set before complete
+    };
 }
 
 namespace coro {
@@ -36,16 +56,24 @@ namespace coro {
  * that driver (see doc/design/websocket_stream.md, "lws on the I/O driver"). So the
  * Runtime that calls `connect()` or `WsListener::bind()` must turn its IoDriver, and
  * the connection lives only as long as that Runtime: once it shuts down, the stream
- * is closed. The stream itself may be used from any Runtime. Obtain one via
- * `co_await WsStream::connect(url)` or `co_await listener.accept()`.
+ * is closed. The stream itself may be used from a task of any Runtime, and from a
+ * thread outside any Runtime with `blocking_wait()`; it may be dropped on any thread.
+ * Obtain one via `co_await WsStream::connect(url)` or `co_await listener.accept()`.
  *
  * **Frame modes:**
  * - `FrameMode::Full` (default) — `receive()` returns after the complete message is assembled.
  * - `FrameMode::Partial` — `receive()` returns for each fragment; check `Message::is_final`.
  *
- * **Concurrency:** only one `receive()` and one `send()` may be in flight at a time unless
- * the send queue is enabled (see design doc § Send Queue). `WsStream` must not be shared
- * across tasks.
+ * **Concurrency:** at most one `receive()` and one `send()` may be in flight at a
+ * time, as for `TcpStream`. The two may be in different tasks: one task may receive
+ * while another sends. Two receives at once are an error (one may never be woken).
+ * A second `send()` started before the first completes is queued behind it today,
+ * but that is not part of the contract and may become an error in a later version;
+ * to send from several tasks, give one task the stream and feed it through a channel.
+ *
+ * `WsStream` is move-only. Tasks that share one share a reference to it, and must
+ * not move or destroy it while another is calling `send()` or `receive()`. A future
+ * already returned stays valid.
  *
  * All lws handles, protocol callbacks, and request types are private implementation details.
  */
@@ -124,14 +152,19 @@ public:
     /**
      * @brief Future<void> returned by @ref WsStream::send().
      *
-     * Owns a heap-allocated `SendSubState`. On first poll, pushes it onto the connection's
-     * send queue and posts `lws_callback_on_writable()` to the lws service. The
-     * WRITEABLE callback pops the entry, calls `lws_write()`, and wakes the future.
+     * On first poll, copies the data into a frame of its own, links itself into the
+     * connection's send queue and posts `lws_callback_on_writable()` to the lws
+     * service. The WRITEABLE callback takes the frame, calls `lws_write()`, and wakes
+     * the future.
      *
-     * Dropping this future sets `cancelled` on the `SendSubState`; the WRITEABLE
-     * callback skips the write if the flag is set when it fires.
+     * Dropping this future unlinks it. A send that lws has not been given yet is then
+     * not sent; one being written at that moment is.
      *
-     * @note The caller's data span must remain valid until the future resolves.
+     * **Move safety:** moving a `SendFuture` is only valid before `poll()` has been
+     * called (before it is linked into the send queue).
+     *
+     * @note The caller's data span must remain valid until the future is first
+     *       polled.
      */
     class SendFuture {
     public:
@@ -143,8 +176,9 @@ public:
                    std::shared_ptr<detail::ws::LwsService>       service);
         ~SendFuture();
 
-        SendFuture(SendFuture&&) noexcept            = default;
-        SendFuture& operator=(SendFuture&&) noexcept = default;
+        // Only valid before poll(): the node must not be linked when moved.
+        SendFuture(SendFuture&& other) noexcept;
+        SendFuture& operator=(SendFuture&&)          = delete;
         SendFuture(const SendFuture&)                = delete;
         SendFuture& operator=(const SendFuture&)     = delete;
 
@@ -152,8 +186,9 @@ public:
 
     private:
         std::shared_ptr<detail::ws::ConnectionState> m_state;
-        std::shared_ptr<detail::ws::SendSubState>    m_sub_state;
         std::shared_ptr<detail::ws::LwsService>      m_service;
+        std::span<const std::byte>                   m_data;   // the caller's, until the first poll
+        detail::ws::SendNode                         m_node;
         bool                                         m_started = false;
     };
 
@@ -200,7 +235,8 @@ public:
 
     /**
      * @brief Sends a binary or text frame.
-     * @note The caller's data span must remain valid until the future resolves.
+     * @note The caller's data span must remain valid until the future is first polled,
+     *       which copies it.
      */
     [[nodiscard]] SendFuture send(std::span<const std::byte> data,
                                   OpCode                     opcode = OpCode::Binary);
@@ -277,20 +313,6 @@ struct ReceiveSubState {
     std::deque<ReceivedMessage>      ready;
 };
 
-struct SendSubState {
-    // mutex guards everything here. The WRITEABLE callback checks cancelled, then
-    // reads data, under the lock; ~SendFuture sets cancelled under it. So the
-    // callback can't pass the check and then read a span whose buffer the caller
-    // has just freed.
-    std::mutex                       mutex;
-    detail::Weak<detail::Waker>      waker;
-    bool                             complete  = false;
-    bool                             cancelled = false;  // set by ~SendFuture
-    std::span<const std::byte>       data;               // non-owning; caller keeps alive
-    coro::WsStream::OpCode           opcode = coro::WsStream::OpCode::Text;
-    int                              error  = 0;
-};
-
 // ---------------------------------------------------------------------------
 // ConnectionState — all per-connection state shared by the futures and the lws
 // callbacks. Reference-counted so any future can outlive the WsStream.
@@ -314,8 +336,14 @@ struct ConnectionState {
     std::size_t                  max_message_size = 0;  // 0 = unlimited; enforced in on_receive
     ConnectSubState              connect;
     ReceiveSubState              receive;
+    // Guards the two members below and every SendNode linked or in flight.
     std::mutex                   send_queue_mutex;
-    std::deque<std::shared_ptr<SendSubState>> send_queue;  // shared_ptr keeps sub-state alive
+    // SendNodes waiting for WRITEABLE, each inside its SendFuture.
+    detail::IntrusiveList<>      send_queue;
+    // The node whose frame the WRITEABLE callback is writing: taken off the queue,
+    // and not yet told the result. Null if there is none, or if its future was
+    // dropped during the write.
+    SendNode*                    send_in_flight = nullptr;
     // Written in a driver turn, read by the futures. Atomic rather than under a
     // mutex: it only ever goes false -> true, and each reader re-checks it under the
     // sub-state mutex that close_connection() takes before waking (see there).

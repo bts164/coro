@@ -77,10 +77,29 @@ while (true) {
       usable); a closed connection throws once the queued messages are drained.
     - `send`: `ENOTCONN` if the connection closed first, `EIO` if `lws_write` failed.
 - **Moved-from streams:** `receive()` and `send()` throw `std::logic_error`.
-- **Concurrency:** only one `receive()` may be in flight. Sends go through a queue and
-  are written in the order they were first polled. A stream must not be shared across
-  tasks.
-- **Drop and move-assign** post a graceful close (Close frame, then the peer's echo).
+- **Concurrency:** at most one `receive()` and one `send()` in flight at a time, as for
+  `TcpStream`. The two may be in different tasks: one task may receive while another
+  sends. Two receives at once are an error: there is one waker slot, so one of them may
+  never be woken.
+- **Threads and runtimes:** a stream may be used from a task of any `Runtime`, and from
+  a thread outside any `Runtime` with `blocking_wait()`. Its connection is serviced by
+  the `Runtime` that called `connect()` (or `bind()`, for an accepted stream): nothing
+  is sent or received unless that one is turning its driver, and when it is destroyed
+  the connection is closed. `connect()` and `bind()` themselves need a current
+  `Runtime` and throw `std::logic_error` without one.
+- **Sharing:** `WsStream` is move-only, with no split or clone. Tasks that share one
+  share a reference to it (or a `std::shared_ptr`), and must not move or destroy it
+  while another is calling `send()` or `receive()`. A future already returned stays
+  valid: it holds the connection itself.
+- **Drop and move-assign** post a graceful close (Close frame, then the peer's echo),
+  from any thread.
+
+!!! note "NOTE: several sends at once work today, but are not part of the contract"
+    A `send()` started while another is in flight is queued behind it, and the two are
+    written in the order they were first polled (see [Send](#send)). That is how the
+    code behaves, not something the API promises: a later version may make it an
+    error. To send from several tasks, give one task the stream and feed it through a
+    channel.
 
 !!! tip "TODO: `send()` still borrows a span"
     `send` takes a `std::span`/`std::string_view` that must outlive the await, unlike the
@@ -140,15 +159,23 @@ flowchart TB
     calls into it. The driver's turn is that guarantee, since only one thread holds it.
     A future's `poll()` or destructor must never call lws; it posts a command. The
     exceptions are `lws_create_context()`, which runs on the calling thread before any
-    socket is registered, `lws_cancel_service()`, which lws allows from any thread, and
-    work on a context that has been detached from its driver (see
-    [Runtime shutdown](#runtime-shutdown)).
+    socket is registered, and `lws_cancel_service()`, which lws allows from any thread.
 
     Which thread holds the turn changes from one turn to the next. That is fine for lws
-    4.3.5 as Conan builds it: it keeps no thread-local state, the package is built with
+    as Conan builds it: it keeps no thread-local state, the package is built with
     `LWS_MAX_SMP` 1 so no code looks up the calling thread, and its one "wrong thread"
     assertion is compiled only in debug builds and only when the event loop supplies a
     `foreign_thread` op, which ours does not.
+
+!!! note "NOTE: all of a runtime's WebSocket work runs on one thread at a time"
+    Whichever thread holds the turn does every read, write, frame and callback for every
+    WebSocket of that runtime, and TLS encryption for `wss://` with them. Nothing else
+    is dispatched meanwhile: TCP, UDP and timers on the same runtime wait for it.
+
+    For a handful of connections this doesn't matter. For heavy traffic, `wss://`
+    above all, it is a ceiling that more worker threads don't raise. Measure before
+    relying on it; [What was considered and left](#what-was-considered-and-left) and
+    [Without lws](#without-lws) are the ways out.
 
 Every other primitive's waker is its task: the driver wakes it and the task does the I/O
 when it is next polled. lws has to be called when its socket is ready, by one thread at a
@@ -203,6 +230,15 @@ the context's wake pipe. The pipe is one more `LwsSocket`. When it fires,
 `LWS_CALLBACK_EVENT_WAIT_CANCELLED`, where the service runs the queued commands in
 posting order.
 
+The wake is sent once per batch: only a `post()` that finds the queue empty calls
+`lws_cancel_service()`. The callback takes the whole queue under the same mutex, so a
+queue that holds a command always has a wake on its way.
+
+Posting and running a command allocate nothing. A command is a function pointer and a
+`shared_ptr` to what it acts on (a send or a close passes the connection's state), not
+a `std::function`, which may allocate for what it captures. The queue and the batch
+being run are two vectors that swap their storage each time.
+
 !!! note "NOTE: a command waits for someone to turn the driver"
     A posted command runs at once if a worker is parked in the driver, otherwise at a
     busy worker's next periodic turn (every 61 task polls) or when a worker runs out of
@@ -235,8 +271,23 @@ driver's timer queue through one more waker, allocated once per context:
   They are registered by the first turn after the context is attached, which a timer
   due at once brings about. Registering from `bind()`'s thread could lose a race with
   `IoDriver::shutdown()`; a turn and the shutdown exclude each other.
-- **Client:** every `WsStream::connect()` on a `Runtime` shares one client context (see
-  [Client contexts](#client-contexts)).
+- **Client:** every `WsStream::connect()` on a `Runtime` shares one client context,
+  created by the first of them (see [Client contexts](#client-contexts)).
+- **Creating and destroying are serialized across the process** by one mutex. lws
+  keeps some state for the whole process without a lock (a count of the contexts that
+  asked for the SSL global init), and contexts are created and destroyed on the
+  threads of whichever runtimes use them.
+- **Every context has its own lws log context** (`info.log_cx`), with the same levels
+  and sink as the process-wide default. lws counts, in a log context and with no lock,
+  each context, vhost and connection that uses it. Contexts sharing the default would
+  race on that count whenever two runtimes opened or closed a connection at once,
+  which the mutex above does not cover.
+- **lws allocates through a plain `realloc()`/`free()`**, installed with
+  `lws_set_allocator()` before the first context is created. lws's default adds every
+  allocation to one counter for the whole process, with no lock, which contexts on two
+  runtimes raced on. The allocator is a setting of the whole process: in a program
+  that also uses lws itself, `lws_get_allocated_heap()` stops counting, and an
+  allocator the program installed earlier is replaced.
 - The service belongs to the `Runtime` that `connect()` or `bind()` was called on. A
   stream may be used from a task of another runtime or from `blocking_wait()` on another
   thread, as a socket may, but it is that first runtime's threads that drive it.
@@ -245,7 +296,7 @@ driver's timer queue through one more waker, allocated once per context:
 
 !!! note "NOTE: one fd table per context"
     lws sizes each context's fd table from the process's fd limit, so each listener,
-    plus each client context, costs that much memory. Negligible for a handful of
+    each runtime's client context, and the anchor cost that much memory. Negligible for a handful of
     listeners; revisit if a program binds many.
 
 ### Lifetimes
@@ -287,10 +338,11 @@ classDiagram
     LwsService --> ListenerState : keep_alive
 ```
 
-- **`shared_ptr<LwsService>` is held only by `WsStream`, `WsListener` and their
-  futures.** Callback state (`ConnectionState`, `ListenerState`) and posted commands
-  never hold it, so a listener's context goes when the last handle does (see
-  [Destroy](#destroy)). Destroying the context closes every connection still on it.
+- **`shared_ptr<LwsService>` is held by `WsStream`, `WsListener` and their futures,**
+  and for a client service by the registry of client contexts too. Callback state
+  (`ConnectionState`, `ListenerState`) and posted commands never hold it, so a
+  listener's context goes when the last handle does (see [Destroy](#destroy)).
+  Destroying the context closes every connection still on it.
 - **Accepted streams hold their listener's service.** So the listening context, and its
   bound port, live until the listener and the last stream it accepted are gone. Until
   then new connections fail the upgrade: the server callback checks
@@ -301,8 +353,8 @@ classDiagram
   gone (`CLOSED`, a connect error, or `WSI_DESTROY`); it is idempotent.
 - **`keep_alive`** holds what `lws_context_creation_info` points into (the protocols
   table and `ListenerState`) until after the context is destroyed.
-- **`m_driver`** is cleared when the service is detached. A command posted after that is
-  dropped.
+- **`m_ctx` and `m_driver`** are cleared when the context is destroyed. A command
+  posted after that is dropped.
 
 ### Destroy
 
@@ -319,7 +371,22 @@ listener and at once binds the same port again can get `EADDRINUSE`. If nothing 
 the driver (a `Runtime(1)` outside `block_on()`), the context waits for the next turn or
 for [shutdown](#runtime-shutdown).
 
-A service that is already detached has no context left to destroy.
+A client context is not destroyed this way: it lives until its runtime shuts down.
+
+`listen()` takes an `on_destroyed` function, which the service runs right after
+`lws_context_destroy()`, whichever path destroyed the context. `WsListener` uses it to
+mark itself closed and wake a waiting `accept()`.
+
+!!! note "NOTE: why not `LWS_CALLBACK_PROTOCOL_DESTROY`"
+    lws sends it only for a vhost whose protocols it has initialized, which it does
+    when the context is first serviced, not when it is created. A listener whose
+    runtime shut down before a turn had serviced it was never told, and `accept()` on
+    it from another runtime waited for good. The service knows when it destroys its
+    own context, so it says so itself.
+
+    Connections need no such hook. lws reports each one it closes during the destroy
+    (`CLOSED` or `WSI_DESTROY`), including a client connection it holds without a
+    socket between two connect attempts.
 
 !!! tip "TODO: an awaitable close for listeners"
     A caller that needs the port back at a known point could await a
@@ -330,71 +397,59 @@ A service that is already detached has no context left to destroy.
 
 `IoDriver::shutdown()` wakes every registration and every timer, with the turn held, and
 those include lws's. The executor's threads have stopped by then. The first of a
-context's wakers to see `shutdown` in `take_ready()`, or `IoDriver::is_shut_down()` for
-the timer, drops the commands still queued (each acts on a connection that is about
-to be closed anyway), then:
+context's wakers to see `IoDriver::is_shut_down()` destroys the context, as
+[Destroy](#destroy) does, for a listener's and a client's alike:
 
-- **a listener's service** destroys its context. lws reports every connection closed, so
-  a waiter from outside the runtime is woken and its `receive()` or `send()` fails as
-  for any closed connection. The listener is marked closed too
-  (`LWS_CALLBACK_PROTOCOL_DESTROY`), so `accept()` fails, with the exception in the
-  FIXME below.
-- **a client service** closes each of its connections, drops its `LwsSocket`s, and goes
-  back to the pool with its context intact.
+- The commands still queued are dropped; each acts on a connection that is about to be
+  closed anyway.
+- lws reports every connection closed, so a waiter from outside the runtime is woken
+  and its `receive()` or `send()` fails as for any closed connection.
+- A listener is marked closed through `on_destroyed`, so `accept()` fails.
 
-Either way the service is then detached, and its remaining wakers do nothing. A
-`WsStream` or `WsListener` that outlives its `Runtime` stays valid: it is closed, and its
-later commands, its destructor's included, are dropped.
-
-!!! warning "FIXME: `accept()` can wait for good if the runtime shut down before its first turn"
-    The listener is marked closed from `LWS_CALLBACK_PROTOCOL_DESTROY`. lws initializes
-    a context's protocols in the first turn after `bind()`, and skips that callback for
-    a context whose protocols were never initialized. So if the runtime shuts down
-    before its driver has turned once since `bind()`, the listener is never marked
-    closed: an `accept()` already waiting is not woken, and every later `accept()`
-    waits for good instead of throwing.
-
-    Only a caller outside the servicing runtime can be affected: a task of another
-    runtime, or a thread in `blocking_wait(listener.accept())`. The window is narrow on
-    a multi-threaded runtime, where a parked worker turns almost at once. It is easier
-    to hit with `Runtime(1)`: `block_on(WsListener::bind(...))` can return without
-    another turn, and if that runtime is then destroyed and the listener used
-    elsewhere, `accept()` hangs. `StreamOutlivingRuntimeIsClosed` doesn't catch it,
-    because it makes a connection first, which takes many turns.
-
-    Proposed fix: stop relying on the lws callback. `LwsService::listen()` takes a
-    callback that the service runs after `lws_context_destroy()` on every path, and
-    the listener marks itself closed and wakes its `accept()` waiter from there. Add a
-    `Runtime(1)` test of the case above.
+The service's remaining wakers then do nothing. A `WsStream` or `WsListener` that
+outlives its `Runtime` stays valid: it is closed, and its later commands, its
+destructor's included, are dropped.
 
 ### Client contexts
 
-A client context can't be destroyed and made again (see the FIXME below), so client
-contexts are pooled for the life of the process:
+Each `Runtime` that connects has one client context:
 
-- The first `connect()` on a `Runtime` takes a free context from the pool, or creates
-  one if there is none, and registers its sockets with that runtime's driver. Later connects on the
-  same runtime share it. If creating one fails, the next `connect()` tries again.
-- At shutdown it returns to the pool, with no connections and no driver.
-- The pool is destroyed at static destruction. A static's initializer creates it, so its
-  destructor runs before OpenSSL's atexit cleanup.
+- The first `connect()` on a runtime creates it and attaches it to that runtime's
+  driver. Later connects on the same runtime share it. If creating one fails, the next
+  `connect()` tries again.
+- It is destroyed when the runtime shuts down, not when its last stream is dropped:
+  creating a client context loads the system's CA certificates, which is too slow to
+  repeat for every burst of connections.
+- A registry (a mutex and a list) finds a driver's context. Entries whose context has
+  been destroyed are dropped the next time anyone connects.
 
-A process that runs one `Runtime` at a time, however many in total, creates one client
-context. One that runs several at once creates as many as have WebSocket clients at the
-same time.
+Beside these there is one **anchor**: an lws context created before the first client
+context, never attached to a driver, never serviced, and never destroyed.
 
-!!! warning "FIXME: a client context can't be recreated"
-    Freeing the client context when its last stream drops, and making a new one on the
-    next `connect()`, fails under ASan in an Ubuntu 24.04 container: every client
-    context after the first fails in `lws_context_init_client_ssl()`. lws logs nothing
-    more specific; the silent failure points in
-    `lws_tls_client_create_vhost_context()` are the SHA-256 hash of the TLS config
-    (`EVP_MD_CTX_create`/`EVP_DigestInit_ex`). Server contexts, which don't do the SSL
-    global init, are unaffected. The root cause wasn't found.
+!!! danger "WARNING: the anchor context must stay"
+    lws 4.5.3 to 4.5.8 count the contexts created with
+    `LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT` and call `OPENSSL_cleanup()` when the last
+    one is destroyed. `OPENSSL_cleanup()` can't be undone: every later digest in the
+    process fails, and with it every later client context, in
+    `lws_context_init_client_ssl()`, with nothing more specific logged and nothing in
+    OpenSSL's error queue. Threads have nothing to do with it.
 
-    Hence the pool. The cost is an idle context, and its fd table, kept after the last
-    client stream has gone. Find the root cause before giving listeners TLS, since each
-    listener has its own context and would hit the same path.
+    The anchor is created with that option and holds the count above zero. It costs two
+    descriptors, an fd table, and an `SSL_CTX` with no certificates loaded
+    (`LWS_SERVER_OPTION_DISABLE_OS_CA_CERTS`). It is reachable from a static, so leak
+    checkers don't report it.
+
+    lws 4.3.5, 4.4.x and 4.5.0 to 4.5.2 don't call `OPENSSL_cleanup()`, and lws `main`
+    has the counter without the call; none of them need the anchor, and none are
+    harmed by it. `test_lws_context_recreate` checks the arrangement against lws alone.
+
+    This was first seen as "a client context can't be recreated" under ASan in the
+    Ubuntu 24.04 container, which resolves lws to 4.5.8 while a host with 4.3.5 in its
+    Conan cache does not show it. An earlier design kept client contexts for the life of
+    the process and handed them from one runtime's driver to the next to avoid it.
+
+Listener contexts don't ask for the SSL global init, so they neither need the anchor
+nor count towards it.
 
 ---
 
@@ -408,8 +463,7 @@ driver). Each operation has its own sub-state and mutex:
 |---|---|---|
 | `ConnectSubState` | `waker`, `complete`, `cancelled`, `error`, lws's `reason` text | `ConnectAttempt` |
 | `ReceiveSubState` | the message being assembled, `ready` queue, `waker` | `ReceiveFuture` |
-| `SendSubState` (one per send) | `data`, `opcode`, `complete`, `cancelled`, `error`, `waker` | `SendFuture` |
-| `send_queue` (own mutex) | `shared_ptr<SendSubState>`s waiting for WRITEABLE | `SendFuture`, close path |
+| `send_queue` (own mutex) | the `SendNode`s waiting for WRITEABLE, the one being written (`send_in_flight`), and each such node's `frame`, `complete`, `error`, `waker` | `SendFuture`, close path |
 
 `wsi`, `self` and `closing` are touched only inside the driver's turn, which is what
 keeps them and lws's own state single-threaded; the mutexes guard only what the futures
@@ -524,21 +578,32 @@ sequenceDiagram
 lws only allows `lws_write()` from inside a WRITEABLE callback, so a send takes one extra
 hop compared to `TcpStream::write()`:
 
-1. The first `SendFuture::poll` stores the waker under its sub-state mutex, releases it,
-   then, under `send_queue_mutex`, checks `closed` and pushes the sub-state. It posts
-   `lws_callback_on_writable()`.
-2. WRITEABLE (`on_writeable`) pops the front entry. Under its mutex, unless `cancelled`,
-   it copies the data into an `LWS_PRE`-padded buffer, calls `lws_write()`, and
-   completes the send. If more entries remain it asks for another WRITEABLE.
+1. The first `SendFuture::poll` copies the data into a frame of its own, with the
+   `LWS_PRE` bytes of headroom `lws_write()` needs, on the sender's thread and with no
+   lock held. Then, under `send_queue_mutex`, it checks `closed` and links its
+   `SendNode` into the queue. It posts `lws_callback_on_writable()`.
+2. WRITEABLE (`on_writeable`), under the mutex, pops the front node, takes its frame
+   and records the node as `send_in_flight`. It releases the mutex and calls
+   `lws_write()`. Under the mutex again it completes the node, if it is still
+   recorded. If more nodes remain it asks for another WRITEABLE.
 3. The next poll sees `complete` and returns, or throws its errno.
 
-Dropping a `SendFuture` sets `cancelled` under the sub-state mutex. WRITEABLE checks it
-and reads `data` under that same lock, so it can't read a span whose buffer the caller
-has just freed.
+The `SendNode` is a member of the `SendFuture`, in an intrusive list, as a waiting
+sender of a [channel](channels.md) is. A send therefore allocates only its frame. The
+caller's span is not read after the first poll.
 
-!!! tip "PERF: one copy per send"
+Dropping a `SendFuture` takes the mutex, unlinks the node and clears `send_in_flight`
+if it names this node. A send still queued is then not sent. One being written is: the
+turn owns the frame by then, and finds nobody to report to.
+
+A `SendFuture` must not be moved once it has been polled, since the queue points at
+the node inside it.
+
+!!! tip "PERF: one copy and one allocation per send"
     `lws_write()` needs `LWS_PRE` bytes of headroom before the payload, so every send
-    copies its data. An owned-buffer `send()` could reserve the headroom itself.
+    copies its data into a frame it allocates. An owned-buffer `send()` could reserve
+    the headroom itself. Short of that, the frames could come from one ring buffer per
+    connection instead of the heap.
 
 !!! tip "PERF: every send waits for a turn"
     A send is queued, the wake pipe is written, and the frame is written by whichever
@@ -556,8 +621,7 @@ gone, `close_connection()`:
 
 1. fails a pending connect,
 2. sets `closed` and wakes the receiver,
-3. fails every queued send with `ENOTCONN` (under `send_queue_mutex`, then each
-   sub-state's mutex),
+3. fails every queued send with `ENOTCONN` (under `send_queue_mutex`),
 4. clears the lws pointer to the state and drops `self`.
 
 If the stream held the last reference to a listener's service, the destructor also
@@ -583,11 +647,18 @@ remaining connections abruptly.
   shutdown finds no context and does nothing.
 - **Attach vs. shutdown.** `bind()` or `connect()` can attach a context just as its
   driver shuts down. Attaching only queues a timer; `add_timer()` throws if the
-  shutdown came first, and otherwise the shutdown wakes that timer, which detaches the
-  context again.
-- **A stale wake after a client context changes drivers.** `shutdown()` collects its
-  wakers before waking them, so one can fire after the context has left that driver.
-  Each attachment has its own wakers, marked dead when it ends.
+  shutdown came first, and otherwise the shutdown wakes that timer, which destroys the
+  context.
+- **A stale wake after the context is destroyed.** `shutdown()` collects its wakers
+  before waking them, so one can fire after the first of them destroyed the context.
+  The wakers are marked dead then.
+- **Two contexts created or destroyed at once.** On different runtimes' threads; see
+  [Contexts](#contexts). One process-wide mutex is held across `lws_create_context()`
+  and `lws_context_destroy()`. It is taken after the client registry's mutex, and the
+  callbacks lws makes while it is held only record, deregister and wake.
+- **A new driver at a destroyed driver's address.** The registry finds a context by
+  its driver's address. A context is destroyed, and its driver pointer cleared, during
+  that driver's shutdown, and the registry drops such entries before it searches.
 - **Event for a socket lws has closed.** One callback can close another connection whose
   event is later in the same batch. Its `LwsSocket` is already dropped, so the driver's
   weak waker fails to upgrade and the event is skipped; the registration itself is freed
@@ -596,11 +667,13 @@ remaining connections abruptly.
 - **Arming a timer from inside the turn (benign).** `add_timer()` during dispatch can
   find the turning thread still recorded as waiting and unpark it. The next turn then
   returns at once, having nothing to do.
-- **Send lock order.** `SendFuture::poll` never holds its sub-state mutex while taking
-  `send_queue_mutex`; the close path takes `send_queue_mutex`, then each sub-state
-  mutex. Checking `closed` and pushing under `send_queue_mutex`, which the close path
-  also holds while setting `closed`, means a send can't be queued after the queue was
-  failed.
+- **A send queued as the connection closes.** `SendFuture::poll` checks `closed` and
+  links its node under `send_queue_mutex`. The close path sets `closed` and then fails
+  the queue under that mutex, so a send can't be queued after the queue was failed.
+- **A send dropped while it is being written.** `on_writeable` does not hold
+  `send_queue_mutex` across `lws_write()`, so the `SendFuture` and its node may go
+  away meanwhile. It reaches the node afterwards only through `send_in_flight`, under
+  the mutex, which `~SendFuture` clears under the same mutex.
 - **Connect cancelled mid-handshake.** See [Connect](#connect).
 - **Bind errno probe.** See [Bind](#bind).
 - **Listener dropped during a handshake.** A connection already past
@@ -608,21 +681,102 @@ remaining connections abruptly.
 
 ---
 
+## Possible changes
+
+A review of the design after it was implemented and its tests passed, under
+ThreadSanitizer too. The core holds up: level-triggered registrations, wakers that call
+lws inline, and the turn as lws's lock. Three things came out of it and are done: the
+service reports its own context's destruction ([Destroy](#destroy)), client contexts
+belong to their runtime instead of a process-wide pool
+([Client contexts](#client-contexts)), and `post()` wakes once per batch
+([Commands](#commands)).
+
+!!! note "NOTE: what a `send()` still costs"
+    Inherent to driving lws from a poller: at most one wake, two interest changes
+    (`epoll_ctl`) around the writable callback, and the write.
+
+### What was considered and left
+
+- **One context per runtime, a vhost per listener.** One wake pipe, one timer and one fd
+  table instead of one each per listener. But a listener would then be closed with
+  lws's vhost destroy, which is deferred and less used than context destroy: more lws
+  internals to trust, not fewer.
+- **Running a command inline when the caller can take the turn.** A `send()` would reach
+  lws without waiting for a turn, which matters most on `Runtime(1)`. It adds a second
+  way into lws beside the wakers. Only if a benchmark asks for it.
+- **A shutdown hook on `IoDriver`,** in place of every waker checking
+  `is_shut_down()`. It would remove the step that registers the sockets in the first
+  turn. What is there works, so this is tidiness only.
+
+### Without lws
+
+Decided against for now, and worth reconsidering if what follows changes.
+
+Nearly all the difficulty in this design is adapting a library that wants its own loop
+and its own thread. WebSocket framing over `TcpStream` is on the order of a thousand
+lines: the upgrade handshake, masking, fragmentation, ping/pong and the close
+handshake. Each connection would then be an ordinary task, so connections run in
+parallel across the workers, nothing runs with the turn held, and a slow receiver
+applies backpressure through the socket, which fixes the unbounded receive queue. It
+would also run on Pico, where lws does not.
+
+The work to match what `WsStream` does today is small. What decided it is what lws
+leaves room for later:
+
+| lws provides | To do it natively |
+|---|---|
+| TLS (`wss://`), used by the client today | A `TlsStream` over `TcpStream`, with WebSockets on top of either. Substantial and security-sensitive, though plain TCP would gain it too. No `wss://` until it exists. |
+| WebSockets over HTTP/2 (RFC 8441), compiled into the Conan build | A whole HTTP/2 stack: HPACK, stream multiplexing, flow control. Rarely required, since the upgrade falls back to HTTP/1.1, but there is no cheap answer behind something that only speaks h2. |
+| A parser hardened by years of hostile input | Fuzzing, the Autobahn conformance suite, and limits on lengths and fragmentation, kept up for as long as a listener faces the internet. |
+| An HTTP server on the same port (health checks, a REST endpoint, static files) | Growing the upgrade parser into a small HTTP server. Open-ended if the requirements grow. |
+| Compression (`permessage-deflate`) and client proxies (HTTP `CONNECT`, SOCKS5), as build options | A few hundred lines each. All three are switched off in the Conan build today, so nothing would be lost now. |
+
+Everything else is easy either way: custom headers, subprotocol negotiation, basic auth,
+keepalive, UTF-8 validation, Unix-domain sockets.
+
+The reasons, then:
+
+- **The integration is paid for.** It is implemented and passes its tests, under
+  ThreadSanitizer too. Keeping lws costs maintenance; replacing it costs a parser to
+  write and harden, and a TLS layer.
+- **lws keeps the upgrade routes short.** Each feature in the table is a build option
+  or a call away, not a project.
+- **A better desktop implementation is valued above microcontroller support** for now,
+  and Pico is the one thing only a native implementation offers.
+- **Two implementations is never ideal.** A native client for Pico alone, beside lws on
+  the desktop, would be possible without touching this design, but it means carrying
+  both.
+
+!!! note "NOTE: the routes through lws are not free either"
+    Each still goes through the custom event loop and the turn. A listener with TLS
+    would ask for the SSL global init, which the anchor already covers (see
+    [Client contexts](#client-contexts)); and TLS is where the turn-held cost becomes
+    real.
+
+What would reopen the question:
+
+- WebSockets on Pico become a requirement.
+- The turn-held cost shows up in measurements and the changes above don't remove it.
+- A `TlsStream` gets built for another reason, which removes the largest item from the
+  table.
+- lws becomes a burden: a version that breaks the assumptions under
+  [Open points](#open-points), or more surprises like the one behind the anchor.
+
+---
+
 ## Open points
 
-- **Other lws versions.** `conanfile.py` accepts `>=4.3.5 <5`. Only 4.3.5 was read for
-  what this design relies on: no thread affinity, the order of the event-loop ops, and
-  the behaviour of `wsi_logical_close`. Re-check when the resolved version changes.
+- **Other lws versions.** `conanfile.py` accepts `>=4.5.8 <4.6`. It used to accept
+  `>=4.3.5 <5`, which resolved to 4.3.5 on one machine and 4.5.8 on another. What this
+  design relies on was read in both and is the same: no thread affinity, the event-loop
+  ops and where lws calls them, the wake pipe and `LWS_CALLBACK_EVENT_WAIT_CANCELLED`,
+  `lws_service_adjust_timeout()` and `_lws_plat_service_forced_tsi()`. Read it again
+  before moving to another minor version; the SSL teardown changed in a patch release.
 - **lws never closes an fd it still polls.** The registration is dropped when lws stops
   both directions, and `IoRegistration` asserts in debug builds if its fd was closed
-  first. Read from the close paths in 4.3.5, and no test has tripped the assert; a
-  path that closes first would.
-- **A client connection without a socket at shutdown.** Between two connect attempts lws
-  holds a connection that has no socket, so the shutdown path doesn't see it. It is not
-  closed then, and fails by itself once the context is serviced again, by the next
-  runtime that takes it from the pool.
-- **`accept()` after a shutdown that came before the first turn.** See the FIXME under
-  [Runtime shutdown](#runtime-shutdown).
+  first. Read from the close paths in 4.3.5 and 4.5.8 (which also takes its wake pipe
+  out of the poll set before closing it), and no test has tripped the assert; a path
+  that closes first would.
 
 ---
 
@@ -630,7 +784,8 @@ remaining connections abruptly.
 
 `test/io/test_ws_stream.cpp` (`test_ws_stream`). Each test uses its own port in
 30201–30299, and accepts are bounded by a timeout so a lost connection fails instead of
-hanging.
+hanging. `test/io/test_lws_context_recreate.cpp` uses lws alone: with an anchor context
+alive, a client context is created and destroyed three times.
 
 | Test | Checks |
 |---|---|
@@ -639,6 +794,10 @@ hanging.
 | `WsStreamTest.BackToBackMessagesStaySeparate`, `...OnClient` | Two quick sends arrive as two messages, on either end. |
 | `WsStreamTest.DroppedReceiveLosesNothing` | A `receive()` dropped by a timeout; the next one gets the message. |
 | `WsStreamTest.OversizedMessageThrowsAndConnectionRecovers` | `EMSGSIZE`, then the next message arrives. |
+| `WsStreamTest.SendAndReceiveInSeparateTasks`, `...OnSingleThreadRuntime` | Each end has one task that only sends and one that only receives, on four threads and on one. |
+| `WsStreamTest.ReceivePendingWhileAnotherTaskSends` | A `receive()` pending through 200 sends by another task on the same stream is still woken by the reply. |
+| `WsStreamTest.PeerCloseEndsSenderAndReceiverTasks` | The peer closes: the task in `receive()` and the task sending both get the error. |
+| `WsStreamTest.SendAndReceiveInSeparateRuntimes` | A stream's sender in the runtime that services it, its receiver in another runtime on another thread. |
 | `WsStreamTest.QueuedMessagesDeliveredBeforeCloseThrows` | Messages queued before a close are received first. |
 | `WsStreamTest.ConnectByName` | `ws://localhost:…` reaches a listener on 127.0.0.1, even if `::1` is tried first. |
 | `WsStreamTest.ConnectRefusedThrowsSystemError` | Nothing listening: `connection_refused`. |
@@ -649,7 +808,8 @@ hanging.
 | `WsStreamTest.ConnectWithoutDriverThrowsLogicError` | `CurrentThreadExecutor` + `PollingParker`: `connect()` and `bind()` throw `std::logic_error`. |
 | `WsStreamTest.RoundTripOnSingleThreadRuntime` | `Runtime(1)`: client and server on the one thread that also turns the driver. |
 | `WsStreamTest.StreamOutlivingRuntimeIsClosed` | Streams and a listener moved out of `block_on()` and used after the `Runtime` is destroyed: `receive()` and `accept()` fail, and the destructors return. |
-| `WsStreamTest.SecondRuntimeReusesClientContext` | Connect, destroy the `Runtime` with the connection still open, connect on a new one. |
+| `WsStreamTest.AcceptAfterRuntimeOfUnusedListenerIsClosed` | A `Runtime(1)` destroyed right after `bind()`: `accept()` from another runtime throws instead of waiting. |
+| `WsStreamTest.ClientContextPerRuntimeInTurn` | Connect, destroy the `Runtime` with the connection still open, connect on a new one: the second client context is created after the first was destroyed. |
 | `WsStreamTest.TwoRuntimesConnectAtOnce` | Two live runtimes each with a client stream. |
 | `WsStreamTest.UsedFromAnotherRuntime` | A round trip from a second runtime's task, on a connection the first runtime services. |
 | `WsStreamTest.SendFromOutsideTheRuntime` | `blocking_wait()` of a send and a receive on a thread the runtime doesn't own, while its workers are parked. |
@@ -669,6 +829,7 @@ hanging.
 |---|---|
 | `include/coro/io/ws_stream.h`, `src/io/ws_stream.cpp` | `WsStream`, `ConnectionState` and sub-states, the client callback, `on_receive`, `on_writeable`, `close_connection` |
 | `include/coro/io/ws_listener.h`, `src/io/ws_listener.cpp` | `WsListener`, `WsUpgradeRequest`, `ListenerState`, the server callback |
-| `src/io/ws_service.h`, `src/io/ws_service.cpp` | `LwsService` and `LwsSocket` (private): the custom event loop ops, the wakers, the command queue, the client context pool |
+| `src/io/ws_service.h`, `src/io/ws_service.cpp` | `LwsService` and `LwsSocket` (private): the custom event loop ops, the wakers, the command queue, the client contexts and the anchor |
+| `test/io/test_lws_context_recreate.cpp` | The anchor arrangement, against lws alone |
 | `test/io/test_ws_stream.cpp` | Tests |
 | `examples/io/ws_echo_client.cpp`, `ws_echo_server.cpp` | Examples |

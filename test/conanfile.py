@@ -1,6 +1,5 @@
 import os, sys
 from conan import ConanFile
-from conan.errors import ConanInvalidConfiguration
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
 
@@ -35,7 +34,6 @@ class CoroRecipe(ConanFile):
         "fPIC": [True, False],
         "with_gperftools": [True, False],
         "with_local_run_queue": [True, False],
-        "with_sanitize": ["none", "asan", "tsan", "ubsan"],
         # Bare metal only (settings.os == "baremetal"); removed otherwise. The
         # on-target firmware compiles GoogleTest from source by default
         # (cmake/on_target_pico.cmake). True takes it from the Conan package
@@ -48,17 +46,14 @@ class CoroRecipe(ConanFile):
         "fPIC": True,
         "with_gperftools": True,
         "with_local_run_queue": True,
-        "with_sanitize": "none",
         "gtest_from_conan": False,
     }
 
     # Mirrors conanfile.py's _env_bool/config_options: lets CORO_<OPTION> in
     # the environment set a boolean option's default without -o on the CLI.
-    # with_gperftools/with_local_run_queue/with_sanitize are mirrored from
-    # the same env vars as the coro package's own conanfile.py so the test
-    # binaries stay consistent with whatever coro package they link against
-    # (required for with_sanitize — see below; the others are just
-    # convenience so one .envrc drives both recipes identically).
+    # with_gperftools/with_local_run_queue are mirrored from the same env vars
+    # as the coro package's own conanfile.py, so one .envrc drives both
+    # recipes identically.
     @staticmethod
     def _env_bool(name, current):
         val = os.environ.get(name)
@@ -86,31 +81,6 @@ class CoroRecipe(ConanFile):
             self.options.with_local_run_queue = self._env_bool(
                 "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
 
-        # CORO_SANITIZE in the environment sets the default so the test
-        # binaries are built with the same sanitizer as the coro package
-        # they link against (required — ASan/TSan must be applied to the
-        # whole binary, not just one side of the link). config_options()
-        # runs before run_configure_method() merges the profile/CLI -o
-        # values onto self.options, so an explicit -o with_sanitize=... still
-        # overrides this; configure() runs too late for this purpose (after
-        # that merge).
-        # baremetal has only ubsan (cmake/Sanitize.cmake). An asan or tsan
-        # left in the environment for the desktop builds means none there,
-        # so one .envrc serves both; an explicit -o is rejected in validate().
-        sanitize = os.environ.get("CORO_SANITIZE", "none").strip().lower()
-        allowed = (("none", "ubsan") if self.settings.os == "baremetal"
-                   else ("none", "asan", "tsan", "ubsan"))
-        if sanitize not in allowed:
-            sanitize = "none"
-        self.options.with_sanitize = sanitize
-
-    def validate(self):
-        if (self.settings.os == "baremetal"
-                and str(self.options.with_sanitize) in ("asan", "tsan")):
-            raise ConanInvalidConfiguration(
-                "with_sanitize on baremetal must be none or ubsan: ASan and "
-                "TSan need a runtime a microcontroller does not have")
-
     def configure(self):
         if self.options.get_safe("shared"):
             self.options.rm_safe("fPIC")
@@ -135,17 +105,14 @@ class CoroRecipe(ConanFile):
 
     def requirements(self):
         if self.settings.os == "baremetal":
-            self.requires(f"coro/{self._coro_dependency_version()}", options={
-                "with_sanitize": self.options.with_sanitize
-            })
+            self.requires(f"coro/{self._coro_dependency_version()}")
             if self.options.gtest_from_conan:
                 self.requires("gtest/[>=1.14.0 <2]",
                               options={"disable_pthreads": True})
             return
         self.requires(f"coro/{self._coro_dependency_version()}", options={
             "with_gperftools": self.options.with_gperftools,
-            "with_local_run_queue": self.options.with_local_run_queue,
-            "with_sanitize": self.options.with_sanitize
+            "with_local_run_queue": self.options.with_local_run_queue
         })
         self.requires("gtest/[>=1.14.0 <2]")
         self.requires("libunicorn/2.1.4")
@@ -168,7 +135,6 @@ class CoroRecipe(ConanFile):
             tc.cache_variables["CORO_PLATFORM"] = "pico"
             tc.cache_variables["CORO_TEST_GTEST_FROM_CONAN"] = bool(
                 self.options.gtest_from_conan)
-        tc.cache_variables["WITH_SANITIZE"] = str(self.options.with_sanitize)
         tc.generate()
 
     def build(self):

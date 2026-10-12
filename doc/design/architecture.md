@@ -498,7 +498,7 @@ A single `protocol_cb` C function dispatches all events (`ESTABLISHED`, `RECEIVE
 `coro::detail::ws::ConnectionState`. The connect attempt, `ReceiveFuture` and
 `SendFuture` share `ConnectionState` via `shared_ptr`.
 
-Writing requires write-readiness: `SendFuture` enqueues a `SendSubState*` and posts
+Writing requires write-readiness: `SendFuture` links a node of its own into the send queue and posts
 `lws_callback_on_writable()`; lws fires `WRITEABLE` when ready; `protocol_cb` calls
 `lws_write()` and wakes the future. This is one extra suspension point versus `TcpStream`
 but required by the lws API.
