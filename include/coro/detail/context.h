@@ -45,6 +45,22 @@ public:
         return true;
     }
 
+    /// @brief For a future that polls several others (`join()`, `select()`): call
+    /// before polling each branch, and do not poll the branch if it returns true.
+    ///
+    /// Returns false while budget is left, taking none of it: the branch pays for
+    /// its own awaits. With none left it makes sure the task has yielded and returns
+    /// true. The yield is the point: a branch that is skipped may have been the one
+    /// this poll was woken for, so the task must be polled again. Returning pending
+    /// without it would lose that wake.
+    ///
+    /// A future with one child has no need of this; the child makes its own check.
+    bool yield_if_budget_spent() {
+        if (m_budget != 0) return false;
+        if (!m_yielded) yield_to_executor();
+        return true;
+    }
+
     /// @brief Wakes the task and marks this poll as yielded, so that the executor
     /// polls its other tasks and turns the I/O driver before this one runs again.
     /// The caller must then return pending.

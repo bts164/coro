@@ -277,6 +277,8 @@ The default multi-threaded executor, modelled on Tokio's scheduler:
   3. The injection queue, taking a batch: one task to run now, the rest onto its local
      queue.
   4. A peer's local queue (stealing), with the number of searching workers bounded.
+     A worker that finds a task this way wakes one more parked worker before it runs
+     the task, so a burst of spawns spreads to every idle worker.
   5. Nothing found: it parks. The first idle worker parks in the `IoDriver`
      (`epoll_wait`); the others park on their own condition variable.
 - A busy worker turns the `IoDriver` without blocking every 61 task polls, and at once

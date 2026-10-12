@@ -155,6 +155,13 @@ private:
     bool poll_active_one(detail::Context& ctx) {
         if (m_states[I] != SelectBranchState::Active) return false;
 
+        // Task budget spent: leave this branch for the task's next poll, as join()
+        // does. The call makes sure the task has yielded, so a skipped branch that
+        // this poll was woken for is polled then. The drain pass above is not held
+        // back: it starts no work, and a result that is ready should be delivered in
+        // this poll. See doc/design/task_budget.md.
+        if (ctx.yield_if_budget_spent()) return false;
+
         auto result = std::get<I>(m_futures).poll(ctx);
 
         if (result.isPending()) return false;

@@ -96,8 +96,9 @@ bool await_ready() noexcept {
     detail::Context& ctx = *m_promise->m_ctx;
     if (!ctx.try_consume_budget()) {
         // Budget spent: do not poll. poll() below makes the first poll of the
-        // future on the task's next turn.
+        // future on a later turn of the task, and takes the unit then.
         ctx.yield_to_executor();
+        m_deferred = true;
         return false;
     }
     // as today: poll once, skip suspension when the result is ready
@@ -114,7 +115,7 @@ flowchart TD
     F --> J["woken later: the task's next poll re-polls f"]
     B -- no --> G["yield: wake own task, mark the poll as yielded,<br/>suspend without polling f"]
     G --> H["executor: task to the back of the queue,<br/>turn the I/O driver"]
-    H --> I["the task's next poll, with a fresh budget,<br/>polls f for the first time"]
+    H --> I["a later poll of the task takes the unit<br/>and polls f for the first time"]
 ```
 
 The budget is checked **before** the future is polled, which is Tokio's order. The
@@ -124,27 +125,120 @@ rejected:
 - A future that has completed has taken something: a datagram from the socket, a
   message from a channel. If the task is then cancelled or dropped while suspended, that
   value is destroyed with the frame. Not polling means nothing is taken.
-- It needs no kept result and no flag to stop the future being polled twice. The
-  existing re-poll before resume (`Coro::poll()` calls `m_poll_current->poll()`) is
-  already the first poll of the future.
+- It needs no kept result. The existing re-poll before resume (`Coro::poll()` calls
+  `m_poll_current->poll()`) makes the first poll of the future; one flag tells it that
+  this poll is the first and still has to be paid for.
 
 The cost is one extra trip through the run queue when the future would have been
 pending anyway.
 
 The rest of the path is unchanged:
 
-- **The re-poll never refuses.** `FutureAwaitable::poll()`, which `Coro::poll()` and
-  `CoroStream::poll_next()` call before they resume a suspended coroutine, always polls
-  the future and takes nothing from the budget. Refusing there would leave the future
-  unpolled with no waker registered. So a task poll can complete one await more than
-  its budget for each coroutine it resumes; with `join()` of several coroutines that is
-  one each.
+- **The re-poll of a future that is waiting never refuses.** `FutureAwaitable::poll()`,
+  which `Coro::poll()` and `CoroStream::poll_next()` call before they resume a
+  suspended coroutine, polls a future that has been polled before whatever the budget,
+  and takes nothing from it. Refusing there would leave the future with no waker
+  registered.
+- **The first poll of a deferred future is charged.** A future that `await_ready()`
+  deferred has never been polled and has nothing registered, so `poll()` treats it as
+  `await_ready()` would have: it takes a unit, and with none left it calls
+  `yield_to_executor()` again and stays pending. A task poll therefore starts at most
+  `budget` awaits, however many coroutines the earlier polls left suspended.
 - **A pending future costs its unit.** Tokio hands the unit back when the operation
   made no progress. Here the task is about to suspend anyway, so nothing is gained by
   it.
 
 `fiber_await()` is the same operation for fibers and gets the same check: with no
-budget left it calls `yield_to_executor()` and `fiber_yield()` before it polls.
+budget left it calls `yield_to_executor()` and `fiber_yield()` before it polls. A fiber
+is suspended in one `fiber_await()` at a time, so its one uncharged poll after the
+yield cannot multiply and is left as it is.
+
+!!! note "NOTE: the charge on a deferred first poll is a failsafe"
+    It is not what the budget rests on. A future that polls several others is meant to
+    stop when the budget is spent ([below](#futures-that-poll-several-others-join-and-select)),
+    and as long as every such future does, a free first poll would cost about one
+    extra await per task poll and nothing more. The charge is there for a future that
+    polls several others and does not make that check.
+
+    What it guards against was seen before `join()` made the check. An earlier version
+    polled a deferred future for free on the next turn. Under nested `join()` each
+    coroutine resumed for free started its children, every one of them was deferred at
+    its own first `co_await`, and all of those were resumed for free on the turn after.
+    The number of suspended coroutines grew by the width of the `join()` on every
+    turn. A task that walked a tree of ready coroutines depth-first, with a few dozen
+    frames alive, instead had the whole tree alive at once; one benchmark of that
+    shape took about six times as long.
+
+    Removing it would loosen the bound from `budget` awaits started per task poll to
+    `budget` plus one for each deferred await resumed in that poll, and would leave
+    the bound depending on every future of that kind making the check. It costs one
+    flag per awaitable and one test of it per resume.
+
+### Futures that poll several others: `join()` and `select()`
+
+A coroutine awaits one future at a time, so the check in `co_await` is enough for it. A
+future that polls several others in one `poll()` is different: when one branch spends
+the budget, the branches after it are still to come. `JoinFuture` and `SelectFuture`
+therefore ask before they poll each branch that is still running:
+
+```cpp
+// Context
+bool yield_if_budget_spent() {
+    if (m_budget != 0) return false;
+    if (!m_yielded) yield_to_executor();
+    return true;
+}
+
+// JoinFuture::poll_active_one<I>(), and the same in SelectFuture
+if (m_states[I] != JoinBranchState::Active) return;
+if (ctx.yield_if_budget_spent()) return;      // leave it for the next task poll
+auto result = std::get<I>(m_futures).poll(ctx);
+```
+
+Three rules make this up:
+
+- **Look, do not take.** The branch pays for its own awaits. A unit taken here as well
+  would charge every branch twice.
+- **A skipped branch means the task must yield.** The task may have been woken for
+  exactly the branch that is skipped. If another branch took the last unit and then
+  went to wait on a real future, nothing has yielded yet, and returning pending would
+  lose that wake. So the check itself makes sure `yield_to_executor()` has been called
+  in this poll.
+- **Draining is not held back.** The passes that drain a cancelled branch (the losers
+  of a `select()`, the other branches of a `join()` after an error) poll whatever the
+  budget. They start no new work, and a result that is ready should be delivered in
+  the poll that found it.
+
+Branches that are skipped include ones that were already waiting. They lose at most a
+trip through the run queue, and both futures start one branch later on each poll, so
+no branch is last every time.
+
+`timeout()` is a `select()` and behaves the same. A future with a single child
+(`FutureRef`, `next()`, `when()`, `co_invoke()`) needs no check: its child makes its
+own.
+
+!!! warning "Why the branches must not be polled once the budget is spent"
+    A coroutine branch that has not started runs, when polled, up to its first
+    `co_await`. With the budget spent it is refused there, but by then it has built
+    whatever it was about to await. Under nested `join()` that is a whole level of
+    child coroutines: every `join()` on the way back up the stack starts its remaining
+    branches, and each of them allocates its children only to be deferred. With the
+    check, a task that walks a tree of ready coroutines depth-first stops where the
+    budget ran out and carries on from there on its next poll.
+
+!!! note "NOTE: a `co_await join(...)` that takes the last unit does nothing that turn"
+    The `co_await` is allowed, and the join then finds the budget spent before its
+    first branch and yields. That is one trip through the run queue, not a stall: the
+    next poll re-polls the join without charge and its branches run on the new budget.
+
+!!! note "NOTE: a combinator written outside the library"
+    A future of your own that polls several others should make the same call before
+    each branch. If it does not, the charged first poll above, which is kept as a
+    failsafe for exactly this, still keeps the number of awaits started per poll
+    within the budget, but branches that have not started are run up to their first
+    `co_await` for nothing. Rotate the starting branch as
+    well, as `join()` and `select()` do: with a fixed order a later branch can stay
+    deferred for as long as the earlier ones spend the whole budget in every poll.
 
 ### What a yield does
 
@@ -217,8 +311,8 @@ twice: once for the budget and once for the future's own first poll. That is har
 
     Either way the wake and the mark are acted on when the task's poll returns: the
     task is re-queued and the driver is turned. A yield caused by the budget does not
-    have this tail, because with no budget left every other branch yields at its next
-    `co_await`.
+    have this tail, because with no budget left the combinator polls no further
+    branch.
 
     To make `yield_now()` end the whole task poll promptly, have
     `Context::yield_to_executor()` also set `m_budget = 0`. Every later `co_await` in
@@ -243,8 +337,9 @@ There is no way to switch the budget off for part of a task (Tokio's
 
 ## What the budget bounds, and what it does not
 
-With the budget, one task poll passes at most `budget` awaits, plus one for each
-coroutine it resumes. The time that takes is whatever the code between those awaits
+With the budget, one task poll starts at most `budget` awaits. A coroutine that was
+already waiting is resumed without charge, though under `join()` or `select()` only
+until the budget is spent. The time that takes is whatever the code between those awaits
 costs: the budget counts awaits, not time, and a task that does 10 ms of work between
 awaits still holds its thread for 10 ms at a time.
 
@@ -257,10 +352,11 @@ Not covered:
   drains a socket until it would block. Such a future should either bound its loop or
   call `ctx.try_consume_budget()` for each item and stop when it fails, calling
   `ctx.yield_to_executor()` before it returns pending.
-- **Children of a combinator.** `select()`, `join()` and `timeout()` poll their
-  children directly, not through `FutureAwaitable`. The `co_await` of the combinator is
-  charged, which is what breaks a loop around it. A child that is itself a coroutine
-  charges its own awaits as usual.
+- **A branch of a combinator that is not a coroutine and does its own work.**
+  `select()`, `join()` and `timeout()` do not charge for polling a branch; they only
+  stop once the budget is spent. A hand-written future used as a branch is polled for
+  free while budget remains. The `co_await` of the combinator is charged, which is
+  what breaks a loop around it.
 - **Fairness between the branches of a `select()` built anew in each iteration.** After
   a yield the timer or cancellation branch may well be ready, but a new `SelectFuture`
   starts at its first branch, so an always-ready first branch still wins every time.
@@ -282,8 +378,12 @@ Not covered:
   delays its first poll by one trip through the run queue, which is no different from
   the task having been queued behind others.
 - **Several coroutines under one `join()`.** One of them spends the budget and yields;
-  the others, polled after it in the same task poll, find the budget spent at their
-  next `co_await` and yield too. The task is woken once and its poll is marked once.
+  the branches after it are not polled in that task poll. The task is woken once and
+  its poll is marked once. On the next poll, which starts one branch later, they share
+  the new budget; the ones that get none of it stay where they were.
+- **Cancelled while deferred, with the budget already spent.** Draining a cancelled
+  `Coro` goes through the same `poll()`, so the drain of a deferred child can wait one
+  more turn. The task has woken itself, so the turn comes.
 - **A wake that races with the yield.** `yield_to_executor()` is an ordinary `wake()`
   on a `Running` task. A second wake from another thread finds
   `RunningAndNotified` and does nothing, as today.
@@ -294,7 +394,7 @@ Not covered:
 ## Cost
 
 Per `co_await`: one load, one compare and one decrement on the `Context` the awaitable
-already holds a pointer to. Per yield: one `wake()` (a reference-count increment and
+already holds a pointer to. Per resume of a suspended coroutine: one test of a flag. Per yield: one `wake()` (a reference-count increment and
 one compare-and-swap), one trip through the run queue, and one non-blocking driver
 turn. With the default that is one `epoll_wait` for every 128 awaits completed without
 suspending.
@@ -317,18 +417,23 @@ stub suite, which has no fibers.
 
 | Test | Proves |
 |---|---|
-| `TaskBudgetContext.*` | A default `Context` has no limit; a budget of N is taken exactly N times; `yield_to_executor()` wakes once and sets `yielded()`. |
+| `TaskBudgetContext.*` | A default `Context` has no limit; a budget of N is taken exactly N times; `yield_to_executor()` wakes once and sets `yielded()`; `yield_if_budget_spent()` takes nothing, and yields once when the budget is spent. |
 | `TaskBudgetCoro.FutureIsNotPolledWhenBudgetIsSpent` | The future awaited at the yield is first polled in the task's next poll, and exactly once. |
 | `TaskBudgetCoro.DropWhileSuspendedByBudget` | Destroying the coroutine at a yield destroys the awaited future, never polled. |
 | `TaskBudgetCoro.CancelWhileSuspendedByBudget` | Cancelling at a yield gives `PollDropped`; the awaited future is never polled. |
 | `TaskBudgetCoro.CancelWhileSuspendedByBudgetOnCoro` | The same with a `Coro` as the awaited future: it is cancelled and drained without having started. |
 | `TaskBudgetCoro.BlockingWaitHasNoBudget` | `blocking_wait()` of a coroutine that awaits 1000 ready futures polls it once. |
 | `TaskBudgetCoro.YieldNowInBlockingWait` | `blocking_wait(yield_now())` returns after two polls. |
-| `YieldsAfterBudgetAwaits` | With budget 4, ten ready awaits take three task polls, which start after 0, 4 and 9 of them: four per poll, plus the uncharged re-poll. |
+| `TaskBudgetCoro.DeferredFirstPollIsCharged` | With two deferred awaits under a `join()` and a budget of 1, the next poll makes exactly one of them. |
+| `TaskBudgetCoro.JoinDoesNotStartBranchWhenBudgetIsSpent` | A `join()` whose first branch spends the budget does not run the body of its second branch until the next task poll. |
+| `TaskBudgetCoro.SelectDoesNotStartBranchWhenBudgetIsSpent` | The same for `select()`; the skipped branch runs, and wins, on the next poll. |
+| `TaskBudgetCoro.SkippedBranchMakesTheTaskYield` | When the first branch takes the last unit and then waits, skipping the second branch yields the task; with budget to spare nothing yields. |
+| `YieldsAfterBudgetAwaits` | With budget 4, ten ready awaits take three task polls, which start after 0, 4 and 8 of them: four per poll, the deferred one included. |
 | `ZeroBudgetMeansUnlimited` | With `set_task_budget(0)` 1000 ready awaits take one task poll. |
 | `NestedCoroutinesShareOneBudget` | Awaits made in a coroutine awaited by the task count against the task's budget. |
+| `NestedJoinStartsAtMostBudgetAwaitsPerPoll` | A four-level tree of `join()`s over ready coroutines starts no more than `budget` awaits in any task poll. |
 | `JoinedCoroutinesYieldTogether` | Two looping coroutines under `join()` both finish and the task is polled more than once. |
-| `PendingAwaitResumesAfterBudgetSpent` | Under `join()`, a branch waiting on timers is resumed in polls where the other branch spends the budget (the re-poll never refuses). |
+| `PendingAwaitResumesAfterBudgetSpent` | Under `join()`, a branch waiting on timers is resumed in polls where the other branch spends the budget (the re-poll of a waiting future never refuses). |
 | `AlwaysReadyLoopLetsPeerTaskRun` | A task looping on an always-ready future does not stop a second task from running. On `Runtime(1)` this hangs without the budget. |
 | `AlwaysReadyLoopLetsTimerFire` | The same loop, and a `sleep_for()` in another task completes. |
 | `AlwaysReadyLoopLetsIoEventThrough` | The same loop, and a read on a socket pair in another task completes. |

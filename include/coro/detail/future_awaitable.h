@@ -66,13 +66,15 @@ public:
     //
     // Each call takes one unit of the task's budget. With none left the future is not
     // polled at all: the task wakes itself and suspends, and poll() below makes the
-    // first poll of the future on the task's next turn. Not polling means nothing has
-    // been taken from a socket or channel that a cancel could then lose.
+    // first poll of the future on a later turn of the task, once it can take its unit
+    // there. Not polling means nothing has been taken from a socket or channel that a
+    // cancel could then lose.
     // See doc/design/task_budget.md.
     bool await_ready() noexcept{
         detail::Context& ctx = *m_promise->m_ctx;
         if (!ctx.try_consume_budget()) {
             ctx.yield_to_executor();
+            m_deferred = true;
             return false;
         }
         try {
@@ -110,10 +112,33 @@ public:
         }
     }
 
-    // The re-poll before resume. Takes nothing from the budget and never refuses:
-    // the coroutine is already suspended on this future, so skipping the poll would
-    // leave it with no waker registered.
+    // The re-poll before resume.
+    //
+    // A future that has been polled before is polled again here whatever the budget,
+    // and takes nothing from it: the coroutine is suspended on it, so skipping the
+    // poll would leave it with no waker registered.
+    //
+    // A future that await_ready() deferred has never been polled and has nothing
+    // registered, so its first poll is charged here as it would have been there, and
+    // refused in the same way.
+    //
+    // NOTE: this charge is a failsafe, not what the budget rests on. A future that
+    // polls several others is meant to stop when the budget is spent
+    // (Context::yield_if_budget_spent(), as join() and select() do), and while every
+    // such future does, a free first poll here would cost about one extra await per
+    // task poll and no more. The charge is for one that does not: its branches would
+    // each get an await for free on the next turn and start children that are
+    // deferred in turn, so the free polls would multiply on every turn and the budget
+    // would bound nothing. With the charge that is held to `budget` awaits per poll.
     bool poll() noexcept override {
+        if (m_deferred) {
+            detail::Context& ctx = *m_promise->m_ctx;
+            if (!ctx.try_consume_budget()) {
+                ctx.yield_to_executor();
+                return false;
+            }
+            m_deferred = false;
+        }
         try {
             m_result = m_future.poll(*m_promise->m_ctx);
         } catch (...) {
@@ -126,6 +151,9 @@ private:
     F                                       m_future;   // reference for lvalue path, value for rvalue path
     PollablePromise*                        m_promise = nullptr;
     PollResult<typename BaseF::OutputType>  m_result{PollPending};
+    // True from the await_ready() that found the budget spent until the first poll.
+    // Only the failsafe in poll() reads it.
+    bool                                    m_deferred = false;
 };
 
 } // namespace coro

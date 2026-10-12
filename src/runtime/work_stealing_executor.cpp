@@ -175,8 +175,17 @@ void WorkStealingExecutor::wait_for_completion(detail::TaskStateBase& state) {
 }
 
 void WorkStealingExecutor::notify_if_needed() {
-    // If at least one worker is already searching it will find the new task.
-    if (m_searching.load(std::memory_order_acquire) > 0) return;
+    // If at least one worker is already searching it will find the new task: on its
+    // sweep, or, if the sweep has already passed the queue the task went to, in the
+    // check the last searcher makes before it parks (Step 4 of worker_loop()).
+    //
+    // Race: that argument needs this read to be ordered against the searcher's
+    // decrement. The caller has just pushed to a lock-free queue and the searcher
+    // reads that queue after decrementing: a store then a load on each side, which
+    // acquire/release does not order. The read is therefore a seq_cst
+    // read-modify-write, paired with the seq_cst fetch_sub in worker_loop(), as in
+    // tokio's Idle::notify_should_wakeup().
+    if (m_searching.fetch_add(0, std::memory_order_seq_cst) > 0) return;
     // Otherwise wake one parked worker to begin searching.
     const uint64_t idle = m_idle_mask.load(std::memory_order_acquire);
     if (idle) {
@@ -249,6 +258,19 @@ std::size_t WorkStealingExecutor::local_len(int index) const {
 #endif
 }
 
+bool WorkStealingExecutor::peer_has_tasks(int index) const {
+    const int n = static_cast<int>(m_workers.size());
+    for (int i = 0; i < n; ++i) {
+        if (i == index) continue;
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+        if (!m_worker_queues[i].steal.is_empty()) return true;
+#else
+        if (m_local_queues[i].size() != 0) return true;
+#endif
+    }
+    return false;
+}
+
 void WorkStealingExecutor::after_turn(int index, std::size_t dispatched) {
     // One woken task: run it here, no cross-thread wake. More: let a peer help.
     if (dispatched > 0 && local_len(index) > 1)
@@ -274,6 +296,8 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 
     while (true) {
         std::shared_ptr<detail::TaskBase> task;
+        // Set when this pass ends a steal sweep that leaves no worker searching.
+        bool last_searcher = false;
 
         // --- Periodic injection-queue check ---
         // Step 2 is reached only with an empty local queue. Tasks that keep each
@@ -394,7 +418,22 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                     }
                 }
 
-                m_searching.fetch_sub(1, std::memory_order_release);
+                // seq_cst: pairs with the read in notify_if_needed().
+                last_searcher =
+                    m_searching.fetch_sub(1, std::memory_order_seq_cst) == 1;
+
+                // Found work by searching: pass the wake on before running it (tokio's
+                // transition_worker_from_searching). enqueue() wakes one worker per
+                // push at most, and a burst of pushes keeps picking the same worker
+                // until it has woken and cleared its idle bit, so a burst of N tasks
+                // wakes one worker, not N. That worker steals half of them and, without
+                // this, would be the only help the burst ever got until some later
+                // enqueue. Each worker woken here does the same in turn, so workers
+                // keep waking until one finds nothing or none is idle.
+                //
+                // Race (benign): the task just taken may have been the last one. The
+                // woken worker then sweeps, finds nothing and parks again.
+                if (task) notify_if_needed();
             }
         }
 
@@ -430,6 +469,31 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                     m_injection_queue.pop_front();
                     m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
                 }
+            }
+
+            // The last searcher looks at its peers' queues once more (tokio's
+            // notify_if_work_pending()). A worker that pushed to its own queue while
+            // this one was still counted as searching woke nobody, on the grounds
+            // that the searcher would find the task; but the sweep may already have
+            // passed that queue. With nobody searching any more, this is the only
+            // worker that can still make good on that. It goes round again and
+            // steals.
+            //
+            // Race (benign): the peer may run the task itself first, or another
+            // worker may be part-way through stealing it. The next pass then finds
+            // nothing and comes back here, and goes round once more only if a peer's
+            // queue is still non-empty, so the repeats end when that queue does.
+            //
+            // Not covered, as in tokio: a worker that parks without having searched
+            // (the searching limit was reached) does not look. A push that saw no
+            // searcher and no idle worker just before this one set its bit then
+            // waits for its own worker, or for the next wake of any kind. Nothing is
+            // lost, since the pushing worker runs its own queue; the task only
+            // misses a chance to run in parallel.
+            if (!task && last_searcher && peer_has_tasks(worker_index)) {
+                m_idle_mask.fetch_and(~(1ull << worker_index),
+                                      std::memory_order_relaxed);
+                continue;
             }
 
             if (!task) {

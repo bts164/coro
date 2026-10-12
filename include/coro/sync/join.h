@@ -199,14 +199,21 @@ private:
     /**
      * @brief Polls a single active branch.
      *
-     * If the branch becomes ready, its result is stored and its state is set to
-     * `Done`. If it faults, the exception is recorded, the branch is marked `Done`,
+     * Does nothing when the task's budget is spent. If the branch becomes ready, its
+     * result is stored and its state is set to `Done`. If it faults, the exception is recorded, the branch is marked `Done`,
      * and all remaining active branches are immediately cancelled so that draining
      * can begin.
      */
     template<std::size_t I>
     void poll_active_one(detail::Context& ctx) {
         if (m_states[I] != JoinBranchState::Active) return;
+
+        // Task budget spent: leave this branch for the task's next poll. Polling it
+        // would let a branch that has not started run up to its first co_await, and
+        // under nested join() that builds a level of children nobody can run yet.
+        // The call makes sure the task has yielded, so a skipped branch that this
+        // poll was woken for is polled then. See doc/design/task_budget.md.
+        if (ctx.yield_if_budget_spent()) return;
 
         auto result = std::get<I>(m_futures).poll(ctx);
 

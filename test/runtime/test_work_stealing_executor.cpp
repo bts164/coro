@@ -9,6 +9,7 @@
 #include <coro/task/spawn_blocking.h>
 #include <coro/task/yield_now.h>
 #include <coro/co_invoke.h>
+#include <coro/stream.h>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -360,6 +361,52 @@ Coro<int> overflow_while_busy(std::atomic<bool>& stop, WorkerSet& workers,
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// A burst of spawns reaches every worker, although the spawns themselves wake
+// only one. See doc/design/work_stealing_executor.md, "Passing the wake on".
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kChainWorkers = 4;
+constexpr int kChainTasks   = 8;
+
+// Holds its worker, with no co_await, until kChainWorkers of these have started.
+// None of them finishes before that, so the first kChainWorkers to start are
+// running at the same moment, each on a worker of its own.
+Coro<bool> hold_worker(std::atomic<int>& started) {
+    started.fetch_add(1, std::memory_order_acq_rel);
+    const auto deadline = std::chrono::steady_clock::now() + kGiveUp;
+    while (started.load(std::memory_order_acquire) < kChainWorkers) {
+        if (std::chrono::steady_clock::now() >= deadline) co_return false;
+        std::this_thread::yield();
+    }
+    co_return true;
+}
+
+Coro<bool> spawn_burst(std::atomic<int>& started) {
+    JoinSet<bool> js;
+    for (int i = 0; i < kChainTasks; ++i)
+        js.spawn(hold_worker(started));
+    bool all = true;
+    while (auto held = co_await next(js))
+        all = held.value() && all;
+    co_return all;
+}
+
+} // namespace
+
+// The spawns all come from one worker within a few microseconds, sooner than a
+// parked worker can wake, so every one of them picks the same worker to wake. That
+// worker steals half the tasks and runs one. Nothing is enqueued after that: the
+// tasks never suspend. The other two workers start only if a worker that finds work
+// by stealing wakes the next one.
+TEST(WorkStealingExecutorTest, BurstOfSpawnsReachesEveryWorker) {
+    Runtime rt(kChainWorkers);
+    std::atomic<int> started{0};
+    EXPECT_TRUE(rt.block_on(spawn_burst(started)));
+}
 
 TEST(WorkStealingExecutorTest, InjectedTaskRunsWhileEveryWorkerIsBusy) {
     Runtime rt(kBusyWorkers);

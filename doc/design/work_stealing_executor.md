@@ -54,7 +54,8 @@ priority order:
 3. Enter "searching" state (if permitted)
    a. Steal from a peer's local queue         (one full sweep, round-robin)
    b. Re-check injection queue                (a task may have arrived during the sweep)
-4. Exit searching, park
+   c. Found a task: wake one parked worker    (see "Passing the wake on")
+4. Exit searching, park                       (the last searcher looks at its peers again first)
 ```
 
 Step 2 is checked before stealing so that tasks enqueued from outside the executor
@@ -142,7 +143,8 @@ while (expected < max_searching):
     if m_searching.compare_exchange_weak(expected, expected + 1):
         // entered searching — do the steal sweep
         ...
-        m_searching.fetch_sub(1)
+        last_searcher = m_searching.fetch_sub(1) == 1
+        if found a task: notify_if_needed()   // see "Passing the wake on"
         break
 // If CAS loop fails (already enough searchers), skip to park.
 ```
@@ -153,6 +155,90 @@ piling onto the same victim queues.
 
 The steal sweep itself acts as the latency buffer before parking — there is no separate
 spin-yield loop.
+
+### Passing the wake on
+
+A worker that finds a task while searching, by stealing or in the injection queue
+re-check, calls `notify_if_needed()` after it leaves the searching state and before it
+runs the task. Tokio does the same in `transition_worker_from_searching()`.
+
+`enqueue()` alone does not get a burst of work to every worker. It wakes at most one
+worker per push, and it picks the lowest idle bit, which stays set until the chosen
+worker has woken up and cleared it. A task that spawns ten tasks in a row does so
+faster than a parked thread wakes, so all ten pushes pick the same worker:
+
+```mermaid
+sequenceDiagram
+    participant W0 as Worker 0 (spawning)
+    participant W1 as Worker 1 (parked)
+    participant W2 as Worker 2 (parked)
+    W0->>W1: push task 1, unpark
+    Note over W0: pushes 2..10 find worker 1's idle bit<br/>still set and unpark it again: no effect
+    W1->>W0: wakes, steals half
+    W1->>W2: found work while searching: unpark
+    W2->>W0: wakes, steals from worker 0 or 1
+    Note over W2: wakes the next idle worker in turn
+```
+
+Without the last two steps worker 1 is the only help the burst gets. It runs one of the
+stolen tasks and the rest wait in two local queues while every other worker sleeps,
+until something else happens to be enqueued. Tasks that suspend or spend their
+[budget](task_budget.md) often hide this, because every wake of a task is another
+`enqueue()`. Tasks that run for a long time in one poll do not.
+
+The chain stops by itself: each woken worker wakes one more only if it found a task, and
+`notify_if_needed()` does nothing when a worker is already searching or none is idle.
+
+### The last searcher looks again
+
+`notify_if_needed()` wakes nobody while a worker is searching, on the grounds that the
+searcher will find the task. That holds only if the searcher has not yet swept the queue
+the task went to:
+
+```mermaid
+sequenceDiagram
+    participant K as Worker k (running a task)
+    participant S as Worker s (searching)
+    S->>K: sweep: k's queue is empty
+    K->>K: push a task to its own queue
+    Note over K: m_searching is 1: wake nobody
+    S->>S: sweep ends with nothing, m_searching becomes 0
+    S->>K: last searcher: is any peer's queue non-empty?
+    Note over S: yes: clear idle bit, search again, steal
+```
+
+The last step is the fix, and it is what Tokio does in `notify_if_work_pending()`. A
+worker whose decrement takes `m_searching` to zero, and which then finds nothing in its
+own queue or the injection queue, reads the length of every peer's local queue
+(`peer_has_tasks()`) before it parks. If one is non-empty it clears its idle bit and
+runs the loop again. Without it the task waits behind whatever worker k is running,
+with idle workers asleep, until the next wake of any kind.
+
+Only the last searcher looks. An earlier one leaves a searcher behind it, and that one
+will be last in its turn.
+
+!!! danger "WARNING: the read of `m_searching` in `notify_if_needed()` must be seq_cst"
+    The pushing worker stores to its queue and then reads `m_searching`; the searcher
+    stores to `m_searching` and then reads the queue. Acquire and release do not order
+    a store against a later load of a different variable, so with them both sides could
+    miss each other. `notify_if_needed()` therefore reads with
+    `fetch_add(0, seq_cst)` and the worker decrements with `fetch_sub(1, seq_cst)`,
+    as Tokio's `Idle` does. Do not weaken either to make `enqueue()` cheaper.
+
+!!! note "NOTE: a worker that parks without having searched does not look"
+    When `max_searching` workers are already searching, a further idle worker goes
+    straight to parking and makes no check of its peers. A push that sees no searcher
+    and no idle bit, just before that worker sets its bit, wakes nobody. Tokio has the
+    same window. Nothing is lost: the task is in the queue of a worker that is running
+    and will get to it. It only misses a chance to run in parallel.
+
+There is no test for this alone. The window is a few instructions wide and cannot be
+held open from outside the executor; the stress tests and the benchmarks run through it.
+
+!!! note "NOTE: the last wake of a chain may find nothing"
+    The task a worker steals may have been the only one left. The worker it then wakes
+    sweeps the queues, finds nothing and parks again. That is one wasted wake per burst,
+    the price of not counting what is left in the victim's queue.
 
 ### Parking and Wakeup
 
@@ -277,7 +363,8 @@ semaphore token is banked and `acquire()` returns immediately without sleeping.
 worker loop (park sequence):
   1. decrement m_searching (no longer searching)
   2. set idle bit in m_idle_mask  (release store)
-  3. re-check local queue, injection queue, peer queues
+  3. re-check local queue and injection queue; the last searcher also checks
+     whether any peer's queue is non-empty (see "The last searcher looks again")
   4. if work found: clear idle bit, loop back to step 1 of worker loop
   5. else: parker.acquire()       (sleeps only if no banked token)
   6. clear idle bit (already cleared by enqueuer's race wins too — harmless double-clear)
@@ -507,10 +594,12 @@ sets `m_stop` and then calls `unpark_worker()` on every worker.
 !!! warning "FIXME: lost wakeup on the non-`CORO_USE_LOCAL_RUN_QUEUE` affinity path"
     Without `CORO_USE_LOCAL_RUN_QUEUE`, a remote `enqueue()` pushes to the task's last
     worker `k` (the affinity path). It then calls `notify_if_needed()`, which returns early
-    if any worker is searching. The searcher re-checks only its own queue and the injection
-    queue before parking, never `k`'s. If `k` is parked, the task strands until some later
-    wake. The default build doesn't take this path. Fix by unparking `k` directly when its
-    idle bit is set, or by dropping the affinity path.
+    if any worker is searching. Before the last searcher re-checked its peers' queues, the
+    searcher looked only at its own queue and the injection queue before parking, never
+    `k`'s, and if `k` was parked the task stranded until some later wake. That re-check
+    should now find the task and steal it, but this has not been tested in that build,
+    which the default does not use. If it still strands, unpark `k` directly when its idle
+    bit is set, or drop the affinity path.
 
 ### Tests
 
@@ -664,7 +753,8 @@ void WorkStealingExecutor::enqueue(shared_ptr<Task> task) {
 
 void WorkStealingExecutor::notify_if_needed() {
     // If at least one worker is already searching, it will find the task.
-    if (m_searching.load(memory_order_acquire) > 0) return;
+    // seq_cst read-modify-write: see "The last searcher looks again".
+    if (m_searching.fetch_add(0, memory_order_seq_cst) > 0) return;
     // Otherwise wake one parked worker to begin searching.
     uint64_t idle = m_idle_mask.load(memory_order_acquire);
     if (idle) {
@@ -675,7 +765,8 @@ void WorkStealingExecutor::notify_if_needed() {
 ```
 
 All three enqueue paths share `notify_if_needed()`. A searching worker will find a
-locally-enqueued task on its steal sweep without an explicit wake.
+locally-enqueued task without an explicit wake: on its steal sweep, or in the check the
+last searcher makes before it parks.
 
 ---
 
@@ -722,6 +813,10 @@ Unit tests are in `test/runtime/test_work_stealing_executor.cpp`. Key cases cove
 - Tasks complete correctly with `N` workers and `M >> N` short-lived tasks.
 - Stealing occurs: verify that with tasks pinned to worker 0's local queue, idle workers
   steal and execute them.
+- A burst of spawns reaches every worker (`BurstOfSpawnsReachesEveryWorker`): eight
+  tasks spawned at once on four workers each hold their worker until four have started.
+  The spawns wake one worker only, so this passes only if a worker that finds work by
+  stealing wakes the next one.
 - Shutdown drains all in-flight tasks.
 - Skynet benchmark (disabled by default — run with `--gtest_also_run_disabled_tests`).
 

@@ -20,6 +20,7 @@
 #include <coro/runtime/runtime.h>
 #include <coro/sync/join.h>
 #include <coro/sync/mpsc.h>
+#include <coro/sync/select.h>
 #include <coro/sync/sleep.h>
 #include <coro/task/yield_now.h>
 
@@ -42,6 +43,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -197,6 +199,22 @@ Coro<void> ready_then_probe_coro(Probe* probe) {
     co_await await_probe(probe);
 }
 
+// Never ready and never wakes: a branch that is waiting on something.
+struct WaitingFuture {
+    using OutputType = void;
+    PollResult<void> poll(detail::Context&) { return PollPending; }
+};
+
+Coro<void> await_waiting() {
+    co_await WaitingFuture{};
+}
+
+// Has no co_await: counts that its body ran.
+Coro<void> count_start(int* started) {
+    ++*started;
+    co_return;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -230,6 +248,21 @@ TEST(TaskBudgetContext, YieldWakesAndMarksThePoll) {
     EXPECT_EQ(wakes, 1);
 }
 
+TEST(TaskBudgetContext, YieldIfBudgetSpent) {
+    int wakes = 0;
+    detail::Context ctx(detail::make_rc<CountingWaker>(&wakes), 1);
+    // Looks, takes nothing.
+    EXPECT_FALSE(ctx.yield_if_budget_spent());
+    EXPECT_FALSE(ctx.yield_if_budget_spent());
+    EXPECT_FALSE(ctx.yielded());
+    EXPECT_TRUE(ctx.try_consume_budget());
+    // Spent: yields, and only once however often it is asked.
+    EXPECT_TRUE(ctx.yield_if_budget_spent());
+    EXPECT_TRUE(ctx.yield_if_budget_spent());
+    EXPECT_TRUE(ctx.yielded());
+    EXPECT_EQ(wakes, 1);
+}
+
 // ---------------------------------------------------------------------------
 // Driven by hand: what a coroutine does when the budget runs out
 // ---------------------------------------------------------------------------
@@ -251,6 +284,113 @@ TEST(TaskBudgetCoro, FutureIsNotPolledWhenBudgetIsSpent) {
     EXPECT_TRUE(coro.poll(second).isReady());
     EXPECT_FALSE(second.yielded());
     EXPECT_EQ(probe.polls, 1);
+}
+
+// That first poll takes a unit like any other: with two deferred awaits under a
+// join() and a budget of 1, the next poll makes one of them and defers the other again.
+TEST(TaskBudgetCoro, DeferredFirstPollIsCharged) {
+    int   wakes = 0;
+    auto  waker = detail::make_rc<CountingWaker>(&wakes);
+    Probe probe;
+    std::atomic<std::size_t> polls{0};
+    auto coro = [](std::atomic<std::size_t>& polls, Probe* probe) -> Coro<void> {
+        co_await join(await_ready_n(3, polls), await_probe(probe));
+    }(polls, &probe);
+
+    // The co_await of the join() itself takes the only unit, so both branches are
+    // deferred at their first await.
+    detail::Context first(waker, 1);
+    EXPECT_TRUE(coro.poll(first).isPending());
+    EXPECT_TRUE(first.yielded());
+    EXPECT_EQ(polls.load(), 0u);
+    EXPECT_EQ(probe.polls, 0);
+
+    // One unit, two deferred awaits: exactly one of them is polled.
+    detail::Context second(waker, 1);
+    EXPECT_TRUE(coro.poll(second).isPending());
+    EXPECT_TRUE(second.yielded());
+    EXPECT_EQ(polls.load() + static_cast<std::size_t>(probe.polls), 1u);
+
+    // Without a limit everything left runs.
+    detail::Context third(waker);
+    EXPECT_TRUE(coro.poll(third).isReady());
+    EXPECT_EQ(polls.load(), 3u);
+    EXPECT_EQ(probe.polls, 1);
+}
+
+// The co_await of the join() takes one unit and the first branch's first await the
+// other. The second branch has not started, and must not be started just to find at
+// its first co_await that it cannot go on.
+TEST(TaskBudgetCoro, JoinDoesNotStartBranchWhenBudgetIsSpent) {
+    int  wakes   = 0;
+    int  started = 0;
+    auto waker   = detail::make_rc<CountingWaker>(&wakes);
+    std::atomic<std::size_t> polls{0};
+    auto coro = [](std::atomic<std::size_t>& polls, int* started) -> Coro<void> {
+        co_await join(await_ready_n(3, polls), count_start(started));
+    }(polls, &started);
+
+    detail::Context first(waker, 2);
+    EXPECT_TRUE(coro.poll(first).isPending());
+    EXPECT_TRUE(first.yielded());
+    EXPECT_EQ(polls.load(), 1u);
+    EXPECT_EQ(started, 0);
+
+    detail::Context second(waker);
+    EXPECT_TRUE(coro.poll(second).isReady());
+    EXPECT_EQ(polls.load(), 3u);
+    EXPECT_EQ(started, 1);
+}
+
+TEST(TaskBudgetCoro, SelectDoesNotStartBranchWhenBudgetIsSpent) {
+    int  wakes   = 0;
+    int  started = 0;
+    auto waker   = detail::make_rc<CountingWaker>(&wakes);
+    std::atomic<std::size_t> polls{0};
+    auto coro = [](std::atomic<std::size_t>& polls, int* started) -> Coro<std::size_t> {
+        auto won = co_await select(await_ready_n(3, polls), count_start(started));
+        co_return won.index();
+    }(polls, &started);
+
+    detail::Context first(waker, 2);
+    EXPECT_TRUE(coro.poll(first).isPending());
+    EXPECT_TRUE(first.yielded());
+    EXPECT_EQ(polls.load(), 1u);
+    EXPECT_EQ(started, 0);
+
+    // select() starts one branch later on each poll, so the second branch goes
+    // first now and wins. The first branch is cancelled and drained in the same poll.
+    detail::Context second(waker);
+    auto result = coro.poll(second);
+    ASSERT_TRUE(result.isReady());
+    EXPECT_EQ(std::move(result).value(), 1u);
+    EXPECT_EQ(started, 1);
+}
+
+// The first branch takes the last unit and then waits on something, so nothing has
+// yielded when join() comes to the second branch. Skipping it must make the yield:
+// this poll may have been for that branch, and nothing else would bring the task back.
+TEST(TaskBudgetCoro, SkippedBranchMakesTheTaskYield) {
+    int  wakes   = 0;
+    int  started = 0;
+    auto waker   = detail::make_rc<CountingWaker>(&wakes);
+    auto coro = [](int* started) -> Coro<void> {
+        co_await join(await_waiting(), count_start(started));
+    }(&started);
+
+    detail::Context first(waker, 2);
+    EXPECT_TRUE(coro.poll(first).isPending());
+    EXPECT_EQ(started, 0);
+    EXPECT_TRUE(first.yielded());
+    EXPECT_EQ(wakes, 1);
+
+    // With budget left for it the second branch runs, and nothing yields: the task
+    // now waits for the first branch alone.
+    detail::Context second(waker, 2);
+    EXPECT_TRUE(coro.poll(second).isPending());
+    EXPECT_EQ(started, 1);
+    EXPECT_FALSE(second.yielded());
+    EXPECT_EQ(wakes, 1);
 }
 
 TEST(TaskBudgetCoro, DropWhileSuspendedByBudget) {
@@ -331,14 +471,14 @@ protected:
 };
 TYPED_TEST_SUITE(TaskBudgetTest, AllExecutors);
 
-// Poll 1 passes kBudget awaits and yields at the next one. Poll 2 first completes
-// that await (the re-poll before resume is not charged), then passes kBudget more.
+// Poll 1 passes kBudget awaits and yields at the next one. Poll 2 completes that
+// await, which is charged like any other, and passes kBudget - 1 more.
 TYPED_TEST(TaskBudgetTest, YieldsAfterBudgetAwaits) {
     std::atomic<std::size_t> polls{0};
     std::vector<std::size_t> starts;
     this->traits.rt.block_on(log_polls(await_ready_n(10, polls), polls, starts));
     EXPECT_EQ(polls.load(), 10u);
-    EXPECT_EQ(starts, (std::vector<std::size_t>{0, 4, 9}));
+    EXPECT_EQ(starts, (std::vector<std::size_t>{0, 4, 8}));
 }
 
 TYPED_TEST(TaskBudgetTest, ZeroBudgetMeansUnlimited) {
@@ -364,6 +504,45 @@ TYPED_TEST(TaskBudgetTest, NestedCoroutinesShareOneBudget) {
     EXPECT_EQ(starts, (std::vector<std::size_t>{0, 3}));
 }
 
+// A tree of join()s over coroutines that never wait: 3 children per node, 4 levels,
+// 40 inner nodes. Each task poll may start at most kBudget awaits, however many
+// coroutines the earlier polls left suspended. Before deferred awaits were charged,
+// every suspended coroutine started its children for free on the next poll and the
+// whole tree was live after a few polls.
+Coro<std::size_t> ready_tree(std::size_t depth, std::atomic<std::size_t>& awaits) {
+    if (depth == 0) co_return 1;
+    struct Counted {
+        using Join = JoinFuture<Coro<std::size_t>, Coro<std::size_t>, Coro<std::size_t>>;
+        using OutputType = Join::OutputType;
+        Join                      m_join;
+        std::atomic<std::size_t>* m_awaits;
+        bool                      m_counted = false;
+        PollResult<OutputType> poll(detail::Context& ctx) {
+            // Counted at its first poll, which is what the budget charges for.
+            if (!std::exchange(m_counted, true))
+                m_awaits->fetch_add(1, std::memory_order_relaxed);
+            return m_join.poll(ctx);
+        }
+    };
+    auto [a, b, c] = co_await Counted{
+        join(ready_tree(depth - 1, awaits), ready_tree(depth - 1, awaits),
+             ready_tree(depth - 1, awaits)),
+        &awaits};
+    co_return a + b + c;
+}
+
+TYPED_TEST(TaskBudgetTest, NestedJoinStartsAtMostBudgetAwaitsPerPoll) {
+    std::atomic<std::size_t> awaits{0};
+    std::vector<std::size_t> starts;
+    const std::size_t leaves =
+        this->traits.rt.block_on(log_polls(ready_tree(4, awaits), awaits, starts));
+    EXPECT_EQ(leaves, 81u);
+    EXPECT_EQ(awaits.load(), 40u);
+    starts.push_back(awaits.load());
+    for (std::size_t i = 1; i < starts.size(); ++i)
+        EXPECT_LE(starts[i] - starts[i - 1], kBudget) << "task poll " << i;
+}
+
 TYPED_TEST(TaskBudgetTest, JoinedCoroutinesYieldTogether) {
     std::atomic<std::size_t> polls{0};
     std::vector<std::size_t> starts;
@@ -376,7 +555,8 @@ TYPED_TEST(TaskBudgetTest, JoinedCoroutinesYieldTogether) {
 }
 
 // One branch spends the budget in every poll; the other is resumed from a pending
-// await in those same polls and must still be re-polled.
+// await in those same polls and must still be re-polled. Its next sleep_for() may
+// then be deferred, and gets its first poll in a turn where join() polls it first.
 TYPED_TEST(TaskBudgetTest, PendingAwaitResumesAfterBudgetSpent) {
     std::atomic<bool> stop{false};
     const bool seen = this->traits.rt.block_on(

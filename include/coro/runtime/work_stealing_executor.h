@@ -145,6 +145,10 @@ private:
     /// @brief Number of tasks in worker `index`'s local queue. Owner thread only.
     std::size_t local_len(int index) const;
 
+    /// @brief True if any worker other than `index` has a task in its local queue.
+    /// Safe from any worker thread; the answer may be out of date at once.
+    bool peer_has_tasks(int index) const;
+
     /// @brief Called by worker `index` after a turn that dispatched `dispatched` events:
     /// wakes a peer if the turn left more than one task queued (tokio's
     /// should_notify_others).
