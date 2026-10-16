@@ -112,6 +112,7 @@ exports the `next()` helper that users call in `co_await` loops.
 ### `runtime/` — executor and event loop
 
 Anything that drives tasks to completion or owns I/O infrastructure goes here. This includes:
+
 - The `Runtime` class (entry point for `block_on` and `spawn`)
 - The abstract `Executor` interface
 - Concrete executor implementations: `CurrentThreadExecutor`, `WorkSharingExecutor`, `WorkStealingExecutor`
@@ -122,6 +123,7 @@ Anything that drives tasks to completion or owns I/O infrastructure goes here. T
 
 Types that represent the *handle* to a running or completed task, and the builders used to
 configure and submit tasks. This includes:
+
 - `JoinHandle<T>` — `co_await` to retrieve a spawned task's result
 - `JoinSet<T>` — fan out many homogeneous tasks; collect results in completion order
 - `StreamHandle<T>` — consumer end of the bounded channel that backs `spawn(stream)`
@@ -132,6 +134,7 @@ configure and submit tasks. This includes:
 ### `sync/` — synchronization primitives and channels
 
 Types that coordinate between concurrently running tasks. This includes:
+
 - `Event` — one-shot signal; `set()` from any thread, `co_await wait()` in a coroutine
 - **Channels**: `oneshot` (single-value), `mpsc` (bounded multi-producer), `watch` (latest-value multi-consumer), `broadcast` (multi-producer multi-consumer, lag-detecting)
 - **Combinators**: `join()`, `select()`, `timeout()`, `sleep_for()`
@@ -155,6 +158,7 @@ the `IoDriver` (the epoll reactor in `runtime/`) or the blocking pool, and satis
 Headers in `detail/` fall into two sub-categories:
 
 **Stable API for advanced users** (custom `Future`/`Stream` implementors and I/O integrators):
+
 - `poll_result.h` — `PollResult<T>`, the return type of every `poll()` / `poll_next()` call
 - `waker.h` — `Waker` abstract base; subclass this to integrate with external event sources
 - `context.h` — `Context`, passed to every `poll()` call; carries the current `Waker`
@@ -164,6 +168,7 @@ are only needed when writing custom futures or integrating a new I/O backend. Th
 **stable API**: their interfaces will not change without a compatibility note.
 
 **Truly internal** (implementation details; do not include directly):
+
 - `coro_scope.h` — coroutine lifetime tracking and child task management
 - `future_awaitable.h` — C++20 awaiter adapter; part of the `co_await` machinery
 - `intrusive_list.h` — intrusive linked list used by waiter queues

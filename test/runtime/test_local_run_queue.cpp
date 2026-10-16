@@ -84,12 +84,37 @@ TEST(LocalRunQueue, LenTracksRingAndLifo) {
 
     local.push_lifo(make_task(2));
     EXPECT_EQ(local.len(), 2u);
+    EXPECT_TRUE(local.has_lifo());
 
     local.pop();
     EXPECT_EQ(local.len(), 1u);
 
     local.pop_lifo();
     EXPECT_EQ(local.len(), 0u);
+    EXPECT_FALSE(local.has_lifo());
+}
+
+// A thief can't take the slot, so Steal::len() (what peer_has_tasks() reads) must
+// not count it; otherwise the last searcher would loop instead of parking.
+TEST(LocalRunQueue, StealLenExcludesLifo) {
+    auto [steal, local] = make_local_run_queue<Task>();
+    local.push_lifo(make_task(1));
+    EXPECT_EQ(steal.len(), 0u);
+    EXPECT_TRUE(steal.is_empty());
+
+    local.push_back(make_task(2));
+    EXPECT_EQ(steal.len(), 1u);
+    EXPECT_EQ(local.len(), 2u);
+    drain(local);
+}
+
+TEST(LocalRunQueue, MoveCarriesLifo) {
+    auto [steal, local] = make_local_run_queue<Task>();
+    local.push_lifo(make_task(3));
+    Local<Task> moved(std::move(local));
+    auto t = moved.pop_lifo();
+    ASSERT_TRUE(t);
+    EXPECT_EQ(*t, 3);
 }
 
 TEST(LocalRunQueue, RemainingSlots) {
@@ -187,16 +212,17 @@ TEST(LocalRunQueue, StealIntoReturnsOneToRunImmediately) {
     drain(dst);
 }
 
-TEST(LocalRunQueue, StealIntoFallsBackToLifoSlotWhenRingEmpty) {
+TEST(LocalRunQueue, StealIntoNeverTakesLifoSlot) {
     auto [steal_src, src] = make_local_run_queue<Task>();
     auto [steal_dst, dst] = make_local_run_queue<Task>();
 
     src.push_lifo(make_task(55));
 
-    auto t = steal_src.steal_into(dst);
+    EXPECT_FALSE(steal_src.steal_into(dst));   // owner-only, as in tokio
+    EXPECT_EQ(dst.len(), 0u);
+    auto t = src.pop_lifo();
     ASSERT_TRUE(t);
     EXPECT_EQ(*t, 55);
-    EXPECT_EQ(dst.len(), 0u);  // lifo path places nothing into dst
 }
 
 TEST(LocalRunQueue, StealIntoDeclinesDstMoreThanHalfFull) {
@@ -249,7 +275,6 @@ TEST(LocalRunQueue, ConcurrentPushAndSteal) {
 
     while (src.pop())  consumed.fetch_add(1, std::memory_order_relaxed);
     while (dst.pop())  consumed.fetch_add(1, std::memory_order_relaxed);
-    if (src.pop_lifo()) consumed.fetch_add(1, std::memory_order_relaxed);
 
     EXPECT_EQ(consumed.load(), N);
 }

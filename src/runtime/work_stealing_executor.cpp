@@ -1,8 +1,10 @@
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/runtime/runtime.h>
 #include <coro/detail/context.h>
+#include <coro/detail/trace.h>
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cstdlib>
 #include <iostream>
 
@@ -29,7 +31,62 @@ struct InDriverTurn {
     InDriverTurn& operator=(const InDriverTurn&) = delete;
 };
 
+// The WakeBatch open on this thread, if any. Read only by enqueue() on this thread;
+// no other thread ever sees it. See doc/design/work_stealing_executor.md,
+// "Batched wakes (`WakeBatch`)".
+thread_local detail::WakeBatch* t_wse_wake_batch = nullptr;
+
 } // namespace
+
+// --- WakeBatch ---------------------------------------------------------------------
+
+namespace detail {
+
+WakeBatch::WakeBatch() noexcept : m_prev(t_wse_wake_batch) {
+    t_wse_wake_batch = this;
+}
+
+WakeBatch::~WakeBatch() {
+    // Restored first: nothing the flush does may land in this batch again.
+    // WARNING: correct only if this batch was opened on this thread and has not
+    // been held across a suspension (the task may resume on another worker).
+    assert(t_wse_wake_batch == this && "WakeBatch closed out of order or on another thread");
+    t_wse_wake_batch = m_prev;
+    if (m_count == 0) return;
+    // The tasks are Notified and nothing else will enqueue them again: the flush
+    // must happen, also during unwinding. flush_wake_batch() allocates nothing; its
+    // lock and unparks are the same operations enqueue() makes.
+    if (m_count <= kInlineCapacity)
+        m_executor->flush_wake_batch(m_inline, m_count);
+    else
+        m_executor->flush_wake_batch(m_overflow.data(), m_overflow.size());
+}
+
+bool WakeBatch::is_open() noexcept {
+    return t_wse_wake_batch != nullptr;
+}
+
+bool WakeBatch::try_add(WorkStealingExecutor* executor, TaskBase* task) {
+    if (m_executor != nullptr && m_executor != executor) return false;
+    if (m_count < kInlineCapacity) {
+        m_inline[m_count++] = task;
+    } else {
+        // Past the inline buffer the tasks live in m_overflow, all of them. If the
+        // allocation fails, the task goes through the normal path instead.
+        try {
+            if (m_count == kInlineCapacity)
+                m_overflow.assign(m_inline, m_inline + kInlineCapacity);
+            m_overflow.push_back(task);
+        } catch (...) {
+            return false;
+        }
+        ++m_count;
+    }
+    m_executor = executor;
+    return true;
+}
+
+} // namespace detail
 
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
 using TaskSP = detail::TaskBase*;
@@ -130,14 +187,35 @@ bool WorkStealingExecutor::has_tasks() const {
 }
 
 void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
+    // A WakeBatch open on this thread collects the task; closing it pushes and
+    // notifies for all of them at once. Never the LIFO slot.
+    if (detail::WakeBatch* batch = t_wse_wake_batch;
+            batch != nullptr && batch->try_add(this, task.get()))
+        return;
+
     const int  local_idx = t_wse_worker_index;
     const bool local     = local_idx >= 0 && t_wse_owning_executor == this;
 
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
     if (local) {
-        // Fast path: push to own local queue; spill to injection queue if full.
+        auto& queue = m_worker_queues[local_idx].local;
         InjectionOverflow overflow{m_mutex, m_injection_queue, m_injection_len};
-        m_worker_queues[local_idx].local.push_or_overflow(task.get(), overflow);
+        if (t_wse_in_driver_turn) {
+            // Woken by this worker's own driver turn: run in order after the turn,
+            // with no notify (see below). Not the LIFO slot.
+            queue.push_or_overflow(task.get(), overflow);
+            return;
+        }
+        // Woken by the task this worker is polling (or by a task's destruction just
+        // after its poll): the LIFO slot, to run next on this worker while what the
+        // waker handed it is still in cache. A task placed in an empty slot wakes
+        // nobody: a peer could not take it anyway. One it displaces goes to the ring
+        // and is notified for as any local push. The polled task's own re-queue
+        // never comes here (requeue_after_poll()). See
+        // doc/design/work_stealing_executor.md, "LIFO slot".
+        detail::TaskBase* displaced = queue.push_lifo(task.get());
+        if (displaced == nullptr) return;
+        queue.push_or_overflow(displaced, overflow);
     } else {
         // Local<T> is single-owner so we cannot push directly to another
         // worker's ring from here. All remote pushes go to the injection queue.
@@ -170,6 +248,43 @@ void WorkStealingExecutor::enqueue(std::shared_ptr<detail::TaskBase> task) {
     notify_if_needed();
 }
 
+void WorkStealingExecutor::requeue_after_poll(int index,
+                                              std::shared_ptr<detail::TaskBase> task) {
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+    // Straight to the back of the ring: through the LIFO slot a yield would poll the
+    // same task again at once (doc/design/task_budget.md, "What a yield does").
+    InjectionOverflow overflow{m_mutex, m_injection_queue, m_injection_len};
+    m_worker_queues[index].local.push_or_overflow(task.get(), overflow);
+    notify_if_needed();
+#else
+    (void)index;
+    enqueue(std::move(task));
+#endif
+}
+
+void WorkStealingExecutor::flush_wake_batch(detail::TaskBase* const* tasks, std::size_t n) {
+    {
+        std::lock_guard lock(m_mutex);
+        // To the back: a backlog already queued runs first.
+        m_injection_queue.insert(m_injection_queue.end(), tasks, tasks + n);
+        m_injection_len.store(m_injection_queue.size(), std::memory_order_release);
+    }
+    // Wake as many parked workers as there are tasks, ignoring m_searching: one
+    // searcher would take one task and the rest would ramp up one wake at a time.
+    //
+    // Race (benign): a worker whose bit is read here may have just woken for another
+    // reason; the unpark banks a token and costs it one loop iteration. A worker that
+    // sets its bit after this read re-checks the injection queue under m_mutex in
+    // Step 4 before parking, and that lock orders it after the push above.
+    // Lowest-numbered first, as in notify_if_needed().
+    uint64_t idle = m_idle_mask.load(std::memory_order_acquire);
+    for (std::size_t woken = 0; idle != 0 && woken < n; ++woken) {
+        const int idx = std::countr_zero(idle);
+        idle &= idle - 1;
+        unpark_worker(idx);
+    }
+}
+
 void WorkStealingExecutor::wait_for_completion(detail::TaskStateBase& state) {
     state.wait_until_done();
 }
@@ -186,7 +301,10 @@ void WorkStealingExecutor::notify_if_needed() {
     // read-modify-write, paired with the seq_cst fetch_sub in worker_loop(), as in
     // tokio's Idle::notify_should_wakeup().
     if (m_searching.fetch_add(0, std::memory_order_seq_cst) > 0) return;
-    // Otherwise wake one parked worker to begin searching.
+    // Otherwise wake one parked worker to begin searching: the lowest-numbered, so
+    // work stays on a few warm workers and the rest stay parked and their cores idle.
+    // Deliberately not random or round-robin; see the design doc, "Which worker is
+    // woken".
     const uint64_t idle = m_idle_mask.load(std::memory_order_acquire);
     if (idle) {
         // Race (benign): two enqueuers may both pick the same worker before it
@@ -224,6 +342,7 @@ std::size_t WorkStealingExecutor::park_worker(int index) {
     if (!dispatched && slot.park_state != ParkState::Notified) {
         // Another worker holds the driver: wait on our own condvar instead.
         slot.park_state = ParkState::ParkedCondvar;
+        detail::trace::SleepScope sleeping;
         slot.park_cv.wait(lock, [&] { return slot.park_state == ParkState::Notified; });
     }
     // Consumes any token, including one whose driver.unpark() hasn't been written
@@ -286,6 +405,8 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     t_wse_owning_executor = this;
     t_wse_worker_index    = worker_index;
     set_current_runtime(m_runtime);
+    detail::trace::thread_name("coro-worker", worker_index);
+    detail::trace::AwakeZone awake;
 
     const int    n            = static_cast<int>(m_workers.size());
     const int    max_search   = std::max(1, n / 2);
@@ -293,11 +414,45 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
     unsigned     polls_since_turn = 0;
     // Passes of the loop below; decides when the injection queue goes first.
     unsigned     tick = 0;
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+    // LIFO-slot polls in a row; reset by any other poll.
+    unsigned      lifo_polls = 0;
+#endif
+    // Budget left by the last poll, passed on to a task run from the LIFO slot.
+    std::uint32_t carried_budget = 0;
 
     while (true) {
         std::shared_ptr<detail::TaskBase> task;
         // Set when this pass ends a steal sweep that leaves no worker searching.
         bool last_searcher = false;
+        // Set when `task` came from the LIFO slot.
+        bool from_lifo = false;
+
+#ifdef CORO_USE_LOCAL_RUN_QUEUE
+        // --- LIFO slot ---
+        // Only this worker fills it, from the poll that just ended (or from a task
+        // destroyed at the end of that pass), so it goes first. At most
+        // kMaxLifoPolls in a row: two tasks that keep waking each other would
+        // otherwise keep the queues below from ever being reached. A slot task
+        // with no budget left to carry over would only yield at its first await.
+        // Either way it goes to the back of the ring, where a peer can steal it.
+        {
+            auto& local = m_worker_queues[worker_index].local;
+            if (local.has_lifo()) {
+                detail::TaskBase* t = local.pop_lifo();
+                if (lifo_polls < kMaxLifoPolls && carried_budget != 0) {
+                    task      = t->shared_from_this();
+                    from_lifo = true;
+                    ++lifo_polls;
+                } else {
+                    InjectionOverflow overflow{m_mutex, m_injection_queue, m_injection_len};
+                    local.push_or_overflow(t, overflow);
+                    notify_if_needed();
+                }
+            }
+            if (!from_lifo) lifo_polls = 0;
+        }
+#endif
 
         // --- Periodic injection-queue check ---
         // Step 2 is reached only with an empty local queue. Tasks that keep each
@@ -309,7 +464,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
         // stale. Nothing is lost: the task is found at the next interval, or by
         // Step 2 or Step 4 of whichever worker runs dry first. This check plays no
         // part in parking.
-        if (++tick % kGlobalQueueInterval == 0 &&
+        if (!task && ++tick % kGlobalQueueInterval == 0 &&
                 m_injection_len.load(std::memory_order_acquire) != 0) {
             std::lock_guard lock(m_mutex);
             if (!m_injection_queue.empty()) {
@@ -541,10 +696,21 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 
         task->last_worker_index = worker_index;
 
-        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task), task_budget());
+        // A slot task gets what the poll that woke it left of its budget, as in
+        // tokio: a ping-pong pair shares one budget instead of a fresh one per hop.
+        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task),
+                            from_lifo ? carried_budget : task_budget());
         detail::TaskBase::current = task.get();
-        const bool done = task->poll(ctx);
+        bool done;
+        {
+            detail::trace::PollZone zone(*task);
+            done = task->poll(ctx);
+            zone.finished(done);
+        }
         detail::TaskBase::current = nullptr;
+        carried_budget = ctx.remaining_budget();
+        // WARNING: a WakeBatch held across a suspension. See WakeBatch.
+        assert(!detail::WakeBatch::is_open() && "WakeBatch open after a task poll");
 
         if (done) {
             task->scheduling_state.store(
@@ -586,7 +752,9 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
                               << " during RunningAndNotified→Notified\n";
                     std::abort();
                 }
-                enqueue(std::move(task));
+                // Woken during its own poll: to the back of the queue, never the
+                // LIFO slot.
+                requeue_after_poll(worker_index, std::move(task));
             }
         }
 

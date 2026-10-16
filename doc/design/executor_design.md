@@ -675,6 +675,7 @@ worker_loop():
 ```
 
 **Key invariants:**
+
 - `task->poll()` runs without holding `m_mutex` so other workers can dequeue and remote
   wakers can push to the injection queue concurrently.
 - `m_cv.notify_all()` on task completion is called **inside** `m_mutex` (via

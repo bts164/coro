@@ -1,6 +1,7 @@
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/runtime.h>
 #include <coro/detail/context.h>
+#include <coro/detail/trace.h>
 #include <cstdlib>
 #include <iostream>
 
@@ -116,6 +117,8 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
     t_owning_executor = this;
     t_worker_index    = worker_index;
     set_current_runtime(m_runtime);
+    detail::trace::thread_name("coro-worker", worker_index);
+    detail::trace::AwakeZone awake;
 
     while (true) {
         std::shared_ptr<detail::TaskBase> task;
@@ -157,7 +160,12 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
 
         detail::Context ctx(std::static_pointer_cast<detail::Waker>(task), task_budget());
         detail::TaskBase::current = task.get();
-        bool done = task->poll(ctx);
+        bool done;
+        {
+            detail::trace::PollZone zone(*task);
+            done = task->poll(ctx);
+            zone.finished(done);
+        }
         detail::TaskBase::current = nullptr;
 
         if (done) {
@@ -223,6 +231,7 @@ std::shared_ptr<detail::TaskBase> WorkSharingExecutor::wait_for_task(int worker_
         if (m_stop) return nullptr;
         if (m_driver_held) {
             // Another worker is in the driver; it notifies m_cv when it leaves.
+            detail::trace::SleepScope sleeping;
             m_cv.wait(lock);
             continue;
         }

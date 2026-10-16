@@ -111,6 +111,13 @@ if(CORO_PLATFORM STREQUAL "pico")
 else()
     option(WITH_GPERFTOOLS "Build with gperftools" OFF)
     option(CORO_USE_LOCAL_RUN_QUEUE "Use lock-free local run queue in WorkStealingExecutor (experimental)" ON)
+    # Backend for the runtime's trace points (doc/design/tracing.md). "none" compiles
+    # them out.
+    set(CORO_TRACING "none" CACHE STRING "Tracing backend: none or tracy")
+    set_property(CACHE CORO_TRACING PROPERTY STRINGS none tracy)
+    if(NOT CORO_TRACING MATCHES "^(none|tracy)$")
+        message(FATAL_ERROR "CORO_TRACING is '${CORO_TRACING}', expected 'none' or 'tracy'")
+    endif()
 
     # Each dependency has a script in cmake/deps/ that provides it and names
     # the target to link. CORO_<DEPENDENCY>_PROVIDER selects how, one
@@ -119,6 +126,9 @@ else()
         include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/deps/gperftools.cmake)
     endif()
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/deps/libwebsockets.cmake)
+    if(CORO_TRACING STREQUAL "tracy")
+        include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/deps/tracy.cmake)
+    endif()
 
     file(GLOB_RECURSE CORO_PUBLIC_HEADERS "include/coro/*.h" "include/coro/*.hpp")
     message(STATUS ${CORO_PUBLIC_HEADERS})
@@ -172,6 +182,13 @@ else()
     target_link_libraries(coro PUBLIC
         $<$<BOOL:${WITH_GPERFTOOLS}>:${CORO_GPERFTOOLS_TARGET}>
         ${CORO_LIBWEBSOCKETS_TARGET})
+    if(CORO_TRACING STREQUAL "tracy")
+        # PRIVATE definition: only src/detail/trace.h reads it, and no public header
+        # includes that. The link is PUBLIC so that a program adding its own zones
+        # uses the same Tracy client as the library.
+        target_compile_definitions(coro PRIVATE CORO_TRACE_TRACY)
+        target_link_libraries(coro PUBLIC ${CORO_TRACY_TARGET})
+    endif()
 
     install(TARGETS coro)
     install(FILES ${CORO_GENERATED_INCLUDE_DIR}/coro/version.h DESTINATION include/coro)

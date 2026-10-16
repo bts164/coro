@@ -156,6 +156,32 @@ piling onto the same victim queues.
 The steal sweep itself acts as the latency buffer before parking — there is no separate
 spin-yield loop.
 
+### Which worker is woken
+
+Every wake goes to the lowest-numbered idle worker (the lowest set bit of `m_idle_mask`),
+never to a random or round-robin one. Work therefore concentrates on the low-numbered
+workers, and the pool grows upward only as far as the load needs: a program with at
+most four tasks runnable at once keeps roughly workers 0-3 busy, and the rest stay
+parked for the whole run, unless one of them steals work during a sweep.
+
+This is deliberate:
+
+- **Warm workers stay warm.** The workers that keep getting woken still have the
+  program's data in cache and are known to the OS scheduler as busy, instead of being
+  pulled out of a long sleep.
+- **Idle cores stay idle.** Parked workers are never woken just to take a turn, so their
+  cores can drop into deep sleep states, and the parts of the program that are actually
+  busy get more thermal and turbo headroom.
+
+Spreading wakes evenly would cost both and gain no throughput. Tokio gets the same effect
+differently, by keeping sleeping workers in a stack and waking the most recently parked
+one.
+
+What a profiler shows follows from this: a moderately parallel program uses the first few
+workers and leaves the high-numbered ones idle, which is not a sign of a bottleneck.
+Worker numbers are not CPU numbers, though. The workers are not pinned, and the OS
+decides which core each one runs on.
+
 ### Passing the wake on
 
 A worker that finds a task while searching, by stealing or in the injection queue
@@ -240,6 +266,125 @@ held open from outside the executor; the stress tests and the benchmarks run thr
     sweeps the queues, finds nothing and parks again. That is one wasted wake per burst,
     the price of not counting what is left in the victim's queue.
 
+### Batched wakes (`WakeBatch`)
+
+The chain above gets a burst to every worker eventually, but one worker at a time: each
+link costs a thread wake-up, a steal sweep and another unpark. When the burst is the
+start of a short computation split across the workers, such as a
+[barrier](barrier.md) releasing its waiters or [`parallel()`](parallel.md) spawning its
+parts, the ramp-up can take longer than the work.
+
+The code that makes the burst knows how big it is. `detail::WakeBatch` lets it say so:
+while a batch is open on a thread, `enqueue()` calls made on that thread for this
+executor collect the tasks instead of pushing and notifying one by one. Closing the batch
+pushes them all at once and wakes as many workers as it has tasks:
+
+```cpp
+{
+    detail::WakeBatch batch;
+    for (auto& waker : to_wake)
+        waker->wake();        // enqueue() appends to the batch; no push, no notify
+}   // ~WakeBatch: one injection-queue push, up to to_wake.size() workers woken
+```
+
+#### Scope
+
+The batch belongs to the thread that opened it and to the stretch of synchronous code
+between its constructor and destructor:
+
+- **A thread-local pointer.** The constructor saves the current
+  `t_wse_wake_batch` and installs itself; the destructor flushes and restores the saved
+  pointer. A nested batch therefore flushes its own tasks when it closes, and the
+  outer one carries on.
+- **Read only by `enqueue()`, only on that thread.** `worker_loop()` doesn't change, and
+  no other thread ever sees the batch. The cost on the normal path is one more
+  thread-local load and branch in `enqueue()`, next to the `t_wse_in_driver_turn` check
+  it already makes.
+- **One executor per batch.** The first diverted task binds the batch to its executor.
+  A task for a different `WorkStealingExecutor` goes through the normal path. Other
+  executors never look at the pointer, so a `WakeBatch` on `CurrentThreadExecutor`,
+  `WorkSharingExecutor` or Pico costs nothing and does nothing; callers can open one
+  unconditionally.
+- **Any thread.** The thread need not be a worker. On a worker, the batch replaces the
+  local push and its notify; elsewhere, it replaces the injection-queue push and its
+  notify.
+
+!!! danger "WARNING: never hold a `WakeBatch` across a suspension"
+    The pointer is per thread, not per task. If a coroutine suspended with a batch open,
+    the tasks other code woke on that worker would collect in the batch, unwoken, until
+    the coroutine resumed; and it might resume on another worker, whose thread-local the
+    destructor would then restore wrongly. Treat a batch like a held mutex: open it as a
+    stack local inside a future's `poll()`, where a suspension is impossible, or, in a
+    coroutine, close it before the next `co_await`. A debug build asserts after each
+    task poll that no batch is open.
+
+`WakeBatch` lives in `include/coro/detail/wake_batch.h` and is not public API. The
+library uses it in `Barrier`'s release, in a [Team](team.md)'s wakes and in `parallel()`'s
+spawn loop.
+
+#### Flush
+
+```mermaid
+sequenceDiagram
+    participant W as Worker 0 (closing the batch)
+    participant Q as Injection queue
+    participant W1 as Worker 1 (parked)
+    participant W2 as Worker 2 (parked)
+    participant W3 as Worker 3 (parked)
+    W->>Q: lock, push k tasks, update m_injection_len
+    W->>W1: unpark
+    W->>W2: unpark
+    W->>W3: unpark
+    Note over W1,W3: each takes its share in Step 2
+```
+
+1. **One push.** All `k` tasks go to the back of the injection queue under one hold of
+   `m_mutex`. A backlog already there runs first; the batch doesn't jump the queue.
+2. **Wake `min(k, idle)` workers.** The flush reads `m_idle_mask` once and calls
+   `unpark_worker()` on that many distinct set bits, lowest first.
+3. **No searching short-circuit.** `notify_if_needed()` wakes nobody while a worker is
+   searching; the flush ignores `m_searching`. One searcher would find one task, and the
+   rest would ramp up by the chain again.
+
+Woken workers find the tasks in Step 2, before the searching cap of Step 3 can turn them
+away. Step 2 takes a `len / n + 1` share, so with `k` tasks and `k` woken workers some
+take two and a later one finds the queue empty. That one goes on to steal from a worker
+that took two, which is the chain again but only for the last task.
+
+`k` wakes, not `k - 1`: the closing worker is usually still busy afterwards (a barrier
+leader goes straight on to its next phase). If it isn't, it takes a task from the queue
+in its own Step 2 and one woken worker finds nothing, which costs one wasted wake.
+
+Races:
+
+- **A bit read as set whose worker has just woken for another reason.** The unpark banks
+  a token and that worker's next park returns at once: one extra loop iteration. Same as
+  `notify_if_needed()`.
+- **A worker that sets its idle bit just after the flush read the mask.** It re-checks the
+  injection queue under `m_mutex` in Step 4 before parking, and finds the tasks.
+- **Fewer idle workers than tasks.** The rest wait in the injection queue for a busy
+  worker to reach Step 2 or its periodic check. Every worker is busy, so nothing is gained
+  by waking more.
+
+!!! danger "WARNING: the destructor must flush, also during unwinding"
+    The collected tasks are `Notified`; nothing else will enqueue them again. A batch
+    that dropped them would be a lost wake-up, and a hang. The destructor is `noexcept`
+    and flushes whether the scope ends normally or by an exception.
+
+The tasks are held as `TaskBase*`, as in the run queues: the owned-task list keeps them
+alive. Up to 64 fit in the batch itself; more spill into a vector, so the usual batch
+allocates nothing.
+
+#### What it replaces and what it doesn't
+
+- **The driver-turn deferral stays as it is.** Wakes during a driver turn are local
+  pushes that skip `notify_if_needed()` (see [Parking in the I/O driver](#parking-in-the-io-driver)).
+  No batch is ever open during a turn: the driver calls wakers, it doesn't poll futures.
+- **The chain stays.** It still spreads bursts made without a batch: a task that spawns in
+  a loop, or a driver turn that dispatches many tasks.
+- **No LIFO slot.** A task diverted into a batch never goes to the
+  [LIFO slot](#lifo-slot); a batch is for spreading work across workers.
+
 ### Parking and Wakeup
 
 #### What park and unpark are
@@ -267,6 +412,7 @@ check and the `wait()` call.
 #### How Tokio parks workers
 
 Tokio avoids the global mutex entirely. Each worker owns a `Parker` struct containing:
+
 - A small per-worker atomic (`AtomicUsize`) with three states: `EMPTY`, `PARKED`,
   `NOTIFIED`.
 - The OS thread handle needed to call `unpark()` on that specific thread.
@@ -386,16 +532,118 @@ per-worker approach was adopted because:
 The shared `m_mutex` is retained only for protecting the injection queue (remote
 enqueue path). It is no longer used for parking/wakeup.
 
-### LIFO Slot Optimization (Optional)
+### LIFO slot
 
-Tokio maintains a single-slot LIFO buffer per worker, separate from the local run
-queue. When a task wakes another task (e.g. a sender waking a receiver), the newly
-woken task is placed in the LIFO slot instead of the queue. On the next loop iteration,
-the LIFO slot is checked first. This reduces latency for producer-consumer pairs by
-running the consumer immediately after the producer yields, improving cache reuse.
+When a task wakes another task on the same worker (a sender waking its receiver, the last
+part of a join waking the task that waits on it), the woken task is put in a one-task slot
+and polled as soon as the current poll returns, ahead of the local queue. The data the
+waker just wrote is still in this core's cache, and the consumer doesn't wait behind
+everything else that is queued. Tokio has the same slot.
 
-This optimization is not required for correctness and can be added after the baseline
-stealing path works.
+The slot is part of `LocalRunQueue`'s owner handle (`push_lifo()`, `pop_lifo()`); see
+[Not stealable](#not-stealable-as-in-tokio). It exists in the `CORO_USE_LOCAL_RUN_QUEUE`
+build only; the mutex-backed deque has no slot.
+
+#### Which wakes use it
+
+A wake goes to the slot only when all of these hold:
+
+- `enqueue()` is called on a worker of this executor (the local path);
+- not inside a driver turn (those are run in order after the turn);
+- not into a [`WakeBatch`](#batched-wakes-wakebatch);
+- the task is not the one the worker is polling. A task that wakes itself, including
+  every yield and every spent budget, is re-queued after its poll by the worker loop,
+  which pushes it to the back of the ring directly, never to the slot. Otherwise a yield
+  would poll the same task again at once (see
+  [What a yield does](task_budget.md#what-a-yield-does)).
+
+A task spawned on a worker takes the same path (`schedule()` calls `enqueue()`), so it
+too lands in the slot and runs once the spawning poll returns, as in tokio. A burst of
+spawns keeps only the last in the slot; each one it displaces goes to the ring with a
+notify, so peers can steal them. To start several tasks across the workers at once, spawn
+them inside a [`WakeBatch`](#batched-wakes-wakebatch), as `parallel()` does.
+
+```mermaid
+flowchart TD
+    A["enqueue(task)"] --> B{"WakeBatch open<br/>for this executor?"}
+    B -- yes --> C["append to batch"]
+    B -- no --> D{"local?"}
+    D -- no --> E["injection queue, notify_if_needed()"]
+    D -- yes --> F{"in driver turn?"}
+    F -- yes --> G["push to ring, no notify"]
+    F -- no --> H["swap into LIFO slot"]
+    H --> I{"slot held a task?"}
+    I -- yes --> J["push it to ring, notify_if_needed()"]
+    I -- no --> K["no notify"]
+```
+
+A task placed in an empty slot wakes nobody: it is meant to run next on this worker, and a
+peer that woke to steal it would defeat that. A task it displaces goes to the back of the
+ring and is notified for as any local push.
+
+#### Running it
+
+The worker takes the slot before anything else, at the top of each turn of its loop:
+after a poll and the state transitions that follow it, and also after a task destroyed at
+the end of the previous turn has woken another into the slot.
+
+- **At most 3 in a row.** Two tasks that keep waking each other would otherwise hold the
+  worker, with the periodic injection check and the local queue never reached. After three
+  consecutive slot polls the slot's task is moved to the back of the ring and the loop
+  carries on as normal. Tokio uses the same limit (`MAX_LIFO_POLLS_PER_TICK`).
+- **The budget carries over.** A slot poll gets what was left of the
+  [budget](task_budget.md) of the poll that woke it, as in tokio, so a ping-pong pair
+  shares one budget rather than getting a fresh one per hop. With none left, the slot's
+  task goes to the back of the ring instead, as for the three-poll limit.
+- **Counted as a poll.** Slot polls count toward `kEventInterval`, so busy driver turns
+  still happen every 61 polls.
+
+#### Not stealable, as in tokio
+
+Only the owning worker ever reads or writes the slot. The task in it was woken because
+the task that just ran handed it something: a value through a channel, the last result
+of a join. That data is in this core's cache now. A thief that took the task would run
+it on a cold core, which is the cost the slot exists to avoid, so stealing it works
+against the slot's purpose.
+
+It also makes the slot free. With no thief, it is a plain `TaskBase*` in the owner's
+`Local` handle: no atomic, no cache line that another core can touch. Changes to
+`LocalRunQueue`:
+
+- the slot moves out of the shared `Inner` into `Local`, as a plain pointer;
+- `steal_into()` loses its fallback to the slot;
+- `Steal::len()` and `is_empty()` stop counting it. Otherwise `peer_has_tasks()` would
+  report a task no thief can take, and the last searcher would loop instead of parking.
+  `Local::len()` still counts it, for `after_turn()`.
+
+Parking can't strand a slot task: the worker takes the slot before anything else after
+each poll, so it is always empty by the time the worker gets to Step 1.
+
+!!! warning "Hazard: a task in the slot waits for the poll that woke it"
+    If the task that woke it goes on working in the same poll, the woken task waits
+    for that poll to end, with other workers idle, and no other worker can take it.
+    The budget bounds the wait for code that awaits; code that doesn't is bounded
+    only by the poll. Tokio has the same limit; its builder has an unstable option to
+    turn the slot off.
+
+    Long compute polls belong apart from latency-sensitive tasks: in
+    `spawn_blocking()`, or on a runtime of their own. See
+    [BL.5](../guidelines.md#bl5-keep-long-computations-off-a-runtime-that-serves-latency-sensitive-tasks).
+
+#### Tests
+
+In `test/runtime/test_work_stealing_executor.cpp`. Stealing makes the order in which
+tasks run nondeterministic, so these test that everything still runs, not the order:
+
+- A ping-pong pair through two `Event`s for 10,000 rounds completes.
+- A ping-pong pair on one worker, with 20 tasks queued behind it and the other worker held
+  by a blocking task so it can't steal them: the queued tasks all run while the pair is
+  still going. Only the three-poll cap lets them in.
+
+Not covered by an automated test: that the slot task runs before an earlier-queued one,
+that `yield_now()` lets a queued task run first, that a searching peer leaves a slot task
+alone during a long poll, and that batched and driver-turn wakes skip the slot. Each
+would need a hook into the worker loop to observe deterministically.
 
 ---
 
@@ -768,6 +1016,10 @@ All three enqueue paths share `notify_if_needed()`. A searching worker will find
 locally-enqueued task without an explicit wake: on its steal sweep, or in the check the
 last searcher makes before it parks.
 
+Two checks come before these paths: an open [`WakeBatch`](#batched-wakes-wakebatch) for
+this executor takes the task first, and on the local path a wake from a task poll goes
+to the [LIFO slot](#lifo-slot) (see the flowchart there).
+
 ---
 
 ## Shutdown
@@ -788,6 +1040,7 @@ Workers exit their loop when `m_stop` is true and all queues are drained.
 simpler concurrency). `WorkStealingExecutor` is added alongside it as a new class.
 
 Files:
+
 - `include/coro/runtime/work_stealing_executor.h`
 - `src/runtime/work_stealing_executor.cpp`
 
@@ -817,6 +1070,16 @@ Unit tests are in `test/runtime/test_work_stealing_executor.cpp`. Key cases cove
   tasks spawned at once on four workers each hold their worker until four have started.
   The spawns wake one worker only, so this passes only if a worker that finds work by
   stealing wakes the next one.
+- A `WakeBatch` of `k` wakes on a pool with at least `k` parked workers: every task has
+  started on a different worker before any of them finishes, with each task holding its
+  worker until all `k` have started (as in `BurstOfSpawnsReachesEveryWorker`, but
+  without relying on the chain).
+- A batch of 200 spawns, more than it holds without allocating: every task runs.
+- Nested batches: the outer one is open again after the inner one closes, and every
+  task runs.
+- A batch closed by an exception still enqueues its tasks.
+- A batch opened on a non-worker thread delivers its wake.
+- A batch on `CurrentThreadExecutor` or `WorkSharingExecutor` changes nothing.
 - Shutdown drains all in-flight tasks.
 - Skynet benchmark (disabled by default — run with `--gtest_also_run_disabled_tests`).
 
@@ -869,6 +1132,7 @@ contention on the victim's mutex. Chase-Lev eliminates all locks on the common p
 ### The Algorithm
 
 Chase-Lev is a double-ended queue (deque) where:
+
 - The **owner** thread pushes and pops from the **bottom** (back). No contention from
   thieves on this end in the common case.
 - **Thief** threads steal from the **top** (front). Multiple thieves can race here, resolved

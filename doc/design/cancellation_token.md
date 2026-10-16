@@ -299,7 +299,7 @@ waker from firing after a losing `select()` branch has been discarded.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Live : cancellation::make()
+    [*] --> Live : cancellation#58;#58;make()
     Live --> Cancelled : source.cancel()
     Cancelled --> Cancelled : source.cancel() (idempotent)
 
@@ -348,6 +348,7 @@ auto res = co_await coro::select(work_future, token.cancelled());
 ```
 
 When the token fires while `work_future` is pending:
+
 1. The `CancelledFuture`'s waker is invoked by `cancel()`.
 2. The `select()` future is woken and re-polled.
 3. `CancelledFuture::poll()` returns `PollReady`; `select()` picks branch 1.

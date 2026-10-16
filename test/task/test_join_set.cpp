@@ -6,8 +6,10 @@
 #include <coro/sync/select.h>
 #include <coro/sync/when.h>
 #include <coro/task/join_set.h>
+#include "co_assert.h"
 #include <coro/runtime/runtime.h>
 #include <stdexcept>
+#include <string>
 #include <variant>
 #include <vector>
 #include <algorithm>
@@ -502,6 +504,114 @@ TYPED_TEST(JoinSetVoidTest, DrainDiscardsAllButFirstException) {
         catch (const std::runtime_error&) { ++caught_count; }
     }(caught_count));
     EXPECT_EQ(caught_count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// cancel_all() and drain_or_cancel()
+// ---------------------------------------------------------------------------
+
+static_assert(Cancellable<detail::JoinSetDrainFuture<void, detail::DrainMode::CancelOnError>>);
+static_assert(!Cancellable<detail::JoinSetDrainFuture<void, detail::DrainMode::All>>);
+
+namespace {
+
+// Counts the destruction of the coroutine frame it is passed into, whether or not the
+// coroutine has started: a task cancelled before its first poll never runs its body.
+// A cancelled task's frame is destroyed before the task reports to its JoinSet.
+class DropToken {
+public:
+    explicit DropToken(std::atomic<int>& dropped) : m_dropped(&dropped) {}
+    DropToken(DropToken&& other) noexcept : m_dropped(std::exchange(other.m_dropped, nullptr)) {}
+    ~DropToken() { if (m_dropped) m_dropped->fetch_add(1); }
+private:
+    std::atomic<int>* m_dropped;
+};
+
+Coro<void> wait_forever([[maybe_unused]] DropToken token) {
+    co_await never<void>();
+}
+
+}  // namespace
+
+TYPED_TEST(JoinSetVoidTest, CancelAllCancelsEveryPendingTask) {
+    std::atomic<int> dropped = 0;
+    this->traits.rt.block_on([](std::atomic<int>& dropped) -> Coro<void> {
+        JoinSet<void> js;
+        for (int i = 0; i < 3; ++i) js.spawn(wait_forever(DropToken{dropped}));
+        js.cancel_all();
+        co_await js.drain();
+    }(dropped));
+    EXPECT_EQ(dropped, 3);
+}
+
+TYPED_TEST(JoinSetVoidTest, CancelAllLeavesSetUsable) {
+    bool got_result = false;
+    std::atomic<int> dropped = 0;
+    this->traits.rt.block_on([](bool& got_result, std::atomic<int>& dropped) -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(wait_forever(DropToken{dropped}));
+        js.cancel_all();
+        co_await js.drain();
+        js.spawn(ReadyVoidFuture{});
+        got_result = co_await next(js);
+    }(got_result, dropped));
+    EXPECT_TRUE(got_result);
+    EXPECT_EQ(dropped, 1);
+}
+
+TYPED_TEST(JoinSetVoidTest, DrainOrCancelWaitsForAllWithoutError) {
+    std::atomic<int> completed = 0;
+    this->traits.rt.block_on([](std::atomic<int>& completed) -> Coro<void> {
+        JoinSet<void> js;
+        for (int i = 0; i < 3; ++i)
+            js.spawn(co_invoke([&completed]() -> Coro<void> {
+                co_await OneShotFuture<int>{0};
+                ++completed;
+            }));
+        co_await js.drain_or_cancel();
+    }(completed));
+    EXPECT_EQ(completed, 3);
+}
+
+TYPED_TEST(JoinSetVoidTest, DrainOrCancelCancelsRestOnFirstException) {
+    bool caught = false;
+    int dropped_at_catch = -1;
+    std::atomic<int> dropped = 0;
+    this->traits.rt.block_on([](bool& caught, int& dropped_at_catch,
+                                std::atomic<int>& dropped) -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(wait_forever(DropToken{dropped}));
+        js.spawn(wait_forever(DropToken{dropped}));
+        js.spawn(ThrowingVoidFuture{});
+        try { co_await js.drain_or_cancel(); }
+        catch (const std::runtime_error& e) {
+            caught = (std::string(e.what()) == "void task failed");
+            dropped_at_catch = dropped.load();
+        }
+        CO_ASSERT(js.empty());
+    }(caught, dropped_at_catch, dropped));
+    EXPECT_TRUE(caught);
+    // Both waiting tasks had finished before the exception reached the caller.
+    EXPECT_EQ(dropped_at_catch, 2);
+}
+
+TYPED_TEST(JoinSetVoidTest, DrainOrCancelLosingSelectBranchCancelsTasks) {
+    std::size_t winner = 0;
+    int dropped_after_select = -1;
+    std::atomic<int> dropped = 0;
+    this->traits.rt.block_on([](std::size_t& winner, int& dropped_after_select,
+                                std::atomic<int>& dropped) -> Coro<void> {
+        JoinSet<void> js;
+        js.spawn(wait_forever(DropToken{dropped}));
+        js.spawn(wait_forever(DropToken{dropped}));
+        auto sel = co_await select(js.drain_or_cancel(), ReadyVoidFuture{});
+        winner = sel.index();
+        dropped_after_select = dropped.load();
+        CO_ASSERT(js.empty());
+    }(winner, dropped_after_select, dropped));
+    EXPECT_EQ(winner, 1u);
+    // select() returned only once the drain had seen every task finish.
+    EXPECT_EQ(dropped_after_select, 2);
 }
 
 // ---------------------------------------------------------------------------

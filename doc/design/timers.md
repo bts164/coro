@@ -86,7 +86,7 @@ sequenceDiagram
     S->>R: add_timer(deadline, weak waker)
     R->>Q: insert (driver on desktop, executor on Pico)
     Q-->>S: TimerId
-    Note over Q: deadline passes; the thread turning the driver fires it
+    Note over Q: deadline passes, and the thread turning the driver fires it
     Q-->>S: wake (task re-polled)
     S->>S: poll(): now >= deadline → Ready
     Note over S,Q: dropped before the deadline instead: cancel_timer(id)

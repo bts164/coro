@@ -173,10 +173,10 @@ sequenceDiagram
     A->>A: poll: pending empty, store waker
     A->>A: poll_io(Read, drain) reads the byte
     A->>A: broadcast(): lock registry
-    Note over A,B: for each watcher, each watch:<br/>delta = count - seen; seen = count;<br/>coalesce delta into pending; take its waker
+    Note over A,B: for each watcher, each watch:<br/>delta = count - seen, then seen = count,<br/>coalesce delta into pending, take its waker
     A-->>B: wake B (after unlocking)
     A->>A: loop: pending non-empty, Ready
-    B->>B: poll: pending non-empty, Ready<br/>(its own driver may also have woken it; its drain finds EAGAIN)
+    B->>B: poll: pending non-empty, Ready<br/>(its own driver may also have woken it, and its drain finds EAGAIN)
 ```
 
 - `poll` loops. If `pending` is non-empty, it is ready. Otherwise it stores the weak

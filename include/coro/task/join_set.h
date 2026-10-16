@@ -114,19 +114,55 @@ private:
     Weak<JoinSetSharedState<T>> m_set_state;
 };
 
+/**
+ * @brief Cancels every pending task of the set, leaving each in pending_handles
+ * with its Node::task set: unlike JoinSet::cancel_pending(), the set keeps tracking
+ * them, and on_task_complete() moves each to idle_handles when it finishes.
+ *
+ * Only asks: the tasks finish at their next poll, on whatever worker.
+ */
+template<typename T>
+void join_set_cancel_all(JoinSetSharedState<T>& state) {
+    // Strong refs taken under the lock: once it is released a task may finish and
+    // be destroyed (see JoinSet::cancel_pending()).
+    std::vector<Rc<TaskBase>> to_cancel;
+    {
+        std::lock_guard lock(state.mutex);
+        to_cancel.reserve(state.pending_handles.size());
+        for (auto* node = state.pending_handles.front(); node; node = node->next)
+            if (node->task) to_cancel.push_back(node->task->shared_from_this());
+    }
+    // Outside the lock: cancel_task() wakes the task, and a task that has already
+    // finished ignores both the flag and the wake.
+    for (auto& task : to_cancel)
+        task->cancel_task();
+}
+
 // -----------------------------------------------------------------------
-// JoinSetDrainFuture<T>
+// JoinSetDrainFuture<T, Mode>
 // -----------------------------------------------------------------------
 
+/// What a drain does when a task fails. See doc/design/join_set.md.
+enum class DrainMode {
+    All,            ///< drain(): wait for every task, then rethrow the first exception.
+    CancelOnError,  ///< drain_or_cancel(): on the first exception cancel the rest,
+                    ///< wait for every task, then rethrow it.
+};
+
 /**
- * @brief Future<void> returned by JoinSet::drain().
+ * @brief Future<void> returned by JoinSet::drain() and JoinSet::drain_or_cancel().
  *
  * Polls until all pending tasks have completed or been cancelled. Each poll
  * sweeps idle_handles (discarding values, capturing the first exception) and
  * returns Pending if any tasks are still running. Rethrows the first exception
  * after pending_handles reaches zero.
+ *
+ * With `DrainMode::CancelOnError` the first exception also cancels every pending
+ * task (join_set_cancel_all()), and the future is `Cancellable`: cancel() cancels
+ * every pending task, and the future then returns `PollDropped` once all have
+ * finished.
  */
-template<typename T>
+template<typename T, DrainMode Mode = DrainMode::All>
 class JoinSetDrainFuture {
 public:
     using OutputType = void;
@@ -135,6 +171,21 @@ public:
         : m_state(std::move(state)) {}
 
     JoinSetDrainFuture(JoinSetDrainFuture&&) noexcept = default;
+
+    /// Whether an exception should give way to a later one. See set_ranks_last().
+    using RanksLast = bool (*)(const std::exception_ptr&) noexcept;
+
+    /// @brief The first exception is kept unless it ranks last and a later one
+    /// doesn't. For parallel(), whose parts fail with TeamBroken once one of them
+    /// has thrown: that one's exception is the one to report.
+    void set_ranks_last(RanksLast ranks_last) noexcept { m_ranks_last = ranks_last; }
+
+    /// Cancels every pending task. Polls then return pending until all have
+    /// finished, then `PollDropped`.
+    void cancel() requires (Mode == DrainMode::CancelOnError) {
+        m_dropped = true;
+        cancel_all_once();
+    }
 
     PollResult<void> poll(detail::Context& ctx) {
         std::deque<Rc<TaskState<T>>> to_process;
@@ -149,12 +200,25 @@ public:
 
         // Process completed tasks outside the lock — collect first exception, discard values.
         for (auto& ts : to_process) {
-            if (!m_first_exception) {
+            if (m_first_exception && !(m_ranks_last && m_ranks_last(m_first_exception)))
+                continue;
+            std::exception_ptr exception;
+            {
                 std::lock_guard tlock(ts->mutex);
-                if (ts->exception) m_first_exception = ts->exception;
+                exception = ts->exception;
             }
+            if (!exception) continue;
+            if (!m_first_exception || !m_ranks_last(exception))
+                m_first_exception = std::move(exception);
         }
         // to_process destructs here, releasing task allocations.
+
+        if constexpr (Mode == DrainMode::CancelOnError) {
+            // The tasks of this set wait on each other; with one failed the rest may
+            // never finish on their own. Cancelled tasks carry no exception, so later
+            // sweeps only find tasks that failed for themselves.
+            if (m_first_exception) cancel_all_once();
+        }
 
         if (any_pending) return PollPending;
 
@@ -168,13 +232,25 @@ public:
             }
         }
 
+        if constexpr (Mode == DrainMode::CancelOnError) {
+            if (m_dropped) return PollDropped;
+        }
         if (m_first_exception) return PollError(std::move(m_first_exception));
         return PollReady;
     }
 
 private:
+    void cancel_all_once() {
+        if (m_cancelled) return;
+        m_cancelled = true;
+        join_set_cancel_all(*m_state);
+    }
+
     Rc<JoinSetSharedState<T>> m_state;
     std::exception_ptr        m_first_exception;
+    RanksLast                 m_ranks_last = nullptr;
+    bool                      m_cancelled = false;  // CancelOnError: cancel_all done
+    bool                      m_dropped   = false;  // CancelOnError: cancel() called
 };
 
 } // namespace detail
@@ -378,6 +454,31 @@ public:
     [[nodiscard]] detail::JoinSetDrainFuture<T> drain() {
         return detail::JoinSetDrainFuture<T>{m_state};
     }
+
+    /**
+     * @brief Like drain(), but the first exception cancels the remaining tasks; the
+     * future still waits for every task to finish before it rethrows.
+     *
+     * For tasks that wait on each other (parts meeting at a `Barrier`, a producer
+     * and its consumers), where drain() would wait forever once one has failed.
+     * The future is `Cancellable`: cancelled, it cancels the tasks and completes
+     * once they have all finished.
+     */
+    [[nodiscard]] detail::JoinSetDrainFuture<T, detail::DrainMode::CancelOnError>
+    drain_or_cancel() {
+        return detail::JoinSetDrainFuture<T, detail::DrainMode::CancelOnError>{m_state};
+    }
+
+    /**
+     * @brief Cancels every pending task without dropping the set, like tokio's
+     * `abort_all()`. The tasks stay in the set: each still finishes (with no result)
+     * and is reported by next(), drain() and drain_or_cancel() as usual.
+     *
+     * WARNING: waits for nothing. A task finishes at its next poll, on whatever
+     * worker; anything it references must outlive that. Await drain() before
+     * releasing it.
+     */
+    void cancel_all() { detail::join_set_cancel_all(*m_state); }
 
 private:
     // Cancels all pending tasks and, if inside a coroutine scope, registers each

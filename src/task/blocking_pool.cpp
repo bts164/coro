@@ -1,5 +1,6 @@
 #include <coro/task/spawn_blocking.h>
 #include <coro/runtime/runtime.h>
+#include <coro/detail/trace.h>
 #include <cstdlib>
 #include <stdexcept>
 #include <thread>
@@ -247,6 +248,8 @@ void BlockingPool::worker_loop() {
     // the thread exits below: the OS thread terminates right after, so nothing can
     // read it stale.
     set_current_runtime(m_runtime);
+    detail::trace::thread_name("coro-blocking");
+    detail::trace::AwakeZone awake;
 
     while (true) {
         detail::Rc<detail::BlockingTaskBase> task;
@@ -255,9 +258,12 @@ void BlockingPool::worker_loop() {
             ++m_idle_threads;
 
             // Wait for work, shutdown, or keep-alive timeout.
-            m_cv.wait_for(lock, kKeepAlive, [this] {
-                return !m_queue.empty() || m_stop;
-            });
+            {
+                detail::trace::SleepScope sleeping;
+                m_cv.wait_for(lock, kKeepAlive, [this] {
+                    return !m_queue.empty() || m_stop;
+                });
+            }
 
             --m_idle_threads;
 
@@ -285,7 +291,10 @@ void BlockingPool::worker_loop() {
         // way the cancelled flag was set first, and run() and every cancellation
         // point read the flag, not the scheduling state.
         task->scheduling_state.store(detail::SchedulingState::Running, std::memory_order_release);
-        task->run();
+        {
+            detail::trace::BlockingJobZone zone;
+            task->run();
+        }
         t_current_blocking_task = nullptr;
 
         bool closed;

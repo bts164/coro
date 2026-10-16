@@ -70,6 +70,11 @@ public:
     /// the executor after the task's `poll()` returns.
     bool yielded() const noexcept { return m_yielded; }
 
+    /// @brief The budget left in this poll. Read by an executor after `poll()`
+    /// returns, to pass what is left on to a task it runs next in the same turn
+    /// (the work-stealing executor's LIFO slot).
+    std::uint32_t remaining_budget() const noexcept { return m_budget; }
+
     /// @brief Returns the waker for the current task. Store this and call `wake()` when ready.
     /// For leaf futures that store the waker for later notification, prefer get_weak_waker()
     /// to avoid contributing to ownership cycles. getWaker() is appropriate for temporary use

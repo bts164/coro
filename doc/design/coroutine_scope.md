@@ -214,6 +214,7 @@ thread-local to identify which scope to register with.
 ### Registration mechanism
 
 When a `JoinHandle` is destroyed and `t_current_coro` is non-null, the destructor:
+
 1. Sets `cancelled = true` on the child `TaskState` (via `cancel()`).
 2. Records a `weak_ptr<TaskBase>` to the child in the scope's pending list so the
    scope can track drain completion. The executor's owned list keeps the child alive

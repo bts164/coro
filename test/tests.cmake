@@ -50,6 +50,7 @@ coro_test(task/test_join_set.cpp                 DESKTOP PICO_STUB ON_TARGET cor
 coro_test(task/test_stream_handle.cpp            DESKTOP PICO_STUB ON_TARGET core)
 coro_test(task/test_coro_scope.cpp               DESKTOP PICO_STUB ON_TARGET runtime)
 coro_test(task/test_spawn_blocking.cpp           DESKTOP)
+coro_test(task/test_parallel.cpp                 DESKTOP PICO_STUB)
 # Fibers: on the host these run on the desktop backend. On the board it is the real
 # ARM context switch on a real stack. Not in the stub suite, which has no fibers.
 coro_test(task/test_fiber.cpp                    DESKTOP ON_TARGET core)
@@ -62,6 +63,8 @@ coro_test(task/test_switch_context_pico.cpp      HOST_LINK unicorn::unicorn)
 
 # sync/
 coro_test(sync/test_event.cpp                    DESKTOP PICO_STUB ON_TARGET sync)
+coro_test(sync/test_barrier.cpp                  DESKTOP PICO_STUB ON_TARGET sync)
+coro_test(sync/test_team.cpp                     DESKTOP PICO_STUB)
 coro_test(sync/test_select.cpp                   DESKTOP PICO_STUB ON_TARGET sync)
 coro_test(sync/test_when.cpp                     DESKTOP PICO_STUB ON_TARGET sync)
 coro_test(sync/test_sleep.cpp                    DESKTOP PICO_STUB ON_TARGET sync)

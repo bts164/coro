@@ -70,6 +70,8 @@ public:
     /// True: an idle worker turns the runtime's IoDriver when no other worker holds it.
     bool turns_io_driver() const noexcept override { return true; }
 
+    std::size_t worker_count() const noexcept override { return m_workers.size(); }
+
     /// Cancels every owned task; later schedule() calls cancel their task too.
     void begin_shutdown() override;
 

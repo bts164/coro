@@ -222,8 +222,29 @@ co_await coro;  // safe only because lambda is still alive and has not been move
 This breaks the moment `coro` is stored and awaited somewhere else, or if `lambda` is
 ever moved. Prefer `co_invoke` in all cases.
 
-**Rule of thumb:** if a lambda is a coroutine and captures anything, always wrap it in
-`co_invoke` rather than invoking it directly.
+Passing a capturing lambda coroutine to `parallel()` is safe too, and supported: there
+it isn't invoked directly. `parallel()` gives the lambda the same two guarantees as
+`co_invoke`. Its future holds the lambda until every part has finished, on every path
+including cancellation and errors, and doesn't move it once the parts have started. So
+each part's `this` stays valid:
+
+```cpp
+// GOOD — parallel() owns the lambda for as long as any part runs
+co_await coro::parallel(k, [&](coro::TeamMember me) -> Coro<void> {
+    const auto [begin, end] = me.range(rows.size());
+    filter(rows, begin, end);
+    co_await me.sync();
+    summarize(rows, begin, end);
+});
+```
+
+All the parts share the one lambda object, so they share its captures, by value or by
+reference: two parts that write to the same capture race. The references `[&]` takes
+are to the caller's locals, which outlive the parts because the caller is suspended in
+the `co_await` until they have all finished.
+
+**Rule of thumb:** if a lambda is a coroutine and captures anything, wrap it in
+`co_invoke` rather than invoking it directly, or pass it to `parallel()`, which owns it.
 
 ### CS.4 — Be careful when spawning member function coroutines; `this` is implicitly captured
 
@@ -386,6 +407,40 @@ auto h2 = build_task().name("serve-connection").spawn(serve_connection(conn));
 
 // Named stream with custom buffer
 auto sh = build_task().name("packet-reader").buffer(128).spawn(read_packets(sock));
+```
+
+### SP.3 — Take a `TeamMember` by value in the coroutine that uses it
+
+**Reason:** A team finds out that a member's task has ended when the member is
+destroyed: its destructor breaks the team, so the others fail with `TeamBroken` instead
+of waiting for it. Taken by value, as a coroutine parameter or a member of a
+hand-written future, the member lives exactly as long as the task. This is the
+supported pattern, and the one `parallel()` passes members in by.
+
+Other patterns aren't prevented, but whoever uses one takes on the lifetime rules it
+relies on. A member stored where it outlives its task (a struct, a container, a global)
+hides the task's exit, and the others wait in their next collective until something
+times out or cancels them. A member taken by reference dangles once the handle it
+refers to moves or is destroyed. The team catches what it can, such as a moved-from
+handle or a member dropped before it is used, not all of it.
+
+```cpp
+// WRONG — the reference outlives the factory's parameter:
+coro::Coro<void> part(coro::TeamMember& me, Data& d);
+coro::Coro<void> start_part(coro::TeamMember me, Data& d) { return part(me, d); }
+
+// WRONG — the member outlives the task; the team never learns that the task ended:
+coro::Coro<void> part(coro::TeamMember me, Registry& r) {
+    r.members.push_back(std::move(me));
+    co_await work(r);
+}
+
+// CORRECT — the coroutine owns its member:
+coro::Coro<void> part(coro::TeamMember me, Data& d) {
+    const auto [begin, end] = me.range(d.size());
+    co_await me.sync();
+    use(d, begin, end);
+}
 ```
 
 ---
@@ -627,6 +682,39 @@ Coro<void> run() {
     epoll fd and an eventfd) and blocking pool. The pool starts threads only when
     `spawn_blocking` is called on it, so the nested runtime adds no threads otherwise.
 
+### BL.5 — Keep long computations off a runtime that serves latency-sensitive tasks
+
+**Reason:** A task holds its worker for the whole of a poll, and the
+[budget](design/task_budget.md) counts only `co_await`s, so code that computes without
+awaiting is bounded by nothing but its own length. While it runs, everything queued on
+that worker waits for it. On `WorkStealingExecutor` that includes a task it has just
+woken: the woken task goes into this worker's
+[LIFO slot](design/work_stealing_executor.md#lifo-slot), which no other worker takes from,
+even while they are idle. If every worker is computing, I/O and timers wait as well.
+
+Computations of up to a few milliseconds per poll are fine, and `parallel()` spreads one
+across the workers. Run longer ones in `spawn_blocking()`, or on a `Runtime` of their own
+so that latency-sensitive tasks never share a worker with them.
+
+```cpp
+// BAD — the consumer woken by send() waits in this worker's LIFO slot until
+// analyse() returns, although other workers are idle
+Coro<void> bad(MpscReceiver<Frame>& rx, MpscSender<Summary>& tx) {
+    while (auto frame = co_await rx.recv()) {
+        co_await tx.send(summarise(*frame));  // wakes the consumer
+        analyse(*frame);                       // 50 ms, no co_await
+    }
+}
+
+// GOOD — the long part runs on the blocking pool, and the worker moves on at once
+Coro<void> good(MpscReceiver<Frame>& rx, MpscSender<Summary>& tx) {
+    while (auto frame = co_await rx.recv()) {
+        co_await tx.send(summarise(*frame));
+        co_await spawn_blocking([frame = std::move(*frame)] { analyse(frame); });
+    }
+}
+```
+
 ---
 
 ## Channels
@@ -854,6 +942,10 @@ Two rules to remember when using `coro::ref()`:
    has a lifetime longer than the wrapper.
 2. **Result consumption.** If the `coro::ref(f)` branch wins, the result is moved out of `f`.
    Do not await `f` again afterward — it is logically spent even though it was never moved.
+3. **Not for a future you want cancelled.** If `f` should stop when its branch loses, pass
+   it by value: `select()` cancels the losing branch and waits for it to drain before it
+   returns. Wrapping it in `coro::ref()` instead leaves it running, and stopping it
+   becomes your job (`co_await std::move(task).cancel_and_join()` for a `JoinHandle`).
 
 ---
 

@@ -97,6 +97,7 @@ is not safe is two threads calling methods on the *same* `Sender` or `Receiver` 
 simultaneously.
 
 In practice:
+
 - Each `Sender` clone is an independent object. Multiple threads sending concurrently
   is safe — give each thread its own clone.
 - A `Receiver` is single-owner by design. Move it to whichever thread needs it.

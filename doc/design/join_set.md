@@ -91,6 +91,54 @@ co_await co_invoke([&data]() -> Coro<void> {
 - `drain()`: waits for all tasks to finish, then rethrows the first exception encountered.
 - In both cases, remaining tasks continue running and are only cancelled when `JoinSet`
   is dropped.
+- `drain_or_cancel()`: on the first exception, cancels the remaining tasks, waits for
+  them to finish, then rethrows (below).
+
+## Cancelling without dropping: `cancel_all()` and `drain_or_cancel()`
+
+Dropping the set cancels its tasks but stops tracking them; the enclosing coroutine
+scope is left to wait for them. That is too late when the tasks borrow something that
+lives next to the set, in the same frame or the same future, rather than in an outer
+frame. Two additions cancel while the set keeps tracking:
+
+```cpp
+js.cancel_all();                // like tokio's abort_all(): each pending task is cancelled
+                                // but stays in the set and still reports when it finishes
+
+co_await js.drain_or_cancel();  // drain(); but on the first exception, cancel_all(),
+                                // wait for every task to finish, then rethrow it
+```
+
+`drain_or_cancel()` is for tasks that depend on each other, where one failing leaves the
+others waiting for it: parts of a computation that meet at a [barrier](barrier.md), or a
+producer and its consumers. `drain()` would wait on them forever.
+
+Both futures are the existing `JoinSetDrainFuture<T>` with a mode parameter:
+
+```cpp
+enum class DrainMode { All, CancelOnError };
+template<typename T, DrainMode Mode = DrainMode::All>
+class JoinSetDrainFuture;
+```
+
+- **`cancel_all()`** calls `cancel_task()` on each pending task under the set's mutex but,
+  unlike `cancel_pending()`, leaves `Node::task` set. A cancelled task's
+  `on_task_complete()` still runs at its terminal exit (`mark_done`) and moves it to
+  `idle_handles`, so `next()` and the drain futures see it finish. Calling it twice
+  cancels nothing new.
+- **`CancelOnError`**: when a sweep of `idle_handles` finds the first exception, the
+  future calls `cancel_all()` and goes on draining. It returns the exception once
+  `pending_handles` is empty. Cancelled tasks carry no exception, so later sweeps find
+  only exceptions from tasks that failed on their own; they are dropped, as in `drain()`.
+- **Cancellable.** The `CancelOnError` future also has `cancel()`, so a coroutine or
+  combinator that drops it follows the [cancellation protocol](coroutine_scope.md#step-1-drain-or-drop-the-awaited-future):
+  `cancel()` calls `cancel_all()`, and later polls return pending until every task has
+  finished, then `PollDropped`. `parallel()` relies on this.
+
+!!! danger "WARNING: `cancel_all()` waits for nothing"
+    It only asks. The tasks finish at their next poll, on whatever worker, and
+    anything they reference must outlive that. Await `drain()` (or the drain future's
+    `PollDropped`) before releasing it.
 
 ## Internal design
 

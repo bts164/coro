@@ -197,3 +197,26 @@ TEST(RuntimeTest, FreeSpawnDelegatesToCurrentRuntime) {
     set_current_runtime(nullptr);
     (void)h;
 }
+
+// --- worker_count() ---
+
+TEST(RuntimeTest, SingleThreadRuntimeHasOneWorker) {
+    SingleThreadRuntime rt;
+    EXPECT_EQ(rt.worker_count(), 1u);
+    EXPECT_EQ(rt.block_on([]() -> Coro<std::size_t> { co_return worker_count(); }()), 1u);
+}
+
+#ifndef CORO_PICO
+
+TEST(RuntimeTest, WorkStealingRuntimeCountsItsWorkers) {
+    Runtime rt(std::size_t{4});
+    EXPECT_EQ(rt.worker_count(), 4u);
+    EXPECT_EQ(rt.block_on([]() -> Coro<std::size_t> { co_return worker_count(); }()), 4u);
+}
+
+TEST(RuntimeTest, WorkSharingRuntimeCountsItsWorkers) {
+    Runtime rt(std::in_place_type<WorkSharingExecutor>, std::size_t{3});
+    EXPECT_EQ(rt.worker_count(), 3u);
+}
+
+#endif  // !CORO_PICO

@@ -1,4 +1,7 @@
+#include <array>
 #include <atomic>
+#include <functional>
+#include <numeric>
 #include <optional>
 
 #include <co_assert.h>
@@ -10,6 +13,7 @@
 #include <coro/sync/join.h>
 #include <coro/task/join_handle.h>
 #include <coro/task/join_set.h>
+#include <coro/task/parallel.h>
 #include <coro/task/spawn_builder.h>
 
 using namespace coro;
@@ -329,6 +333,112 @@ TEST(SkynetMixedTest, Stealing) {
         rt.block_on(skynet_mixed0(0, 1000000));
 #else
     size_t result = rt.block_on(skynet_mixed0(0, 1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+#endif
+}
+// parallel() at every level: each node is one part of its parent's parallel() call and
+// writes its sum into the parent's array. Every node carries a team, a JoinSet and a
+// WakeBatch, so on WorkStealingExecutor every spawn goes through the injection queue.
+Coro<void> skynet_parallel_node(TeamMember part, size_t parent_num, size_t remaining,
+                                std::array<size_t, 10>& parent_sums) {
+    const size_t my_num = parent_num + part.rank()*remaining;
+    if (remaining == 1) {
+        parent_sums[part.rank()] = my_num;
+        co_return;
+    }
+    std::array<size_t, 10> sums{};
+    co_await parallel(10, skynet_parallel_node, my_num, remaining/10, std::ref(sums));
+    size_t sum = std::accumulate(sums.begin(), sums.end(), size_t{0});
+    #ifndef SKYNET_BENCHMARK_ITERATIONS
+    size_t exp = SkynetLookup::instance[my_num, remaining];
+    CO_ASSERT_EQ(sum, exp)
+        << sum << " != " << exp << " (my_num = " << my_num << ", remaining = " << remaining << ")";
+    #endif
+    parent_sums[part.rank()] = sum;
+}
+
+Coro<size_t> skynet_parallel(size_t remaining) {
+    std::array<size_t, 10> sums{};
+    co_await parallel(10, skynet_parallel_node, size_t{0}, remaining/10, std::ref(sums));
+    co_return std::accumulate(sums.begin(), sums.end(), size_t{0});
+}
+
+TEST(SkynetParallelTest, SingleThreaded) {
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
+#ifdef SKYNET_BENCHMARK_ITERATIONS
+    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
+        rt.block_on(skynet_parallel(1000000));
+#else
+    size_t result = rt.block_on(skynet_parallel(1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+#endif
+}
+
+TEST(SkynetParallelTest, Sharing) {
+    Runtime rt(std::in_place_type<WorkSharingExecutor>);
+#ifdef SKYNET_BENCHMARK_ITERATIONS
+    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
+        rt.block_on(skynet_parallel(1000000));
+#else
+    size_t result = rt.block_on(skynet_parallel(1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+#endif
+}
+
+TEST(SkynetParallelTest, Stealing) {
+    Runtime rt(std::in_place_type<WorkStealingExecutor>);
+#ifdef SKYNET_BENCHMARK_ITERATIONS
+    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
+        rt.block_on(skynet_parallel(1000000));
+#else
+    size_t result = rt.block_on(skynet_parallel(1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+#endif
+}
+
+// parallel() at the first level only, then join() below: SkynetMixedTest with parallel()
+// in place of the JoinSet.
+Coro<void> skynet_parallel_mixed_part(TeamMember part, size_t remaining,
+                                      std::array<size_t, 10>& sums) {
+    sums[part.rank()] = co_await skynet_mixed1(part.rank()*remaining, remaining,
+                                                std::make_index_sequence<10>{});
+}
+
+Coro<size_t> skynet_parallel_mixed(size_t remaining) {
+    std::array<size_t, 10> sums{};
+    co_await parallel(10, skynet_parallel_mixed_part, remaining/10, std::ref(sums));
+    co_return std::accumulate(sums.begin(), sums.end(), size_t{0});
+}
+
+TEST(SkynetParallelMixedTest, SingleThreaded) {
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
+#ifdef SKYNET_BENCHMARK_ITERATIONS
+    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
+        rt.block_on(skynet_parallel_mixed(1000000));
+#else
+    size_t result = rt.block_on(skynet_parallel_mixed(1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+#endif
+}
+
+TEST(SkynetParallelMixedTest, Sharing) {
+    Runtime rt(std::in_place_type<WorkSharingExecutor>);
+#ifdef SKYNET_BENCHMARK_ITERATIONS
+    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
+        rt.block_on(skynet_parallel_mixed(1000000));
+#else
+    size_t result = rt.block_on(skynet_parallel_mixed(1000000));
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+#endif
+}
+
+TEST(SkynetParallelMixedTest, Stealing) {
+    Runtime rt(std::in_place_type<WorkStealingExecutor>);
+#ifdef SKYNET_BENCHMARK_ITERATIONS
+    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
+        rt.block_on(skynet_parallel_mixed(1000000));
+#else
+    size_t result = rt.block_on(skynet_parallel_mixed(1000000));
     EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
 #endif
 }

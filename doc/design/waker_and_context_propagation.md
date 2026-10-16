@@ -95,6 +95,7 @@ sequenceDiagram
 ```
 
 Key observations:
+
 - `main_coro` and `compute_coro` never store the waker — they just forward `ctx`
 - `read_packet` is the only future that interacts with the I/O driver
 - On the second poll, each coroutine resumes instantly from where it was — the intermediate

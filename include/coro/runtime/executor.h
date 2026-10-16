@@ -51,6 +51,10 @@ public:
     /// that never turns the driver, a wait for readiness would never be woken.
     virtual bool turns_io_driver() const noexcept { return false; }
 
+    /// @brief Number of threads that poll tasks. 1 for a single-threaded executor.
+    /// Used to size data-parallel work such as `parallel()`.
+    virtual std::size_t worker_count() const noexcept { return 1; }
+
     // --- Runtime shutdown. See doc/design/runtime_shutdown.md. ----------------------
 
     /// @brief Starts shutdown: cancels every task this executor owns, and from now on

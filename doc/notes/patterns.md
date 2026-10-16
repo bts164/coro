@@ -381,10 +381,11 @@ coro::Coro<int> async_main(int argc, char *argv[]) {
     // SIGINT or SIGTERM received. Cancel run_server & wait for it to drain.
     // Cancel itself does not throw an exception, but rather stops polling
     // and runs RAII cleanup of all coroutine frames in drain order. We
-    // should still co_await the handle here to receive any exceptions that
+    // should still co_await the result here to receive any exceptions that
     // may have already happened in the background before the cancel was
-    // requested.
-    co_return co_await std::move(run_server_handle).cancel_and_join();
+    // requested. It is std::nullopt unless run_server finished first.
+    std::optional<int> code = co_await std::move(run_server_handle).cancel_and_join();
+    co_return code.value_or(0);
 }
 
 int main(int argc, char *argv[]) {

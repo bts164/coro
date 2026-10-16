@@ -141,6 +141,11 @@ public:
     /// @brief Constructs a Runtime with the default executor for the given thread count.
     /// `num_threads <= 1` → CurrentThreadExecutor (tasks run on the thread calling
     /// `block_on()`, which also turns the I/O driver); otherwise → WorkStealingExecutor.
+    ///
+    /// `num_threads` is a ceiling, not a target: the work-stealing executor wakes the
+    /// lowest-numbered idle worker first, so a program that only ever has a few tasks
+    /// runnable at once keeps a few workers busy and leaves the rest parked. See
+    /// WorkStealingExecutor.
     explicit Runtime(std::size_t num_threads = std::thread::hardware_concurrency());
 
     /// @brief Constructs a Runtime with an explicit executor type.
@@ -253,6 +258,12 @@ public:
      */
     void set_task_budget(std::uint32_t budget) noexcept {
         if (m_executor) m_executor->set_task_budget(budget);
+    }
+
+    /// @brief Number of worker threads that poll tasks: `n` for `Runtime(n)` with
+    /// `n > 1`, otherwise 1 (and always 1 on Pico). 1 after shutdown().
+    std::size_t worker_count() const noexcept {
+        return m_executor ? m_executor->worker_count() : 1;
     }
 
     /// @brief The exception a future fails with when the runtime it waits on has
@@ -401,6 +412,12 @@ inline void schedule_task(detail::Rc<detail::TaskBase> task) {
 /// @brief Returns the thread-local current runtime.
 /// @throws std::runtime_error if called outside a `Runtime::block_on()` context.
 Runtime& current_runtime();
+
+/// @brief Worker threads of the current runtime. See Runtime::worker_count().
+/// @throws std::runtime_error if called outside a `Runtime::block_on()` context.
+inline std::size_t worker_count() {
+    return current_runtime().worker_count();
+}
 
 /**
  * @brief Spawns a @ref Future as a background task and returns a @ref JoinHandle.

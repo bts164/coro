@@ -2,6 +2,7 @@
 
 #include <coro/detail/context.h>
 #include <coro/future.h>
+#include <coro/task/cancel_and_join.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/task.h>
@@ -135,20 +136,22 @@ public:
         }
     }
 
-    /// @brief Cancels the task and returns the handle for the caller to co_await.
+    /// @brief Cancels the task and returns a future that waits for it to finish.
     ///
-    /// Calls cancel() then moves the handle out so the caller can co_await it
-    /// directly — no intermediate coroutine frame, no extra allocation.
+    ///   std::optional<int> last = co_await std::move(handle).cancel_and_join();
     ///
-    ///   co_await std::move(*g_handle).cancel_and_join();
-    ///   g_handle = spawn(new_task());
+    /// The await completes once the task has fully drained (frame and all scope
+    /// children destroyed). It yields `std::nullopt` if the cancel stopped the task
+    /// before it produced a value, or the value if the task had already finished;
+    /// which one is a race. For JoinHandle<void> it yields a bool instead: true if
+    /// the task finished first. See CancelAndJoin. No intermediate coroutine frame, no allocation.
     ///
-    /// The caller suspends until the task has fully drained (frame and all scope
-    /// children destroyed), then resumes. For JoinHandle<void>, the co_await
-    /// completes silently whether the task finished normally or was cancelled.
-    [[nodiscard]] JoinHandle cancel_and_join() && {
+    /// Only needed where the handle is not already being dropped by something that
+    /// waits for it: moving the handle into select() cancels and drains it when
+    /// another branch wins, with no extra code.
+    [[nodiscard]] CancelAndJoin<JoinHandle> cancel_and_join() && {
         cancel();
-        return std::move(*this);
+        return CancelAndJoin<JoinHandle>(std::move(*this));
     }
 
     /// @brief Cancels the task (if cancelOnDestroy) and registers with the enclosing scope.

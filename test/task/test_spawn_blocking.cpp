@@ -13,6 +13,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -398,6 +399,21 @@ TEST(SpawnBlockingCancel, CancelAndJoinUnwindsParkedCallable) {
     }(probe));
     EXPECT_TRUE(probe->unwound.load());
     EXPECT_FALSE(probe->finished.load());
+}
+
+TEST(SpawnBlockingCancel, CancelAndJoinYieldsNulloptWhenCallableUnwinds) {
+    coro::Runtime rt(1);
+    auto probe = std::make_shared<Probe>();
+    std::optional<int> result = rt.block_on([](std::shared_ptr<Probe> probe) -> coro::Coro<std::optional<int>> {
+        auto h = coro::spawn_blocking([probe] {
+            park_until_cancelled(*probe);
+            return 7;
+        });
+        co_await probe->started.wait();
+        co_return co_await std::move(h).cancel_and_join();
+    }(probe));
+    EXPECT_EQ(result, std::nullopt);
+    EXPECT_TRUE(probe->unwound.load());
 }
 
 TEST(SpawnBlockingCancel, DroppingHandleRequestsCancellation) {

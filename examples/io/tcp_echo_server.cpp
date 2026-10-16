@@ -27,6 +27,7 @@
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <thread>
 #include <variant>
@@ -160,6 +161,8 @@ static Coro<int> run_server() {
 // ---------------------------------------------------------------------------
 static Coro<int> async_main() {
     auto server_handle = coro::spawn(run_server());
+    // coro::ref() keeps the server running when a signal wins, so that the shutdown
+    // can be announced before waiting for it.
     auto result = co_await coro::select(
         coro::ref(server_handle),
         coro::signal(SIGINT),
@@ -172,7 +175,8 @@ static Coro<int> async_main() {
     // connection still open before cancel_and_join() resolves. Each one sends its
     // goodbye on the way out, so shutdown takes at most the 1s send_goodbye() allows.
     LOG(-1, "Signal received — shutting down");
-    co_return co_await std::move(server_handle).cancel_and_join();
+    std::optional<int> code = co_await std::move(server_handle).cancel_and_join();
+    co_return code.value_or(0);  // nullopt: the cancel stopped it, as it normally will
 }
 
 // ---------------------------------------------------------------------------

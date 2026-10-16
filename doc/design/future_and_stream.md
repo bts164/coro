@@ -99,6 +99,7 @@ private:
 ```
 
 Notes:
+
 - The waker is read and cleared under the lock — this prevents a missed-wakeup race where
   `set()` reads a null waker just before `poll()` stores a new one.
 - If the waker may be stored across threads (e.g. a callback run by another Runtime's I/O driver),
@@ -136,11 +137,11 @@ concept Stream = requires(S s, detail::Context& ctx) {
 
 - `S::ItemType` — the element type of the stream.
 - `poll_next(ctx)` — advances the stream by one item. Returns:
-  - `Ready(some(T))` — next item is available
-  - `Ready(nullopt)` — stream is exhausted (no more items will follow)
-  - `Pending` — no item ready yet; waker registered for later wake-up
-  - `Error` — stream faulted; exception captured in the `PollResult`
-  - `Dropped` — stream was cancelled
+    - `Ready(some(T))` — next item is available
+    - `Ready(nullopt)` — stream is exhausted (no more items will follow)
+    - `Pending` — no item ready yet; waker registered for later wake-up
+    - `Error` — stream faulted; exception captured in the `PollResult`
+    - `Dropped` — stream was cancelled
 
 ### Writing a custom Stream
 

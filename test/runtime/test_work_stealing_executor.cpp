@@ -4,6 +4,8 @@
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #include <coro/coro.h>
+#include <coro/detail/wake_batch.h>
+#include <coro/sync/event.h>
 #include <coro/task/join_handle.h>
 #include <coro/task/join_set.h>
 #include <coro/task/spawn_blocking.h>
@@ -464,4 +466,214 @@ TEST(WorkStealingExecutorTest, OverflowedTasksRunWhileEveryWorkerIsBusy) {
     std::atomic<int> counter{0};
     EXPECT_EQ(rt.block_on(overflow_while_busy(stop, workers, counter, kTasks)), kTasks);
     stop.store(true, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------
+// WakeBatch. See doc/design/work_stealing_executor.md, "Batched wakes (`WakeBatch`)".
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Spawns kChainWorkers tasks inside one batch; each holds its worker until all
+// have started, so they must run on kChainWorkers workers at once.
+Coro<bool> spawn_batch_of_holders(std::atomic<int>& started) {
+    JoinSet<bool> js;
+    {
+        detail::WakeBatch batch;
+        for (int i = 0; i < kChainWorkers; ++i)
+            js.spawn(hold_worker(started));
+    }
+    bool all = true;
+    while (auto held = co_await next(js))
+        all = held.value() && all;
+    co_return all;
+}
+
+Coro<int> spawn_in_batch(std::atomic<int>& counter, int n) {
+    JoinSet<void> js;
+    {
+        detail::WakeBatch batch;
+        for (int i = 0; i < n; ++i)
+            js.spawn(count_one(counter));
+    }
+    co_await js.drain();
+    co_return counter.load();
+}
+
+Coro<bool> nested_batches(std::atomic<int>& counter) {
+    bool open_states_ok = !detail::WakeBatch::is_open();
+    JoinSet<void> js;
+    {
+        detail::WakeBatch outer;
+        js.spawn(count_one(counter));
+        {
+            detail::WakeBatch inner;
+            js.spawn(count_one(counter));
+            open_states_ok = open_states_ok && detail::WakeBatch::is_open();
+        }
+        // The outer batch is open again.
+        open_states_ok = open_states_ok && detail::WakeBatch::is_open();
+        js.spawn(count_one(counter));
+    }
+    open_states_ok = open_states_ok && !detail::WakeBatch::is_open();
+    co_await js.drain();
+    co_return open_states_ok && counter.load() == 3;
+}
+
+Coro<int> batch_closed_by_exception(std::atomic<int>& counter) {
+    JoinSet<void> js;
+    try {
+        detail::WakeBatch batch;
+        js.spawn(count_one(counter));
+        js.spawn(count_one(counter));
+        throw std::runtime_error("unwinds through the batch");
+    } catch (const std::runtime_error&) {}
+    co_await js.drain();
+    co_return counter.load();
+}
+
+} // namespace
+
+TEST(WorkStealingExecutorTest, BatchedSpawnsStartOnEveryWorker) {
+    Runtime rt(kChainWorkers);
+    std::atomic<int> started{0};
+    EXPECT_TRUE(rt.block_on(spawn_batch_of_holders(started)));
+}
+
+TEST(WorkStealingExecutorTest, BatchLargerThanInlineCapacityRunsEveryTask) {
+    constexpr int kTasks = 200;  // more than WakeBatch holds without allocating
+    Runtime rt(4);
+    std::atomic<int> counter{0};
+    EXPECT_EQ(rt.block_on(spawn_in_batch(counter, kTasks)), kTasks);
+}
+
+TEST(WorkStealingExecutorTest, NestedBatchesRestoreTheOuterOne) {
+    Runtime rt(2);
+    std::atomic<int> counter{0};
+    EXPECT_TRUE(rt.block_on(nested_batches(counter)));
+}
+
+TEST(WorkStealingExecutorTest, BatchClosedByExceptionDeliversItsTasks) {
+    Runtime rt(2);
+    std::atomic<int> counter{0};
+    EXPECT_EQ(rt.block_on(batch_closed_by_exception(counter)), 2);
+}
+
+TEST(WorkStealingExecutorTest, BatchOnThreadOutsideExecutorDeliversWake) {
+    Runtime rt(2);
+    std::promise<detail::Rc<detail::Waker>> waker_promise;
+    auto waker_future = waker_promise.get_future();
+    std::thread outside([&] {
+        if (waker_future.wait_for(kGiveUp) != std::future_status::ready) return;
+        auto waker = waker_future.get();
+        detail::WakeBatch batch;
+        waker->wake();
+    });
+    const int value = rt.block_on(WakeFromOutsideFuture{9, &waker_promise});
+    outside.join();
+    EXPECT_EQ(value, 9);
+}
+
+TEST(WorkStealingExecutorTest, BatchIsNoOpOnOtherExecutors) {
+    std::atomic<int> counter{0};
+    {
+        Runtime rt(1);
+        EXPECT_EQ(rt.block_on(spawn_in_batch(counter, 100)), 100);
+    }
+    counter = 0;
+    {
+        Runtime rt(std::in_place_type<WorkSharingExecutor>, std::size_t{2});
+        EXPECT_EQ(rt.block_on(spawn_in_batch(counter, 100)), 100);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LIFO slot. See doc/design/work_stealing_executor.md, "LIFO slot".
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Holds its worker, with no co_await, until `stop` (or kGiveUp).
+Coro<void> hold_until_stopped(std::atomic<bool>& started, std::atomic<bool>& stop) {
+    started.store(true, std::memory_order_release);
+    const auto deadline = std::chrono::steady_clock::now() + kGiveUp;
+    while (!stop.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    co_return;
+}
+
+// The partner of ping_pong(): answers each ping until `done`.
+Coro<void> pong(Event& ping, Event& pong_ev, std::atomic<bool>& done) {
+    for (;;) {
+        co_await ping.wait();
+        ping.clear();
+        if (done.load(std::memory_order_acquire)) co_return;
+        pong_ev.set();
+    }
+}
+
+// Exchanges wakes with a partner task until `until()` or kGiveUp, and returns the
+// number of round trips. Each wake comes from a worker, so it goes to the LIFO slot.
+template<typename Until>
+Coro<int> ping_pong(Until until) {
+    Event ping, pong_ev;
+    std::atomic<bool> done{false};
+    auto partner = coro::spawn(pong(ping, pong_ev, done));
+    int rounds = 0;
+    const auto deadline = std::chrono::steady_clock::now() + kGiveUp;
+    while (!until(rounds) && std::chrono::steady_clock::now() < deadline) {
+        ping.set();
+        co_await pong_ev.wait();
+        pong_ev.clear();
+        ++rounds;
+    }
+    done.store(true, std::memory_order_release);
+    ping.set();
+    co_await std::move(partner);
+    co_return rounds;
+}
+
+struct RoundsReached {
+    int n;
+    bool operator()(int rounds) const { return rounds >= n; }
+};
+
+struct CounterReached {
+    std::atomic<int>* counter;
+    int               n;
+    bool operator()(int) const { return counter->load(std::memory_order_relaxed) >= n; }
+};
+
+// Holds every worker but one, then ping-pongs on that one with tasks queued behind
+// the pair. The queued tasks run only if the slot gives way after kMaxLifoPolls.
+Coro<int> ping_pong_beside_queued_tasks(std::atomic<int>& counter, int n) {
+    std::atomic<bool> holder_started{false}, stop{false};
+    auto holder = coro::spawn(hold_until_stopped(holder_started, stop));
+    const auto deadline = std::chrono::steady_clock::now() + kGiveUp;
+    while (!holder_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline)
+        co_await coro::yield_now();
+    // From here this task and everything it spawns run on the one free worker.
+    for (int i = 0; i < n; ++i)
+        coro::spawn(count_one(counter)).detach();
+    co_await ping_pong(CounterReached{&counter, n});
+    stop.store(true, std::memory_order_release);
+    co_await std::move(holder);
+    co_return counter.load();
+}
+
+} // namespace
+
+TEST(WorkStealingExecutorTest, PingPongThroughLifoSlotCompletes) {
+    constexpr int kRounds = 10000;
+    Runtime rt(4);
+    EXPECT_EQ(rt.block_on(ping_pong(RoundsReached{kRounds})), kRounds);
+}
+
+TEST(WorkStealingExecutorTest, LifoPingPongDoesNotStarveQueuedTasks) {
+    constexpr int kTasks = 20;
+    Runtime rt(2);
+    std::atomic<int> counter{0};
+    EXPECT_EQ(rt.block_on(ping_pong_beside_queued_tasks(counter, kTasks)), kTasks);
 }

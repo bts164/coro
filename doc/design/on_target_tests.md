@@ -238,7 +238,7 @@ worst result.
 | Image | Files |
 |---|---|
 | `core` | `test_poll_result`, `test_waker_context`, `test_intrusive_list`, `test_rc`, `test_frame_pool`, `test_timer_queue`, `test_future`, `test_future_ref`, `test_stream`, `test_coro`, `test_coro_stream`, `test_co_invoke`, `test_join_set`, `test_stream_handle`, `test_fiber` |
-| `runtime` | `test_runtime`, `test_executor_task`, `test_join_handle`, `test_coro_scope` |
+| `runtime` | `test_runtime`, `test_executor_task`, `test_current_thread_executor`, `test_task_budget`, `test_join_handle`, `test_coro_scope` |
 | `sync` | `test_event`, `test_select`, `test_when`, `test_sleep`, `test_oneshot`, `test_mpsc`, `test_watch`, `test_broadcast`, `test_isr_event` |
 | `net` | `test_tcp_stream`, `test_udp_socket` |
 

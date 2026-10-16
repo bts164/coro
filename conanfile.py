@@ -43,6 +43,9 @@ class CoroRecipe(ConanFile):
         "fPIC": [True, False],
         "with_gperftools": [True, False],
         "with_local_run_queue": [True, False],
+        # Backend for the runtime's trace points (doc/design/tracing.md).
+        # Desktop only; removed on baremetal.
+        "tracing": ["none", "tracy"],
         # Pico-only (settings.os == "baremetal"); ignored/removed otherwise.
         # Drives both whether coro_pico_mqtt is built and whether the
         # bundled default lwipopts.h defines LWIP_MQTT — see
@@ -56,6 +59,7 @@ class CoroRecipe(ConanFile):
         "fPIC": True,
         "with_gperftools": True,
         "with_local_run_queue": True,
+        "tracing": "none",
         "with_mqtt": False,
     }
     exports_sources = (
@@ -128,6 +132,7 @@ class CoroRecipe(ConanFile):
             self.options.rm_safe("shared")
             self.options.rm_safe("fPIC")
             self.options.rm_safe("with_gperftools")
+            self.options.rm_safe("tracing")
         else:
             self.options.rm_safe("with_mqtt")
             self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
@@ -152,6 +157,15 @@ class CoroRecipe(ConanFile):
             return
         if self.options.with_gperftools:
             self.requires("gperftools/2.17.2",
+                transitive_headers = True,
+                transitive_libs = True)
+        if self.options.tracing == "tracy":
+            # on_demand: nothing is recorded until a viewer connects. shared follows
+            # coro's own, so that a program adding its own zones next to a shared
+            # coro gets the same Tracy client and not a second one. The version is
+            # exact because the viewer has to match it.
+            self.requires("tracy/0.13.1",
+                options={"on_demand": True, "shared": bool(self.options.shared)},
                 transitive_headers = True,
                 transitive_libs = True)
         # lws is serviced by coro's IoDriver through a custom event loop
@@ -231,6 +245,7 @@ class CoroRecipe(ConanFile):
         else:
             tc.cache_variables["WITH_GPERFTOOLS"] = self.options.with_gperftools
             tc.cache_variables["CORO_USE_LOCAL_RUN_QUEUE"] = self.options.with_local_run_queue
+            tc.cache_variables["CORO_TRACING"] = str(self.options.tracing)
         tc.generate()
 
     def build(self):
@@ -299,6 +314,8 @@ class CoroRecipe(ConanFile):
             self.cpp_info.requires.append("gperftools::gperftools")
         if self.options.with_local_run_queue:
             self.cpp_info.defines.append("CORO_USE_LOCAL_RUN_QUEUE")
+        if self.options.tracing == "tracy":
+            self.cpp_info.requires.append("tracy::tracyclient")
         self.cpp_info.requires.append("libwebsockets::libwebsockets")
 
         self.cpp_info.set_property("cmake_find_package", "coro")

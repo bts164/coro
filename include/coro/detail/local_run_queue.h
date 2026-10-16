@@ -22,13 +22,11 @@
 // two-phase protocol ensures only one thread accesses each buffer slot at a
 // time, so the slots need no per-element atomics and can store T by value.
 //
-// The LIFO slot is different: both the owner and stealers may exchange it
-// concurrently, so it is stored as std::atomic<T>.  For T = shared_ptr<X>
-// this uses the C++20 atomic<shared_ptr> specialization (lock-based but
-// correct).
-//
-// An additional LIFO slot (atomic<T>) caches the most recently pushed task
-// so it runs next, improving data locality for message-passing patterns.
+// A LIFO slot in the Local handle holds the most recently woken task so it runs
+// next, improving data locality for message-passing patterns. Unlike Tokio's
+// queue.rs, which keeps it beside the ring, it is a plain T that only the owner
+// touches: as in Tokio's worker, it is never stolen. See
+// doc/design/work_stealing_executor.md, "LIFO slot".
 //
 // When the ring is full, push_or_overflow() spills the second half of the
 // ring (+ the new task) to an injection queue, then re-exposes the first half.
@@ -42,7 +40,6 @@
 //   - Default-constructible to a logically "empty" / null state.
 //   - Contextually convertible to bool (false == empty).
 //   - Movable.
-//   - Either trivially copyable OR std::shared_ptr<X> (for atomic<T> in lifo).
 
 #include <array>
 #include <atomic>
@@ -94,12 +91,6 @@ struct LocalRunQueueInner {
     // RACE: owner stores with Release; stealers load with Acquire.
     alignas(64) std::atomic<uint32_t> tail{0};
 
-    // LIFO slot — owner and stealers both exchange this concurrently.
-    // Uses std::atomic<T>; for T = shared_ptr<X> this is the C++20
-    // atomic<shared_ptr> specialization.
-    // RACE: owner and stealers exchange/load this atomically.
-    alignas(64) std::atomic<T> lifo{};
-
     // Ring buffer.  The head/tail protocol guarantees only one thread accesses
     // any given slot at a time, so no per-element atomics are needed.
     // T is stored by value — no boxing or extra allocations.
@@ -120,13 +111,18 @@ public:
 
     Local(const Local&)            = delete;
     Local& operator=(const Local&) = delete;
-    Local(Local&&) noexcept            = default;
-    Local& operator=(Local&&) noexcept = default;
+    Local(Local&& other) noexcept
+        : m_inner(std::move(other.m_inner)), m_lifo(std::exchange(other.m_lifo, T{})) {}
+    Local& operator=(Local&& other) noexcept {
+        m_inner = std::move(other.m_inner);
+        m_lifo  = std::exchange(other.m_lifo, T{});
+        return *this;
+    }
 
     ~Local() {
         if (nullptr != m_inner) {
             assert(0 == len() && "queue not empty on destruction");
-            assert(nullptr == m_inner->lifo.load(std::memory_order_acquire) && "LIFO slot not empty on destruction");
+            assert(!m_lifo && "LIFO slot not empty on destruction");
         }
     }
 
@@ -138,9 +134,7 @@ public:
             m_inner->head.load(std::memory_order_acquire));
         (void)s;
         uint32_t tail = m_inner->tail.load(std::memory_order_relaxed);
-        bool lifo = static_cast<bool>(
-            m_inner->lifo.load(std::memory_order_relaxed));
-        return lrq_detail::queue_len(head, tail) + (lifo ? 1u : 0u);
+        return lrq_detail::queue_len(head, tail) + (m_lifo ? 1u : 0u);
     }
 
     /// Free ring slots available for push_back (accounting for in-progress steals).
@@ -157,17 +151,22 @@ public:
 
     // ── LIFO slot ─────────────────────────────────────────────────────────────
 
+    // Owner only: stealers never see the slot, so no atomics.
+
     /// Deposit `task` into the LIFO slot.
     /// Returns the displaced task (or a default-constructed T if the slot was empty).
     T push_lifo(T task) noexcept {
-        return m_inner->lifo.exchange(std::move(task), std::memory_order_acq_rel);
+        return std::exchange(m_lifo, std::move(task));
     }
 
     /// Consume and return the LIFO-slot task.
     /// Returns a default-constructed (falsy) T if the slot is empty.
     T pop_lifo() noexcept {
-        return m_inner->lifo.exchange(nullptr, std::memory_order_acq_rel);
+        return std::exchange(m_lifo, T{});
     }
+
+    /// True if the LIFO slot holds a task.
+    bool has_lifo() const noexcept { return static_cast<bool>(m_lifo); }
 
     // ── ring buffer ───────────────────────────────────────────────────────────
 
@@ -292,6 +291,7 @@ private:
     }
 
     std::shared_ptr<LocalRunQueueInner<T>> m_inner;
+    T                                      m_lifo{};   // owner thread only
 };
 
 // ─── Steal ────────────────────────────────────────────────────────────────────
@@ -308,14 +308,14 @@ public:
     Steal(Steal&&) noexcept            = default;
     Steal& operator=(Steal&&) noexcept = default;
 
+    /// Tasks in the ring, which is all a thief can take: the owner's LIFO slot is
+    /// not counted.
     std::size_t len() const noexcept {
         auto [s, head] = lrq_detail::unpack(
             m_inner->head.load(std::memory_order_acquire));
         (void)s;
         uint32_t tail = m_inner->tail.load(std::memory_order_acquire);
-        bool lifo = static_cast<bool>(
-            m_inner->lifo.load(std::memory_order_relaxed));
-        return lrq_detail::queue_len(head, tail) + (lifo ? 1u : 0u);
+        return lrq_detail::queue_len(head, tail);
     }
 
     bool is_empty() const noexcept { return len() == 0; }
@@ -337,10 +337,7 @@ public:
 
         uint32_t n = steal_into2(dst, dst_tail);
 
-        if (n == 0) {
-            // Ring empty — fall back to the LIFO slot.
-            return m_inner->lifo.exchange(nullptr, std::memory_order_acq_rel);
-        }
+        if (n == 0) return nullptr;
 
         --n;
         T ret = std::move(dst.m_inner->buffer[(dst_tail + n) & LOCAL_QUEUE_MASK]);

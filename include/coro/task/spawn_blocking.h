@@ -11,6 +11,7 @@
 #include <coro/detail/task_state.h>
 #include <coro/detail/waker.h>
 #include <coro/runtime/executor.h>
+#include <coro/task/cancel_and_join.h>
 #include <cassert>
 #include <chrono>
 #include <concepts>
@@ -119,11 +120,14 @@ public:
             task->cancel_task();
     }
 
-    // request_cancel(), then hands the handle back to be awaited. The await
-    // completes once the callable has returned or unwound.
-    [[nodiscard]] BlockingHandle cancel_and_join() && {
+    // request_cancel(), then hands the handle to a future that waits for it. The
+    // await completes once the callable has returned or unwound, with
+    // std::nullopt if it unwound (or was skipped) and its value if it returned
+    // first. For BlockingHandle<void> it yields a bool instead: true if the
+    // callable returned first. See CancelAndJoin.
+    [[nodiscard]] CancelAndJoin<BlockingHandle> cancel_and_join() && {
         request_cancel();
-        return std::move(*this);
+        return CancelAndJoin<BlockingHandle>(std::move(*this));
     }
 
     // Dropping the handle no longer requests cancellation: the callable runs to

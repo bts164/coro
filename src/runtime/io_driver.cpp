@@ -1,4 +1,5 @@
 #include <coro/runtime/io_driver.h>
+#include <coro/detail/trace.h>
 
 #include <cassert>
 #include <stdexcept>
@@ -96,8 +97,14 @@ std::size_t IoDriver::turn_locked(std::optional<std::chrono::nanoseconds> timeou
     // below, an add_timer() with an earlier deadline unparks this poll; see
     // TimerQueue::begin_wait(). That window includes dispatch, where such an unpark
     // only makes the next turn return at once (one extra turn).
-    m_poller.poll(m_events, m_timers.begin_wait(timeout));
+    {
+        // No wait (nullopt) means block until something happens.
+        const auto wait = m_timers.begin_wait(timeout);
+        detail::trace::IoWaitZone zone(!wait || wait->count() > 0);
+        m_poller.poll(m_events, wait);
+    }
 
+    detail::trace::IoDispatchZone zone;
     std::size_t dispatched = 0;
     for (const auto& event : m_events) {
         if (event.key == &m_unpark_key) {
@@ -107,7 +114,9 @@ std::size_t IoDriver::turn_locked(std::optional<std::chrono::nanoseconds> timeou
         dispatch(event);
         ++dispatched;
     }
-    return dispatched + m_timers.end_wait_and_fire_expired();
+    dispatched += m_timers.end_wait_and_fire_expired();
+    zone.dispatched(dispatched);
+    return dispatched;
 }
 
 void IoDriver::unpark() noexcept {

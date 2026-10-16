@@ -178,6 +178,10 @@ public:
     }
 
     inline std::size_t size() const noexcept { return m_size; }
+
+    /// @brief The front node without removing it, or nullptr if empty. Walk the rest
+    /// through `next`, under the same lock that guards the list.
+    NodePtr front() const noexcept { return m_head; }
 private:
     std::size_t m_size = 0;
     NodePtr m_head = nullptr;

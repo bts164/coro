@@ -802,7 +802,7 @@ sequenceDiagram
 
     L->>L: on_recv: copy min(pending_len, p->tot_len) bytes into pending_buf
     L->>L: udp_recv(pcb, nullptr, nullptr) — deregister immediately (single-shot)
-    L-->>C: result_ready = true; rx_waker->wake()
+    L-->>C: result_ready = true#59; rx_waker->wake()
     E->>C: resumes, returns {result_len, buf, sender}
 
     C->>L: co_await send_to(): udp_sendto(pcb, pbuf, addr, port) — synchronous, no suspension

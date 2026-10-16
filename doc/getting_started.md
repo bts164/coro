@@ -1654,6 +1654,7 @@ static coro::Coro<void> handle_connection(coro::TcpStream stream, int id) {
 ```
 
 The return type mirrors `select(F, SleepFuture)`:
+
 - `SelectBranch<0, T>` — the future completed in time.
 - `SelectBranch<1, void>` — the deadline elapsed first.
 
@@ -2124,17 +2125,17 @@ either a normal exit or a signal triggers the same cleanup path:
 #include <coro/io/signal.h>
 
 coro::Coro<int> async_main() {
-    auto server_handle = coro::spawn(run_server());
     auto result = co_await coro::select(
-        coro::ref(server_handle),
+        coro::spawn(run_server()),
         coro::signal(SIGINT),
         coro::signal(SIGTERM)
     );
     if (result.index() == 0) {
         co_return std::get<0>(result).value;  // run_server() exited normally
     }
-    // SIGINT or SIGTERM received — cancel run_server() and wait for it to drain.
-    co_return co_await std::move(server_handle).cancel_and_join();
+    // SIGINT or SIGTERM received: select() has already cancelled run_server()
+    // and waited for it to drain.
+    co_return 0;
 }
 
 int main() {
@@ -2143,15 +2144,24 @@ int main() {
 }
 ```
 
-`coro::ref(server_handle)` (section 10) keeps the losing branch's future usable after
-`select` returns — without it, `select` would cancel `server_handle` the moment a
-signal won, racing with the explicit `cancel_and_join()` call below.
+The `JoinHandle` is moved into `select`, which owns it from then on. When a signal wins,
+`select` cancels the losing server branch and waits for it to drain before it returns,
+just as it does for any other losing branch (section 10), so by the time `async_main()`
+resumes the server is gone.
+
+To do something between the signal and the shutdown, such as logging that it has
+started, keep the handle in a local instead, pass `coro::ref(server_handle)` to `select`
+so that losing leaves it running, and stop it yourself afterwards with
+`co_await std::move(server_handle).cancel_and_join()`. That cancels the task, waits for
+it to drain, and yields a `std::optional<int>`: `std::nullopt` if the cancel stopped
+the server, or its return value if it happened to finish first. The complete example
+below does this.
 
 Notice what `run_server()` does *not* have to do: it doesn't take a cancellation token
 as a parameter, it doesn't thread that token down through every nested coroutine it
 spawns, and it doesn't have to remember to check it — or cancel children in the right
-order — at every level of the call tree. `cancel_and_join()` cancels exactly one task,
-the root, from the top. Cancellation then propagates *down* automatically: each
+order — at every level of the call tree. `select` cancels exactly one task, the root,
+from the top. Cancellation then propagates *down* automatically: each
 suspended `co_await` along every branch unwinds much as it would for an exception,
 running RAII destructors as it goes, which is what cancels and drains that branch's own
 children in turn. (Much as, not exactly: recall from section 7 that no `catch` block runs
@@ -2280,6 +2290,7 @@ the centrepiece of section 15.
 #include <csignal>
 #include <cstdio>
 #include <exception>
+#include <optional>
 #include <string>
 #include <thread>
 #include <variant>
@@ -2358,6 +2369,8 @@ static Coro<int> run_server() {
 // Runs the server until it exits on its own or SIGINT/SIGTERM arrives (section 12).
 static Coro<int> async_main() {
     auto server_handle = coro::spawn(run_server());
+    // coro::ref() keeps the server running when a signal wins, so that the shutdown
+    // can be announced before waiting for it.
     auto result = co_await coro::select(
         coro::ref(server_handle),
         coro::signal(SIGINT),
@@ -2370,7 +2383,8 @@ static Coro<int> async_main() {
     // connection still open before cancel_and_join() resolves. Each one sends its
     // goodbye on the way out, so shutdown takes at most the 1s send_goodbye() allows.
     std::printf("signal received — shutting down\n");
-    co_return co_await std::move(server_handle).cancel_and_join();
+    std::optional<int> code = co_await std::move(server_handle).cancel_and_join();
+    co_return code.value_or(0);  // nullopt: the cancel stopped it, as it normally will
 }
 
 int main(int argc, char* argv[]) {

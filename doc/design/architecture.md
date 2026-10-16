@@ -209,6 +209,7 @@ alive long enough for the wake call to complete, then it is freed.
 ## Runtime and Executors
 
 `Runtime` is the top-level object. On desktop it owns:
+
 - An `IoDriver` (`m_io_driver`) — epoll readiness reactor with no thread of its own;
   executor threads turn it when they park (see `io_driver.md`)
 - An `Executor` (`m_executor`) — user-facing task scheduler; `CurrentThreadExecutor` or
@@ -271,16 +272,16 @@ The default multi-threaded executor, modelled on Tokio's scheduler:
 - A shared injection queue accepts tasks from threads outside the executor (blocking
   threads, another runtime's workers) and tasks spilled from a full local queue.
 - Each pass of its loop, a worker looks for a task in this order:
-  1. On every 61st pass, one task from the injection queue, so that workers whose local
-     queues never empty cannot shut it out.
-  2. Its own local queue.
-  3. The injection queue, taking a batch: one task to run now, the rest onto its local
-     queue.
-  4. A peer's local queue (stealing), with the number of searching workers bounded.
-     A worker that finds a task this way wakes one more parked worker before it runs
-     the task, so a burst of spawns spreads to every idle worker.
-  5. Nothing found: it parks. The first idle worker parks in the `IoDriver`
-     (`epoll_wait`); the others park on their own condition variable.
+    1. On every 61st pass, one task from the injection queue, so that workers whose local
+       queues never empty cannot shut it out.
+    2. Its own local queue.
+    3. The injection queue, taking a batch: one task to run now, the rest onto its local
+       queue.
+    4. A peer's local queue (stealing), with the number of searching workers bounded.
+       A worker that finds a task this way wakes one more parked worker before it runs
+       the task, so a burst of spawns spreads to every idle worker.
+    5. Nothing found: it parks. The first idle worker parks in the `IoDriver`
+       (`epoll_wait`); the others park on their own condition variable.
 - A busy worker turns the `IoDriver` without blocking every 61 task polls, and at once
   after a poll that yielded, so I/O and timers are not starved when no worker is idle.
 - Tasks are woken via `waker->wake()`, which calls `executor->enqueue(task)`. A wake
@@ -329,12 +330,14 @@ The primary coroutine return type. Implements `Future<T>`. The compiler generate
 coroutine frame for any function returning `Coro<T>` that uses `co_await` or `co_return`.
 
 `Coro<T>` wraps a `shared_ptr<TaskState<T>>` which holds:
+
 - The `coroutine_handle<>` to the suspended frame
 - The `cancelled` flag
 - The `CoroutineScope` pending-children list
 - The result (set on completion)
 
 `poll()` on `Coro<T>`:
+
 1. Sets `t_current_coro` to this coroutine's state.
 2. If `cancelled`: calls `handle.destroy()`, registers children in the pending list,
    returns `PollPending` (or `PollDropped` if the pending list is empty).
@@ -381,6 +384,7 @@ completes, then returns the result (or rethrows the exception).
 ### Handle lifecycle and cancellation
 
 Dropping a `JoinHandle` without calling `.detach()` or `co_await`ing it:
+
 1. Sets `TaskState::cancelled = true`.
 2. Reads `t_current_coro` — if inside a coroutine poll, registers the `TaskState` as a
    pending child of that coroutine (the coroutine scope mechanism).
@@ -448,6 +452,7 @@ co_await js.drain();
 
 Internally, `JoinSetSharedState<T>` is shared between the `JoinSet`, all `JoinSetTask`
 wrappers, and any live drain future via `shared_ptr`. It holds:
+
 - A result queue (`variant<T, exception_ptr>` for non-void, `exception_ptr` for void)
 - `pending_count` — number of tasks still running
 - A consumer waker for `next()`/`drain()` waiters
@@ -621,6 +626,7 @@ waiters. `SenderNode` (linked into `sender_waiters`) holds the waker and the uns
 destination pointer into the receiver's frame.
 
 **Zero-copy fast paths:**
+
 - Sender finds a waiting receiver → value moves directly from sender argument to receiver
   frame, bypassing the ring buffer.
 - Receiver finds suspended senders with an empty buffer → value moves directly from sender
@@ -635,6 +641,7 @@ the channel state.
 Single producer, multiple consumers, latest-value semantics. Send never blocks.
 
 `WatchShared<T>` uses two separate locks:
+
 - `std::shared_mutex value_mutex` — shared for `borrow()`, exclusive for `send()`
 - `std::mutex waker_mutex` — guards the receiver waker list only
 
@@ -685,6 +692,7 @@ auto result = co_await select(timeout(5s), read_packet(sock), recv_signal());
 
 `SelectFuture<Fs...>` polls all branches in round-robin order (advancing `m_poll_start`
 each tick for fairness). On the first `PollReady` or `PollError`:
+
 1. The winning result is stored internally.
 2. Each losing branch that satisfies `Cancellable` (`Coro<T>`, `CoroStream<T>`) is
    cancelled and polled until it returns `PollDropped`.

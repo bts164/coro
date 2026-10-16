@@ -114,6 +114,9 @@ nav:
     - Synchronization & Combinators:
       - Channels: design/channels.md
       - JoinSet: design/join_set.md
+      - Barrier: design/barrier.md
+      - Team: design/team.md
+      - parallel(): design/parallel.md
       - Select: design/select.md
       - Timers: design/timers.md
     - Platform & Integration:

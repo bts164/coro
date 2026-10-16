@@ -5,6 +5,7 @@
 #include <coro/detail/owned_tasks.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
+#include <coro/detail/wake_batch.h>
 #include <coro/detail/work_stealing_deque.h>
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
 #include <coro/detail/local_run_queue.h>
@@ -40,6 +41,12 @@ class Runtime;
  *   See doc/design/work_stealing_executor.md, "Parking in the I/O driver".
  * - **Task affinity**: `Task::last_worker_index` routes re-enqueued tasks back to
  *   their last worker's local queue, improving cache locality.
+ * - **Lowest worker first**: a wake always goes to the lowest-numbered idle worker, so
+ *   work concentrates on a few warm workers and the rest stay parked. A program with at
+ *   most N tasks runnable at once mostly runs on workers 0..N-1; idle high-numbered
+ *   workers in a profile are expected, not a bottleneck. Worker numbers are not CPU
+ *   numbers: workers are not pinned. See doc/design/work_stealing_executor.md,
+ *   "Which worker is woken".
  *
  * **Worker limit**: `m_idle_mask` is a `uint64_t`, so the pool is capped at
  * `MAX_WORKERS` (64): a larger `num_threads`, including the hardware_concurrency()
@@ -81,6 +88,8 @@ public:
     /// Workers park in the driver and busy workers poll it; see park_worker().
     bool turns_io_driver() const noexcept override { return true; }
 
+    std::size_t worker_count() const noexcept override { return m_workers.size(); }
+
     /// Cancels every owned task; later schedule() calls cancel their task too.
     void begin_shutdown() override;
 
@@ -88,6 +97,8 @@ public:
     bool has_tasks() const override;
 
 private:
+    friend class detail::WakeBatch;
+
 #ifdef CORO_USE_LOCAL_RUN_QUEUE
     // shared_ptr<TaskBase> is stored by value directly in the ring buffer.
     // The head/tail Release/Acquire fences synchronize buffer slot access, so
@@ -154,6 +165,15 @@ private:
     /// should_notify_others).
     void after_turn(int index, std::size_t dispatched);
 
+    /// @brief Closes a WakeBatch: pushes its `n` tasks to the injection queue under
+    /// one lock, then wakes up to `n` parked workers. Safe from any thread.
+    void flush_wake_batch(detail::TaskBase* const* tasks, std::size_t n);
+
+    /// @brief Pushes a task that was re-queued after its own poll (a self-wake, a
+    /// yield, a spent budget) to the back of worker `index`'s queue, never the LIFO
+    /// slot, and notifies as any local push. Worker `index` only.
+    void requeue_after_poll(int index, std::shared_ptr<detail::TaskBase> task);
+
     // --- Per-worker state ---
 
     // Category 3 (see doc/task_ownership.md): temporary strong references held while
@@ -203,6 +223,9 @@ private:
     /// polls, so that tasks which keep the local queues non-empty cannot shut out
     /// the ones waiting there. The value tokio's multi-thread scheduler starts from.
     static constexpr unsigned kGlobalQueueInterval = 61;
+    /// At most this many LIFO-slot polls in a row; then the slot's task goes to the
+    /// back of the local queue. tokio's MAX_LIFO_POLLS_PER_TICK.
+    static constexpr unsigned kMaxLifoPolls = 3;
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
     // Inserted in schedule(), removed after poll() returns true (task reached terminal state).

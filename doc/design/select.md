@@ -49,12 +49,12 @@ SelectFuture<Fs...> select(Fs&&... futures);
 
 1. Shuffle the poll order for this tick (fairness — avoids starvation of later futures)
 2. Poll each inner future in shuffled order, passing the same `Context` through
-   - All inner futures register against the same waker, so any one of them waking the
-     outer task causes a full re-poll of `SelectFuture`
+    - All inner futures register against the same waker, so any one of them waking the
+      outer task causes a full re-poll of `SelectFuture`
 3. First inner future that returns `Ready(value)` wins:
-   - Wrap the value in the corresponding `std::variant` alternative
-   - Drop all remaining inner futures (triggering cancellation)
-   - Return `Ready(variant)`
+    - Wrap the value in the corresponding `std::variant` alternative
+    - Drop all remaining inner futures (triggering cancellation)
+    - Return `Ready(variant)`
 4. First inner future that returns `Error` propagates immediately (same drop behaviour)
 5. If all return `Pending`, return `Pending`
 

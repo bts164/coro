@@ -64,9 +64,15 @@ concept Cancellable = Future<F> && requires(F& f) { f.cancel(); };
  * Returned by `coro::ref(f)`. Holds a raw pointer to `f` and delegates `poll()` to the
  * underlying future without taking ownership of it.
  *
- * The primary use-case is passing a future to `select()` (or `join()`, `timeout()`, etc.)
- * without consuming it — if the branch loses, the underlying future keeps running and can
- * be used again in the next round.
+ * **What it is for:** keeping `f` alive, with its progress, when a `select()` (or
+ * `timeout()`, etc.) branch it was passed to loses, so that `f` can be polled again:
+ * offered to the next round, or awaited later. That is the only reason to use it.
+ *
+ * **What it is not for:** if `f` should be cancelled when its branch loses, pass `f`
+ * itself (`std::move(f)`), not `coro::ref(f)`. `select()` then cancels the losing branch
+ * and waits for it to drain before returning, as it does for every branch it owns. Using
+ * `ref()` there throws that away: `f` keeps running, and stopping it becomes the
+ * caller's job.
  *
  * **Lifetime:** `FutureRef<F>` holds a raw pointer to `f`. `f` must outlive the
  * `FutureRef`. The intended usage pattern — `co_await select(coro::ref(f), other)` — is
@@ -114,18 +120,26 @@ private:
 };
 
 /**
- * @brief Wraps `f` in a `FutureRef<F>` — a non-owning future that delegates to `f`.
+ * @brief Lends `f` to `select()` and friends so that it survives losing, to be polled again.
+ *
+ * Use it only when `f` must outlive a losing branch: a pending send or write that is
+ * offered to every round of a loop until it completes, or a task that should keep
+ * running after the other branch wins. Do not use it to protect a future you want
+ * cancelled when its branch loses — pass that future by value, and `select()` cancels
+ * and drains it for you. See @ref FutureRef.
  *
  * Only accepts lvalues. This prevents accidentally wrapping a temporary (which would
- * immediately dangle). The typical usage:
+ * immediately dangle).
  *
  * @code
- * JoinHandle<int> task = spawn(work());
- * // task keeps running if the other branch wins:
- * auto sel = co_await select(coro::ref(task), signal);
+ * auto write = stream.write(std::move(reply));  // created once, outside the loop
+ * for (;;) {
+ *     // A tick that wins leaves the write where it was, to resume next round:
+ *     auto sel = co_await select(coro::ref(write), coro::sleep_for(1s));
+ *     if (sel.index() == 0) break;
+ *     report_progress();
+ * }
  * @endcode
- *
- * See @ref FutureRef for the full contract.
  */
 template<Future F>
 [[nodiscard]] FutureRef<F> ref(F& f) noexcept {

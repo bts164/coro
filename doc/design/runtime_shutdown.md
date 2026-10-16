@@ -461,8 +461,9 @@ only after that.
 !!! warning "FIXME: `co_await` of a dropped future with a value"
     A coroutine that is not itself cancelled and awaits a future that reports dropped
     (a handle to a task that was cancelled) is resumed, and `await_resume()` reads a
-    value that is not there. For a `void` future the resume is harmless and is relied
-    on: `co_await std::move(h).cancel_and_join()` is exactly this. `blocking_wait`
+    value that is not there. For a `void` future the resume is harmless.
+    `cancel_and_join()` avoids the case altogether: its `CancelAndJoin` future turns
+    dropped into `std::nullopt` (or `false` for `void`). `blocking_wait`
     turns the same case into `BlockingCancelled`. The coroutine side needs a defined
     outcome for non-void futures, which is an API decision (which exception) and is
     not made here. Shutdown does not make this newly reachable from a coroutine:

@@ -134,7 +134,7 @@ auto sel = co_await coro::select(fast(), slow());
 if (sel.index() == 0)
     use(std::get<0>(sel).value);
 
-// coro::ref — borrow without cancelling the losing branch
+// coro::ref — losing branch survives, to be polled again
 coro::JoinHandle<int> task = coro::spawn(long_running());
 while (true) {
     auto sel = co_await coro::select(

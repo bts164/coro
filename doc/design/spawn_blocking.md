@@ -90,9 +90,10 @@ public:
     // Asks the task to stop. Returns at once; see "Cancellation and ownership".
     void request_cancel() noexcept;
 
-    // request_cancel(), then hands the handle back to be awaited. The await completes
-    // once the callable has returned or unwound.
-    [[nodiscard]] BlockingHandle cancel_and_join() &&;
+    // request_cancel(), then returns a future that completes once the callable has
+    // returned or unwound: std::optional<T> holding its value if it returned first,
+    // std::nullopt if it unwound (for BlockingHandle<void>, a bool: true if it returned).
+    [[nodiscard]] CancelAndJoin<BlockingHandle> cancel_and_join() &&;
 
     // Dropping the handle no longer requests cancellation: the callable runs to
     // completion and its result is discarded. The handle can still be awaited.
@@ -180,6 +181,7 @@ pointer from `TaskBase::current`, which stays null on pool threads: code that re
 is not one.
 
 **Pool sizing:**
+
 - The pool grows on demand, up to a configurable maximum (default: 512, matching Tokio).
 - Idle threads time out after a keep-alive period (default: 10 seconds) and exit,
   decrementing `total_threads`.
@@ -490,10 +492,11 @@ sequenceDiagram
     T->>T: fut.cancel() and poll until drained (if Cancellable)
     T->>T: destroy fut
     T->>T: throw BlockingCancelled
-    T->>T: f unwinds; destroy f; mark_done()
+    T->>T: f unwinds#59; destroy f#59; mark_done()
 ```
 
 Edge cases:
+
 - **Handle polled after work already finished:** the task has already terminated on the
   first poll; return `PollReady` without suspending.
 - **Handle dropped before work finishes:** the task stays alive through the pool's and
@@ -724,11 +727,13 @@ coro::Coro<void> run() {
 ```
 
 **What this gives you:**
+
 - The outer executor thread is free for other tasks while `inner.block_on()` blocks.
 - `inner_async_work` has full access to `co_await`, I/O, timers, and `spawn()` — it runs
   in a complete async environment.
 
 **What it does NOT give you:**
+
 - Shared I/O handles, sockets, or timers with the outer runtime. The inner runtime has
   its own `IoDriver`; any `TcpStream`, `WsStream`, or `sleep_for` inside it is
   completely independent.

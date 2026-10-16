@@ -1,6 +1,7 @@
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/detail/context.h>
 #include <coro/detail/waker.h>
+#include <coro/detail/trace.h>
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
@@ -197,7 +198,12 @@ bool CurrentThreadExecutor::poll_task(detail::Rc<detail::TaskBase> task) {
 
     detail::Context ctx(task, task_budget());
     detail::TaskBase::current = task.get();
-    bool done = task->poll(ctx);
+    bool done;
+    {
+        detail::trace::PollZone zone(*task);
+        done = task->poll(ctx);
+        zone.finished(done);
+    }
     detail::TaskBase::current = nullptr;
 
     if (done) {
@@ -412,6 +418,8 @@ void CurrentThreadExecutor::run_loop(Done&& done) {
     // For the whole loop, not per batch: timers fired by check_expired_timers() and
     // wakers fired inside park() are local wakes too.
     LoopScope running(*this);
+    // Closed while park() sleeps, if the parker's driver turn is traced (IoDriverParker).
+    detail::trace::AwakeZone awake;
     while (true) {
         if (done()) break;
         run_batch();

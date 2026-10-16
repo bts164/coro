@@ -271,10 +271,12 @@ With it they wait for 128.
     executors would change.
 
 !!! danger "WARNING: a yield relies on a first-in first-out local queue"
-    A task that yields must go behind the other runnable tasks. Both local queues of
-    `WorkStealingExecutor` do that today. `LocalRunQueue` also has a LIFO slot, which
-    the executor does not use. If it is ever used, a task that yielded must bypass it,
-    as in Tokio, or the worker would poll the same task again at once.
+    A task that yields must go behind the other runnable tasks. `WorkStealingExecutor`'s
+    [LIFO slot](work_stealing_executor.md#lifo-slot) would poll it again at once, so a
+    task that wakes itself, by yielding or otherwise, is re-queued after its poll
+    straight to the back of the local queue and never goes through the slot, as in
+    Tokio. A new path that re-queues a task after its own poll must do the same
+    (`requeue_after_poll()`).
 
 ### `yield_now()`
 
