@@ -68,3 +68,9 @@
 .rst-content details.error > summary {
     background: #f29f97;
 }
+
+/* mkdocs_graphviz inlines diagrams as fixed-size SVG; shrink them to fit narrow screens. */
+.rst-content svg.graphviz {
+    max-width: 100%;
+    height: auto;
+}

@@ -94,7 +94,6 @@ nav:
       - Coroutine Frame Lifetime: design/coroutine_scope.md
       - Task Ownership Model: design/task_ownership.md
       - Fibers: design/fiber.md
-      - Cancellation Token: design/cancellation_token.md
     - Runtime & Scheduling:
       - Runtime, Tasks, and Executors: design/task_and_executor.md
       - Executor Scheduling Design: design/executor_design.md

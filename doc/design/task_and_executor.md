@@ -320,12 +320,127 @@ This three-way design mirrors Julia's pattern extended with explicit detach:
 with its respective state type into a single `make_shared` allocation. Users never interact
 with any of these types directly.
 
+Every task type derives from `TaskBase`. Each concrete type also derives from the state
+that its handle reads, so a task and its state are one allocation. A handle holds an `Rc`
+to that state and a `Weak` to the task. The executor's `OwnedTasks` holds the only strong
+reference to the task itself, as the lifetime anchor (see
+[task_ownership.md](task_ownership.md)). `TaskImpl<F>` and `BlockingTaskImpl<F>` derive
+from `TaskState<F::OutputType>`, and `StreamTaskImpl<S>` from
+`StreamTaskState<S::ItemType>`.
+
+In the diagram, blue boxes are tasks the executor polls, green boxes are state shared with
+a handle, and amber boxes are owners. Hollow triangles mark inheritance, solid arrows `Rc`
+and dashed arrows `Weak`. Italic methods are pure virtual.
+
+```dot
+digraph tasks {
+    graph [rankdir=TB, newrank=true, nodesep=0.4, ranksep=0.55, bgcolor="transparent"];
+    // Defaults go inside subgraphs: mkdocs_graphviz passes -N/-E colour options to dot, and
+    // those override top-level node/edge defaults (but not subgraph or per-object ones).
+    subgraph classes {
+    node  [shape=plain, fontname="Helvetica,Arial,sans-serif", fontsize=11, fontcolor="#1f2937"];
+
+    // Colour by role: blue = task (polled by the executor), green = state shared with a
+    // handle, amber = owners. Italic methods are pure virtual.
+    Waker [label=<<table style="rounded" bgcolor="#f8fafc" border="1" color="#64748b" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#e2e8f0"><b>Waker</b></td></tr>
+        <tr><td align="left"><i>wake()</i><br align="left"/><i>clone()</i><br align="left"/>weak_clone()<br align="left"/></td></tr></table>>];
+    TaskBase [label=<<table style="rounded" bgcolor="#eff6ff" border="1" color="#2563eb" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bfdbfe"><b>TaskBase</b></td></tr>
+        <tr><td align="left">scheduling_state<br align="left"/>name<br align="left"/></td></tr>
+        <tr><td align="left"><i>poll(ctx)</i><br align="left"/><i>is_complete()</i><br align="left"/><i>set_waker(waker)</i><br align="left"/>on_task_complete()<br align="left"/>cancel_task()<br align="left"/></td></tr></table>>];
+    BlockingTaskBase [label=<<table style="rounded" bgcolor="#eff6ff" border="1" color="#2563eb" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bfdbfe"><b>BlockingTaskBase</b></td></tr>
+        <tr><td align="left"><i>run()</i><br align="left"/>park()<br align="left"/>unpark()<br align="left"/></td></tr></table>>];
+    TaskImpl [label=<<table style="rounded" bgcolor="#eff6ff" border="1" color="#2563eb" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bfdbfe"><b>TaskImpl&lt;F&gt;</b></td></tr>
+        <tr><td align="left">m_future : optional&lt;F&gt;<br align="left"/></td></tr></table>>];
+    StreamTaskImpl [label=<<table style="rounded" bgcolor="#eff6ff" border="1" color="#2563eb" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bfdbfe"><b>StreamTaskImpl&lt;S&gt;</b></td></tr>
+        <tr><td align="left">m_stream : optional&lt;S&gt;<br align="left"/></td></tr></table>>];
+    BlockingTaskImpl [label=<<table style="rounded" bgcolor="#eff6ff" border="1" color="#2563eb" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bfdbfe"><b>BlockingTaskImpl&lt;F&gt;</b></td></tr>
+        <tr><td align="left">callable : optional&lt;F&gt;<br align="left"/></td></tr></table>>];
+    JoinSetTask [label=<<table style="rounded" bgcolor="#eff6ff" border="1" color="#2563eb" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bfdbfe"><b>JoinSetTask&lt;F&gt;</b></td></tr>
+        <tr><td align="left">m_node<br align="left"/>m_set_state<br align="left"/></td></tr>
+        <tr><td align="left">on_task_complete()<br align="left"/></td></tr></table>>];
+    TaskStateBase [label=<<table style="rounded" bgcolor="#f0fdf4" border="1" color="#16a34a" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bbf7d0"><b>TaskStateBase</b></td></tr>
+        <tr><td align="left">mutex<br align="left"/>terminated<br align="left"/>waker<br align="left"/></td></tr></table>>];
+    TaskState [label=<<table style="rounded" bgcolor="#f0fdf4" border="1" color="#16a34a" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bbf7d0"><b>TaskState&lt;T&gt;</b></td></tr>
+        <tr><td align="left">cancelled<br align="left"/>result<br align="left"/>exception<br align="left"/></td></tr></table>>];
+    StreamTaskState [label=<<table style="rounded" bgcolor="#f0fdf4" border="1" color="#16a34a" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bbf7d0"><b>StreamTaskState&lt;T&gt;</b></td></tr>
+        <tr><td align="left">mutex<br align="left"/>buffer<br align="left"/>capacity<br align="left"/>producer_waker<br align="left"/>consumer_waker<br align="left"/>scope_waker<br align="left"/></td></tr></table>>];
+    JoinSetSharedState [label=<<table style="rounded" bgcolor="#f0fdf4" border="1" color="#16a34a" cellborder="0" cellspacing="0" cellpadding="4">
+        <tr><td style="rounded" bgcolor="#bbf7d0"><b>JoinSetSharedState&lt;T&gt;</b></td></tr>
+        <tr><td align="left">mutex<br align="left"/>pending_handles<br align="left"/>idle_handles<br align="left"/>consumer_waker<br align="left"/></td></tr></table>>];
+    OwnedTasks     [label=<<table style="rounded" bgcolor="#fde68a" border="1" color="#d97706" cellborder="0" cellpadding="6"><tr><td style="rounded" bgcolor="#fde68a"><b>OwnedTasks</b></td></tr></table>>];
+    JoinHandle     [label=<<table style="rounded" bgcolor="#fde68a" border="1" color="#d97706" cellborder="0" cellpadding="6"><tr><td style="rounded" bgcolor="#fde68a"><b>JoinHandle&lt;T&gt;</b></td></tr></table>>];
+    BlockingHandle [label=<<table style="rounded" bgcolor="#fde68a" border="1" color="#d97706" cellborder="0" cellpadding="6"><tr><td style="rounded" bgcolor="#fde68a"><b>BlockingHandle&lt;T&gt;</b></td></tr></table>>];
+    StreamHandle   [label=<<table style="rounded" bgcolor="#fde68a" border="1" color="#d97706" cellborder="0" cellpadding="6"><tr><td style="rounded" bgcolor="#fde68a"><b>StreamHandle&lt;T&gt;</b></td></tr></table>>];
+    }
+
+    // Rows, top to bottom: owners, root bases, mid-level bases, concrete tasks, subclasses.
+    // Within a row, task types sit left and state types right; the invisible edges fix that
+    // left-to-right order.
+    { rank=same; OwnedTasks -> JoinHandle -> BlockingHandle -> StreamHandle [style=invis]; }
+    { rank=same; Waker -> TaskStateBase [style=invis]; }
+    { rank=same; TaskBase -> TaskState -> StreamTaskState [style=invis]; }
+    { rank=same; BlockingTaskBase -> TaskImpl -> StreamTaskImpl [style=invis]; }
+    { rank=same; BlockingTaskImpl -> JoinSetTask -> JoinSetSharedState [style=invis]; }
+    OwnedTasks -> Waker [style=invis];
+    JoinHandle -> TaskStateBase [style=invis];
+
+    // Inheritance, written base -> derived so bases sit above; UML triangle at the base.
+    subgraph inheritance {
+    edge [dir=back, arrowtail=empty, color="#334155", penwidth=1.2];
+    Waker -> TaskBase;
+    TaskBase -> BlockingTaskBase;
+    TaskBase -> TaskImpl;
+    TaskBase -> StreamTaskImpl;
+    BlockingTaskBase -> BlockingTaskImpl;
+    TaskImpl -> JoinSetTask;
+    TaskStateBase -> TaskState;
+    TaskState -> TaskImpl;
+    TaskState -> BlockingTaskImpl;
+    StreamTaskState -> StreamTaskImpl;
+    }
+
+    // References: solid = Rc, dashed = Weak. Owners point down into what they hold; the
+    // upward and same-row edges stay out of the layout.
+    subgraph rc {
+    edge [arrowhead=vee, color="#b45309", fontcolor="#b45309", penwidth=1.2,
+          fontname="Helvetica,Arial,sans-serif", fontsize=9];
+    OwnedTasks -> TaskBase [label="Rc, lifetime anchor"];
+    JoinHandle -> TaskState [label="Rc"];
+    BlockingHandle -> TaskState [label="Rc"];
+    StreamHandle -> StreamTaskState [label="Rc"];
+    JoinSetTask -> JoinSetSharedState [style=dashed, label="Weak", constraint=false];
+    JoinSetSharedState:n -> TaskState:e [label="Rc, completed results", constraint=false];
+    }
+    subgraph weak {
+    edge [arrowhead=vee, style=dashed, color="#94a3b8", fontcolor="#64748b", penwidth=1.2,
+          fontname="Helvetica,Arial,sans-serif", fontsize=9];
+    JoinHandle -> TaskBase [label="Weak"];
+    BlockingHandle -> TaskBase [label="Weak"];
+    StreamHandle -> TaskBase [label="Weak"];
+    }
+}
+```
+
+The blocking branch is described in more detail in
+[spawn_blocking.md](spawn_blocking.md#the-blocking-task-blockingtaskimplf).
+
 ```cpp
 // Internal — not public API
 
-class TaskBase {
+class alignas(64) TaskBase {   // alignas on desktop only
 public:
-    std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};
+    std::atomic<SchedulingState> scheduling_state{SchedulingState::Idle};  // first data member
+    bool        cancel_requested = false;  // poll thread only; fills padding after the state
     std::string name;
     int         last_worker_index = -1;
     virtual bool poll(Context& ctx) = 0;
@@ -339,9 +454,7 @@ public:
 // Future tasks — one result slot
 template<Future F>
 class TaskImpl : public TaskBase, public TaskState<typename F::OutputType> {
-    F    m_future;
-    bool m_completed        = false;
-    bool m_cancel_requested = false;
+    std::optional<F> m_future;  // reset when the task finishes, so "empty" means "done"
     bool poll(Context& ctx) override { /* cooperative cancel protocol; calls on_task_complete() at terminal exit */ }
     bool is_complete() const override { /* checks TaskState::terminated under lock */ }
     void set_waker(std::weak_ptr<Waker> w) override { /* stores in TaskState::waker */ }
@@ -351,9 +464,7 @@ class TaskImpl : public TaskBase, public TaskState<typename F::OutputType> {
 // Stream tasks — bounded queue of results
 template<Stream S>
 class StreamTaskImpl : public TaskBase, public StreamTaskState<typename S::ItemType> {
-    S    m_stream;
-    bool m_completed        = false;
-    bool m_cancel_requested = false;
+    std::optional<S> m_stream;  // reset when the task finishes, so "empty" means "done"
     bool poll(Context& ctx) override { /* drives m_stream; pushes items into StreamTaskState queue */ }
     bool is_complete() const override;
     void set_waker(std::weak_ptr<Waker> w) override;
@@ -386,26 +497,36 @@ executor->schedule(std::shared_ptr<TaskBase>(impl));  // inserts into executor's
 return StreamHandle<T>(std::move(sh_ptr));             // queue-access ref only
 ```
 
-!!! tip "PERF: a task is 384 bytes before the coroutine frame"
-    `sizeof(TaskImpl<Coro<size_t>>)` is 384 bytes on x86-64 GCC, for a 40-byte future.
-    In the Skynet stress test, which keeps about a million tasks alive, 18% to 37% of
-    samples are kernel page faults under the allocator, and those scale with bytes per
-    task. Contributors, from reading the headers (not yet confirmed with a layout dump):
+!!! tip "PERF: a task allocation is 320 bytes before the coroutine frame"
+    `sizeof(TaskImpl<Coro<size_t>>)` is 256 bytes on x86-64 GCC, for a 40-byte future
+    (all 256 used: one more byte of data would round it up to 320). The allocation is
+    larger: `make_shared` puts its 16-byte control block in front of the object, padded
+    to 64 bytes by the alignment, so the task takes 320 bytes (`JoinSetTask`: 320 →
+    384). In the Skynet stress test, which keeps about a million tasks alive, 18% to 37%
+    of samples are kernel page faults under the allocator, and those scale with bytes
+    per task. Contributors (layout from `ptype /o` in gdb):
 
-    - `alignas(64)` on `scheduling_state`, a field in the middle of `TaskBase`. It
-      pads on both sides and rounds the whole object up to a multiple of 64. Aligning
-      the object and placing the scheduling state first would give the same
-      false-sharing protection with less padding. Tokio aligns the whole task cell.
-    - `TaskStateBase::cv` (48 bytes), waited on only by `block_on()`. See
-      `doc/roadmap.md`, "Move the `block_on` wait out of the task".
+    - The `shared_ptr` machinery: the control block and its padding (64 bytes), the
+      `enable_shared_from_this` pointer (16), `owned_self` (16) and half of the waker
+      slot (8). Intrusive reference counts remove all of it and bring the allocation to
+      256 bytes (`JoinSetTask` too); see
+      [Planned: intrusive reference counting](task_ownership.md#planned-intrusive-reference-counting-not-yet-implemented).
+    - `alignas(64)` on `TaskBase`, which rounds the object up to a multiple of 64 and
+      pads the control block in front of it. `scheduling_state` is the first data
+      member, so there is no padding before it inside the object. Without the
+      alignment the allocations would be 272 and 328 bytes, which the allocator likely
+      rounds to 288 and 352, at the risk of false sharing on `scheduling_state` between
+      neighbouring tasks.
     - `TaskStateBase::mutex` (40 bytes). Tokio uses one atomic state word instead;
       here that needs a profile to justify it under the mutex-over-atomics convention.
     - `std::string name` (32 bytes), empty for most tasks.
     - A result slot separate from the future. Tokio stores the output in the storage
       the finished future occupied.
-    - The `OwnedTasks` links and self-reference (32 bytes).
+    - The `OwnedTasks` links (16 bytes).
 
-    Run `pahole` on `libcoro.so` before changing anything.
+    Check the layout again (`ptype /o` in gdb, or `pahole`) before changing anything,
+    and count the allocation, not `sizeof`: a saving smaller than the rounding to 64
+    does not shrink it.
 
 ### Abstract Executor interface
 
@@ -705,22 +826,11 @@ else hits the deleted overload and fails at compile time. There is no free
 
 ### Cancellation
 
-Cancellation is a required feature. The `JoinHandle`, `Context`, and `Task` designs must
-not foreclose it. `Context` will carry a `shared_ptr<CancellationToken>` from the start,
-returning `nullptr` until cancellation is implemented. Adding it later would require changing
-every `poll()` signature.
-
-```cpp
-class Context {
-public:
-    explicit Context(std::shared_ptr<Waker> waker,
-                     std::shared_ptr<CancellationToken> token = nullptr);
-    std::shared_ptr<Waker>             getWaker() const;
-    std::shared_ptr<CancellationToken> getCancellationToken() const;  // nullptr until implemented
-};
-```
-
-The cancellation design will be its own feature phase.
+Cancellation is built into every task and needs no token or extra parameter. Dropping a
+`JoinHandle` (or calling `cancel()`) sets the task's `cancelled` flag and wakes it; the
+task stops at its next poll, and the drain invariant below makes sure its frame is
+destroyed before its parent's. See [coroutine_scope.md](coroutine_scope.md) for the
+protocol.
 
 ### The Drain Invariant
 

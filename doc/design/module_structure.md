@@ -38,7 +38,6 @@ include/coro/
 │
 ├── sync/               tokio::sync — synchronization primitives and channels
 │   ├── broadcast.h         broadcast_channel — multi-producer, multi-consumer, lag-detecting
-│   ├── cancellation_token.h
 │   ├── channel_error.h     SendError / RecvError shared by all channel types
 │   ├── event.h             Event — one-shot signal (any-thread set, coroutine wait)
 │   ├── join.h              join() — wait for a fixed heterogeneous set of futures
@@ -82,7 +81,7 @@ src/
 │   ├── blocking_pool.cpp
 │   └── context.cpp              t_current_coro + CoroutineScope helpers
 ├── sync/
-│   └── cancellation_token.cpp
+│   └── sleep.cpp
 ├── io/
 │   ├── tcp_stream.cpp
 │   ├── tcp_listener.cpp
@@ -138,7 +137,6 @@ Types that coordinate between concurrently running tasks. This includes:
 - `Event` — one-shot signal; `set()` from any thread, `co_await wait()` in a coroutine
 - **Channels**: `oneshot` (single-value), `mpsc` (bounded multi-producer), `watch` (latest-value multi-consumer), `broadcast` (multi-producer multi-consumer, lag-detecting)
 - **Combinators**: `join()`, `select()`, `timeout()`, `sleep_for()`
-- `CancellationToken` — cooperative cancellation signal passed via `Context`
 - `IsrEvent` / `IsrChannel<T>` — ISR-to-coroutine primitives; MCU platforms only (`CORO_PICO`)
 
 ### `io/` — async I/O

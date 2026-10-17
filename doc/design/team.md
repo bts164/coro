@@ -1277,9 +1277,9 @@ cancelling its collective, for example with a `timeout()` whose deadline has pas
 that directly. Worth adding if the pattern turns up.
 
 **Cancelling on a break.** Members that compute for a long time between collectives only
-find out about a break at their next collective or when they check `is_broken()`. A
-`CancellationToken` that the team cancels when it breaks would let them use the usual
-cancellation tools.
+find out about a break at their next collective or when they check `is_broken()`. The
+team could cancel the members' tasks when it breaks, so they stop at their next
+suspension point like any other cancelled task.
 
 **Subteams.** MPI split, Fortran `form team` and CUDA `tiled_partition` all create
 smaller teams from a larger one, each with its own ranks. Here that would be a collective,

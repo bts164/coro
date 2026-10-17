@@ -323,7 +323,6 @@ classDiagram
         wake()
     }
     class Waker {
-        <<interface>>
         wake()
     }
     class ConnectionState {

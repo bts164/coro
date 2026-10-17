@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <type_traits>
 #include <utility>
 
 namespace coro::detail {
@@ -21,10 +22,22 @@ struct IntrusiveListNode {
 };
 
 /**
- * @brief Intrusive doubly-linked list of @ref IntrusiveListNode objects.
+ * @brief Intrusive doubly-linked list of nodes that carry their own links.
  *
  * Does not own the nodes — all storage is in the embedded nodes themselves.
  * Not thread-safe; callers must hold an external lock.
+ *
+ * The links are the members `Prev` and `Next` of the node, by default ones named
+ * `prev` and `next`. Name others to put a type in a list through hooks it already
+ * has under other names, or to link one node into two lists at once through two
+ * pairs of hooks:
+ *
+ * ```cpp
+ * IntrusiveList<TaskBase*, &TaskBase::owned_prev, &TaskBase::owned_next> owned;
+ * ```
+ *
+ * Both hooks must be of type `NodePtr`, and the node type must be complete where
+ * the list type is named.
  *
  * ### Complexity
  * | Operation            | Complexity |
@@ -36,9 +49,17 @@ struct IntrusiveListNode {
  * | pop_back_block(n)    | O(n)       |
  *
  * @tparam NodePtr Pointer type stored in the list; defaults to `IntrusiveListNode*`.
+ * @tparam Prev    The node's member linking to the previous node.
+ * @tparam Next    The node's member linking to the next node.
  */
-template<typename NodePtr = IntrusiveListNode*>
+template<typename NodePtr = IntrusiveListNode*,
+         auto Prev = &std::remove_pointer_t<NodePtr>::prev,
+         auto Next = &std::remove_pointer_t<NodePtr>::next>
 class IntrusiveList {
+    static_assert(std::is_same_v<decltype(std::declval<NodePtr>()->*Prev), NodePtr&> &&
+                  std::is_same_v<decltype(std::declval<NodePtr>()->*Next), NodePtr&>,
+                  "IntrusiveList hooks must be members of type NodePtr");
+
 public:
     IntrusiveList() = default;
     IntrusiveList(IntrusiveList &&other) :
@@ -63,9 +84,9 @@ public:
     {
         m_size = 0;
         while (auto node = m_head) {
-            m_head->prev = nullptr;
-            m_head = node->next;
-            node->next = nullptr;
+            prev(m_head) = nullptr;
+            m_head = next(node);
+            next(node) = nullptr;
         }
         m_tail = nullptr;
     }
@@ -86,17 +107,17 @@ public:
             m_tail = std::exchange(other.m_tail, nullptr);
         } else {
             m_size += std::exchange(other.m_size, 0);
-            other.m_head->prev = m_tail;
-            m_tail->next = std::exchange(other.m_head, nullptr);
+            prev(other.m_head) = m_tail;
+            next(m_tail) = std::exchange(other.m_head, nullptr);
             m_tail = std::exchange(other.m_tail, nullptr);
         }
     }
 
     /// @brief Appends @p node to the back of the list.
     void push_back(NodePtr node) noexcept {
-        node->prev = m_tail;
-        node->next = nullptr;
-        if (m_tail) m_tail->next = node;
+        prev(node) = m_tail;
+        next(node) = nullptr;
+        if (m_tail) next(m_tail) = node;
         else        m_head = node;
         m_tail = node;
         ++m_size;
@@ -116,8 +137,8 @@ public:
         }
         NodePtr node = m_tail;
         size_t i = 1;
-        for (; i < n && node->prev != nullptr; ++i) {
-            node = node->prev;
+        for (; i < n && prev(node) != nullptr; ++i) {
+            node = prev(node);
         }
         if (node == m_head) {
             list.m_size = std::exchange(m_size, 0);
@@ -128,21 +149,21 @@ public:
             list.m_head = node;
             list.m_tail = m_tail;
             m_size -= i;
-            m_tail = node->prev;
-            list.m_head->prev = nullptr;
-            m_tail->next = nullptr;
+            m_tail = prev(node);
+            prev(list.m_head) = nullptr;
+            next(m_tail) = nullptr;
         }
         return list;
     }
 
-    /// @brief Removes and returns the front node, or nullptr if empty.
+    /// @brief Removes and returns the back node, or nullptr if empty.
     NodePtr pop_back() noexcept {
         if (!m_head) return nullptr;
         NodePtr node = m_tail;
-        m_tail = node->prev;
-        if (m_tail) m_tail->next = nullptr;
+        m_tail = prev(node);
+        if (m_tail) next(m_tail) = nullptr;
         else        m_head = nullptr;
-        node->prev = node->next = nullptr;
+        prev(node) = next(node) = nullptr;
         --m_size;
         return node;
     }
@@ -151,10 +172,10 @@ public:
     NodePtr pop_front() noexcept {
         if (!m_head) return nullptr;
         NodePtr node = m_head;
-        m_head = node->next;
-        if (m_head) m_head->prev = nullptr;
+        m_head = next(node);
+        if (m_head) prev(m_head) = nullptr;
         else        m_tail = nullptr;
-        node->prev = node->next = nullptr;
+        prev(node) = next(node) = nullptr;
         --m_size;
         return node;
     }
@@ -163,26 +184,29 @@ public:
     ///
     /// Safe to call unconditionally on any node, whether or not it is
     /// currently linked into this list — a no-op if not. Nodes with null
-    /// `prev`/`next` are ambiguous (never-linked vs. sole element), so this
+    /// links are ambiguous (never-linked vs. sole element), so this
     /// is disambiguated via `m_head`, which only this list has access to;
     /// callers should not try to track linkage themselves and should always
     /// call `remove()` rather than guessing first.
     void remove(NodePtr node) noexcept {
-        if (!node->prev && !node->next && m_head != node) return;
-        if (node->prev) node->prev->next = node->next;
-        else            m_head = node->next;
-        if (node->next) node->next->prev = node->prev;
-        else            m_tail = node->prev;
+        if (!prev(node) && !next(node) && m_head != node) return;
+        if (prev(node)) next(prev(node)) = next(node);
+        else            m_head = next(node);
+        if (next(node)) prev(next(node)) = prev(node);
+        else            m_tail = prev(node);
         --m_size;
-        node->prev = node->next = nullptr;
+        prev(node) = next(node) = nullptr;
     }
 
     inline std::size_t size() const noexcept { return m_size; }
 
     /// @brief The front node without removing it, or nullptr if empty. Walk the rest
-    /// through `next`, under the same lock that guards the list.
+    /// through the `Next` hook, under the same lock that guards the list.
     NodePtr front() const noexcept { return m_head; }
 private:
+    static NodePtr& prev(NodePtr node) noexcept { return node->*Prev; }
+    static NodePtr& next(NodePtr node) noexcept { return node->*Next; }
+
     std::size_t m_size = 0;
     NodePtr m_head = nullptr;
     NodePtr m_tail = nullptr;

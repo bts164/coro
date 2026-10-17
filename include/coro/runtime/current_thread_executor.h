@@ -10,6 +10,7 @@
 
 #include <coro/runtime/executor.h>
 #include <coro/runtime/parker.h>
+#include <coro/detail/intrusive_list.h>
 #include <coro/detail/mutex.h>
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
@@ -27,7 +28,6 @@
 #ifndef CORO_PICO
 #include <thread>
 #endif
-#include <unordered_set>
 #include <vector>
 
 namespace coro {
@@ -108,7 +108,8 @@ public:
     explicit CurrentThreadExecutor(Runtime* rt);
 #endif
 
-    ~CurrentThreadExecutor() override = default;
+    /// Releases every task still owned. Defined in the .cpp.
+    ~CurrentThreadExecutor() override;
 
     CurrentThreadExecutor(const CurrentThreadExecutor&)            = delete;
     CurrentThreadExecutor& operator=(const CurrentThreadExecutor&) = delete;
@@ -279,11 +280,15 @@ private:
 #endif
 
     // Category 1 (doc/task_ownership.md): persistent lifetime anchor for every live task.
-    // Inserted in schedule(), erased after poll() returns true (task reached terminal state).
-    mutable detail::Mutex                               m_owned_mutex;
-    std::unordered_set<detail::Rc<detail::TaskBase>>     m_owned_tasks;
+    // Linked in schedule(), unlinked after poll() returns true (task reached terminal
+    // state). Intrusive through TaskBase::owned_prev/owned_next; the strong reference
+    // is TaskBase::owned_self, set while linked. Neither linking nor unlinking
+    // allocates. GUARDED BY m_owned_mutex.
+    mutable detail::Mutex m_owned_mutex;
+    detail::IntrusiveList<detail::TaskBase*, &detail::TaskBase::owned_prev,
+                          &detail::TaskBase::owned_next> m_owned_tasks;
     // Set by begin_shutdown(), never cleared. GUARDED BY m_owned_mutex.
-    bool                                                m_closed = false;
+    bool                  m_closed = false;
 
 #ifdef CORO_PICO
     struct IsrPollRegistration {

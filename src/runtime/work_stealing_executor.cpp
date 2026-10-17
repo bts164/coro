@@ -698,8 +698,7 @@ void WorkStealingExecutor::worker_loop(int worker_index) {
 
         // A slot task gets what the poll that woke it left of its budget, as in
         // tokio: a ping-pong pair shares one budget instead of a fresh one per hop.
-        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task),
-                            from_lifo ? carried_budget : task_budget());
+        detail::Context ctx(*task, from_lifo ? carried_budget : task_budget());
         detail::TaskBase::current = task.get();
         bool done;
         {

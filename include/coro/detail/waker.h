@@ -30,6 +30,14 @@ public:
     /// @brief Returns a new `Waker` that wakes the same task.
     /// Used when a future needs to hand off the waker to multiple waiters.
     virtual Rc<Waker> clone() = 0;
+
+    /// @brief Returns a weak reference to the waker `clone()` returns.
+    ///
+    /// The default goes through `clone()`, a strong reference taken and dropped. A waker
+    /// that can hand out a weak reference to itself directly should override this. The
+    /// default is only right when `clone()` returns this waker itself: a weak reference
+    /// to a fresh copy expires at once. A non-owning `Context` calls this.
+    virtual Weak<Waker> weak_clone() { return clone(); }
 };
 
 } // namespace coro::detail

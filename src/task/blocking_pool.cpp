@@ -56,7 +56,7 @@ void BlockingTaskBase::park() {
     // wait() and then notifies it.
     TaskStateBase& state = park_state();
     std::unique_lock lock(state.mutex);
-    state.cv.wait(lock, [this] {
+    park_cv.wait(lock, [this] {
         return scheduling_state.load(std::memory_order_acquire) == SchedulingState::Notified;
     });
     // Notified → Running. wake() is a no-op while Notified, so nothing else can
@@ -67,9 +67,7 @@ void BlockingTaskBase::park() {
 void BlockingTaskBase::unpark() {
     TaskStateBase& state = park_state();
     std::lock_guard lock(state.mutex);
-    // notify_all: the condition variable is TaskStateBase's, shared with
-    // wait_until_done().
-    state.cv.notify_all();
+    park_cv.notify_one();  // only the task's own thread waits on it
 }
 
 BlockingTaskBase* current_blocking_task() noexcept {

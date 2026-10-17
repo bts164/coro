@@ -57,7 +57,7 @@ design introduces the library's first address type.
 
 Modeled on Rust's `SocketAddr`/`Ipv4Addr`/`Ipv6Addr` split, but spelled out in full
 (`SocketAddress`) to match this codebase's existing naming (`JoinHandle`,
-`CancellationToken`) rather than Rust's abbreviation. Like Rust's version, addresses are
+`StreamHandle`) rather than Rust's abbreviation. Like Rust's version, addresses are
 stored as fixed-size byte arrays, never as strings:
 
 ```cpp

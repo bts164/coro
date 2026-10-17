@@ -3,8 +3,6 @@
 > This document describes the library's built-in **structured cancellation** mechanism:
 > automatic, drop-based cancellation that propagates through the task tree via `PollDropped`.
 > It requires no API surface — dropping a `JoinHandle` is all that is needed.
-> For the proposed opt-in **cooperative cancellation** API (`CancellationToken`), see
-> [CancellationToken Design](cancellation_token.md).
 
 ## Problem
 

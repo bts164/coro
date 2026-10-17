@@ -6,7 +6,7 @@ homogeneous child tasks and collect their results as they complete.
 ```mermaid
 sequenceDiagram
     participant C as Coroutine
-    participant JS as JoinSet<T>
+    participant JS as JoinSet#lt;T#gt;
     participant E as Executor
     participant T1 as JoinSetTask A
     participant T2 as JoinSetTask B
@@ -21,8 +21,8 @@ sequenceDiagram
     E->>T2: poll() → Ready(result_b)
     T2->>JS: on_task_complete(): pending→idle, wake consumer
 
-    C->>JS: co_await next(js) → result_a (read directly from TaskState<T>)
-    C->>JS: co_await next(js) → result_b (read directly from TaskState<T>)
+    C->>JS: co_await next(js) → result_a (read directly from TaskState#lt;T#gt;)
+    C->>JS: co_await next(js) → result_b (read directly from TaskState#lt;T#gt;)
     C->>JS: co_await next(js) → nullopt (exhausted)
 ```
 

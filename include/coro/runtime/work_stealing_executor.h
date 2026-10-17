@@ -106,8 +106,10 @@ private:
     using TaskPtr = detail::TaskBase*;
 
     // One per worker: the owner-side Local handle plus a clonable Steal handle
-    // that other workers call steal_into() on.
-    struct WorkerQueue {
+    // that other workers call steal_into() on. A line each: the owner writes its
+    // LIFO slot on nearly every poll, and packed at 40 bytes a neighbour's slot
+    // shared the line.
+    struct alignas(64) WorkerQueue {
         detail::Local<TaskPtr> local;
         detail::Steal<TaskPtr> steal;
 
@@ -206,12 +208,17 @@ private:
 
     // --- Parking / searching protocol ---
 
+    // These two share a line with nothing else. notify_if_needed() makes a
+    // read-modify-write of m_searching on every spawn and wake, from every worker;
+    // on the line with m_owned_tasks, every insert and remove missed on the shard
+    // lookup.
+
     /// Number of workers currently performing a steal sweep. Capped at num_workers/2.
-    std::atomic<int>      m_searching{0};
+    alignas(64) std::atomic<int>      m_searching{0};
     /// Bitmask of parked workers: bit k is set while worker k is parking or parked (park_worker()).
     std::atomic<uint64_t> m_idle_mask{0};
 
-    Runtime*  m_runtime;
+    alignas(64) Runtime*  m_runtime;
     /// Shared by all workers; owned by the Runtime, which declares it before the
     /// executor, so it outlives every worker.
     IoDriver& m_driver;

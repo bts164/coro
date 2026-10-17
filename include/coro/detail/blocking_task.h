@@ -33,7 +33,7 @@ struct BlockingTaskBase : TaskBase {
     /// `TaskState<T>::cancelled`.
     virtual bool is_cancelled() const noexcept = 0;
 
-    /// The mutex and condition variable park() waits on (the task's `TaskState<T>`).
+    /// The task's `TaskState<T>`, whose mutex park() waits under (with `park_cv`).
     virtual TaskStateBase& park_state() noexcept = 0;
 
     /// Blocks the task's own thread until the task is woken (`Running → Idle`, then
@@ -50,6 +50,10 @@ struct BlockingTaskBase : TaskBase {
 
     /// Number of live `BlockingCancelShield`s. Touched only by the task's own thread.
     int shield_depth = 0;
+
+    /// What park() waits on, under `park_state().mutex`. Only the task's own thread
+    /// waits on it. Kept here, not in `TaskStateBase`, so only blocking tasks pay for it.
+    CondVar park_cv;
 
     /// Intrusive membership in the pool's list of live (queued or running) tasks.
     /// Read and written only under the pool's mutex.

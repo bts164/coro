@@ -2,6 +2,29 @@
 
 Planned work not yet implemented, in rough priority order.
 
+## Intrusive reference counts for tasks and wakers
+
+A task's `make_shared` allocation carries 112 bytes of `shared_ptr` machinery: the
+control block padded to 64 by `TaskBase`'s alignment, the `enable_shared_from_this`
+pointer, the owned list's `owned_self` and half of each stored waker reference. The plan
+is to pack the strong count and task flags into one state word in `Waker`, beside a
+weak count. `Rc` and `Weak` become single pointers, and a `Weak` may no longer outlive
+its task: if one does, the process aborts. A `TaskImpl` allocation goes
+from 320 to 256 bytes, and a `JoinSetTask` from 384 to 256. A forgotten reference becomes
+a loud abort instead of a silent leak. The design is in
+[Planned: intrusive reference counting](design/task_ownership.md#planned-intrusive-reference-counting-not-yet-implemented).
+
+!!! tip "TODO: Replace `shared_ptr` and `weak_ptr` for tasks and wakers"
+    Three stages, each tested before the next (see
+    [Migration stages](design/task_ownership.md#migration-stages)):
+
+    1. Intrusive counts with today's weak semantics. No behaviour change.
+    2. The `Weak` lifetime invariant. Audit and fix every `Weak` holder first; the
+       IoDriver's registrations are known to break it.
+    3. Pack the strong count and `CANCELLED` into the state word.
+
+    Measure the Skynet tests after each stage.
+
 ## WorkStealingExecutor: more than 64 workers
 
 `WorkStealingExecutor` tracks parked workers in a single `std::atomic<uint64_t>`
@@ -23,39 +46,6 @@ such machines.)
       live in a mutex-protected `std::vector`, locked only when a wake is needed.
       This has no worker limit and wakes workers in LIFO order (warmer caches), but
       it is a larger rewrite of the park/notify protocol.
-
-## Move the `block_on` wait out of the task
-
-Every task carries a `std::condition_variable` (`TaskStateBase::cv`, 48 bytes), and
-every terminal method on `TaskState` calls `cv.notify_all()`. The only waiter is the
-thread inside `Runtime::block_on()`, and only for the root task: `WorkStealingExecutor`
-and `WorkSharingExecutor` implement `wait_for_completion()` as
-`state.wait_until_done()`. Worker threads never wait on it, `JoinHandle` uses the waker
-slot, and `CurrentThreadExecutor` runs its poll loop on the calling thread instead.
-
-!!! tip "TODO: wait for the root task through a waker, not a per-task condition variable"
-    `block_on()` keeps a mutex, a condition variable and a `done` flag on its own
-    stack and installs a waker on the root task's state that sets the flag and
-    notifies. The task already has a waker slot for this kind of notification. An
-    alternative is to hold the pair in the executor, since a `block_on()` call waits
-    for one task at a time.
-
-    What changes:
-
-    - `TaskStateBase` loses `cv` and `wait_until_done()`, and the four
-      `cv.notify_all()` calls in `task_state.h` go away.
-    - The rule that every terminal method must set `terminated` and notify under the
-      same lock (the race-condition note in `task_state.h`) no longer has to be upheld
-      in four places. The lost-wakeup reasoning moves to the one new waker.
-    - `Executor::wait_for_completion()` takes whatever the new wait object is. All
-      three executors and the Pico path are touched, and `CurrentThreadExecutor`'s
-      poll loop still needs a way to see that the root task finished.
-
-    This removes code and per-task state; it is not expected to show up in a
-    benchmark. A `TaskImpl<Coro<size_t>>` is 384 bytes and is rounded up to a multiple
-    of 64 by `alignas(64)` on `scheduling_state`, so dropping 48 bytes may not shrink
-    the allocation at all. Get a layout dump (`pahole`) first if size is the goal; see
-    the note on task size in `doc/design/task_and_executor.md`, "Internal Task types".
 
 ## Migrate error-returning futures to `std::expected`
 
@@ -279,40 +269,17 @@ All combinators are lazy (zero-cost wrappers satisfying `Stream`) and live in
 `include/coro/stream/` (new subdirectory). Each has a corresponding free function
 returning a `[[nodiscard]]` adaptor type.
 
-## `CancellationSource` / `CancellationToken`
+## `CancelHandle`
 
-A cancellation primitive for cases where tasks are spawned independently and cannot
-share a common owner — for example, tasks registered from multiple call sites that all
-need to observe the same shutdown signal.
+A copyable handle that can request cancellation of a task and do nothing else, like
+Tokio's `AbortHandle`. The `JoinHandle` stays the task's only owner and the only way to
+get its result. The main use is a detached task that should still be stoppable. See
+[task_ownership.md](design/task_ownership.md#planned-cancelhandle-not-yet-implemented) for
+the design.
 
-```cpp
-auto [source, token] = coro::cancellation_source();
-
-// Pass token to any number of independently spawned tasks:
-coro::spawn(worker_a(token.clone())).detach();
-coro::spawn(worker_b(token.clone())).detach();
-
-// Signal all of them simultaneously:
-source.cancel();
-```
-
-Inside a task, `token.is_cancelled()` can be checked at any point, and
-`co_await token.cancelled()` suspends until the token fires — both without requiring
-the task to be in a parent–child ownership relationship with the canceller.
-
-This is the idiomatic solution for cross-cutting cancellation that does not map cleanly
-to a task tree. Without it, the only alternative is manually threading a watch channel
-carrying a shutdown flag, which reimplements cancellation by hand and should be avoided.
-
-This primitive also subsumes the previously considered `AbortHandle` design. The only
-thing `AbortHandle` added over dropping a `JoinHandle` was the ability to cancel a task
-while still holding the handle to observe its result. That is equally achievable by
-passing a `CancellationToken` to the task at spawn time and cancelling the token while
-retaining the `JoinHandle` — no separate type needed. `SpawnBuilder` should accept an
-optional token via something like `build_task().with_cancel(token).spawn(...)`.
-
-Modelled on Tokio's `CancellationToken` (`tokio-util` crate). Lives in
-`include/coro/sync/cancellation_token.h`.
+A `CancellationToken` was considered and dropped: built-in cancellation already reaches
+every task with no code in the task, which a token cannot do. A graceful shutdown, where
+tasks choose how to wind down, is a `watch` channel the tasks `select` on.
 
 ## I/O primitives
 

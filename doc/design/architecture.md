@@ -398,9 +398,7 @@ skipping all of the above. Detached tasks are fire-and-forget.
 ## Cancellation and Structured Concurrency
 
 > The cancellation described in this section is the library's built-in **structured
-> cancellation**: automatic, drop-based, requires no API surface. A separate opt-in
-> **cooperative cancellation** mechanism (`CancellationToken`) is proposed but not yet
-> implemented — see [CancellationToken Design](cancellation_token.md).
+> cancellation**: automatic, drop-based, requires no API surface.
 
 ### The core problem
 

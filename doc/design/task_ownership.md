@@ -111,8 +111,8 @@ flowchart TD
 `shared_from_this()` — a strong `shared_ptr<TaskBase>`. The change is in how futures
 **store** wakers for later notification.
 
-`Context` gains a `get_weak_waker()` accessor that constructs a `weak_ptr<Waker>` from
-the strong waker it holds:
+`Context` gains a `get_weak_waker()` accessor that returns a `weak_ptr<Waker>` to the
+task:
 
 ```cpp
 class Context {
@@ -132,6 +132,13 @@ m_waker = ctx.get_weak_waker();
 // Firing:
 if (auto w = m_waker.lock()) w->wake();
 ```
+
+An executor's `Context` holds no reference of its own: it is built from `*task`, and the
+executor's own `Rc` keeps the task alive through the poll. `getWaker()` and
+`get_weak_waker()` take a reference only when a future asks for one, through `clone()` and
+`weak_clone()`. Most polls never ask, so this saves a reference count increment and
+decrement per poll. A `Context` built from an `Rc<Waker>` (`blocking_wait()`, tests) holds
+that `Rc` and returns it.
 
 The executor constructs `Context` with a strong `shared_ptr<Waker>` for the duration
 of the poll call. This temporary strong reference exists only while the task is
@@ -153,7 +160,7 @@ insertion, removal, and iteration:
 ```mermaid
 graph TD
     JS["JoinSet&lt;T&gt;"]
-    State["JoinSetSharedState&lt;T&gt;\n──────────────────────────\npending_handles: intrusive list\nidle_handles: deque&lt;shared_ptr&lt;TaskState&lt;T&gt;&gt;&gt;"]
+    State["JoinSetSharedState&lt;T&gt;\n──────────────────────────\npending_handles: intrusive list\nidle_handles: intrusive list"]
     Task["JoinSetTask&lt;F&gt;"]
 
     JS -->|"m_state: shared_ptr — strong"| State
@@ -162,10 +169,14 @@ graph TD
 ```
 
 On task completion, `on_task_complete()` unlinks `this` from `pending_handles` in O(1)
-via the embedded intrusive list node. An aliased `shared_ptr<TaskState<T>>` (into the
-same allocation) is moved to `idle_handles` for the consumer to read. At this point the
-executor still holds the task via its owned list; when both the executor's owned-list
-entry and the `idle_handles` entry are dropped, the allocation is freed.
+via the embedded intrusive list node, stores an aliased `shared_ptr<TaskState<T>>` to
+itself (into the same allocation) in that node, and links the node into `idle_handles`
+for the consumer to read. A node is in at most one of the two lists, and neither list
+allocates. At this point the executor still holds the task via its owned list; when both
+the executor's owned-list entry and the node's reference are dropped, the allocation is
+freed. The consumer takes the reference when it pops the node (`next()` or a drain); a
+`JoinSetSharedState` destroyed with nodes still in `idle_handles` drops their references
+in its destructor.
 
 On `JoinSet` destruction, `cancel_pending()` iterates `pending_handles`, calls
 `cancel_task()` on each, and clears the list. No ownership transfer to a `CoroutineScope`
@@ -228,10 +239,63 @@ from any `CoroutineScope` and do not block their spawning coroutine from returni
 
 ---
 
+## Planned: `CancelHandle` (not yet implemented)
+
+!!! tip "TODO: CancelHandle, a handle that can only cancel"
+    A copyable handle whose only operation is `cancel()`, like Tokio's `AbortHandle`.
+    The `JoinHandle` (or `StreamHandle`, `BlockingHandle`) stays the task's only owner and
+    the only way to get its result. A `CancelHandle` just lets other code ask the task to
+    stop.
+
+    The main use is a detached task that should still be stoppable: take a
+    `CancelHandle` first, then `detach()`. Today a detached task can't be cancelled
+    before shutdown. `JoinSet::spawn` could also return one, as Tokio's does.
+
+    ```cpp
+    auto handle = coro::spawn(serve(conn));
+    coro::CancelHandle stop = handle.cancel_handle();
+    std::move(handle).detach();
+    // ... later, from any thread:
+    stop.cancel();
+    ```
+
+    Design:
+
+    - It holds a single `Weak<TaskBase>`, a Category 4 reference, and `cancel()` locks it
+      and calls the virtual `TaskBase::cancel_task()`. So it is not a template, one type
+      serves every kind of task, and the task needs no new fields.
+    - For a blocking task, `cancel_task()` already means "request": the callable sees it
+      at its next cancellation point, as with `BlockingHandle::request_cancel()`.
+    - It never keeps the task alive. After the task is freed, `lock()` fails and
+      `cancel()` does nothing.
+    - A cancel that arrives after the task has stored its result changes nothing:
+      `JoinHandle::poll()` returns the result whenever one is present, whatever the
+      `cancelled` flag says.
+    - `cancel()` is safe from any thread, because `cancel_task()` is.
+    - It is not a `Future`, so it does not satisfy `Cancellable`, and discarding one is
+      harmless (no `[[nodiscard]]`).
+    - Every handle type gets a `cancel_handle()` accessor. A default-constructed,
+      moved-from or detached handle returns an empty `CancelHandle`.
+
+    Cancelling a task through a `CancelHandle` has the same effect as
+    `JoinHandle::cancel()`: an awaiting `JoinHandle` sees the task end as cancelled.
+
+    This replaces the dropped `CancellationToken` idea. Built-in cancellation already
+    reaches every task without code in the task, which an opt-in token can't. For a
+    graceful shutdown, where tasks choose how to wind down, use a `watch` channel that
+    the tasks `select` on.
+
+---
+
 ## Reference categories
 
 Every `shared_ptr` or `weak_ptr` touching a `TaskBase`/`TaskState` allocation falls
 into one of four categories.
+
+!!! note "NOTE: The categories outlive `shared_ptr`"
+    These categories describe ownership, not a pointer type. The planned intrusive
+    reference counts (see [Planned: intrusive reference counting](#planned-intrusive-reference-counting-not-yet-implemented))
+    change how each reference is stored, but not which category it belongs to.
 
 ---
 
@@ -267,8 +331,9 @@ m_executor->wait_for_completion(*state);
 // state keeps TaskImpl alive on the call stack for the duration of block_on()
 ```
 
-`JoinSet::idle_handles` also holds `shared_ptr<TaskState<T>>` aliased into the
-`JoinSetTask` allocation, keeping it alive until the consumer reads the result.
+Each `JoinSetTask` in `JoinSet::idle_handles` also holds a `shared_ptr<TaskState<T>>`
+to itself, aliased into its own allocation, keeping it alive until the consumer reads
+the result.
 
 ---
 
@@ -310,7 +375,7 @@ See [shared_ptr_cycles.md](../notes/shared_ptr_cycles.md) for the full cycle ana
 |---|---|---|---|
 | Executor owned list entry | `shared_ptr<TaskBase>` | 1 — lifetime anchor | authoritative owner from spawn to terminal state |
 | `JoinHandle::m_state` | `shared_ptr<TaskState<T>>` | 2 — result access | typed result access; same allocation; extends lifetime after executor removes at completion |
-| `JoinSetSharedState::idle_handles` | `deque<shared_ptr<TaskState<T>>>` | 2 — result access | aliased into `JoinSetTask` allocation; consumer reads result directly |
+| `JoinSetSharedState::Node::completed` (while in `idle_handles`) | `shared_ptr<TaskState<T>>` | 2 — result access | the task's reference to itself, aliased into its own allocation; consumer takes it on pop and reads the result directly |
 | `Runtime::block_on()` local `state` | `shared_ptr<TaskState<T>>` | 2 — result access | root task anchor for synchronous call stack |
 | Executor queue entries | `shared_ptr<TaskBase>` | 3 — temporary (Notified/Running) | task must stay alive between enqueue and poll |
 | `TaskState::waker` | `weak_ptr<Waker>` | 4 — notification only | shared slot for JoinHandle awaiter and CoroutineScope drain; must not create cycle |
@@ -371,3 +436,282 @@ before `block_on` returns. `add_child()` is no longer required for JoinSet cance
 `JoinHandle::detach()` removes the handle's Category 2 reference. The executor's owned
 list keeps the task alive. On shutdown, the executor cancels and drains all tracked
 tasks including detached ones — no self-reference or external anchor is needed.
+
+---
+
+## Planned: intrusive reference counting (not yet implemented)
+
+!!! tip "TODO: Intrusive reference counting for tasks"
+    Replace `make_shared`'s control block with counts stored in the task, so each task
+    reference is one pointer and task allocations shrink (320 to 256 bytes for a
+    `TaskImpl`). The plan, with its rules and migration stages, is the rest of this
+    section.
+
+The ownership model above keeps its shape. The executor's owned list is still the
+lifetime anchor, and notification references still own nothing. What changes is how
+references are represented:
+
+- **The counts move into the task.** `Rc<Waker>` and `Weak<Waker>` (and the `TaskBase`
+  forms) stay RAII types that adjust the counts automatically, as `shared_ptr` and
+  `weak_ptr` do. Each becomes a single 8-byte pointer to the task, not a pointer pair.
+- **A `Weak` must not outlive the task.** Today a `weak_ptr` may outlive its target,
+  and `lock()` then returns null. Under the new rule, every `Weak` is destroyed before
+  the task's last strong reference drops. The weak count becomes a check: if it is not
+  zero when the strong count reaches zero, the process aborts.
+
+### Why
+
+A task's allocation is larger than `sizeof` suggests. `make_shared` puts a 16-byte
+control block (a vptr and the two counts) in front of the object in the same
+allocation. Because `TaskBase` is `alignas(64)`, that block is padded to 64 bytes so the
+task starts on a cache line. Measured on x86-64 GCC:
+
+| Type | `sizeof` | `make_shared` allocation |
+|---|---|---|
+| `TaskImpl<Coro<size_t>>` | 256 | 320 |
+| `JoinSetTask<Coro<size_t>>` | 320 | 384 |
+
+The `shared_ptr` machinery accounts for 112 bytes of a `TaskImpl` allocation:
+
+- 64 bytes for the control block and its padding;
+- 16 bytes for the `enable_shared_from_this` weak pointer, which only exists so
+  `clone()` can find the control block;
+- 16 bytes for `owned_self`, the owned list's strong reference stored in the task;
+- 8 of the 16 bytes of the `TaskState::waker` slot.
+
+Size is not the only reason. A `weak_ptr` keeps the allocation's memory alive until the
+`weak_ptr` itself goes away. A `weak_ptr` left in a long-lived structure, such as a timer
+entry that is never removed, pins that memory indefinitely, and nothing reports it.
+Under this design the memory is freed as soon as the last strong reference drops, and
+the same mistake aborts the process, naming the task.
+
+### The state word
+
+`Waker` gains one 32-bit word that packs the scheduling state, task flags and the
+strong count, as Tokio's task header does. It replaces both the 8-bit
+`scheduling_state` and the `shared_ptr` strong count. The weak count is a separate
+32-bit atomic beside it (see below).
+
+| Bits | Field |
+|---|---|
+| 0–2 | `SchedulingState` (the five states described above) |
+| 3 | `CANCELLED`: replaces `TaskState::cancelled`, set by `JoinHandle`'s destructor and `cancel_task()` |
+| 4–7 | Reserved for flags |
+| 8–31 | Strong reference count, in units of `REF_ONE = 1 << 8` |
+
+- **Reference count changes** use `fetch_add` and `fetch_sub` of `REF_ONE`. These never
+  disturb the low bits, so cloning a waker needs no CAS. 24 bits allow about 16 million
+  references; an increment that would overflow aborts.
+- **Scheduling transitions** stay CAS loops, now over the whole word, preserving the
+  count bits. A concurrent clone or drop can make a CAS retry. That is the cost of
+  sharing the word, and Tokio accepts the same cost.
+- **Setting `CANCELLED`** is a `fetch_or`.
+- **Wakers that are not tasks** (`BlockingWaker`, test mocks) use only the count bits.
+  Keeping the word in `Waker` makes reference counting non-virtual for every waker.
+- **Destruction** goes through `Waker`'s virtual destructor. The control block's vptr
+  is gone, because the task already has one.
+- **On Pico** the word is a plain integer, as `RelaxedState` is today.
+
+`cancel_requested` stays a plain `bool`. It is only touched by the polling thread and
+fills padding that would otherwise be wasted, so moving it into the word would turn plain
+stores into atomic read-modify-writes and save nothing. `terminated` and the `waker`
+slot stay under `TaskStateBase::mutex`. Tokio replaces that mutex with more flag bits
+(`COMPLETE`, `JOIN_WAKER`), but doing so rewrites the completion protocol. That is a
+separate change, which the reserved bits leave room for, and it needs a profile to
+justify it under the mutex-over-atomics convention.
+
+### Weak references and the weak count
+
+`Weak` keeps its role: it is a reference that owns nothing, used for every Category 4
+waker and every "notify or cancel, but don't keep alive" link. What changes is its
+lifetime contract:
+
+- **Creating, copying or destroying a `Weak`** increments or decrements the weak count,
+  as `weak_ptr` does now.
+- **`lock()`** increments the strong count without checking it first. The contract
+  guarantees the target is alive while any `Weak` to it exists, so there is no CAS loop.
+  Debug builds assert that the strong count was not zero.
+- **When the strong count reaches zero**, the task is destroyed and freed at once,
+  unless the weak count is not zero. Then the process aborts, naming the task. This
+  check is in every build, not only debug builds. The weak count never keeps memory
+  alive; it only reports a `Weak` that outlived its task.
+
+The weak count does not need libstdc++'s convention of reserving one weak count for
+all strong references together. The memory is freed when the strong count reaches
+zero, so there is no separate "last weak reference frees" path to coordinate with.
+
+`Weak` references held as intrusive list links change shape, because a list that
+outlives its members must unlink them at completion:
+
+| Today | Planned |
+|---|---|
+| `TaskState::waker`, leaf future, channel, timer and I/O waker fields (`weak_ptr<Waker>`) | `Weak<Waker>`, 8 bytes |
+| `StreamHandle`'s driver reference (`weak_ptr<TaskBase>`) | `Weak<TaskBase>`, 8 bytes |
+| `CoroutineScope::m_pending` (`vector<weak_ptr<TaskBase>>`) | An intrusive list, unlinked by the child at completion, as `JoinSet` does |
+| `JoinSetSharedState::pending_handles` (raw pointers today) | Unchanged, except that linking a node takes a weak count and unlinking it releases the count |
+
+Intrusive links are the only place raw task pointers remain. They adjust the weak count
+explicitly when they link and unlink, so the abort check covers them too.
+`JoinSetTask::m_set_state` is a weak reference to `JoinSetSharedState`, which is not a
+task, so it keeps its current type.
+
+Two rules make the contract hold:
+
+!!! danger "WARNING: Destroy every `Weak` before the task's last strong reference drops"
+    A holder releases its `Weak` when the waiting future is destroyed, if firing the
+    waker has not already released it. This works because the future is reset when
+    the task reaches a terminal state, which runs every registration's destructor,
+    while the owned list still holds the task. Keep that order: reset the future
+    first, remove the task from the owned list second.
+
+!!! danger "WARNING: Upgrade a stored `Weak` under the holder's lock"
+    Wakers are fired after unlocking. If a holder moves its `Weak` out under the lock
+    and calls `lock()` only after unlocking, the target can finish in that gap. The
+    abort check then sees an outstanding weak count. So, while holding the lock, call
+    `lock()` and release the `Weak`. After unlocking, call `wake()` on the resulting
+    `Rc`. The target's deregistration takes the same lock, so it cannot interleave.
+    Mark each site with a `// RACE:` comment naming the lock.
+
+```mermaid
+stateDiagram-v2
+    Live: Live (strong count > 0)
+    Check: Last strong reference dropped
+    Freed: Destroyed and freed
+    Abort: Abort, naming the task
+    [*] --> Live: spawn
+    Live --> Check
+    Check --> Freed: weak count = 0
+    Check --> Abort: weak count > 0
+```
+
+### Handles and aliased references
+
+A `shared_ptr` can alias: `JoinHandle`'s `shared_ptr<TaskState<T>>` shares the task's
+count but points at a different base. An intrusive count lives in `Waker`, which
+`TaskState<T>` does not inherit. So `JoinHandle<T>`, `StreamHandle<T>` and
+`Runtime::block_on()`'s local reference each hold a strong task reference plus a typed
+`TaskState<T>*`. That is 16 bytes, the same as today, and it sits in the handle, not in
+the task. `JoinHandle`'s destructor sets `CANCELLED` through the task reference.
+
+A `JoinSetSharedState::Node` is embedded in its own task. While the node is in
+`idle_handles`, the list holds a strong count on the task, so `Node::completed` shrinks
+from a 16-byte aliased `shared_ptr` to an 8-byte `TaskState<T>*`.
+
+### Expected sizes
+
+Measured with a mock of the planned layout on x86-64 GCC, keeping `alignas(64)`:
+
+| Type | Data | Allocation today | Allocation planned |
+|---|---|---|---|
+| `TaskImpl<Coro<size_t>>` | 208 | 320 | 256 |
+| `JoinSetTask<Coro<size_t>>` | 256 | 384 | 256 |
+
+The alignment no longer costs any padding, because nothing sits in front of the object
+in its allocation. `JoinSetTask` uses all 256 bytes, with no room to spare. Moving
+`cancelled` into the state word is what frees the last 8 bytes.
+
+### Audit
+
+Before switching, every holder of a `Weak` must be checked against the first rule.
+Holders whose stored reference can outlive the waiting future need fixing.
+The IoDriver's timer and fd registrations are known cases. Also check:
+
+- the `Mutex` waiter queue;
+- the waker lists in `broadcast`;
+- the waker slots in `oneshot`, the channels and `isr_event`;
+- the lwIP callback results.
+
+Some of these store a strong `Rc<Waker>` today. Those do not need to change: a strong
+reference cannot dangle, and its only failure is keeping the task alive if it is never
+released. The audit only needs to confirm that each one is released when its future is
+destroyed. Converting one to `Weak` is optional; it gains the abort check in exchange
+for following the two rules above.
+
+### Scope
+
+- **Changes:** the `Waker` base and every `Waker` subclass (`TaskBase`,
+  `BlockingWaker`, and the test mocks); every field and parameter typed `Rc<Waker>`,
+  `Weak<Waker>`, `Rc<TaskBase>` or `Weak<TaskBase>`, including the executor queues,
+  `Context` and the owned lists; `JoinHandle`, `StreamHandle`, `CoroutineScope` and
+  `JoinSet`'s nodes.
+- **Unchanged:** `Rc` and `Weak` for types that are not wakers, such as
+  `JoinSetSharedState` and channel state. These stay `std::shared_ptr` off Pico.
+- **The atomics convention:** the strong and weak counts are atomics,
+  but `shared_ptr`'s counts already are. The state word extends the existing
+  scheduling-state exception rather than adding a new synchronization protocol.
+
+### Migration stages
+
+The sections above describe the end state. Getting there takes three changes, each
+tested on its own before the next starts:
+
+| Stage | Change | `TaskImpl` allocation | `JoinSetTask` allocation |
+|---|---|---|---|
+| Today | `shared_ptr` / `weak_ptr` | 320 | 384 |
+| 1 | Intrusive counts, today's weak semantics | 256 | 320 |
+| 2 | `Weak` must not outlive the task | 256 | 320 |
+| 3 | Strong count and `CANCELLED` packed into the state word | 256 | 256 |
+
+**Stage 1: intrusive counts, no change in behaviour.** Every `Rc` and `Weak` of `Waker`
+or `TaskBase` switches to the intrusive types. The strong and weak counts are two plain
+32-bit atomics in `Waker`. `last_worker_index` moves next to `scheduling_state` so the
+counts fill existing padding. `JoinHandle`, `StreamHandle` and `block_on()` hold a task
+reference plus a typed `TaskState<T>*` instead of an aliased `shared_ptr`. Weak
+semantics stay exactly as they are today:
+
+- When the strong count reaches zero, the payload is destroyed.
+- When the weak count reaches zero, the memory is freed.
+- `lock()` returns null once the strong count is zero.
+
+So the IoDriver, `CoroutineScope` and every other `Weak` holder keep their current
+logic, and the existing tests, TSan runs included, stay a valid baseline. This stage
+needs three pieces of machinery that stage 2 removes:
+
+- **A split between destruction and freeing.** The payload (result, exception, name,
+  stream buffer) is destroyed when the strong count reaches zero, while the counts must
+  stay readable until the weak count reaches zero. They must not be read from an
+  object whose destructor has run. GCC's default `-flifetime-dse` treats that storage
+  as dead, and sanitizers report the cross-thread reads. Workable layouts include:
+    - a virtual hook that resets the payload members;
+    - holding the payload in a `std::optional`;
+    - counts in a header in front of the object that its destructor never touches.
+      The header must not bring back the padding in front of a 64-byte-aligned task.
+
+    The choice is left to the implementation.
+- **One weak count held for all strong references together**, as libstdc++ does, so
+  that only the thread that brings the weak count to zero frees the memory.
+- **A CAS loop in `lock()`** that increments the strong count only if it is not zero.
+
+**Stage 2: the `Weak` lifetime invariant.** This stage applies the two rules in
+[Weak references and the weak count](#weak-references-and-the-weak-count):
+
+- Fix every holder the audit finds, starting with the IoDriver's registrations.
+- Convert `CoroutineScope::m_pending` to an intrusive list that children unlink at
+  completion.
+- Make `JoinSet`'s links take and release a weak count.
+- Add the abort when the strong count reaches zero while the weak count is not.
+
+Then remove the stage 1 machinery: the task is destroyed and freed at once, and `lock()`
+becomes an unconditional increment. A forgotten `Weak` turns from silently pinned
+memory into an abort that names the task.
+
+**Stage 3: the packed state word.** This stage moves the strong count and
+`TaskState::cancelled` into the state word described in [The state word](#the-state-word),
+so every scheduling transition becomes a CAS that preserves the count bits.
+`JoinSetTask` reaches 256 bytes in this stage. It is last because it is the only stage
+that changes the scheduling protocol, and it is easier to review once reference
+counting is settled.
+
+### Alternatives considered
+
+- **Weak references that may outlive the task (`make_shared` semantics).** These keep
+  a `lock()` that can fail safely. But the memory stays allocated until the last weak
+  reference drops, and a weak reference that is never removed pins it silently and
+  indefinitely. The abort check covers the same mistakes and makes them loud.
+- **Raw pointers with a hand-maintained count.** These have the same layout as the
+  planned `Weak`, but every holder must remember to adjust the count, and a missed
+  adjustment hides from the check. A RAII `Weak` makes the count automatic.
+- **Strong wakers only (Tokio).** Tokio has no weak or raw waker references, and a
+  stored waker owns the task. Missing a removal then keeps the whole task alive,
+  coroutine frame included, and produces no report. With the planned `Weak`, the same
+  mistake aborts.

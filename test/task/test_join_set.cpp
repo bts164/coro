@@ -6,6 +6,7 @@
 #include <coro/sync/select.h>
 #include <coro/sync/when.h>
 #include <coro/task/join_set.h>
+#include <coro/task/yield_now.h>
 #include "co_assert.h"
 #include <coro/runtime/runtime.h>
 #include <stdexcept>
@@ -14,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 #include <atomic>
+#include <memory>
 
 #ifndef CORO_PICO
 #include <coro/runtime/current_thread_executor.h>
@@ -73,6 +75,18 @@ public:
 private:
     T    m_value;
     bool m_polled{false};
+};
+
+// Ready at its first poll, which it records in `polled`. On CurrentThreadExecutor the
+// task has reported to its JoinSet by the time any other task sees the flag.
+struct FlaggedReadyFuture {
+    using OutputType = std::shared_ptr<int>;
+    std::shared_ptr<int> value;
+    bool& polled;
+    PollResult<std::shared_ptr<int>> poll(detail::Context&) {
+        polled = true;
+        return std::move(value);
+    }
 };
 
 // Used only in single-threaded tests — relies on ordering guarantees.
@@ -645,6 +659,43 @@ TEST(JoinSetSingleThreadedTest, MoveAssignmentCancelsPreviousTasks) {
     }(old_completed_naturally, new_task_ran));
     EXPECT_FALSE(old_completed_naturally);
     EXPECT_TRUE(new_task_ran);
+}
+
+// A completed task refers to itself until next() or a drain takes it from the set, so
+// destroying the set with results nobody consumed must release them.
+TEST(JoinSetSingleThreadedTest, DestroyReleasesUnconsumedResults) {
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
+    std::weak_ptr<int> result;
+    bool held_until_destroyed = false;
+    rt.block_on([](std::weak_ptr<int>& result, bool& held_until_destroyed) -> Coro<void> {
+        bool polled = false;
+        {
+            JoinSet<std::shared_ptr<int>> js;
+            auto value = std::make_shared<int>(42);
+            result = value;
+            js.spawn(FlaggedReadyFuture{std::move(value), polled});
+            while (!polled) co_await yield_now();
+            held_until_destroyed = !result.expired();
+        }
+    }(result, held_until_destroyed));
+    EXPECT_TRUE(held_until_destroyed);
+    EXPECT_TRUE(result.expired());
+}
+
+TEST(JoinSetSingleThreadedTest, DrainReleasesResults) {
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
+    std::weak_ptr<int> result;
+    bool released_by_drain = false;
+    rt.block_on([](std::weak_ptr<int>& result, bool& released_by_drain) -> Coro<void> {
+        bool polled = false;
+        JoinSet<std::shared_ptr<int>> js;
+        auto value = std::make_shared<int>(42);
+        result = value;
+        js.spawn(FlaggedReadyFuture{std::move(value), polled});
+        co_await js.drain();
+        released_by_drain = result.expired();
+    }(result, released_by_drain));
+    EXPECT_TRUE(released_by_drain);
 }
 
 // ---------------------------------------------------------------------------

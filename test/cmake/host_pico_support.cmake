@@ -29,7 +29,6 @@ add_library(coro_pico_core STATIC
     ${CORO_SRC}/task/waker.cpp
     ${CORO_SRC}/task/task.cpp
     ${CORO_SRC}/task/context.cpp
-    ${CORO_SRC}/sync/cancellation_token.cpp
     ${CORO_SRC}/sync/sleep.cpp
     ${CORO_SRC}/detail/timer_queue.cpp
     ${CORO_SRC}/runtime/executor.cpp

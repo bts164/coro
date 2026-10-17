@@ -254,3 +254,75 @@ TEST(IntrusiveList, RoundTrip) {
     EXPECT_EQ(list.size(), 5u);
     EXPECT_EQ(drain(list), (std::vector<int>{1, 2, 3, 4, 5}));
 }
+
+// ── hooks named by member pointer ────────────────────────────────────────────
+
+namespace {
+
+// Linked through two pairs of hooks, neither named prev/next, so that one node
+// can be in two lists at once.
+struct TwoListNode {
+    int          value;
+    TwoListNode* a_prev = nullptr;
+    TwoListNode* a_next = nullptr;
+    TwoListNode* b_prev = nullptr;
+    TwoListNode* b_next = nullptr;
+    explicit TwoListNode(int v) : value(v) {}
+};
+
+using ListA = IntrusiveList<TwoListNode*, &TwoListNode::a_prev, &TwoListNode::a_next>;
+using ListB = IntrusiveList<TwoListNode*, &TwoListNode::b_prev, &TwoListNode::b_next>;
+
+template<typename List>
+std::vector<int> drain_values(List& list) {
+    std::vector<int> out;
+    while (auto* node = list.pop_front())
+        out.push_back(node->value);
+    return out;
+}
+
+}  // namespace
+
+TEST(IntrusiveList, NamedHooksBasicOps) {
+    TwoListNode a(1), b(2), c(3), d(4);
+    ListA list;
+    list.push_back(&a);
+    list.push_back(&b);
+    list.push_back(&c);
+    list.push_back(&d);
+    list.remove(&b);
+    EXPECT_EQ(list.pop_back()->value, 4);
+
+    ListA other;
+    other.push_back(&d);
+    list.push_back_block(std::move(other));
+    auto taken = list.pop_back_block(2);
+    EXPECT_EQ(drain_values(list),  (std::vector<int>{1}));
+    EXPECT_EQ(drain_values(taken), (std::vector<int>{3, 4}));
+
+    // Only the named hooks were ever written.
+    for (auto* node : {&a, &b, &c, &d}) {
+        EXPECT_EQ(node->a_prev, nullptr);
+        EXPECT_EQ(node->a_next, nullptr);
+        EXPECT_EQ(node->b_prev, nullptr);
+        EXPECT_EQ(node->b_next, nullptr);
+    }
+}
+
+TEST(IntrusiveList, NamedHooksNodeInTwoLists) {
+    TwoListNode a(1), b(2), c(3);
+    ListA list_a;
+    ListB list_b;
+    list_a.push_back(&a);
+    list_a.push_back(&b);
+    list_a.push_back(&c);
+    list_b.push_back(&c);
+    list_b.push_back(&b);
+    list_b.push_back(&a);
+
+    // Unlinking from one list leaves the node's place in the other untouched.
+    list_a.remove(&b);
+    EXPECT_EQ(list_b.size(), 3u);
+    EXPECT_EQ(drain_values(list_a), (std::vector<int>{1, 3}));
+    EXPECT_EQ(drain_values(list_b), (std::vector<int>{3, 2, 1}));
+}

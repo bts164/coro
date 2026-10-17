@@ -47,11 +47,19 @@ namespace coro::detail {
  *
  * **Not movable:** `TaskBase` objects are always heap-allocated via `make_shared` and
  * accessed through `shared_ptr`. Moving the object itself is never required.
+ *
+ * **Alignment (desktop):** the class is `alignas(64)` so no other object shares the
+ * cache line holding `scheduling_state`, which wakers on any thread CAS. Keep
+ * `scheduling_state` the first data member: it then sits right after the vptr and the
+ * `enable_shared_from_this` pointer, in the object's first cache line, and the class
+ * needs no padding before it. Aligning the field instead would put it at offset 64 and
+ * leave a 40-byte hole. The rest of that line is written only at spawn. Not applied on
+ * Pico: the RP2040 has no data cache, so the alignment would only add padding.
  */
 #ifdef CORO_PICO
 class TaskBase : public Waker {
 #else
-class TaskBase : public Waker, public std::enable_shared_from_this<TaskBase> {
+class alignas(64) TaskBase : public Waker, public std::enable_shared_from_this<TaskBase> {
 #endif
 public:
     TaskBase()                             = default;
@@ -85,8 +93,21 @@ public:
      * Starts at `Idle`. `schedule()` sets it to `Notified` before the first enqueue.
      * All subsequent transitions are CAS operations — see `SchedulingState` for the
      * full transition table.
+     *
+     * First data member on desktop, so the class-level `alignas(64)` puts it in the
+     * object's first cache line without padding (see the class comment).
      */
-    alignas(64) RelaxedState<SchedulingState> scheduling_state{SchedulingState::Idle};
+    RelaxedState<SchedulingState> scheduling_state{SchedulingState::Idle};
+
+    /**
+     * @brief Set once `TaskImpl` / `StreamTaskImpl` has called `cancel()` on its future
+     * or stream, so it is called only once. Unused by blocking tasks.
+     *
+     * Touched only by the thread polling the task. Declared here, not in the subclasses,
+     * because it fills padding after `scheduling_state` (on the line the poll already
+     * owns) instead of adding bytes past a 64-byte boundary at the end of the object.
+     */
+    bool cancel_requested = false;
 
     /// @brief Optional human-readable name set via SpawnBuilder::name(). Empty if unset.
     std::string name;
@@ -113,22 +134,22 @@ public:
      */
     Executor* owning_executor = nullptr;
 
-#ifndef CORO_PICO
     /**
-     * @brief Intrusive membership in an executor's `OwnedTasks` (detail/owned_tasks.h).
+     * @brief Intrusive membership in the executor's list of owned tasks:
+     * `OwnedTasks` (detail/owned_tasks.h) on WorkStealingExecutor, an
+     * `IntrusiveList` through these hooks on CurrentThreadExecutor.
      *
      * `owned_self` is the strong reference the list holds on this task, stored in
      * the task itself so that linking allocates nothing; it is non-null exactly
-     * while the task is linked. This is a deliberate reference cycle, broken by
-     * `OwnedTasks::remove()` when the task reaches a terminal state, or by
-     * `~OwnedTasks()`.
+     * while the task is linked. This is a deliberate reference cycle, broken when
+     * the executor unlinks the task on reaching a terminal state, or when the list
+     * is destroyed.
      *
-     * All three are read and written only under the task's shard mutex.
+     * All three are read and written only under the mutex guarding that list.
      */
-    TaskBase*                 owned_prev = nullptr;
-    TaskBase*                 owned_next = nullptr;
-    std::shared_ptr<TaskBase> owned_self;
-#endif
+    TaskBase*    owned_prev = nullptr;
+    TaskBase*    owned_next = nullptr;
+    Rc<TaskBase> owned_self;
 
     /**
      * @brief Advances the inner future by one step.
@@ -178,6 +199,7 @@ public:
     // alternative is tracked there.
     void wake() override;
     Rc<Waker> clone() override;
+    Weak<Waker> weak_clone() override;
 
     /// @brief The task currently being polled on this thread, or nullptr if outside a poll.
     /// Set by the executor before each poll() call and cleared afterward.
@@ -212,7 +234,7 @@ public:
      * destruction — exactly once per poll() call, whether poll() returns
      * because the future is still Pending or because the task just reached
      * a terminal state. Construct at the top of poll(), after the early
-     * `if (m_completed) return true;` check.
+     * "already finished" check.
      */
     struct LifecycleHookScope {
         const TaskBase& task;
@@ -273,7 +295,8 @@ public:
     }
 
     bool poll(Context& ctx) override {
-        if (m_completed) return true;
+        // The future is reset exactly when the task finishes.
+        if (!m_future) return true;
 
         LifecycleHookScope hooks{*this};
 
@@ -283,13 +306,12 @@ public:
             if constexpr (Cancellable<F>) {
                 // Cooperative cancel: call cancel() once, then poll until the future
                 // drains (Coro<T>/CoroStream<T> will run the 4-step cancel protocol).
-                if (!m_cancel_requested) {
+                if (!cancel_requested) {
                     m_future->cancel();
-                    m_cancel_requested = true;
+                    cancel_requested = true;
                 }
             } else {
                 // Non-Cancellable (leaf) future: mark done immediately.
-                m_completed = true;
                 m_future.reset();
                 this->mark_done();
                 on_task_complete();
@@ -300,7 +322,6 @@ public:
         auto result = m_future->poll(ctx);
         if (result.isPending()) return false;
 
-        m_completed = true;
         // Destroy the future (and any coroutine frame it holds) immediately on
         // completion — Coro<T>/CoroStream<T> already destroy their frames when done,
         // but other Future types may not. Reset here so that a JoinHandle keeping
@@ -322,9 +343,7 @@ public:
     }
 
 private:
-    std::optional<F> m_future;
-    bool m_completed        = false;
-    bool m_cancel_requested = false;
+    std::optional<F> m_future;  ///< Empty once the task has finished.
 };
 
 /**
@@ -369,7 +388,8 @@ public:
     }
 
     bool poll(Context& ctx) override {
-        if (m_completed) return true;
+        // The stream is reset exactly when the task finishes.
+        if (!m_stream) return true;
 
         LifecycleHookScope hooks{*this};
 
@@ -381,10 +401,10 @@ public:
             // future. Items it still yields on the way are discarded. A stream with no
             // cancel() is a leaf and is simply destroyed.
             if constexpr (requires(S& s) { s.cancel(); }) {
-                if (!m_cancel_requested) {
+                if (!cancel_requested) {
                     m_pending.reset();
                     m_stream->cancel();
-                    m_cancel_requested = true;
+                    cancel_requested = true;
                 }
                 for (;;) {
                     auto result = m_stream->poll_next(ctx);
@@ -406,7 +426,6 @@ public:
             if (auto w = consumer_wk.lock()) w->wake();
             m_stream.reset();
             m_pending.reset();
-            m_completed = true;
             this->mark_done();
             on_task_complete();
             return true;
@@ -446,7 +465,6 @@ public:
                 }
                 if (auto w = consumer_wk.lock()) w->wake();
                 m_stream.reset();
-                m_completed = true;
                 this->mark_done();
                 on_task_complete();
                 return true;
@@ -463,7 +481,6 @@ public:
                 }
                 if (auto w = consumer_wk.lock()) w->wake();
                 m_stream.reset();
-                m_completed = true;
                 this->mark_done();
                 on_task_complete();
                 return true;
@@ -488,10 +505,8 @@ public:
     }
 
 private:
-    std::optional<S>        m_stream;
+    std::optional<S>        m_stream;  ///< Empty once the task has finished.
     std::optional<ItemType> m_pending;
-    bool                    m_completed = false;
-    bool                    m_cancel_requested = false;
     RelaxedState<bool>      m_cancelled{false};
 };
 

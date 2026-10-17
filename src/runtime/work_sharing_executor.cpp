@@ -158,7 +158,7 @@ void WorkSharingExecutor::worker_loop(int worker_index) {
             std::abort();
         }
 
-        detail::Context ctx(std::static_pointer_cast<detail::Waker>(task), task_budget());
+        detail::Context ctx(*task, task_budget());
         detail::TaskBase::current = task.get();
         bool done;
         {

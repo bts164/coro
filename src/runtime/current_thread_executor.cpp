@@ -85,6 +85,23 @@ CurrentThreadExecutor::CurrentThreadExecutor(Runtime* rt)
 }
 #endif
 
+CurrentThreadExecutor::~CurrentThreadExecutor() {
+    // Here, not left to the member destructors: the list holds its references in the
+    // tasks themselves (owned_self), so destroying the list would only unlink them.
+    // Every member is still alive while a task's destructor runs, as it may cancel a
+    // timer in m_timers or wake another task onto m_inject.
+    for (;;) {
+        // Released outside the lock: a task's destructor runs arbitrary user code.
+        detail::Rc<detail::TaskBase> released;
+        {
+            std::lock_guard lock(m_owned_mutex);
+            detail::TaskBase* task = m_owned_tasks.pop_front();
+            if (!task) break;
+            released = std::move(task->owned_self);
+        }
+    }
+}
+
 void CurrentThreadExecutor::schedule(detail::Rc<detail::TaskBase> task) {
     task->owning_executor = this;
     task->scheduling_state.store(
@@ -92,7 +109,8 @@ void CurrentThreadExecutor::schedule(detail::Rc<detail::TaskBase> task) {
     bool closed;
     {
         std::lock_guard lock(m_owned_mutex);
-        m_owned_tasks.insert(task);
+        m_owned_tasks.push_back(task.get());
+        task->owned_self = task;
         closed = m_closed;
     }
     if (closed) {
@@ -196,7 +214,7 @@ bool CurrentThreadExecutor::poll_task(detail::Rc<detail::TaskBase> task) {
         std::abort();
     }
 
-    detail::Context ctx(task, task_budget());
+    detail::Context ctx(*task, task_budget());
     detail::TaskBase::current = task.get();
     bool done;
     {
@@ -212,7 +230,10 @@ bool CurrentThreadExecutor::poll_task(detail::Rc<detail::TaskBase> task) {
         bool closed;
         {
             std::lock_guard lock(m_owned_mutex);
-            m_owned_tasks.erase(task);
+            m_owned_tasks.remove(task.get());
+            // Not the last reference: `task` still holds one, so nothing is
+            // destroyed under the lock.
+            task->owned_self = nullptr;
             closed = m_closed;
         }
         if (closed) notify_shutdown_progress();
@@ -341,7 +362,9 @@ void CurrentThreadExecutor::begin_shutdown() {
     {
         std::lock_guard lock(m_owned_mutex);
         m_closed = true;
-        tasks.assign(m_owned_tasks.begin(), m_owned_tasks.end());
+        tasks.reserve(m_owned_tasks.size());
+        for (detail::TaskBase* task = m_owned_tasks.front(); task; task = task->owned_next)
+            tasks.push_back(task->owned_self);
     }
     // Outside m_owned_mutex: cancel_task() wakes the task, which may take
     // m_inject_mutex.

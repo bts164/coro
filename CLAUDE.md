@@ -10,7 +10,7 @@ include/coro/          # Public headers — see doc/module_structure.md for plac
   stream.h             #   Stream concept + next() helper
   runtime/             #   Runtime, Executor (tokio::runtime analogue)
   task/                #   JoinHandle, SpawnBuilder (tokio::task analogue)
-  sync/                #   JoinSet, StreamHandle, channels, CancellationToken (tokio::sync analogue)
+  sync/                #   JoinSet, StreamHandle, channels (tokio::sync analogue)
   detail/              #   Internal plumbing + low-level extension points (PollResult, Waker, Context)
 src/                   # Implementation source files
 test/                  # gtest unit tests

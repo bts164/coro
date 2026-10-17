@@ -63,12 +63,10 @@ plumbing is needed.
 > via its former handle. Only detach tasks that are genuinely fire-and-forget and whose
 > errors can be safely discarded.
 
-> **Planned:** A `CancellationSource` / `CancellationToken` primitive (analogous to
-> Tokio's `CancellationToken`) is planned for cases where tasks are spawned
-> independently and cannot easily share a common owner — for example, tasks registered
-> from multiple call sites that all need to observe the same shutdown signal. Until that
-> is available, restructure to a shared owner where possible rather than threading a
-> manual signal through unrelated tasks.
+When tasks have no common owner, restructure so they do where possible. When tasks
+should wind down gracefully on shutdown (flush, say goodbye) instead of stopping at their
+next suspension point, give each one a `watch` receiver and have it `select` on
+`changed()` alongside its work; the owner sends once to signal all of them.
 
 ---
 

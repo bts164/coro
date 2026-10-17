@@ -182,7 +182,8 @@ that already holds live tasks gains a `closed` flag, under the mutex it already 
 | Holds | Mutex | Closed by |
 |---|---|---|
 | Work-stealing executor: `OwnedTasks`, one flag per shard | the shard's | `begin_shutdown()` |
-| Work-sharing and current-thread executors: the owned set | `m_owned_mutex` | `begin_shutdown()` |
+| Work-sharing executor: the owned set | `m_owned_mutex` | `begin_shutdown()` |
+| Current-thread executor: the owned list | `m_owned_mutex` | `begin_shutdown()` |
 | `BlockingPool`: the live list | the pool's | `begin_shutdown()` |
 
 Closing a set and collecting its tasks for cancellation is one step under that mutex,

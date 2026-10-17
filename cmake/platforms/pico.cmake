@@ -60,7 +60,6 @@ add_library(coro_pico STATIC
     ${_CORO_SRC}/task/fiber.cpp
     ${_CORO_SRC}/detail/fiber_context_pico.S
     ${_CORO_SRC}/detail/fiber_context_pico.cpp
-    ${_CORO_SRC}/sync/cancellation_token.cpp
     ${_CORO_SRC}/sync/sleep.cpp
     ${_CORO_SRC}/detail/timer_queue.cpp
     ${_CORO_SRC}/runtime/executor.cpp

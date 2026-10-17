@@ -36,9 +36,14 @@ namespace detail {
  *   is destroyed, cancel_pending() sets each node's task pointer to nullptr
  *   (the sentinel that tells on_task_complete() to skip) and calls cancel_task().
  *
- * - `idle_handles` — aliased shared_ptr<TaskState<T>> for tasks that have
- *   reached a terminal state. The consumer reads results directly from
- *   TaskState<T>, avoiding any extra result copy.
+ * - `idle_handles` — intrusive list of the same Nodes, for tasks that have
+ *   reached a terminal state. A task's Node moves from pending_handles to
+ *   idle_handles when it completes, so it is in at most one list at a time.
+ *   Once complete the executor no longer keeps the task alive, so the Node
+ *   holds an aliased Rc<TaskState<T>> to its own task while it is idle;
+ *   whoever pops the Node takes that reference. The consumer reads results
+ *   directly from TaskState<T>, avoiding any extra result copy. Unlike a
+ *   deque, the list allocates nothing, including when a drain swaps it out.
  *
  * JoinSetTask holds a weak_ptr<JoinSetSharedState> — no strong back-reference.
  */
@@ -52,13 +57,30 @@ struct JoinSetSharedState {
         // task, so there is no window where this pointer can dangle.
         // nullptr is the sentinel meaning cancel_pending() already processed this node.
         TaskBase* task = nullptr;
+        // Set only while the Node is in idle_handles: the task's reference to itself,
+        // which keeps it alive until the consumer pops it. Move it out on popping, and
+        // drop it outside the mutex, since that may destroy the task.
+        Rc<TaskState<T>> completed;
         Node* next = nullptr;
         Node* prev = nullptr;
     };
+
+    JoinSetSharedState() = default;
+    JoinSetSharedState(const JoinSetSharedState&)            = delete;
+    JoinSetSharedState& operator=(const JoinSetSharedState&) = delete;
+
+    /// Releases completed tasks nobody consumed: each refers to itself while in
+    /// idle_handles, so unlinking alone would leak it. No lock: this is the last owner.
+    ~JoinSetSharedState() {
+        while (Node* node = idle_handles.pop_front()) {
+            Rc<TaskState<T>> completed = std::move(node->completed);
+        }
+    }
+
     detail::Mutex                       mutex;
     Rc<Waker>                           consumer_waker;
     detail::IntrusiveList<Node*>        pending_handles; ///< Running tasks (lifetime anchors).
-    std::deque<Rc<TaskState<T>>>        idle_handles;    ///< Completed tasks awaiting consumption.
+    detail::IntrusiveList<Node*>        idle_handles;    ///< Completed tasks awaiting consumption.
 };
 
 // -----------------------------------------------------------------------
@@ -103,7 +125,8 @@ public:
             if (!m_node.task) return;  // JoinSet is being destroyed — discard result
             state->pending_handles.remove(&m_node);
             m_node.task = nullptr;
-            state->idle_handles.push_back(std::move(self_state));
+            m_node.completed = std::move(self_state);
+            state->idle_handles.push_back(&m_node);
             waker = std::exchange(state->consumer_waker, nullptr);
         }
         if (waker) waker->wake();
@@ -188,30 +211,29 @@ public:
     }
 
     PollResult<void> poll(detail::Context& ctx) {
-        std::deque<Rc<TaskState<T>>> to_process;
+        IntrusiveList<typename JoinSetSharedState<T>::Node*> to_process;
         bool any_pending;
         {
             std::lock_guard lock(m_state->mutex);
-            std::swap(m_state->idle_handles, to_process);
+            to_process = std::move(m_state->idle_handles);
             any_pending = !m_state->pending_handles.empty();
             if (any_pending)
-                m_state->consumer_waker = ctx.getWaker()->clone();
+                m_state->consumer_waker = ctx.getWaker();
         }
 
         // Process completed tasks outside the lock — collect first exception, discard values.
-        for (auto& ts : to_process) {
+        // Each task's reference is dropped at the end of its iteration, which may free it.
+        while (auto* node = to_process.pop_front()) {
+            Rc<TaskState<T>> ts = std::move(node->completed);
             if (m_first_exception && !(m_ranks_last && m_ranks_last(m_first_exception)))
                 continue;
-            std::exception_ptr exception;
-            {
-                std::lock_guard tlock(ts->mutex);
-                exception = ts->exception;
-            }
+            // No lock on ts->mutex, for the reason given in JoinSet::poll_next(): the
+            // node was taken from idle_handles under m_state->mutex.
+            std::exception_ptr exception = ts->exception;
             if (!exception) continue;
             if (!m_first_exception || !m_ranks_last(exception))
                 m_first_exception = std::move(exception);
         }
-        // to_process destructs here, releasing task allocations.
 
         if constexpr (Mode == DrainMode::CancelOnError) {
             // The tasks of this set wait on each other; with one failed the rest may
@@ -227,7 +249,7 @@ public:
         {
             std::lock_guard lock(m_state->mutex);
             if (!m_state->pending_handles.empty() || !m_state->idle_handles.empty()) {
-                m_state->consumer_waker = ctx.getWaker()->clone();
+                m_state->consumer_waker = ctx.getWaker();
                 return PollPending;
             }
         }
@@ -267,13 +289,20 @@ private:
  * Call `.name("...")` to set a human-readable task name, then `.spawn()` to
  * submit the task. `[[nodiscard]]` — discarding the builder without calling
  * `.spawn()` silently drops the future without scheduling it.
+ *
+ * WARNING: use it only as a temporary, in one expression:
+ * `js.build_task(f).name("x").spawn();`. It holds a non-owning pointer to the
+ * set, so storing it and spawning after the `JoinSet` is destroyed or moved from
+ * is undefined behaviour. Holding a reference instead would cost every spawn a
+ * reference count increment and decrement on the set's state, which the set's
+ * children, completing on other workers, also touch.
  */
 template<typename T, Future F>
     requires std::same_as<typename F::OutputType, T>
 class [[nodiscard]] JoinSetSpawnBuilder {
 public:
-    JoinSetSpawnBuilder(F future, detail::Rc<detail::JoinSetSharedState<T>> state)
-        : m_future(std::move(future)), m_state(std::move(state)) {}
+    JoinSetSpawnBuilder(F future, const detail::Rc<detail::JoinSetSharedState<T>>& state)
+        : m_future(std::move(future)), m_state(&state) {}
 
     JoinSetSpawnBuilder(JoinSetSpawnBuilder&&) noexcept            = default;
     JoinSetSpawnBuilder(const JoinSetSpawnBuilder&)                = delete;
@@ -294,27 +323,27 @@ public:
     /// @brief Schedules the future as a child task in the owning `JoinSet`.
     /// Must be called exactly once. Consumes the builder.
     void spawn() && {
+        const auto& state = *m_state;
         auto task = detail::make_rc<detail::JoinSetTask<F>>(
             std::move(m_future),
-            detail::Weak<detail::JoinSetSharedState<T>>(m_state));
+            detail::Weak<detail::JoinSetSharedState<T>>(state));
         task->name = std::move(m_name);
         // Non-owning raw pointer — lifetime is anchored by the executor's owned map.
         task->m_node.task = task.get();
-        detail::Weak<detail::TaskBase> task_ref{task};
 #ifdef CORO_PICO
-        task->set_self(task_ref);
+        task->set_self(detail::Weak<detail::TaskBase>(task));
 #endif
         {
-            std::lock_guard lock(m_state->mutex);
-            m_state->pending_handles.push_back(&task->m_node);
+            std::lock_guard lock(state->mutex);
+            state->pending_handles.push_back(&task->m_node);
         }
         coro::schedule_task(detail::Rc<detail::TaskBase>(std::move(task)));
     }
 
 private:
-    F                                              m_future;
-    detail::Rc<detail::JoinSetSharedState<T>>      m_state;
-    std::string                                    m_name;
+    F                                                m_future;
+    const detail::Rc<detail::JoinSetSharedState<T>>* m_state;  ///< The JoinSet's own; not owned.
+    std::string                                      m_name;
 };
 
 
@@ -401,13 +430,16 @@ public:
     PollResult<OptionalType> poll_next(detail::Context& ctx) {
         std::unique_lock lock(m_state->mutex);
 
-        if (!m_state->idle_handles.empty()) {
-            auto task_state = std::move(m_state->idle_handles.front());
-            m_state->idle_handles.pop_front();
+        if (auto* node = m_state->idle_handles.pop_front()) {
+            detail::Rc<detail::TaskState<T>> task_state = std::move(node->completed);
             lock.unlock();
 
             // Read result directly from TaskState — same logic as JoinHandle::poll().
-            std::lock_guard tlock(task_state->mutex);
+            // No need for task_state->mutex: the task wrote its result before
+            // on_task_complete() pushed the node under m_state->mutex, and we popped it
+            // under that same mutex, which orders the write before this read. Nothing
+            // writes the result after completion. A JoinHandle has no such hand-off,
+            // which is why JoinHandle::poll() locks.
             if (task_state->exception)
                 return PollError(task_state->exception);
             if constexpr (std::is_void_v<T>) {
@@ -421,7 +453,7 @@ public:
         }
 
         if (!m_state->pending_handles.empty()) {
-            m_state->consumer_waker = ctx.getWaker()->clone();
+            m_state->consumer_waker = ctx.getWaker();
             return PollPending;
         }
 

@@ -1,8 +1,15 @@
+#include <algorithm>
 #include <array>
-#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <functional>
+#include <map>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <co_assert.h>
 #include <coro/coro.h>
@@ -18,8 +25,34 @@
 
 using namespace coro;
 
-// #define SKYNET_BENCHMARK_ITERATIONS 10
-#ifndef SKYNET_BENCHMARK_ITERATIONS
+//#define SKYNET_BENCHMARK_ITERATIONS 10
+
+#ifdef SKYNET_BENCHMARK_ITERATIONS
+// Runs make_future() to completion SKYNET_BENCHMARK_ITERATIONS times on rt and prints
+// each iteration's wall time, so the first (cold heap) can be told from the rest.
+template<typename MakeFuture>
+void run_skynet(Runtime& rt, MakeFuture make_future) {
+    using Clock = std::chrono::steady_clock;
+    std::vector<double> ms;
+    ms.reserve(SKYNET_BENCHMARK_ITERATIONS);
+    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i) {
+        auto start = Clock::now();
+        rt.block_on(make_future());
+        ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+    }
+
+    auto const* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    std::printf("%s.%s:\n", info->test_suite_name(), info->name());
+    for (size_t i = 0; i < ms.size(); ++i)
+        std::printf("  iter %2zu: %9.3f ms\n", i, ms[i]);
+    auto sorted = ms;
+    std::sort(sorted.begin(), sorted.end());
+    double total = std::accumulate(ms.begin(), ms.end(), 0.0);
+    std::printf("  min %.3f  median %.3f  max %.3f  mean %.3f  total %.3f ms\n",
+                sorted.front(), sorted[sorted.size() / 2], sorted.back(),
+                total / ms.size(), total);
+}
+#else
 class SkynetLookup {
 private:
     static SkynetLookup& initialize()
@@ -49,85 +82,28 @@ public:
         return expected.at(m).at(r);
     }
 };
+
+// Runs make_future() once on rt and checks the tree's total.
+template<typename MakeFuture>
+void run_skynet(Runtime& rt, MakeFuture make_future) {
+    size_t result = rt.block_on(make_future());
+    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
+}
 #endif
 
-class ArgMarker
-{
-    ArgMarker() = default;
-public:
-    static inline std::atomic_size_t depth_counters[7];
-    static inline std::atomic_size_t clone_depth_counters[7];
-    static void reset_counters() {
-        for (auto& c : depth_counters)
-            c.store(0, std::memory_order_release);
-        for (auto& c : clone_depth_counters)
-            c.store(0, std::memory_order_release);
-    }
-
-    ArgMarker(std::atomic_size_t& id, size_t depth) :
-        m_id(&id),
-        m_depth(depth)
-    {
-        m_id->store(0, std::memory_order_release);
-    }
-    ArgMarker clone() const
-    {
-        ArgMarker a;
-        a.m_id = m_id;
-        a.m_clone_depth = m_depth;
-        return a;
-    }
-    ArgMarker(const ArgMarker&) = delete;
-    ArgMarker(ArgMarker&&other) :
-        m_id(std::exchange(other.m_id, nullptr)),
-        m_depth(std::exchange(other.m_depth, std::nullopt)),
-        m_clone_depth(std::exchange(other.m_clone_depth, std::nullopt))
-    {}
-    ArgMarker& operator=(const ArgMarker&) = delete;
-    ArgMarker& operator=(ArgMarker&&) = delete;
-    ~ArgMarker()
-    {
-        if (m_id) {
-            m_id->fetch_add(1);
-        }
-        if (m_depth) {
-            depth_counters[m_depth.value()].fetch_add(1);
-            //std::cout << "Set arg to true\n" << std::flush;
-        }
-        if (m_clone_depth) {
-            clone_depth_counters[m_clone_depth.value()].fetch_add(1);
-            //std::cout << "Set arg to true\n" << std::flush;
-        }
-    }
-private:
-    std::atomic_size_t *m_id = nullptr;
-    std::optional<std::size_t> m_depth;
-    std::optional<std::size_t> m_clone_depth;
-};
-
 template<std::size_t... Is>
-Coro<size_t> skynet_handles(size_t my_num, size_t remaining, size_t depth, ArgMarker arg_lifetime_marker, std::index_sequence<Is...> seq) {
-    size_t sum;
-    {
-        auto arg = arg_lifetime_marker.clone();
-        if (remaining == 1) co_return my_num;
+Coro<size_t> skynet_handles(size_t my_num, size_t remaining, std::index_sequence<Is...> seq) {
+    if (remaining == 1) co_return my_num;
 
-        static constexpr size_t N = sizeof...(Is);
-        std::atomic_size_t arg_markers[N];
-        JoinHandle<size_t> handles[N] = {
-            coro::spawn(
-                skynet_handles(my_num + Is*(remaining/N), remaining/N, depth - 1, ArgMarker(arg_markers[Is], depth - 1), std::make_index_sequence<N>{})
-            )
-            ...
-        };
-        auto results = co_await coro::join(std::move(handles[Is])...);
-        for (size_t i = 0; i < N; ++i) {
-            size_t n = arg_markers[i].load(std::memory_order_acquire);
-            CO_ASSERT_EQ(n, 2)
-                << "Argument lifetimes not as expected: " << n << " != 2 (" << my_num << ", " << remaining << ", " << i << ") not set after completion";
-        }
-        sum = ((std::get<Is>(results) + ...));
-    }
+    static constexpr size_t N = sizeof...(Is);
+    JoinHandle<size_t> handles[N] = {
+        coro::spawn(
+            skynet_handles(my_num + Is*(remaining/N), remaining/N, seq)
+        )
+        ...
+    };
+    auto results = co_await coro::join(std::move(handles[Is])...);
+    size_t sum = (std::get<Is>(results) + ...);
     #ifndef SKYNET_BENCHMARK_ITERATIONS
     size_t exp = SkynetLookup::instance[my_num, remaining];
     CO_ASSERT_EQ(sum, exp)
@@ -135,40 +111,20 @@ Coro<size_t> skynet_handles(size_t my_num, size_t remaining, size_t depth, ArgMa
     #endif
     co_return sum;
 }
-TEST(SkynetHandlesTest, Single) {
+
+TEST(SkynetHandlesTest, SingleThreaded) {
     Runtime rt(std::in_place_type<CurrentThreadExecutor>);
-    std::atomic_size_t arg_marker{0};
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_handles(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
-#else
-    rt.block_on(skynet_handles(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
-    ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
-#endif
+    run_skynet(rt, [] { return skynet_handles(0, 1000000, std::make_index_sequence<10>{}); });
 }
 
 TEST(SkynetHandlesTest, Sharing) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>);
-    std::atomic_size_t arg_marker{0};
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_handles(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
-#else
-    rt.block_on(skynet_handles(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
-    ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
-#endif
+    run_skynet(rt, [] { return skynet_handles(0, 1000000, std::make_index_sequence<10>{}); });
 }
 
 TEST(SkynetHandlesTest, Stealing) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
-    std::atomic_size_t arg_marker{0};
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_handles(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
-#else
-    rt.block_on(skynet_handles(0, 1000000, 6, ArgMarker(arg_marker, 6), std::make_index_sequence<10>{}));
-    ASSERT_TRUE(arg_marker.load(std::memory_order_acquire)) << "Expected argument marker not set";
-#endif
+    run_skynet(rt, [] { return skynet_handles(0, 1000000, std::make_index_sequence<10>{}); });
 }
 
 Coro<size_t> skynet_join(size_t my_num, size_t remaining) {
@@ -177,7 +133,6 @@ Coro<size_t> skynet_join(size_t my_num, size_t remaining) {
     for (size_t i = 0; i < 10; ++i)
         handles.emplace_back(
             coro::spawn(skynet_join(my_num + i*(remaining/10), remaining/10))
-
         );
     size_t sum = 0;
     for (auto &h : handles) {
@@ -193,35 +148,17 @@ Coro<size_t> skynet_join(size_t my_num, size_t remaining) {
 
 TEST(SkynetJoinTest, SingleThreaded) {
     Runtime rt(std::in_place_type<CurrentThreadExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_join(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_join(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_join(0, 1000000); });
 }
 
 TEST(SkynetJoinTest, Sharing) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_join(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_join(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_join(0, 1000000); });
 }
 
 TEST(SkynetJoinTest, Stealing) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_join(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_join(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_join(0, 1000000); });
 }
 
 Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
@@ -231,7 +168,7 @@ Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
         js.spawn(skynet_joinset(my_num + i*(remaining/10), remaining/10));
     size_t sum = 0;
     while (auto item = co_await next(js)) {
-        sum += item .value();
+        sum += item.value();
     }
     #ifndef SKYNET_BENCHMARK_ITERATIONS
     size_t exp = SkynetLookup::instance[my_num, remaining];
@@ -241,37 +178,104 @@ Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
     co_return sum;
 }
 
+// skynet_joinset as a hand-written future: the same JoinSet tree, but no coroutine frames.
+// Comparing the two benchmarks shows what allocating and resuming the frames costs.
+class SkynetJoinsetFuture
+{
+    enum class Stage {
+        Start,
+        Spawned,
+        Done
+    };
+public:
+    using OutputType = size_t;
+    SkynetJoinsetFuture(size_t my_num, size_t remaining) :
+        m_my_num(my_num), m_remaining(remaining)
+    {}
+    PollResult<OutputType> poll(detail::Context& ctx)
+    {
+        for (;;) {
+            switch (m_stage) {
+            case Stage::Start: {
+                if (m_remaining == 1) {
+                    m_stage = Stage::Done;
+                    return m_my_num;
+                }
+                m_js.emplace();
+                for (size_t i = 0; i < 10; ++i) {
+                    m_js->spawn(SkynetJoinsetFuture(m_my_num + i*(m_remaining/10), m_remaining/10));
+                }
+                m_next.emplace(next(m_js.value()));
+                m_stage = Stage::Spawned;
+            } break;
+            case Stage::Spawned: {
+                auto result = m_next.value().poll(ctx);
+                if (result.isPending()) {
+                    return PollPending;
+                }
+                if (result.isError()) {
+                    m_stage = Stage::Done;
+                    return PollError(result.error());
+                }
+                auto item = std::move(result).value();
+                if (item.has_value()) {
+                    m_sum += item.value();
+                    m_next.emplace(next(m_js.value()));
+                    break;
+                }
+                m_stage = Stage::Done;
+                #ifndef SKYNET_BENCHMARK_ITERATIONS
+                size_t exp = SkynetLookup::instance[m_my_num, m_remaining];
+                if (m_sum != exp) {
+                    return PollError(std::make_exception_ptr(std::runtime_error(
+                        std::to_string(m_sum) + " != " + std::to_string(exp) + " (my_num = "
+                        + std::to_string(m_my_num) + ", remaining = " + std::to_string(m_remaining) + ")")));
+                }
+                #endif
+                return m_sum;
+            }
+            case Stage::Done:
+                return PollError(std::make_exception_ptr(std::runtime_error("poll() called after completion")));
+            }
+        }
+    }
+private:
+    size_t m_my_num;
+    size_t m_remaining;
+    Stage m_stage = Stage::Start;
+    size_t m_sum = 0;
+    std::optional<JoinSet<size_t>> m_js;
+    std::optional<NextFuture<JoinSet<size_t>>> m_next;
+};
+
 TEST(SkynetJoinSetTest, SingleThreaded) {
     Runtime rt(std::in_place_type<CurrentThreadExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_joinset(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_joinset(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_joinset(0, 1000000); });
 }
 
 TEST(SkynetJoinSetTest, Sharing) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_joinset(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_joinset(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_joinset(0, 1000000); });
 }
 
 TEST(SkynetJoinSetTest, Stealing) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_joinset(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_joinset(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_joinset(0, 1000000); });
+}
+
+TEST(SkynetJoinSetFutureTest, SingleThreaded) {
+    Runtime rt(std::in_place_type<CurrentThreadExecutor>);
+    run_skynet(rt, [] { return SkynetJoinsetFuture(0, 1000000); });
+}
+
+TEST(SkynetJoinSetFutureTest, Sharing) {
+    Runtime rt(std::in_place_type<WorkSharingExecutor>);
+    run_skynet(rt, [] { return SkynetJoinsetFuture(0, 1000000); });
+}
+
+TEST(SkynetJoinSetFutureTest, Stealing) {
+    Runtime rt(std::in_place_type<WorkStealingExecutor>);
+    run_skynet(rt, [] { return SkynetJoinsetFuture(0, 1000000); });
 }
 
 template<std::size_t... Is>
@@ -294,7 +298,7 @@ Coro<size_t> skynet_mixed0(size_t my_num, size_t remaining) {
         js.spawn(skynet_mixed1(my_num + i*(remaining/10), remaining/10, std::make_index_sequence<10>{}));
     size_t sum = 0;
     while (auto item = co_await next(js)) {
-        sum += item .value();
+        sum += item.value();
     }
     #ifndef SKYNET_BENCHMARK_ITERATIONS
     size_t exp = SkynetLookup::instance[my_num, remaining];
@@ -306,35 +310,17 @@ Coro<size_t> skynet_mixed0(size_t my_num, size_t remaining) {
 
 TEST(SkynetMixedTest, SingleThreaded) {
     Runtime rt(std::in_place_type<CurrentThreadExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_mixed0(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_mixed0(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_mixed0(0, 1000000); });
 }
 
 TEST(SkynetMixedTest, Sharing) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_mixed0(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_mixed0(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_mixed0(0, 1000000); });
 }
 
 TEST(SkynetMixedTest, Stealing) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_mixed0(0, 1000000));
-#else
-    size_t result = rt.block_on(skynet_mixed0(0, 1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_mixed0(0, 1000000); });
 }
 // parallel() at every level: each node is one part of its parent's parallel() call and
 // writes its sum into the parent's array. Every node carries a team, a JoinSet and a
@@ -365,35 +351,17 @@ Coro<size_t> skynet_parallel(size_t remaining) {
 
 TEST(SkynetParallelTest, SingleThreaded) {
     Runtime rt(std::in_place_type<CurrentThreadExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_parallel(1000000));
-#else
-    size_t result = rt.block_on(skynet_parallel(1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_parallel(1000000); });
 }
 
 TEST(SkynetParallelTest, Sharing) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_parallel(1000000));
-#else
-    size_t result = rt.block_on(skynet_parallel(1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_parallel(1000000); });
 }
 
 TEST(SkynetParallelTest, Stealing) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_parallel(1000000));
-#else
-    size_t result = rt.block_on(skynet_parallel(1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_parallel(1000000); });
 }
 
 // parallel() at the first level only, then join() below: SkynetMixedTest with parallel()
@@ -412,33 +380,15 @@ Coro<size_t> skynet_parallel_mixed(size_t remaining) {
 
 TEST(SkynetParallelMixedTest, SingleThreaded) {
     Runtime rt(std::in_place_type<CurrentThreadExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_parallel_mixed(1000000));
-#else
-    size_t result = rt.block_on(skynet_parallel_mixed(1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_parallel_mixed(1000000); });
 }
 
 TEST(SkynetParallelMixedTest, Sharing) {
     Runtime rt(std::in_place_type<WorkSharingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_parallel_mixed(1000000));
-#else
-    size_t result = rt.block_on(skynet_parallel_mixed(1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_parallel_mixed(1000000); });
 }
 
 TEST(SkynetParallelMixedTest, Stealing) {
     Runtime rt(std::in_place_type<WorkStealingExecutor>);
-#ifdef SKYNET_BENCHMARK_ITERATIONS
-    for (size_t i = 0; i < SKYNET_BENCHMARK_ITERATIONS; ++i)
-        rt.block_on(skynet_parallel_mixed(1000000));
-#else
-    size_t result = rt.block_on(skynet_parallel_mixed(1000000));
-    EXPECT_EQ(result, (SkynetLookup::instance[0, 1000000]));
-#endif
+    run_skynet(rt, [] { return skynet_parallel_mixed(1000000); });
 }

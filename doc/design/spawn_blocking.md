@@ -207,17 +207,17 @@ classDiagram
     }
     class TaskStateBase {
         mutex
-        condvar
         terminated
+        waker
     }
     class TaskState~T~ {
         cancelled
-        waker
         result
         exception
     }
     class BlockingTaskBase {
         shield_depth
+        park_cv
         run()*
         is_cancelled()*
         park_state()*
@@ -268,10 +268,11 @@ parking executor, the pool — reaches the three things a blocking task has and 
 struct BlockingTaskBase : TaskBase {
     virtual void           run() = 0;                 // run the callable to the end, once
     virtual bool           is_cancelled() const = 0;  // TaskState<T>::cancelled
-    virtual TaskStateBase& park_state() = 0;          // the mutex + condvar to park on
+    virtual TaskStateBase& park_state() = 0;          // the mutex park_cv waits under
     void park();                                      // Running → Idle, wait for a wake
     void unpark();                                    // lock, notify
     int  shield_depth = 0;                            // live BlockingCancelShields
+    CondVar park_cv;                                  // park() waits on it
     bool poll(Context&) final;                        // never called; aborts
 };
 ```
@@ -312,8 +313,9 @@ task; only the meaning of the states differs:
 What makes `wake()` work is the task's `owning_executor`. For a blocking task it is the
 pool's `ParkingExecutor`, set once in `spawn_blocking`. Its `enqueue(task)` does not
 queue anything: it calls `BlockingTaskBase::unpark()`, which locks the task's mutex and
-notifies its condition variable (`TaskStateBase` already has both). "Enqueue this task so
-that it is polled again" becomes "unpark the thread that is this task".
+notifies `park_cv`. The mutex is `TaskStateBase`'s; the condition variable lives in
+`BlockingTaskBase`, so ordinary tasks do not carry one. "Enqueue this task so that it is
+polled again" becomes "unpark the thread that is this task".
 
 `blocking_wait` then does what an executor worker does around a poll:
 

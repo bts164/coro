@@ -190,11 +190,12 @@ succeeds and pushes to the queue; the rest observe `Notified` (or `RunningAndNot
 and return as no-ops. Each clone is a `shared_ptr<TaskBase>`, so the task remains alive
 until the winning clone transfers its ref to the queue via `enqueue()`.
 
-The executor obtains the initial waker immediately before calling `poll()` with a simple
-cast — no allocation:
+The executor builds the `Context` from the task itself, immediately before calling
+`poll()`. It takes no reference: the executor's own `Rc` keeps the task alive through the
+poll, and a future that stores the waker takes its own reference then:
 
 ```cpp
-Context ctx(std::static_pointer_cast<detail::Waker>(task));
+Context ctx(*task, task_budget());
 ```
 
 ### Executor::enqueue()
@@ -267,7 +268,7 @@ completion signal lives in `TaskStateBase` — a non-template base of `TaskState
 is itself a base of every `TaskImpl<F>`. The inheritance chain is:
 
 ```
-TaskStateBase   ← mutex, cv, terminated, wait_until_done()
+TaskStateBase   ← mutex, terminated, waker, wait_until_done()
   └── TaskState<T>   ← cancelled, join_waker, scope_waker, self_waker, result, exception
         └── TaskImpl<F>   ← m_future, poll() override    (also inherits TaskBase)
 ```
@@ -278,26 +279,41 @@ holds a `shared_ptr<TaskState<T>>` aliased from that same allocation.
 
 ```cpp
 struct TaskStateBase {
-    mutable std::mutex      mutex;
-    std::condition_variable cv;
-    bool                    terminated{false};
+    mutable std::mutex mutex;
+    bool               terminated{false};
+    Weak<Waker>        waker;  // the sole waiter: JoinHandle, scope drain, or block_on
 
-    // RACE CONDITION NOTE: this is safe because every code path that sets
-    // `terminated = true` also calls `cv.notify_all()` *in the same critical section*
-    // (under `mutex`). Key invariant: set `terminated = true` AND call `cv.notify_all()`
-    // while holding `mutex`.
-    void wait_until_done() {
-        std::unique_lock lock(mutex);
-        cv.wait(lock, [this]{ return terminated; });
-    }
+    void wait_until_done();    // desktop only; defined in task.cpp
 };
+
+void TaskStateBase::wait_until_done() {
+    auto parker = make_rc<BlockingWaker>();
+    {
+        std::lock_guard lock(mutex);
+        if (terminated) return;
+        waker = parker;
+    }
+    while (true) {
+        parker->wait_for_wake();
+        std::lock_guard lock(mutex);
+        if (terminated) return;
+    }
+}
 ```
+
+The task carries no condition variable. The thread in `block_on` registers a
+`BlockingWaker` in the same `waker` slot that `JoinHandle::poll()` uses; a `block_on`
+task has no `JoinHandle` and no scope, so nothing else competes for the slot. The
+parker is ref-counted rather than a local because the terminal methods call `wake()`
+after releasing `mutex`: a stack object could be destroyed by the waiter returning
+while `notify_one()` is still running.
 
 `scheduling_state` does **not** live here — see the implementation note in [Task Scheduling State](#task-scheduling-state).
 
 Every terminal method (`setResult`, `setDone`, `setException`, `mark_done`) sets
-`terminated = true` and calls `cv.notify_all()` **inside the same lock**, eliminating
-any lost-wakeup window.
+`terminated = true` and takes the waker out **inside the same lock**, and a waiter checks
+`terminated` and stores its waker inside that lock too, eliminating any lost-wakeup
+window.
 
 Cancellation is delivered by setting `cancelled = true` (in `TaskState<T>`) and then
 calling `waker->wake()`. This transitions the task from `Idle → Notified` so it is
@@ -561,7 +577,6 @@ The tests of the queues and the two intervals:
 ```mermaid
 classDiagram
     class Executor {
-        <<abstract>>
         +schedule(task: shared_ptr~TaskBase~) void
         +enqueue(task: shared_ptr~TaskBase~) void
         +wait_for_completion(state) void
@@ -678,11 +693,9 @@ worker_loop():
 
 - `task->poll()` runs without holding `m_mutex` so other workers can dequeue and remote
   wakers can push to the injection queue concurrently.
-- `m_cv.notify_all()` on task completion is called **inside** `m_mutex` (via
-  `TaskStateBase::wait_until_done`). Calling it after the lock release creates a
-  lost-wakeup window.
-- `m_stop = true` is set **inside** `m_mutex` before `notify_all()` in the destructor,
-  for the same reason.
+- `m_stop = true` is set **inside** `m_mutex` before `notify_all()` in the destructor.
+  Setting it after the lock release would let a worker check `m_stop`, miss the
+  notify, and sleep forever.
 
 ### I/O and timers: the driver handoff
 

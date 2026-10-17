@@ -40,9 +40,9 @@ public:
     ///
     /// `CurrentThreadExecutor` drives its own internal poll loop — it cannot block
     /// because it is the polling thread.
-    /// Multi-threaded executors call `state.wait_until_done()`, blocking on `state.cv`.
-    /// Because `terminated` is always set and `cv` notified under `state.mutex`, there
-    /// is no lost-wakeup window.
+    /// Multi-threaded executors call `state.wait_until_done()`, which parks on a
+    /// `BlockingWaker` registered in `state.waker`. Because `terminated` is set and the
+    /// waker taken under `state.mutex`, there is no lost-wakeup window.
     virtual void wait_for_completion(detail::TaskStateBase& state) = 0;
 
     /// @brief True if this executor's threads turn the Runtime's @ref IoDriver.

@@ -159,7 +159,6 @@ else()
         src/detail/socket_state.cpp
         src/detail/timer_queue.cpp
         # sync/
-        src/sync/cancellation_token.cpp
         src/sync/sleep.cpp
         # io/
         src/io/tcp_stream.cpp

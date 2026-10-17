@@ -3,7 +3,10 @@
 namespace coro::detail {
 
 Context::Context(Rc<Waker> waker, std::uint32_t budget)
-    : m_waker(std::move(waker)), m_budget(budget) {}
+    : m_owner(std::move(waker)), m_waker(m_owner.get()), m_budget(budget) {}
+
+Context::Context(Waker& waker, std::uint32_t budget)
+    : m_waker(&waker), m_budget(budget) {}
 
 Context::~Context() = default;
 
@@ -20,11 +23,13 @@ void Context::yield_to_executor() {
 }
 
 Rc<Waker> Context::getWaker() const {
-    return m_waker;
+    if (m_owner || !m_waker) return m_owner;
+    return m_waker->clone();
 }
 
 Weak<Waker> Context::get_weak_waker() const {
-    return m_waker;
+    if (m_owner || !m_waker) return m_owner;
+    return m_waker->weak_clone();
 }
 
 } // namespace coro::detail

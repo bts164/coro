@@ -49,8 +49,6 @@ struct CoroPromiseBase : public PollablePromise {
     void await_transform(U&&) = delete;
 
     std::exception_ptr    m_exception;
-    CoroPromiseBase*      m_prev = nullptr;
-    CoroPromiseBase*      m_next = nullptr;
 
 #if defined(CORO_PICO) && defined(CORO_PICO_FRAME_POOL)
     // Experimental, opt-in (define CORO_PICO_FRAME_POOL to enable — off by
@@ -284,8 +282,9 @@ public:
 
         // Coroutine suspended — check if pending children need the waker updated.
         // (Children drain in parallel with the coroutine's own suspension.)
-        if (!m_scope.empty())
+        if (!m_scope.empty()) {
             m_scope.set_drain_waker(ctx.get_weak_waker());
+        }
 
         return PollPending;
     }

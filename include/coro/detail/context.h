@@ -29,7 +29,18 @@ public:
     /// The budget of a `Context` that never asks its task to yield.
     static constexpr std::uint32_t kUnlimitedBudget = UINT32_MAX;
 
+    /// @brief A `Context` that holds a reference to `waker` for as long as it lives.
+    /// `getWaker()` returns `waker` itself. For `blocking_wait()` and tests.
     explicit Context(Rc<Waker> waker, std::uint32_t budget = kUnlimitedBudget);
+
+    /// @brief A `Context` that does not own `waker`: `getWaker()` and `get_weak_waker()`
+    /// call `waker.clone()` and `waker.weak_clone()` only when a future asks for one.
+    ///
+    /// For executors. Most polls never ask, so this saves a reference count increment
+    /// and decrement per poll. The caller must keep `waker` alive until the `Context`
+    /// is destroyed; an executor does, since it holds the task for the whole poll.
+    explicit Context(Waker& waker, std::uint32_t budget = kUnlimitedBudget);
+
     virtual ~Context();
 
     /// @brief Takes one unit of the task's budget. Returns false when none is left:
@@ -88,7 +99,8 @@ public:
     Weak<Waker>   get_weak_waker() const;
 
 private:
-    Rc<Waker>     m_waker;
+    Rc<Waker>     m_owner;   ///< Empty for a non-owning `Context`.
+    Waker*        m_waker;   ///< `m_owner.get()`, or the non-owned waker.
     // Both are touched only by the thread polling the task, during that poll.
     std::uint32_t m_budget;
     bool          m_yielded = false;

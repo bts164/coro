@@ -51,31 +51,31 @@ enum class SchedulingState : uint8_t {
  * thread until the task reaches a terminal state. Separated from the template
  * so the executor interface can accept either specialisation without templates.
  *
- * `mutex`, `cv`, and `terminated` are always accessed together: `terminated`
- * is set inside `mutex`, and `cv.notify_all()` is called in the same critical
- * section, so `wait_until_done()` can never miss the wakeup.
+ * `terminated` and `waker` are only touched under `mutex`. The terminal methods
+ * set `terminated` and take `waker` out in one critical section, and a waiter
+ * checks `terminated` and stores its waker in one critical section, so a waiter
+ * either sees the task finished or is woken.
  */
 struct TaskStateBase {
     mutable detail::Mutex   mutex;
-    detail::CondVar         cv;
     bool                    terminated{false};
+    // Category 4 (doc/task_ownership.md): notification-only, no lifetime ownership.
+    // weak_ptr so that storing a waker derived from ctx.getWaker() (which IS the task)
+    // does not create a shared_ptr cycle back to the owning TaskImpl.
+    // At most one waiter exists: a JoinHandle awaiter, a CoroutineScope drain loop,
+    // or a thread blocked in wait_until_done() (only for a block_on() task, which has
+    // neither of the others).
+    // Fire via: if (auto w = waker.lock()) w->wake();
+    Weak<Waker>             waker;                ///< Wakes the sole waiter on completion.
 
-    // RACE CONDITION NOTE: this is safe because every code path that sets
-    // `terminated = true` also calls `cv.notify_all()` *in the same critical
-    // section* (under `mutex`). This guarantees no lost wakeup: the waiter
-    // holds `mutex` while evaluating the predicate, so either it sees
-    // `terminated == true` before sleeping, or the notifier hasn't acquired
-    // the lock yet and will call notify_all() after the waiter enters wait().
-    //
-    // When implementing a new executor's wait_for_completion(), use this
-    // function rather than rolling your own condvar loop. The key invariant to
-    // preserve in all terminal methods (setResult, setDone, setException,
-    // mark_done) is: set `terminated = true` AND call `cv.notify_all()` while
-    // holding `mutex`. Breaking this invariant reintroduces the lost wakeup.
-    void wait_until_done() {
-        std::unique_lock lock(mutex);
-        cv.wait(lock, [this]{ return terminated; });
-    }
+#ifndef CORO_PICO
+    /// @brief Blocks the calling OS thread until `terminated` is true.
+    ///
+    /// Used by the multi-threaded executors' `wait_for_completion()`. Registers a
+    /// `BlockingWaker` in `waker`, so the task's state carries no condition variable
+    /// of its own. Defined in task.cpp.
+    void wait_until_done();
+#endif
 };
 
 
@@ -85,12 +85,14 @@ struct TaskStateBase {
  * Both ends hold a `shared_ptr<TaskState<T>>`. The executor writes the result (or exception)
  * when the task completes; the `JoinHandle` reads it and wakes the waiting coroutine.
  *
- * A single `waker` slot covers both awaiter cases:
+ * A single `waker` slot (in @ref TaskStateBase) covers every awaiter case:
  * - Set by `JoinHandle::poll()` when the handle is being `co_await`-ed.
  * - Set by `CoroutineScope::set_drain_waker()` when the handle was dropped and the scope
  *   is waiting for the child to drain.
+ * - Set by `TaskStateBase::wait_until_done()` for a `block_on()` task, which has no
+ *   JoinHandle and no scope.
  *
- * These two cases are mutually exclusive: if the JoinHandle is being awaited it has not
+ * These cases are mutually exclusive: if the JoinHandle is being awaited it has not
  * been dropped; if the handle was dropped the scope tracks the child and the JoinHandle
  * can no longer call poll(). Only one waiter exists at any point in the task's lifetime.
  *
@@ -115,12 +117,6 @@ struct TaskState : TaskStateBase {
         }
     }
     RelaxedState<bool>   cancelled{false};        ///< Set by `JoinHandle` destructor; checked by `Task::poll()`.
-    // Category 4 (doc/task_ownership.md): notification-only, no lifetime ownership.
-    // weak_ptr so that storing a waker derived from ctx.getWaker() (which IS the task)
-    // does not create a shared_ptr cycle back to the owning TaskImpl.
-    // At most one waiter exists: either a JoinHandle awaiter or a CoroutineScope drain loop.
-    // Fire via: if (auto w = waker.lock()) w->wake();
-    Weak<Waker>          waker;                   ///< Wakes the sole waiter (JoinHandle or CoroutineScope) on completion.
     ResultType           result = init_result();  ///< Set by `setResult()` on successful completion.
     std::exception_ptr   exception;               ///< Set by `setException()` on fault.
 
@@ -137,7 +133,6 @@ struct TaskState : TaskStateBase {
         {
             std::lock_guard lock(mutex);
             terminated = true;
-            cv.notify_all();
             wk = std::move(waker);
         }
         if (auto w = wk.lock()) w->wake();
@@ -150,7 +145,6 @@ struct TaskState : TaskStateBase {
             std::lock_guard lock(mutex);
             result = true;
             terminated = true;
-            cv.notify_all();
             wk = std::move(waker);
         }
         if (auto w = wk.lock()) w->wake();
@@ -164,7 +158,6 @@ struct TaskState : TaskStateBase {
             std::lock_guard lock(mutex);
             result = std::forward<U>(value);
             terminated = true;
-            cv.notify_all();
             wk = std::move(waker);
         }
         if (auto w = wk.lock()) w->wake();
@@ -177,7 +170,6 @@ struct TaskState : TaskStateBase {
             std::lock_guard lock(mutex);
             exception = std::move(e);
             terminated = true;
-            cv.notify_all();
             wk = std::move(waker);
         }
         if (auto w = wk.lock()) w->wake();
