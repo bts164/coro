@@ -279,7 +279,8 @@ public:
      * @tparam F A type satisfying @ref Future.
      * @param future The top-level future to drive to completion.
      * @return The value produced by `future` (void for `Future<void>`).
-     * @throws Any exception propagated out of the future.
+     * @throws Any exception propagated out of the future, @ref TaskCancelled included (as
+     *         from a `co_await` of a handle to a cancelled task).
      * @throws std::runtime_error if the runtime has been shut down, or shuts down
      *         before `future` completes (a `block_on()` made by a blocking callable
      *         while shutdown() is draining).
@@ -305,9 +306,15 @@ public:
         set_current_runtime(nullptr);
         if (state->exception)
             std::rethrow_exception(state->exception);
-        // Neither a result nor an exception: the task was cancelled, which only
-        // shutdown() does to a block_on() task.
-        if (!state->result) throw_cancelled_by_shutdown();
+        // Neither a result nor an exception: the task ended as cancelled. Only shutdown()
+        // sets a block_on() task's flag; without it, a TaskCancelled escaped the future (it
+        // awaited a handle to a task cancelled elsewhere), so it is rethrown as it was.
+        // RACE: shutdown() may set the flag after the future threw. That is reported as
+        // the shutdown, which also happened.
+        if (!state->result) {
+            if (state->cancelled.load(std::memory_order_relaxed)) throw_cancelled_by_shutdown();
+            throw TaskCancelled{};
+        }
         if constexpr (!std::is_void_v<typename F::OutputType>)
             return std::move(*state->result);
     }
