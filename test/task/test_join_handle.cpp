@@ -289,3 +289,68 @@ TEST(JoinHandleTest, CancelAndJoinOfParkedTaskYieldsNullopt) {
     }());
     EXPECT_EQ(result, std::nullopt);
 }
+
+// A plain co_await has no value to return for a cancelled task, so it throws, for void too.
+TEST(JoinHandleTest, AwaitOfCancelledTaskThrowsTaskCancelled) {
+    SingleThreadRuntime rt;
+    bool caught = rt.block_on([]() -> Coro<bool> {
+        JoinHandle<int> h = spawn(never<int>());
+        h.cancel();
+        try {
+            (void)co_await std::move(h);
+        } catch (const TaskCancelled&) {
+            co_return true;
+        }
+        co_return false;
+    }());
+    EXPECT_TRUE(caught);
+}
+
+TEST(JoinHandleTest, VoidAwaitOfCancelledTaskThrowsTaskCancelled) {
+    SingleThreadRuntime rt;
+    bool caught = rt.block_on([]() -> Coro<bool> {
+        JoinHandle<void> h = spawn(never<void>());
+        h.cancel();
+        try {
+            co_await std::move(h);
+        } catch (const TaskCancelled&) {
+            co_return true;
+        }
+        co_return false;
+    }());
+    EXPECT_TRUE(caught);
+}
+
+namespace {
+
+// Lets the task that awaits a cancelled task's handle let TaskCancelled escape.
+Coro<int> awaits_cancelled_task() {
+    JoinHandle<int> h = spawn(never<int>());
+    h.cancel();
+    co_return co_await std::move(h);
+}
+
+// Ready(true) if F ends Dropped, Ready(false) if it ends any other way. Observes how a
+// handle ends without cancelling the task, as cancel_and_join() would.
+template<typename F>
+struct EndsDropped {
+    using OutputType = bool;
+    F inner;
+    PollResult<bool> poll(detail::Context& ctx) {
+        auto r = inner.poll(ctx);
+        if (r.isPending()) return PollPending;
+        return r.isDropped();
+    }
+};
+
+}  // namespace
+
+// The outer task was never cancelled, but it ended with TaskCancelled from a task it
+// awaited: its own handle reports it as cancelled, as a blocking task's does.
+TEST(JoinHandleTest, TaskEndingWithTaskCancelledReportsDropped) {
+    SingleThreadRuntime rt;
+    bool dropped = rt.block_on([]() -> Coro<bool> {
+        co_return co_await EndsDropped<JoinHandle<int>>{spawn(awaits_cancelled_task())};
+    }());
+    EXPECT_TRUE(dropped);
+}

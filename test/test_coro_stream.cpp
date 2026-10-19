@@ -74,6 +74,113 @@ CoroStream<int> awaiting_stream() {
     co_yield b;
 }
 
+// --- Controllable futures, for the suspension and cancellation tests ---
+
+// Set and read back by a test, through the future it controls.
+struct Gate {
+    bool open    = false;  // poll() completes once set
+    int  polls   = 0;
+    int  cancels = 0;      // CancellableFuture only
+    bool drained = false;  // CancellableFuture: once cancelled, poll() reports Dropped when set
+};
+
+// Pending until its gate opens, then Ready(value). A leaf: no cancel(), so not Cancellable.
+class GateFuture {
+public:
+    using OutputType = int;
+    GateFuture(Gate& gate, int value) : m_gate(&gate), m_value(value) {}
+
+    PollResult<int> poll(detail::Context&) {
+        ++m_gate->polls;
+        if (m_gate->open) return m_value;
+        return PollPending;
+    }
+
+private:
+    Gate* m_gate;
+    int   m_value;
+};
+
+// A GateFuture with a cancel(), so Cancellable. Once cancelled it stays Pending until the gate's
+// `drained` is set, as a future with children of its own to drain would, then reports Dropped.
+class CancellableFuture {
+public:
+    using OutputType = int;
+    CancellableFuture(Gate& gate, int value) : m_gate(&gate), m_value(value) {}
+
+    void cancel() noexcept {
+        ++m_gate->cancels;
+        m_cancelled = true;
+    }
+
+    PollResult<int> poll(detail::Context&) {
+        ++m_gate->polls;
+        if (m_cancelled) {
+            if (m_gate->drained) return PollDropped;
+            return PollPending;
+        }
+        if (m_gate->open) return m_value;
+        return PollPending;
+    }
+
+private:
+    Gate* m_gate;
+    int   m_value;
+    bool  m_cancelled = false;
+};
+
+static_assert(!Cancellable<GateFuture>);
+static_assert(Cancellable<CancellableFuture>);
+
+// A local whose destructor counts, so a test sees when the frame holding it is destroyed.
+struct FrameMarker {
+    int* destroyed;
+    ~FrameMarker() { ++*destroyed; }
+};
+
+// Awaits a Cancellable future, yields, then awaits a leaf. The leaf's await once left the
+// first future's cancel hook set, pointing at its destroyed awaitable.
+CoroStream<int> cancellable_then_leaf(Gate& first, Gate& second, int& destroyed) {
+    FrameMarker marker{&destroyed};
+    co_yield co_await CancellableFuture(first, 1);
+    co_yield co_await GateFuture(second, 2);
+}
+
+// Yields what one leaf future produces, then ends.
+CoroStream<int> leaf_then_end(Gate& gate, int& destroyed) {
+    FrameMarker marker{&destroyed};
+    co_yield co_await GateFuture(gate, 1);
+}
+
+CoroStream<int> sets_started(bool& started) {
+    started = true;
+    co_yield 1;
+}
+
+// Awaits a leaf, then yields twice without awaiting anything.
+CoroStream<int> leaf_then_two_yields(Gate& gate) {
+    co_yield co_await GateFuture(gate, 1);
+    co_yield 2;
+}
+
+CoroStream<int> awaits_failing_future() {
+    struct FailingFuture {
+        using OutputType = int;
+        PollResult<int> poll(detail::Context&) {
+            return PollError(std::make_exception_ptr(std::runtime_error("inner boom")));
+        }
+    };
+    co_yield co_await FailingFuture{};
+}
+
+CoroStream<int> awaits_dropped_future() {
+    struct DroppedFuture {
+        using OutputType = int;
+        PollResult<int> poll(detail::Context&) { return PollDropped; }  // as a cancelled task's handle
+    };
+    co_yield co_await DroppedFuture{};
+}
+
 // --- Concept checks (compile-time) ---
 
 static_assert(Stream<CoroStream<int>>);
@@ -199,4 +306,212 @@ TEST(CoroStreamTest, AwaitingStreamYieldsCorrectValues) {
     auto s = awaiting_stream();
     auto items = drain(s, ctx);
     EXPECT_THAT(items, ::testing::ElementsAre(10, 20));
+}
+
+TEST(CoroStreamTest, InnerFutureErrorStoredAsError) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    auto s = awaits_failing_future();
+    auto r = s.poll_next(ctx);
+    EXPECT_TRUE(r.isError());
+    EXPECT_THROW(r.rethrowIfError(), std::runtime_error);
+}
+
+TEST(CoroStreamTest, AwaitOfDroppedFutureStoredAsTaskCancelled) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    auto s = awaits_dropped_future();
+    auto r = s.poll_next(ctx);
+    ASSERT_TRUE(r.isError());
+    EXPECT_THROW(r.rethrowIfError(), TaskCancelled);
+}
+
+// --- Suspension on a pending inner future ---
+
+TEST(CoroStreamTest, SuspendsOnPendingInnerFutureThenResumes) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate gate;
+    int  destroyed = 0;
+    auto s = leaf_then_end(gate, destroyed);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    gate.open = true;
+    auto r = s.poll_next(ctx);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_EQ(r.value(), 1);
+
+    auto end = s.poll_next(ctx);
+    ASSERT_TRUE(end.isReady());
+    EXPECT_FALSE(end.value().has_value());
+    EXPECT_EQ(destroyed, 1);
+}
+
+// A poll while the inner future is still pending (a spurious wake) must not resume the body.
+TEST(CoroStreamTest, SpuriousWakeDoesNotResumeGenerator) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate gate;
+    int  destroyed = 0;
+    auto s = leaf_then_end(gate, destroyed);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    EXPECT_EQ(gate.polls, 2);
+
+    gate.open = true;
+    auto r = s.poll_next(ctx);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_EQ(r.value(), 1);
+}
+
+// Once a co_await has resumed, the next poll resumes from the co_yield after it without
+// polling the finished future again.
+TEST(CoroStreamTest, ResumeFromYieldDoesNotRepollFinishedFuture) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate gate;
+    auto s = leaf_then_two_yields(gate);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    gate.open = true;
+    EXPECT_EQ(s.poll_next(ctx).value(), 1);
+    const int polls = gate.polls;
+    EXPECT_EQ(s.poll_next(ctx).value(), 2);
+    EXPECT_EQ(gate.polls, polls);
+}
+
+TEST(CoroStreamTest, MovedWhileSuspendedResumes) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate gate;
+    int  destroyed = 0;
+    auto s1 = leaf_then_end(gate, destroyed);
+
+    EXPECT_TRUE(s1.poll_next(ctx).isPending());
+    auto s2 = std::move(s1);
+    gate.open = true;
+    auto r = s2.poll_next(ctx);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_EQ(r.value(), 1);
+    EXPECT_EQ(destroyed, 0);
+}
+
+// --- Cancellation ---
+
+TEST(CoroStreamTest, CancelBeforeFirstPollSkipsBody) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    bool started = false;
+    auto s = sets_started(started);
+
+    s.cancel();
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_FALSE(started);
+}
+
+TEST(CoroStreamTest, CancelAtYieldDestroysFrame) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate gate{.open = true};
+    int  destroyed = 0;
+    auto s = leaf_then_end(gate, destroyed);
+
+    EXPECT_EQ(s.poll_next(ctx).value(), 1);
+    EXPECT_EQ(destroyed, 0);
+    s.cancel();
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_EQ(destroyed, 1);
+}
+
+TEST(CoroStreamTest, CancelledStreamStaysDropped) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate gate;
+    int  destroyed = 0;
+    auto s = leaf_then_end(gate, destroyed);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    s.cancel();
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_EQ(destroyed, 1);
+}
+
+// A leaf future is dropped with the frame: no drain, and no further poll of it.
+TEST(CoroStreamTest, CancelWhileAwaitingLeafDropsAtOnce) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate gate;
+    int  destroyed = 0;
+    auto s = leaf_then_end(gate, destroyed);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    s.cancel();
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_EQ(gate.polls, 1);
+    EXPECT_EQ(destroyed, 1);
+}
+
+// A Cancellable future is cancelled once and polled until it has drained, and only then is
+// the frame destroyed.
+TEST(CoroStreamTest, CancelWhileAwaitingCancellableDrainsItFirst) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate first, second;
+    int  destroyed = 0;
+    auto s = cancellable_then_leaf(first, second, destroyed);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    s.cancel();
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    EXPECT_EQ(first.cancels, 1);
+    EXPECT_EQ(destroyed, 0);
+
+    first.drained = true;
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_EQ(first.cancels, 1);
+    EXPECT_EQ(destroyed, 1);
+}
+
+// Regression: resuming from a Cancellable future's co_await left its cancel hook set. A cancel
+// at the next suspension point, on a leaf, then called cancel() through the hook on the
+// destroyed awaitable and waited for the leaf to complete before dropping, which for a channel
+// that never delivers again was forever.
+TEST(CoroStreamTest, CancelAtLeafAfterCancellableAwaitDropsAtOnce) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate first, second;
+    int  destroyed = 0;
+    auto s = cancellable_then_leaf(first, second, destroyed);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    first.open = true;
+    EXPECT_EQ(s.poll_next(ctx).value(), 1);
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+
+    s.cancel();
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_EQ(first.cancels, 0);
+    EXPECT_EQ(second.polls, 1);
+    EXPECT_EQ(destroyed, 1);
+}
+
+// The same stale hook, with the cancel at the co_yield after the Cancellable future's await.
+TEST(CoroStreamTest, CancelAtYieldAfterCancellableAwaitDoesNotCancelIt) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    Gate first, second;
+    int  destroyed = 0;
+    auto s = cancellable_then_leaf(first, second, destroyed);
+
+    EXPECT_TRUE(s.poll_next(ctx).isPending());
+    first.open = true;
+    EXPECT_EQ(s.poll_next(ctx).value(), 1);
+
+    s.cancel();
+    EXPECT_TRUE(s.poll_next(ctx).isDropped());
+    EXPECT_EQ(first.cancels, 0);
+    EXPECT_EQ(destroyed, 1);
 }

@@ -16,6 +16,25 @@ inline constexpr PendingTag PollPending{};
 /// @brief Sentinel type for the Dropped (cancelled + drained) state. Use the `PollDropped` constant.
 struct DroppedTag {};
 
+/**
+ * @brief Thrown where a dropped future meets code that needs its outcome: by `co_await`
+ * and `fiber_await()` on a future that reports `PollDropped` (a handle to a task that was
+ * cancelled), and by `blocking_wait()`, which also throws it at a cancellation point of a
+ * cancelled blocking task (see @ref spawn_blocking) to unwind the callable.
+ *
+ * Thrown for every output type, `void` included: there is nothing to return, and carrying
+ * on normally would let the caller act as if the work had been done. `join()` and
+ * `select()` fail with it for the same reason.
+ *
+ * A task whose future ends with it is reported as cancelled (`PollDropped`), not as an
+ * error, whether the task itself was cancelled or something it awaited was.
+ *
+ * Deliberately not derived from `std::exception`, so `catch (const std::exception&)`
+ * does not swallow it. Code that catches it (or `catch (...)`) to clean up must rethrow.
+ * In a blocking task, cancellation is sticky: every later cancellation point throws again.
+ */
+struct TaskCancelled {};
+
 template<typename T>
 class PollResult;
 

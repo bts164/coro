@@ -423,7 +423,7 @@ TEST(OneshotBlockingTest, BlockingRecvIsCancelledWhileParked) {
                 started_tx.send();
                 try {
                     (void)coro::blocking_wait(rx.recv());   // parks: nothing is sent
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     unwound->store(true);
                     throw;
                 }

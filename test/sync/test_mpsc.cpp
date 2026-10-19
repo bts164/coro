@@ -577,7 +577,7 @@ TEST(MpscBlockingTest, BlockingRecvIsCancelledWhileParked) {
                 (void)coro::blocking_wait(started_tx.send(0));
                 try {
                     (void)coro::blocking_next(rx);   // parks: nothing is ever sent
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     unwound->store(true);
                     throw;
                 }
@@ -604,7 +604,7 @@ TEST(MpscBlockingTest, BlockingSendIsCancelledWhileParked) {
                 (void)coro::blocking_wait(started_tx.send(0));
                 try {
                     (void)coro::blocking_wait(tx.send(2));   // parks: no space
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     unwound->store(true);
                     throw;
                 }

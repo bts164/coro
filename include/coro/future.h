@@ -189,7 +189,7 @@ template<typename T>
  *
  * **Cancellation.** Inside a `spawn_blocking` callable this is a cancellation point. If
  * the blocking task has been asked to cancel (and no `BlockingCancelShield` is alive),
- * it throws @ref BlockingCancelled, whether the request was already pending on entry or
+ * it throws @ref TaskCancelled, whether the request was already pending on entry or
  * arrives while waiting. Before it throws, `future` is shut down the way a cancelled
  * task shuts down the future it runs: a @ref Cancellable future is cancelled and polled
  * until it has drained, so that whatever it owns (a coroutine frame, its children) is
@@ -198,7 +198,7 @@ template<typename T>
  * cancelled.
  *
  * **A dropped future.** If `future` reports `PollDropped`, there is no value to return:
- * this throws @ref BlockingCancelled, for every output type, on every thread, shielded
+ * this throws @ref TaskCancelled, for every output type, on every thread, shielded
  * or not. That is the synchronous counterpart of a coroutine being dropped at a
  * `co_await`.
  *
@@ -216,7 +216,7 @@ typename F::OutputType blocking_wait(F future) {
         detail::Context ctx(waker->clone());
         for (;;) {
             auto r = future.poll(ctx);
-            if (r.isDropped()) throw BlockingCancelled{};
+            if (r.isDropped()) throw TaskCancelled{};
             if (!r.isPending()) {
                 r.rethrowIfError();
                 if constexpr (std::is_void_v<typename F::OutputType>) return;
@@ -237,7 +237,7 @@ typename F::OutputType blocking_wait(F future) {
     if (!detail::blocking_cancel_pending(*task)) {
         for (;;) {
             auto r = future.poll(ctx);
-            if (r.isDropped()) throw BlockingCancelled{};
+            if (r.isDropped()) throw TaskCancelled{};
             if (!r.isPending()) {
                 r.rethrowIfError();
                 if constexpr (std::is_void_v<typename F::OutputType>) return;
@@ -268,7 +268,7 @@ typename F::OutputType blocking_wait(F future) {
         }
     }
     // `future` is destroyed as the exception leaves this function.
-    throw BlockingCancelled{};
+    throw TaskCancelled{};
 }
 
 #endif // CORO_PICO

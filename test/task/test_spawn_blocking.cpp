@@ -5,9 +5,11 @@
 #include <coro/future.h>
 #include <coro/stream.h>
 #include <coro/sync/event.h>
+#include <coro/sync/mpsc.h>
 #include <coro/sync/sleep.h>
 #include <coro/task/join_set.h>
 #include <coro/task/spawn_blocking.h>
+#include <coro/task/yield_now.h>
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
@@ -309,7 +311,7 @@ namespace {
 // since nothing waits for it when its handle is dropped.
 struct Probe {
     coro::Event       started;          // set by the callable once it is running
-    std::atomic<bool> unwound{false};   // the callable saw BlockingCancelled
+    std::atomic<bool> unwound{false};   // the callable saw TaskCancelled
     std::atomic<bool> finished{false};  // the callable ran past its wait
     std::atomic<bool> flag{false};      // test-specific
     std::atomic<int>  count{0};         // test-specific
@@ -368,12 +370,28 @@ coro::CoroStream<int> stream_with_child(std::shared_ptr<Probe> child_probe) {
 static_assert(!coro::Cancellable<coro::NextFuture<coro::CoroStream<int>>>);
 static_assert(coro::Cancellable<coro::detail::BlockingNextFuture<coro::CoroStream<int>>>);
 
+// Ready on its second poll, so a stream awaiting it suspends there once.
+coro::Coro<int> suspends_once() {
+    co_await coro::yield_now();
+    co_return 1;
+}
+
+// Yields what a Coro that suspended produced, then parks on a channel. Sets
+// `probe->started` once it has resumed past that await, just before it parks.
+coro::CoroStream<int> parked_after_awaiting_coro(coro::MpscReceiver<int> in,
+                                                 std::shared_ptr<Probe> probe) {
+    co_yield co_await suspends_once();
+    probe->started.set();
+    while (auto v = co_await coro::next(in))
+        co_yield *v;
+}
+
 // Parks the calling blocking thread until its task is cancelled.
 void park_until_cancelled(Probe& probe) {
     probe.started.set();
     try {
         (void)coro::blocking_wait(coro::never<int>());
-    } catch (const coro::BlockingCancelled&) {
+    } catch (const coro::TaskCancelled&) {
         probe.unwound.store(true);
         throw;
     }
@@ -456,7 +474,7 @@ TEST(SpawnBlockingCancel, CancellationPointThrowsInBusyCallable) {
                     coro::blocking_cancellation_point();
                     std::this_thread::sleep_for(1ms);
                 }
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 probe->unwound.store(true);
                 throw;
             }
@@ -474,18 +492,18 @@ TEST(SpawnBlockingCancel, CancellationIsSticky) {
         auto h = coro::spawn_blocking([probe] {
             try {
                 park_until_cancelled(*probe);
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 // Swallowed (which a real callable must not do): every later
                 // cancellation point throws again.
             }
             try {
                 coro::blocking_cancellation_point();
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 probe->count.fetch_add(1);
             }
             try {
                 (void)coro::blocking_wait(ReadyInt{});  // thrown on entry, not polled for a value
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 probe->count.fetch_add(1);
             }
         });
@@ -517,7 +535,7 @@ TEST(SpawnBlockingCancel, ShieldDefersCancellation) {
             // The request was kept, and is delivered now.
             try {
                 coro::blocking_cancellation_point();
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 probe->unwound.store(true);
                 throw;
             }
@@ -538,7 +556,7 @@ TEST(SpawnBlockingCancel, CancellableFutureIsDrainedBeforeUnwinding) {
         auto h = coro::spawn_blocking([probe] {
             try {
                 (void)coro::blocking_wait(DrainingFuture(probe));
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 probe->unwound.store(true);
                 throw;
             }
@@ -563,12 +581,12 @@ TEST(SpawnBlockingCancel, CancellableFutureIsDrainedWhenAlreadyCancelled) {
         auto h = coro::spawn_blocking([probe, future_probe] {
             try {
                 park_until_cancelled(*probe);
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 // Swallowed, to reach a blocking_wait() with the request already pending.
             }
             try {
                 (void)coro::blocking_wait(DrainingFuture(future_probe));
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 probe->flag.store(true);
             }
         });
@@ -589,7 +607,7 @@ TEST(SpawnBlockingCancel, BlockingNextDrainsStreamBeforeUnwinding) {
             auto stream = stream_with_child(child_probe);
             try {
                 (void)coro::blocking_next(stream);
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 probe->unwound.store(true);
                 // The stream's child task has already been cancelled and has drained.
                 probe->flag.store(child_probe->count.load() == 2);
@@ -602,14 +620,77 @@ TEST(SpawnBlockingCancel, BlockingNextDrainsStreamBeforeUnwinding) {
         co_await std::move(h).cancel_and_join();
     }(probe, child_probe));
     EXPECT_TRUE(child_probe->flag.load());  // the child's future was cancelled
-    EXPECT_TRUE(probe->flag.load());        // and drained before BlockingCancelled was thrown
+    EXPECT_TRUE(probe->flag.load());        // and drained before TaskCancelled was thrown
     EXPECT_TRUE(probe->unwound.load());
     EXPECT_FALSE(probe->finished.load());
 }
 
-TEST(SpawnBlockingCancel, WaitingOnCancelledHandleThrowsBlockingCancelled) {
+// Regression: the stream kept the cancel hook of the Coro it had awaited. Cancelling it
+// when parked on the channel then waited for the channel, which the live sender never
+// sends on, so the blocking thread (and ~Runtime after it) waited for ever.
+TEST(SpawnBlockingCancel, BlockingNextDrainsStreamParkedAfterAwaitingCoro) {
+    coro::Runtime rt(1);
+    auto probe = std::make_shared<Probe>();
+    rt.block_on([](std::shared_ptr<Probe> probe) -> coro::Coro<void> {
+        auto h = coro::spawn_blocking([probe] {
+            [[maybe_unused]] auto [tx, rx] = coro::mpsc_channel<int>(1);
+            auto stream = parked_after_awaiting_coro(std::move(rx), probe);
+            if (coro::blocking_next(stream) == 1)
+                probe->flag.store(true);
+            try {
+                (void)coro::blocking_next(stream);
+            } catch (const coro::TaskCancelled&) {
+                probe->unwound.store(true);
+                throw;
+            }
+            probe->finished.store(true);
+        });
+        co_await probe->started.wait();
+        co_await std::move(h).cancel_and_join();
+    }(probe));
+    EXPECT_TRUE(probe->flag.load());
+    EXPECT_TRUE(probe->unwound.load());
+    EXPECT_FALSE(probe->finished.load());
+}
+
+// A BlockingHandle is not Cancellable, so a coroutine cancelled while awaiting one is
+// dropped at once rather than held until the callable stops; dropping the handle then
+// asks the callable to stop. The callable here ignores the request (shielded) until the
+// coroutine's cancel_and_join() has returned, which it could not if the coroutine were held.
+TEST(SpawnBlockingCancel, CancelledCoroutineAwaitingHandleIsNotHeld) {
+    coro::Runtime rt(1);
+    auto probe = std::make_shared<Probe>();
+    rt.block_on([](std::shared_ptr<Probe> probe) -> coro::Coro<void> {
+        auto task = coro::spawn([](std::shared_ptr<Probe> probe) -> coro::Coro<void> {
+            co_await coro::spawn_blocking([probe] {
+                probe->started.set();
+                {
+                    coro::BlockingCancelShield shield;
+                    while (!probe->flag.load())
+                        std::this_thread::sleep_for(1ms);
+                }
+                try {
+                    coro::blocking_cancellation_point();
+                } catch (const coro::TaskCancelled&) {
+                    probe->unwound.store(true);
+                    throw;
+                }
+                probe->finished.store(true);
+            });
+        }(probe));
+        co_await probe->started.wait();
+        (void)co_await std::move(task).cancel_and_join();
+        probe->flag.store(true);  // only now may the callable go on
+        for (int i = 0; i < 500 && !probe->unwound.load(); ++i)
+            co_await coro::sleep_for(10ms);
+    }(probe));
+    EXPECT_TRUE(probe->unwound.load());
+    EXPECT_FALSE(probe->finished.load());
+}
+
+TEST(SpawnBlockingCancel, WaitingOnCancelledHandleThrowsTaskCancelled) {
     // The inner task is cancelled and leaves no result, so its handle reports
-    // PollDropped; blocking_wait() turns that into BlockingCancelled even though
+    // PollDropped; blocking_wait() turns that into TaskCancelled even though
     // the outer task itself was never cancelled.
     coro::Runtime rt(1);
     bool caught = rt.block_on([]() -> coro::Coro<bool> {
@@ -618,7 +699,7 @@ TEST(SpawnBlockingCancel, WaitingOnCancelledHandleThrowsBlockingCancelled) {
             inner.request_cancel();
             try {
                 coro::blocking_wait(std::move(inner));
-            } catch (const coro::BlockingCancelled&) {
+            } catch (const coro::TaskCancelled&) {
                 return true;
             }
             return false;

@@ -3,8 +3,11 @@
 #include <coro/coro.h>
 #include <coro/coro_stream.h>
 #include <coro/runtime/runtime.h>
+#include <coro/sync/mpsc.h>
 #include <coro/task/spawn_builder.h>
 #include <coro/task/join_handle.h>
+#include <coro/task/yield_now.h>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -123,4 +126,34 @@ TYPED_TEST(StreamHandleTest, DroppedHandleScopeWaitsForTaskDrain) {
         }(std::move(handle)));
 
     SUCCEED(); // reaching here means the scope drain completed without hanging
+}
+
+// Regression: a stream task that had resumed from awaiting a Cancellable future (a Coro that
+// suspended) and then parked on a channel kept the Coro's cancel hook. Dropping its handle
+// then cancelled through the stale hook and waited for the channel to deliver before letting
+// the task drop, so with a live sender that never sends the parent's scope drain hung.
+TYPED_TEST(StreamHandleTest, DroppedHandleDrainsStreamParkedAfterAwaitingCoro) {
+    auto [tx, rx] = mpsc_channel<int>(1);
+    auto handle = this->traits.rt.build_task().buffer(2).spawn(
+        [](MpscReceiver<int> in) -> CoroStream<int> {
+            co_yield co_await []() -> Coro<int> {
+                co_await yield_now();
+                co_return 1;
+            }();
+            while (auto v = co_await next(in))
+                co_yield *v;
+        }(std::move(rx)));
+
+    auto first = this->traits.rt.block_on(
+        [](StreamHandle<int> h) -> Coro<std::optional<int>> {
+            auto v = co_await next(h);
+            {
+                // Dropped here, inside the poll, so the parent waits for the task to drain.
+                StreamHandle<int> dropped = std::move(h);
+            }
+            co_return v;
+        }(std::move(handle)));
+
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, 1);
 }

@@ -247,6 +247,7 @@ typename F::OutputType fiber_await(F future) {
     if (!detail::t_current_fiber_ctx) throw std::logic_error("fiber_await() called outside a fiber");
     for (;;) {
         auto r = future.poll(*detail::t_current_fiber_ctx);
+        if (r.isDropped()) throw TaskCancelled{};
         if (!r.isPending()) { r.rethrowIfError(); return std::move(r).value(); }
         detail::fiber_yield();   // hand control back; resumes here once woken + re-polled
     }
@@ -264,7 +265,9 @@ more limited way to do the same thing.
 `fiber_await()` is what a fiber body calls to wait on anything coro already
 represents as a `Future` (an `IsrEvent`, a channel receive, `sleep_for`, ...)
 — the fiber-land `co_await`, and what makes the wakeup event-driven rather
-than polled on a fixed cadence.
+than polled on a fixed cadence. Like `co_await`, it rethrows the future's
+exception, and throws `TaskCancelled` for a future that reports `PollDropped`
+(a handle to a task somebody else cancelled), whatever its output type.
 
 ### Thread-locals and worker migration
 
@@ -420,6 +423,15 @@ simply discarded if nothing is left to observe it — same as for a detached
 in `FiberHandle<T>`'s public interface, there's no code path that could ever
 attempt to cancel a fiber mid-switch, whether the handle is awaited, dropped
 immediately, or held and dropped later.
+
+!!! warning "FIXME: a fiber still suspended at runtime shutdown is freed, not unwound"
+    Shutdown cancels every task, and a fiber's task holds a `FiberFuture<T>`, which
+    is not `Cancellable`: it is destroyed as a leaf, and its stack is freed with the
+    fiber's frames still on it. No destructor on that stack runs, including the one
+    of the future the fiber is parked on in `fiber_await()`. A future that left
+    itself registered somewhere is then dangling: an `Event` that outlives the
+    runtime keeps a pointer to its `WaitFuture`, and `~Event()` writes through it.
+    Until this is fixed, let every fiber finish before the runtime shuts down.
 
 ### Usage sketch — bridging a third-party library's blocking wait callback
 

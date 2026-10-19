@@ -88,6 +88,46 @@ TEST(TaskTest, CancelledTaskIsSkipped) {
     EXPECT_FALSE(state->result.has_value());
 }
 
+// A TaskCancelled escaping the future (it awaited a handle to a cancelled task) ends the
+// task as cancelled, not as an error, though this task's own flag was never set.
+TEST(TaskTest, TaskCancelledErrorEndsTaskAsCancelled) {
+    auto waker = make_rc<MockWaker>();
+    Context ctx(waker);
+    struct CancelledFuture {
+        using OutputType = int;
+        PollResult<int> poll(Context&) { return PollError(std::make_exception_ptr(TaskCancelled{})); }
+    };
+    auto impl = make_rc<TaskImpl<CancelledFuture>>(CancelledFuture{});
+    Rc<TaskState<int>> state = impl;
+    EXPECT_TRUE(impl->poll(ctx));
+    EXPECT_TRUE(impl->is_complete());
+    std::lock_guard lock(state->mutex);
+    EXPECT_EQ(state->exception, nullptr);
+    EXPECT_FALSE(state->result.has_value());
+}
+
+TEST(TaskTest, VoidTaskCancelledErrorEndsTaskAsCancelled) {
+    auto waker = make_rc<MockWaker>();
+    Context ctx(waker);
+    struct CancelledFuture {
+        using OutputType = void;
+        PollResult<void> poll(Context&) { return PollError(std::make_exception_ptr(TaskCancelled{})); }
+    };
+    auto impl = make_rc<TaskImpl<CancelledFuture>>(CancelledFuture{});
+    Rc<TaskState<void>> state = impl;
+    EXPECT_TRUE(impl->poll(ctx));
+    EXPECT_TRUE(impl->is_complete());
+    std::lock_guard lock(state->mutex);
+    EXPECT_EQ(state->exception, nullptr);
+    EXPECT_FALSE(state->result);
+}
+
+TEST(TaskTest, IsTaskCancelledMatchesOnlyTaskCancelled) {
+    EXPECT_TRUE(is_task_cancelled(std::make_exception_ptr(TaskCancelled{})));
+    EXPECT_FALSE(is_task_cancelled(std::make_exception_ptr(std::runtime_error("boom"))));
+    EXPECT_FALSE(is_task_cancelled(std::make_exception_ptr(42)));
+}
+
 // Executor-level ready-queue and parking tests live in test_current_thread_executor.cpp.
 
 // --- SchedulingState tests ---

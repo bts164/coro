@@ -59,7 +59,9 @@ enum class SelectBranchState : uint8_t { Active, Draining, Done };
  *
  * Polls branches in round-robin order to ensure fairness. When one branch completes
  * (Ready or Error), all other @ref Cancellable branches are cancelled and drained before
- * the result is delivered. Non-cancellable branches are dropped immediately.
+ * the result is delivered. Non-cancellable branches are dropped immediately. A branch
+ * that reports `PollDropped` without being cancelled (a handle to a task cancelled
+ * elsewhere) completes with @ref TaskCancelled as its error.
  *
  * `OutputType` is `std::variant<SelectBranch<0,T0>, SelectBranch<1,T1>, ...>`.
  *
@@ -172,8 +174,11 @@ private:
         if (result.isError()) {
             m_exception = result.error();
         } else if (result.isDropped()) {
-            // An active branch returned Dropped — not expected in normal usage;
-            // state was already set to Done so nothing to do
+            // Dropped without select() cancelling it: a handle to a task that was
+            // cancelled elsewhere. It finishes first with no value to give, so the select
+            // fails with TaskCancelled, as a co_await of it would. Without a result or an
+            // exception, poll() would wait forever.
+            m_exception = std::make_exception_ptr(TaskCancelled{});
         } else {
             set_result<I>(std::move(result));
         }

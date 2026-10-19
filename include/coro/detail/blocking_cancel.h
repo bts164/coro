@@ -8,26 +8,14 @@
 // opaque BlockingTaskBase and is defined out of line in src/task/blocking_pool.cpp.
 // See doc/design/spawn_blocking.md and doc/design/blocking_wait.md.
 
+#include <coro/detail/poll_result.h>  // TaskCancelled
 #include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
 
 namespace coro {
 
 /**
- * @brief Thrown at a cancellation point of a cancelled blocking task (see
- * @ref spawn_blocking), to unwind the callable.
- *
- * Deliberately not derived from `std::exception`, so `catch (const std::exception&)`
- * does not swallow it. A callable that catches it (or `catch (...)`) to clean up must
- * rethrow. Cancellation is sticky: every later cancellation point throws again.
- *
- * Also thrown by `blocking_wait()`, on any thread, when the future it waits on reports
- * `PollDropped`.
- */
-struct BlockingCancelled {};
-
-/**
- * @brief Throws @ref BlockingCancelled if the calling blocking task has been asked to
+ * @brief Throws @ref TaskCancelled if the calling blocking task has been asked to
  * cancel. For callables that work for long stretches without waiting on anything.
  *
  * No-op on a thread that is not running a `spawn_blocking` callable, and while a

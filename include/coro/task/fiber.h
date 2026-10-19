@@ -182,6 +182,9 @@ void fiber_yield();
  * Takes one unit of the task's budget, as `co_await` does: with none left the fiber
  * yields to the executor once before it polls `future` (doc/design/task_budget.md).
  *
+ * Throws `future`'s exception, or @ref TaskCancelled if it reports `PollDropped` (a
+ * handle to a task that was cancelled), for every output type, as `co_await` does.
+ *
  * Must be called from inside a fiber body (i.e. inside the callable passed to
  * `spawn_fiber()`, or something it calls) — throws std::logic_error otherwise.
  */
@@ -195,6 +198,7 @@ typename F::OutputType fiber_await(F future) {
     }
     for (;;) {
         auto r = future.poll(*detail::t_current_fiber_ctx);
+        if (r.isDropped()) throw TaskCancelled{};  // no value to return, as for co_await
         if (!r.isPending()) {
             r.rethrowIfError();
             if constexpr (std::is_void_v<typename F::OutputType>) return;

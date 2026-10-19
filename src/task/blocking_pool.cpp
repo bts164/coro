@@ -95,7 +95,7 @@ void submit_blocking_task(Rc<BlockingTaskBase> task) {
 void blocking_cancellation_point() {
     detail::BlockingTaskBase* task = t_current_blocking_task;
     if (task != nullptr && task->cancel_pending())
-        throw BlockingCancelled{};
+        throw TaskCancelled{};
 }
 
 // ---------------------------------------------------------------------------

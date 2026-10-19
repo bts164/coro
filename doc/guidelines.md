@@ -126,10 +126,10 @@ returns or unwinds, and a task handle among them is cancelled but not waited for
 blocking callable has no coroutine scope at all. Put the handle in a `co_invoke` scope and
 wait on that with `blocking_wait()`. If the blocking task is cancelled, `blocking_wait()`
 cancels the inner coroutine and keeps polling until it and its children have drained
-before it throws `BlockingCancelled`, so the callable's locals outlive every child.
+before it throws `TaskCancelled`, so the callable's locals outlive every child.
 
 ```cpp
-// BAD — if anything below the spawn throws (BlockingCancelled included), buf is
+// BAD — if anything below the spawn throws (TaskCancelled included), buf is
 // destroyed while the child is still running.
 spawn_blocking([] {
     Buffer buf;

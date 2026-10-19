@@ -62,7 +62,7 @@ order this design replaced.
 | A | parked in `blocking_wait` on a leaf future (a channel, an event) | Works: the pool cancels it and it unwinds | Same |
 | B | waiting on, or already draining, something an executor task must finish: a `JoinHandle`, a `co_invoke` scope with children, a `CoroStream` with children, a `StreamHandle` | **Hangs** in `~BlockingPool`: the executor is gone, so the drain never completes | The executor is still running; the task drains and the callable unwinds |
 | C | unwinding, and drops or cancels a `JoinHandle` or `StreamHandle` | **Use after free**: cancelling a task enqueues it on a destroyed executor | The task is cancelled and drained by the running executor |
-| D | calling `spawn()` or `JoinSet::spawn()` | **Use after free**: schedules on a destroyed executor | The task is born cancelled (rule 2) and drained; `blocking_wait` on its handle throws `BlockingCancelled` |
+| D | calling `spawn()` or `JoinSet::spawn()` | **Use after free**: schedules on a destroyed executor | The task is born cancelled (rule 2) and drained; `blocking_wait` on its handle throws `TaskCancelled` |
 | E | finishing, or sending on a channel, and so waking an executor task | **Race** into an executor that is part-way through its destructor | The executor is whole until both kinds of task are gone |
 | F | cleaning up under a `BlockingCancelShield` with a timer or socket wait | **Hangs**: nothing turns the I/O driver any more | The driver is still turned; the wait completes |
 | G | running, while a task being shut down drops its `BlockingHandle` | Works: the drop requests cancellation and does not wait | Same |
@@ -417,7 +417,7 @@ Why they have to go, rather than stay as shorthand:
 
 What changes for the caller:
 
-- **Inside `spawn_blocking`, the replacement can throw `BlockingCancelled`.** That is
+- **Inside `spawn_blocking`, the replacement can throw `TaskCancelled`.** That is
   the point of the change. A callable that must finish a send or a receive regardless
   holds a `BlockingCancelShield` around it.
 - **On a plain `std::thread`, nothing changes.** Channel futures do not touch the
@@ -459,16 +459,17 @@ only after that.
     `next()` cannot tell. Until there is a way to say which, treat it like any other
     `Cancellable` dropped undrained (guidelines CS.1 and CS.2).
 
-!!! warning "FIXME: `co_await` of a dropped future with a value"
+!!! note "NOTE: `co_await` of a dropped future"
     A coroutine that is not itself cancelled and awaits a future that reports dropped
-    (a handle to a task that was cancelled) is resumed, and `await_resume()` reads a
-    value that is not there. For a `void` future the resume is harmless.
-    `cancel_and_join()` avoids the case altogether: its `CancelAndJoin` future turns
-    dropped into `std::nullopt` (or `false` for `void`). `blocking_wait`
-    turns the same case into `BlockingCancelled`. The coroutine side needs a defined
-    outcome for non-void futures, which is an API decision (which exception) and is
-    not made here. Shutdown does not make this newly reachable from a coroutine:
-    every task that could await such a handle is itself cancelled.
+    (a handle to a task that was cancelled) resumes with `TaskCancelled`, for every
+    output type, as `blocking_wait` and `fiber_await()` throw it. `cancel_and_join()`
+    avoids the exception: its `CancelAndJoin` future turns dropped into `std::nullopt`
+    (or `false` for `void`). `join()` and `select()` fail with `TaskCancelled` when one
+    of their branches reports dropped without having been cancelled by them. A task
+    that lets `TaskCancelled` escape is reported as cancelled, not as failed, as a
+    blocking task is: its handle reports dropped too. Shutdown does not make this newly
+    reachable from a coroutine: every task that could await such a handle is itself
+    cancelled.
 
 ## Testing
 
@@ -488,7 +489,7 @@ that the task shares with the test, that the task's cleanup really ran.
 
 | Test | Scenario | Checks |
 |---|---|---|
-| `ParkedCallableIsCancelled` | A | The callable unwinds with `BlockingCancelled` |
+| `ParkedCallableIsCancelled` | A | The callable unwinds with `TaskCancelled` |
 | `CallableWaitingOnTaskDrainsIt` | B | The awaited task is cancelled and fully drained before the callable unwinds |
 | `CallableOwningScopeDrainsChildren` | B | `blocking_wait(co_invoke(...))` with running children: all children drained first |
 | `CallableOwningStreamDrainsIt` | B | `blocking_next` on a `CoroStream` with a child: stream and child drained first |

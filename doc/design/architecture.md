@@ -585,7 +585,7 @@ int result = co_await coro::spawn_blocking([]() -> int {
   pool's queue entry, the result channel to the `BlockingHandle`, and the waker and
   parking spot for `blocking_wait()` on that thread.
 - Dropping a `BlockingHandle` before the callable returns **requests cancellation and
-  does not wait**. The callable sees the request as a `BlockingCancelled` exception at
+  does not wait**. The callable sees the request as a `TaskCancelled` exception at
   its next cancellation point (`blocking_wait()`, `blocking_next()`,
   `blocking_cancellation_point()`); one that never reaches one runs to completion.
   Waiting is not safe because cancellation of a blocking thread cannot be guaranteed.

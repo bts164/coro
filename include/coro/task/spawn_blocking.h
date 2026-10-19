@@ -75,7 +75,7 @@ public:
     ~BlockingHandle() { close(); }
 
     // Same body as JoinHandle::poll(). A task that ended with neither a result
-    // nor an exception (cancelled, or unwound by BlockingCancelled) reports
+    // nor an exception (cancelled, or unwound by TaskCancelled) reports
     // PollDropped.
     PollResult<T> poll(detail::Context& ctx) {
         if (!m_state)
@@ -105,7 +105,7 @@ public:
 
     // Asks the callable to stop. It sets the task's cancelled flag and wakes the
     // thread if it is parked in blocking_wait(); the callable then unwinds with
-    // BlockingCancelled at its current or next cancellation point (blocking_wait,
+    // TaskCancelled at its current or next cancellation point (blocking_wait,
     // blocking_next, blocking_cancellation_point). A callable that never reaches
     // one runs to completion. A task still queued is skipped. Idempotent; does
     // nothing once the task has finished, or on a moved-from handle.
@@ -230,7 +230,7 @@ public:
                         this->result.emplace(std::move(value));
                     }
                 }
-            } catch (const BlockingCancelled&) {
+            } catch (const TaskCancelled&) {
                 // Cancelled and unwound, or a future it waited on was dropped:
                 // neither a result nor an exception. The handle reports PollDropped.
             } catch (...) {
@@ -356,7 +356,7 @@ private:
 // after the outermost shield is gone. Nests. No effect on other threads.
 //
 // For a stretch that must not be abandoned half way, or for cleanup that has
-// to wait on a future while a BlockingCancelled is already unwinding.
+// to wait on a future while a TaskCancelled is already unwinding.
 // ---------------------------------------------------------------------------
 class BlockingCancelShield {
 public:

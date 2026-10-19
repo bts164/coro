@@ -106,7 +106,7 @@ TYPED_TEST_SUITE(RuntimeShutdown, Runtimes);
 // the point of these tests is that the work outlives block_on().
 struct Probe {
     coro::Event        started;          // the task or callable is running
-    std::atomic<bool>  unwound{false};   // a callable saw BlockingCancelled
+    std::atomic<bool>  unwound{false};   // a callable saw TaskCancelled
     std::atomic<bool>  finished{false};  // ran past its wait, or a body ran at all
     std::atomic<bool>  cleaned{false};   // a coroutine frame's locals were destroyed
     std::atomic<bool>  flag{false};      // test-specific
@@ -199,7 +199,7 @@ void park_until_cancelled(Probe& probe) {
     probe.started.set();
     try {
         (void)coro::blocking_wait(coro::never<int>());
-    } catch (const coro::BlockingCancelled&) {
+    } catch (const coro::TaskCancelled&) {
         probe.unwound.store(true);
         throw;
     }
@@ -247,7 +247,7 @@ TYPED_TEST(RuntimeShutdown, CallableWaitingOnTaskDrainsIt) {
                 auto h = coro::spawn(await_draining_future(task_probe));
                 try {
                     coro::blocking_wait(std::move(h));
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     probe->unwound.store(true);
                     // The task had drained before the callable was let go.
                     probe->flag.store(drained(*task_probe));
@@ -278,7 +278,7 @@ TYPED_TEST(RuntimeShutdown, CallableOwningScopeDrainsChildren) {
                         auto child = coro::spawn(await_draining_future(child_probe));
                         (void)co_await coro::never<int>();
                     }));
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     probe->unwound.store(true);
                     probe->flag.store(drained(*child_probe));
                     throw;
@@ -305,7 +305,7 @@ TYPED_TEST(RuntimeShutdown, CallableOwningStreamDrainsIt) {
                 auto stream = stream_with_child(child_probe);
                 try {
                     (void)coro::blocking_next(stream);
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     probe->unwound.store(true);
                     probe->flag.store(drained(*child_probe));
                     throw;
@@ -333,7 +333,7 @@ TYPED_TEST(RuntimeShutdown, CallableDroppingHandleDuringUnwind) {
         rt->block_on([](std::shared_ptr<Probe> probe,
                         std::shared_ptr<Probe> task_probe) -> coro::Coro<void> {
             coro::spawn_blocking([probe, task_probe] {
-                // Destroyed by the BlockingCancelled that leaves this callable.
+                // Destroyed by the TaskCancelled that leaves this callable.
                 auto h = coro::spawn(await_draining_future(task_probe));
                 park_until_cancelled(*probe);
             }).detach();
@@ -359,7 +359,7 @@ TYPED_TEST(RuntimeShutdown, CallableSpawningDuringShutdown) {
             coro::spawn_blocking([probe, late] {
                 try {
                     park_until_cancelled(*probe);
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     // Shielded, so the wait below reports the new task's outcome and
                     // not this callable's own cancellation.
                     coro::BlockingCancelShield shield;
@@ -368,7 +368,7 @@ TYPED_TEST(RuntimeShutdown, CallableSpawningDuringShutdown) {
                     auto h = coro::spawn(record_body_ran(late, std::move(token)));
                     try {
                         coro::blocking_wait(std::move(h));
-                    } catch (const coro::BlockingCancelled&) {
+                    } catch (const coro::TaskCancelled&) {
                         late->flag.store(true);
                     }
                 }
@@ -435,7 +435,7 @@ TYPED_TEST(RuntimeShutdown, ShieldedCleanupUsesTimer) {
             coro::spawn_blocking([probe] {
                 try {
                     park_until_cancelled(*probe);
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     coro::BlockingCancelShield shield;
                     // Completes only if something still turns the I/O driver.
                     coro::blocking_wait(coro::sleep_for(20ms));
@@ -494,7 +494,7 @@ TYPED_TEST(RuntimeShutdown, SpawnBlockingDuringShutdown) {
             coro::spawn_blocking([probe, late] {
                 try {
                     park_until_cancelled(*probe);
-                } catch (const coro::BlockingCancelled&) {
+                } catch (const coro::TaskCancelled&) {
                     coro::BlockingCancelShield shield;
                     auto token = std::make_shared<int>(0);
                     late->token = token;
@@ -502,7 +502,7 @@ TYPED_TEST(RuntimeShutdown, SpawnBlockingDuringShutdown) {
                         [late, token = std::move(token)] { late->finished.store(true); });
                     try {
                         coro::blocking_wait(std::move(h));
-                    } catch (const coro::BlockingCancelled&) {
+                    } catch (const coro::TaskCancelled&) {
                         late->flag.store(true);
                     }
                 }

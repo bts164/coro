@@ -183,7 +183,7 @@ TEST(BlockingWaitTest, RethrowsException) {
 }
 
 // A future that was cancelled and drained has no value to return. blocking_wait()
-// throws BlockingCancelled, the synchronous counterpart of a coroutine being dropped
+// throws TaskCancelled, the synchronous counterpart of a coroutine being dropped
 // at a co_await. Cancellation of the calling blocking task itself is covered in
 // test/task/test_spawn_blocking.cpp.
 namespace {
@@ -200,9 +200,9 @@ struct DroppedVoidFuture {
 
 } // namespace
 
-TEST(BlockingWaitTest, DroppedFutureThrowsBlockingCancelled) {
-    EXPECT_THROW(blocking_wait(DroppedIntFuture{}), BlockingCancelled);
-    EXPECT_THROW(blocking_wait(DroppedVoidFuture{}), BlockingCancelled);
+TEST(BlockingWaitTest, DroppedFutureThrowsTaskCancelled) {
+    EXPECT_THROW(blocking_wait(DroppedIntFuture{}), TaskCancelled);
+    EXPECT_THROW(blocking_wait(DroppedVoidFuture{}), TaskCancelled);
 }
 
 TEST(BlockingWaitTest, BlocksUntilWokenFromAnotherThread) {

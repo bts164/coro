@@ -40,7 +40,7 @@ namespace coro {
 
 // Polls `future` to completion on the calling thread, blocking between polls.
 // Returns the future's value, or rethrows its exception.
-// On a blocking pool thread this is a cancellation point: it throws BlockingCancelled
+// On a blocking pool thread this is a cancellation point: it throws TaskCancelled
 // if the blocking task has been cancelled (see "Cancellation" below).
 template<Future F>
 typename F::OutputType blocking_wait(F future);
@@ -68,7 +68,7 @@ void run_compute_loop(S stream) {
 This works identically whether `S` is an `MpscReceiver<T>` or a `CoroStream<T>` async
 generator; neither has a blocking-consumption path of its own. Run by `spawn_blocking`,
 the loop also ends when its task is cancelled: `blocking_next` throws
-`BlockingCancelled`, which unwinds it.
+`TaskCancelled`, which unwinds it.
 
 ## Design
 
@@ -102,7 +102,7 @@ typename F::OutputType blocking_wait(F future) {
     detail::Context ctx(task);                 // the task is the waker
     for (;;) {
         auto r = future.poll(ctx);
-        if (r.isDropped()) throw BlockingCancelled{};
+        if (r.isDropped()) throw TaskCancelled{};
         if (!r.isPending()) { /* return value or rethrow */ }
         task->park();                          // see spawn_blocking.md, "Scheduling state and parking"
         if (task->cancel_pending()) { /* cancel, drain, destroy future; throw */ }
@@ -130,7 +130,7 @@ auto waker = detail::make_rc<detail::BlockingWaker>();  // owns mutex + cv + fla
 detail::Context ctx(waker->clone());
 for (;;) {
     auto r = future.poll(ctx);
-    if (r.isDropped()) throw BlockingCancelled{};
+    if (r.isDropped()) throw TaskCancelled{};
     if (!r.isPending()) {
         r.rethrowIfError();
         if constexpr (std::is_void_v<typename F::OutputType>) return;
@@ -143,7 +143,7 @@ for (;;) {
 This path has no dependency on where it is called from, which is what keeps
 `blocking_wait` usable beyond `spawn_blocking` threads — anywhere `current_runtime()` is
 valid works. There is no task to cancel on such a thread, so the call is never a
-cancellation point; it can still throw `BlockingCancelled` for a future that reports
+cancellation point; it can still throw `TaskCancelled` for a future that reports
 `PollDropped` (below).
 
 ## Cancellation
@@ -157,7 +157,7 @@ the blocking task, in the sense of
     - if it is `Cancellable`, call `cancel()` once and keep polling, parking between
       polls, until it stops returning `PollPending`. Whatever it returns is discarded;
     - destroy the future;
-    - throw `BlockingCancelled`.
+    - throw `TaskCancelled`.
 2. **Entry.** If the task is already cancelled on entry, the wait is not started: the
    future is not polled for a result first. It is still shut down by rule 1, so a
    `Cancellable` future is drained even though it was never polled.
@@ -187,11 +187,10 @@ running.
 
 ### A future that reports `PollDropped`
 
-`blocking_wait` is to synchronous code what `co_await` is to a coroutine. When a
-coroutine awaits something that turns out to have been cancelled — a `JoinHandle` or
-`BlockingHandle` whose task somebody else cancelled — `PollDropped` propagates: the
-coroutine does not resume, it drains and reports `PollDropped` in turn. Synchronous code
-has one way to stop and unwind, so `blocking_wait` throws `BlockingCancelled`:
+`blocking_wait` is to synchronous code what `co_await` is to a coroutine, and both treat
+a future that turns out to have been cancelled — a `JoinHandle` or `BlockingHandle` whose
+task somebody else cancelled — the same way: there is no value, so they throw
+`TaskCancelled` (as does `fiber_await()`):
 
 - for every output type, `void` included. There is nothing to return, and returning
   normally from a `void` wait would let the caller carry on as if the work had been done;
@@ -206,7 +205,7 @@ task's `cancelled` flag. A callable that catches the exception may go on and wai
 other things.
 
 The same goes for the result of a drain under rule 1: whatever the cancelled future
-returns, a value included, is discarded and `BlockingCancelled` is thrown. The point of
+returns, a value included, is discarded and `TaskCancelled` is thrown. The point of
 cancelling is to stop and unwind, not to use one last value and continue.
 
 ### Streams
@@ -214,7 +213,7 @@ cancelling is to stop and unwind, not to use one last value and continue.
 `blocking_next(stream)` applies rule 1 to the stream itself. A stream that has a
 `cancel()` — a `CoroStream`, a `StreamHandle` — is cancelled and polled until it reports
 `PollDropped`, an error or exhaustion; items it hands out on the way are discarded. Only
-then is `BlockingCancelled` thrown. The stream is finished at that point, and destroying
+then is `TaskCancelled` thrown. The stream is finished at that point, and destroying
 it during the unwinding is all that is left to do with it. A stream with no `cancel()` (a
 channel receiver) is a leaf and is left alone.
 
@@ -231,7 +230,7 @@ itself in a `BlockingCancelShield`.
 
 !!! warning "WARNING: do not call an unshielded cancellation point from a destructor"
     A destructor that calls `blocking_wait` on a blocking pool thread can throw
-    `BlockingCancelled`, which terminates the program if it happens during unwinding.
+    `TaskCancelled`, which terminates the program if it happens during unwinding.
     Put a `BlockingCancelShield` in the destructor.
 
 ## Excluded on `CORO_PICO` — for now

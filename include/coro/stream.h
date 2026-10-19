@@ -138,7 +138,7 @@ private:
  *
  * **Cancellation.** A cancellation point, like @ref blocking_wait. If the blocking task
  * is cancelled and @p stream has a `cancel()` (a `CoroStream`, a `StreamHandle`), the
- * stream is cancelled and polled until it has drained before @ref BlockingCancelled is
+ * stream is cancelled and polled until it has drained before @ref TaskCancelled is
  * thrown. The stream is finished after that; all that is left to do with it is destroy
  * it.
  *

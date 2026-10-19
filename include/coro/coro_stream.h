@@ -67,9 +67,8 @@ public:
         }
 
         // Only Future<> types may be co_await-ed inside CoroStream.
-        // Clears m_poll_current and m_cancel_current so stale hooks from previous co_awaits
-        // are never mistakenly called. Passes both to FutureAwaitable so await_suspend() can
-        // register the re-poll and (for Cancellable futures) cancel hooks.
+        // Passes the promise to FutureAwaitable so await_suspend() can register the re-poll
+        // and (for Cancellable futures) cancel hooks. poll_next() clears both on resuming.
         // Lvalue overload: future is moved into FutureAwaitable (handle is consumed).
         template<Future F>
         FutureAwaitable<F> await_transform(F& future) {
@@ -200,7 +199,11 @@ public:
         if (promise.m_poll_current) {
             if (!promise.m_poll_current->poll())
                 return PollPending;
-            promise.m_poll_current = nullptr;
+            // Both, as Coro::poll() does: a cancel hook left set would outlive the awaitable it
+            // points to, and a cancel at the next suspension point would call it and then wait for
+            // whatever is awaited there to finish, as though it were the Cancellable future.
+            promise.m_poll_current   = nullptr;
+            promise.m_cancel_current = nullptr;
         }
 
         {

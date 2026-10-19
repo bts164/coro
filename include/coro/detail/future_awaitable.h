@@ -100,7 +100,12 @@ public:
     //   - await_ready() returned true: m_result is Ready or Error.
     //   - await_suspend() path: poll() called the hook, got true, cleared it, then resumed.
     // In either case m_result is never Pending here.
+    //
+    // A dropped future (a handle to a task that was cancelled) has no value to return, so
+    // the coroutine resumes with TaskCancelled, for every output type: carrying on from a
+    // void await would let it act as if the work had been done.
     typename BaseF::OutputType await_resume() {
+        if (m_result.isDropped()) throw TaskCancelled{};
         m_result.rethrowIfError();
         if constexpr (!std::is_void_v<typename BaseF::OutputType>)
             return std::move(m_result).value();

@@ -153,6 +153,34 @@ TYPED_TEST(SelectTest, CancelledCoroBranchDrainsChildrenBeforeSelectCompletes) {
     }(shared));
 }
 
+// A branch reporting PollDropped without select() having cancelled it: as a handle to a
+// task cancelled elsewhere does. Before the fix select() stored neither a result nor an
+// error and waited forever, so a regression hangs here rather than failing.
+namespace {
+
+struct DroppedInt {
+    using OutputType = int;
+    PollResult<int> poll(detail::Context&) { return PollDropped; }
+};
+
+Coro<void> selects_cancelled_handle() {
+    JoinHandle<int> h = spawn(never<int>());
+    h.cancel();
+    (void)co_await select(std::move(h), NeverReadyFuture{});
+}
+
+}  // namespace
+
+TYPED_TEST(SelectTest, DroppedBranchFailsWithTaskCancelled) {
+    EXPECT_THROW(
+        this->traits.rt.block_on(select(DroppedInt{}, NeverReadyFuture{})),
+        TaskCancelled);
+}
+
+TYPED_TEST(SelectTest, HandleToCancelledTaskFailsWithTaskCancelled) {
+    EXPECT_THROW(this->traits.rt.block_on(selects_cancelled_handle()), TaskCancelled);
+}
+
 // ---------------------------------------------------------------------------
 // Timeout tests — desktop only (sleep_for on the IoDriver's timers)
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@
 #include <coro/sync/event.h>
 #include <coro/sync/sleep.h>
 #include <coro/task/fiber.h>
+#include <coro/task/yield_now.h>
 #include "executor_traits.h"
 #include <gtest/gtest.h>
 
@@ -33,6 +34,20 @@ struct NoOpWaker : coro::detail::Waker {
 coro::detail::Context make_ctx() {
     return coro::detail::Context(coro::detail::make_rc<NoOpWaker>());
 }
+
+struct FailingFuture {
+    using OutputType = int;
+    coro::PollResult<int> poll(coro::detail::Context&) {
+        return coro::PollError(std::make_exception_ptr(std::runtime_error("inner boom")));
+    }
+};
+
+// Reports PollDropped, as a handle to a cancelled task does.
+template<typename T>
+struct DroppedFuture {
+    using OutputType = T;
+    coro::PollResult<T> poll(coro::detail::Context&) { return coro::PollDropped; }
+};
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -106,8 +121,64 @@ TEST(Fiber, FiberAwaitOutsideFiberThrows) {
 }
 
 // ---------------------------------------------------------------------------
+// fiber_await() of a future that fails or is dropped — the error is thrown inside
+// the fiber, where its body can catch it.
+// ---------------------------------------------------------------------------
+
+TEST(Fiber, FiberAwaitRethrowsInnerError) {
+    coro::FiberFuture<int> ff([]() -> int {
+        try {
+            return coro::fiber_await(FailingFuture{});
+        } catch (const std::runtime_error&) {
+            return -1;
+        }
+    }, kStackSize);
+    auto ctx = make_ctx();
+    auto r = ff.poll(ctx);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_EQ(r.value(), -1);
+}
+
+TEST(Fiber, FiberAwaitOfDroppedFutureThrowsTaskCancelled) {
+    coro::FiberFuture<int> ff([]() -> int {
+        try {
+            return coro::fiber_await(DroppedFuture<int>{});
+        } catch (const coro::TaskCancelled&) {
+            return -1;
+        }
+    }, kStackSize);
+    auto ctx = make_ctx();
+    auto r = ff.poll(ctx);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_EQ(r.value(), -1);
+}
+
+// A void await has no value to miss, but carrying on would act as if the work had been done.
+TEST(Fiber, VoidFiberAwaitOfDroppedFutureThrowsTaskCancelled) {
+    bool carried_on = false;
+    bool caught     = false;
+    coro::FiberFuture<void> ff([&] {
+        try {
+            coro::fiber_await(DroppedFuture<void>{});
+            carried_on = true;
+        } catch (const coro::TaskCancelled&) {
+            caught = true;
+        }
+    }, kStackSize);
+    auto ctx = make_ctx();
+    ASSERT_TRUE(ff.poll(ctx).isReady());
+    EXPECT_TRUE(caught);
+    EXPECT_FALSE(carried_on);
+}
+
+// ---------------------------------------------------------------------------
 // fiber_await() bridging a real coro::Future — driven by a Runtime so wakeups
 // are event-driven rather than polled on a fixed cadence.
+//
+// TODO: run these over every executor (TYPED_TEST_SUITE with AllExecutors), as the
+// other task tests do. They use CurrentThreadTraits only for now: on a multi-threaded
+// executor a fiber can resume on another worker, and some may fail intermittently (see
+// "Thread-locals and worker migration" in doc/design/fiber.md).
 //
 // The runtime comes from CurrentThreadTraits (executor_traits.h): one thread on
 // the desktop, and on Pico a runtime that leaves the Wi-Fi driver alone.
@@ -205,6 +276,47 @@ TEST(Fiber, HandleDroppedWithoutJoinKeepsRunningToCompletion) {
     }());
 
     EXPECT_TRUE(ran.load());
+}
+
+TEST(Fiber, HandleRethrowsFiberException) {
+    CurrentThreadTraits traits;
+    coro::Runtime& rt = traits.rt;
+
+    bool caught = rt.block_on([]() -> coro::Coro<bool> {
+        auto h = coro::spawn_fiber<int>([]() -> int {
+            coro::fiber_await(coro::sleep_for(1ms));
+            throw std::runtime_error("boom");
+        }, kStackSize);
+        try {
+            (void)co_await std::move(h);
+        } catch (const std::runtime_error&) {
+            co_return true;
+        }
+        co_return false;
+    }());
+
+    EXPECT_TRUE(caught);
+}
+
+// Leaving the scope shuts the runtime down with a detached fiber still parked in
+// fiber_await(). It must neither hang nor crash.
+//
+// The fiber's stack is freed, not unwound (the FIXME in doc/design/fiber.md, "a fiber
+// still suspended at runtime shutdown is freed, not unwound"), so it waits on a future
+// that registers nothing: one parked on an Event would leave the Event a dangling pointer.
+TEST(Fiber, RuntimeShutdownWithParkedFiberDoesNotHang) {
+    std::atomic<bool> parked{false};
+    {
+        CurrentThreadTraits traits;
+        traits.rt.block_on([](std::atomic<bool>& parked) -> coro::Coro<void> {
+            [[maybe_unused]] auto h = coro::spawn_fiber<int>([&parked] {
+                parked.store(true);
+                return coro::fiber_await(coro::never<int>());
+            }, kStackSize);
+            while (!parked.load()) co_await coro::yield_now();
+        }(parked));
+    }
+    EXPECT_TRUE(parked.load());
 }
 
 // ---------------------------------------------------------------------------

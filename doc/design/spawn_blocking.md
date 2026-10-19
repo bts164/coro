@@ -44,7 +44,7 @@ scheduled on that thread. Without `spawn_blocking`, users must either:
 - The callable may call `spawn_blocking` recursively — blocking pool threads are not
   executor threads and may block freely.
 - A blocking task can be **cancelled**, by `BlockingHandle::request_cancel()` or by
-  dropping the handle. Cancellation is delivered as a `coro::BlockingCancelled` exception
+  dropping the handle. Cancellation is delivered as a `coro::TaskCancelled` exception
   thrown from the callable's next *cancellation point* (`blocking_wait`, `blocking_next`,
   `blocking_cancellation_point`). A callable that never reaches one runs to completion.
 - Dropping the handle requests cancellation and returns at once. It does **not** wait for
@@ -103,11 +103,12 @@ public:
     ~BlockingHandle();   // request_cancel() unless detached; never waits
 };
 
-// Thrown from a cancellation point of a cancelled blocking task. Deliberately not
-// derived from std::exception.
-struct BlockingCancelled {};
+// Thrown from a cancellation point of a cancelled blocking task, and wherever a
+// dropped future is awaited (detail/poll_result.h). Deliberately not derived from
+// std::exception.
+struct TaskCancelled {};
 
-// Throws BlockingCancelled if the calling blocking task has been cancelled. No-op on any
+// Throws TaskCancelled if the calling blocking task has been cancelled. No-op on any
 // other thread, and inside a BlockingCancelShield.
 void blocking_cancellation_point();
 
@@ -400,7 +401,7 @@ if (!cancelled) {                       // cancelled while still queued: skip th
     try {
         auto value = (*callable)();
         if (!cancelled) setResult(std::move(value));   // a cancelled task has no result
-    } catch (const BlockingCancelled&) {
+    } catch (const TaskCancelled&) {
         // The task was cancelled and unwound. Not an error: no result, no exception.
     } catch (...) {
         setException(std::current_exception());
@@ -412,15 +413,15 @@ mark_done();                            // terminated = true, wake the awaiter
 ```
 
 A cancelled task ends with neither a result nor an exception, however its callable left:
-by `BlockingCancelled`, by returning a value after swallowing it, or without running.
-So does a task that was not cancelled itself but unwound with `BlockingCancelled` because
+by `TaskCancelled`, by returning a value after swallowing it, or without running.
+So does a task that was not cancelled itself but unwound with `TaskCancelled` because
 something it waited on had been (see
 [blocking_wait.md](blocking_wait.md#a-future-that-reports-polldropped)).
 The handle then reports `PollDropped`, as a `JoinHandle` does for a cancelled coroutine
 task. This mirrors `TaskImpl`, which discards the result of a future that completes after
 its task was cancelled.
 
-An exception other than `BlockingCancelled` is reported even if the task was cancelled,
+An exception other than `TaskCancelled` is reported even if the task was cancelled,
 since it says something went wrong rather than that the task stopped.
 
 ### Shutdown
@@ -493,7 +494,7 @@ sequenceDiagram
     T->>T: Notified → Running, sees cancelled
     T->>T: fut.cancel() and poll until drained (if Cancellable)
     T->>T: destroy fut
-    T->>T: throw BlockingCancelled
+    T->>T: throw TaskCancelled
     T->>T: f unwinds#59; destroy f#59; mark_done()
 ```
 
@@ -517,7 +518,7 @@ include/coro/task/spawn_blocking.h    — BlockingHandle<T>, BlockingTaskImpl<F>
                                         (with its ParkingExecutor), spawn_blocking(),
                                         BlockingCancelShield
 include/coro/detail/blocking_task.h   — BlockingTaskBase
-include/coro/detail/blocking_cancel.h — BlockingCancelled, blocking_cancellation_point(), and
+include/coro/detail/blocking_cancel.h — blocking_cancellation_point(), and
                                         the functions blocking_wait calls on an opaque
                                         BlockingTaskBase: the current blocking task, whether
                                         a cancel is pending, the task as a waker, park
@@ -539,7 +540,7 @@ pool, `BlockingTaskImpl` nor the handle.
 
 The model is the one POSIX threads use for deferred cancellation. Cancelling a blocking
 task sets a flag and wakes the thread if it is parked. The thread acts on the flag only
-at a **cancellation point**, where the library throws `coro::BlockingCancelled`:
+at a **cancellation point**, where the library throws `coro::TaskCancelled`:
 
 | Cancellation point | When it throws |
 |---|---|
@@ -554,7 +555,7 @@ Cancellation is **sticky**: once a task is cancelled, every cancellation point i
 throws, not only the first. A callable that catches the exception and carries on is
 thrown at again at its next wait.
 
-`BlockingCancelled` does not derive from `std::exception`, so the usual
+`TaskCancelled` does not derive from `std::exception`, so the usual
 `catch (const std::exception&)` around a unit of work does not swallow it. `catch (...)`
 does; code that uses it for cleanup must rethrow.
 
@@ -583,7 +584,7 @@ on every iteration, plus some way to release the thread when it is parked.
 
 The library cannot make a callable reach a cancellation point. A callable that is in a
 long computation, stuck in a syscall or an opaque C library call, or that swallows
-`BlockingCancelled` and never waits again, keeps running. This is by design: the
+`TaskCancelled` and never waits again, keeps running. This is by design: the
 alternatives that would force the matter are not viable.
 
 - `pthread_cancel` cancels at arbitrary POSIX cancellation points and leaves resources
@@ -613,7 +614,7 @@ For a callable that does long stretches of work without waiting on anything, cal
 ```cpp
 auto handle = coro::spawn_blocking([]() -> int {
     for (int i = 0; i < 1'000'000; ++i) {
-        coro::blocking_cancellation_point();   // throws BlockingCancelled if cancelled
+        coro::blocking_cancellation_point();   // throws TaskCancelled if cancelled
         do_chunk_of_work(i);
     }
     return 0;
@@ -635,7 +636,7 @@ Some code must not be interrupted: a flush on the way out, a final message to a 
 auto handle = coro::spawn_blocking([tx = std::move(tx)]() mutable {
     try {
         produce_until_cancelled(tx);
-    } catch (const coro::BlockingCancelled&) {
+    } catch (const coro::TaskCancelled&) {
         coro::BlockingCancelShield shield;
         coro::blocking_wait(tx.send(Frame::end_marker()));   // waits, does not throw
         throw;

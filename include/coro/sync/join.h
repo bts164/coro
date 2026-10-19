@@ -77,7 +77,8 @@ using JoinBranchOptionalType = typename detail::JoinBranchTraits<T>::OptionalTyp
  * All branches are polled in round-robin order on every `poll()` call. If any
  * branch faults, all remaining active branches are cancelled and drained before
  * the first exception is propagated. If all branches succeed, their results are
- * returned as a `std::tuple`.
+ * returned as a `std::tuple`. A branch that reports `PollDropped` without being
+ * cancelled (a handle to a task cancelled elsewhere) faults with @ref TaskCancelled.
  *
  * - `OutputType` is `std::tuple<JoinBranchType<T0>, JoinBranchType<T1>, ...>`.
  *   `void` branches contribute `VoidJoinBranch{}` as their tuple element.
@@ -226,8 +227,11 @@ private:
             // Cancel all remaining active branches so draining can begin.
             cancel_active(std::make_index_sequence<N>{});
         } else if (result.isDropped()) {
-            // An active branch returned Dropped — not expected in normal usage;
-            // state was already set to Done so nothing to do.
+            // Dropped without join() cancelling it: a handle to a task that was cancelled
+            // elsewhere. It has no value to give, so the join fails with TaskCancelled, as
+            // a co_await of it would, instead of waiting forever for its result.
+            m_exception = std::make_exception_ptr(TaskCancelled{});
+            cancel_active(std::make_index_sequence<N>{});
         } else {
             using F = std::tuple_element_t<I, std::tuple<Fs...>>;
             if constexpr (std::is_void_v<typename F::OutputType>) {

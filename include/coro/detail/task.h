@@ -13,6 +13,7 @@
 #include <coro/detail/rc.h>
 #include <coro/detail/relaxed_state.h>
 #include <atomic>
+#include <exception>
 #include <functional>
 
 #include <memory>
@@ -247,6 +248,18 @@ public:
     };
 };
 
+/// True if `e` holds a @ref TaskCancelled. Rethrows to find out, so call it only on an
+/// error path.
+inline bool is_task_cancelled(const std::exception_ptr& e) {
+    try {
+        std::rethrow_exception(e);
+    } catch (const TaskCancelled&) {
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 /**
  * @brief Concrete, type-erased task. One `make_shared` allocation combines the executor
  * interface, the result/cancellation state, and the future.
@@ -263,6 +276,10 @@ public:
  * satisfies `Cancellable`, `TaskImpl` calls `m_future.cancel()` once and then polls
  * until the future drains (running the 4-step cancel protocol). For non-`Cancellable`
  * futures the task is marked done immediately.
+ *
+ * A future that ends with @ref TaskCancelled (it awaited a handle to a cancelled task
+ * and let the exception escape) ends the task as cancelled too: the handle reports
+ * `PollDropped`, as it does for a blocking task.
  *
  * @tparam F Any type satisfying @ref Future.
  */
@@ -328,7 +345,11 @@ public:
         // TaskState<T> alive does not also pin the future allocation.
         m_future.reset();
 
-        if (cancelled || result.isDropped()) {
+        // A TaskCancelled that escaped the future ends the task as cancelled, whether this
+        // task was cancelled or a handle it awaited was. The two can't be told apart (the
+        // flag may be set after the throw), and need not be: either way there is no value.
+        if (cancelled || result.isDropped()
+            || (result.isError() && is_task_cancelled(result.error()))) {
             this->mark_done();
         } else if (result.isError()) {
             this->setException(result.error());
