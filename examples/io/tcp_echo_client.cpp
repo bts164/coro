@@ -126,7 +126,7 @@ static Coro<int> collect_results(MpscReceiver<std::string> rx) {
 static Coro<int> async_main(std::string host, uint16_t port, std::string message) {
     constexpr int num_clients = 10;
 
-    JoinSet<void> clients;
+    JoinSet<void, int> clients;  // tagged with the client number
 
     // Spawn all clients, each with a cloned sender.  The original tx is dropped
     // at the end of the lambda so the channel closes when the last task-owned
@@ -134,25 +134,30 @@ static Coro<int> async_main(std::string host, uint16_t port, std::string message
     MpscReceiver<std::string> rx = [&] {
         auto [tx, rx] = mpsc_channel<std::string>(num_clients * 5);
         for (int i = 0; i < num_clients; ++i)
-            clients.spawn(run_client(i, host, port, message, tx.clone()));
+            clients.spawn(i, run_client(i, host, port, message, tx.clone()));
         return rx;  // tx dropped here — channel closes when all task-owned clones drop
     }();
 
-    // Spawn the collector as a separate task with cancelOnDestroy(false).
-    // If clients.drain() throws, every client has already finished and dropped its
-    // sender, but replies may still be sitting in the channel. The collector is not
-    // cancelled — it stays alive, flushes whatever is left, and completes once it
-    // sees the channel closed. async_main cannot exit until the collector finishes.
     JoinHandle<int> collector = coro::spawn(collect_results(std::move(rx)));
-    collector.cancelOnDestroy(false);
 
-    // Waits for every client. If any threw, the first exception is rethrown here
-    // once they have all finished.
-    co_await clients.drain();
+    // Waits for every client and never throws: one JoinResult per client.
+    // OnError::Wait lets the others run on when one fails.
+    int failed = 0;
+    for (JoinResult<void, int>& r : co_await clients.join_all(OnError::Wait)) {
+        try {
+            r.value();  // rethrows if that client threw
+        } catch (const std::exception& e) {
+            LOG(r.tag(), "Client failed: %s", e.what());
+            ++failed;
+        }
+    }
 
+    // Every client has dropped its sender, so the collector finishes as soon as it
+    // has written the replies still in the channel.
     int written = co_await collector;
-    LOG(-1, "All done — %d replies written to results.txt", written);
-    co_return 0;
+    LOG(-1, "All done — %d replies written to results.txt, %d clients failed",
+        written, failed);
+    co_return failed == 0 ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------

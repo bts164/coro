@@ -30,9 +30,18 @@ using StreamItem = std::conditional_t<std::is_void_v<T>, bool, std::optional<T>>
  * `poll_next()` return values for non-void streams:
  * - `Ready(optional<T>)` — next item available, or `nullopt` when exhausted.
  * - `Pending`            — no item ready; waker in `ctx` has been registered.
- * - `Error`              — stream faulted; exception embedded in the return value.
+ * - `Error`              — the stream itself failed; exception embedded in the return value.
+ * - `Dropped`            — the stream was cancelled; it yields nothing more.
  *
  * For `void` streams, `optional<T>` is replaced by `bool` (`true` = item, `false` = exhausted).
+ *
+ * **Errors:** an `Error` is a failure of the stream, not of one item; a failure that belongs
+ * to an item is part of the item (as `JoinSet` yields a `JoinResult`). Once failed, a stream
+ * stays failed: every later poll returns an `Error`, though which exception is unspecified.
+ *
+ * **Exhaustion** is not an error, and not necessarily permanent: each stream's contract says
+ * whether it can yield again (a `JoinSet` does after another `spawn()`; an `MpscReceiver`
+ * with no senders left never does).
  *
  * @tparam S The candidate type to check.
  */
@@ -46,6 +55,10 @@ concept Stream = requires(S& s, detail::Context& ctx) {
  * @brief Adapts a @ref Stream into a @ref Future so it can be `co_await`-ed in a loop.
  *
  * Holds a **reference** to the stream — the stream must outlive the `NextFuture`.
+ *
+ * **Once polled, never move the stream:** a stream must stay in place from its first poll
+ * on, even between items (see doc/design/future_and_stream.md). Move it to where it will
+ * live before the first `next()`.
  *
  * Typical usage:
  * @code
@@ -141,6 +154,8 @@ private:
  * stream is cancelled and polled until it has drained before @ref TaskCancelled is
  * thrown. The stream is finished after that; all that is left to do with it is destroy
  * it.
+ *
+ * **Once polled, never move @p stream**, as for @ref next.
  *
  * @return `nullopt`/`false` once the stream is exhausted (matching `next()`'s return type
  * for the stream's `ItemType` — `bool` for `void` streams, `optional<T>` otherwise).

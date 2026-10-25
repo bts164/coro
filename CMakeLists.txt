@@ -180,7 +180,8 @@ else()
     target_include_directories(coro PUBLIC include ${CORO_GENERATED_INCLUDE_DIR})
     target_link_libraries(coro PUBLIC
         $<$<BOOL:${WITH_GPERFTOOLS}>:${CORO_GPERFTOOLS_TARGET}>
-        ${CORO_LIBWEBSOCKETS_TARGET})
+        ${CORO_LIBWEBSOCKETS_TARGET}
+        $<$<BOOL:${CORO_LIBWEBSOCKETS_USES_LIBCAP}>:cap>)
     if(CORO_TRACING STREQUAL "tracy")
         # PRIVATE definition: only src/detail/trace.h reads it, and no public header
         # includes that. The link is PUBLIC so that a program adding its own zones

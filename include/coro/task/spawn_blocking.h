@@ -12,6 +12,7 @@
 #include <coro/detail/waker.h>
 #include <coro/runtime/executor.h>
 #include <coro/task/cancel_and_join.h>
+#include <coro/task/cancel_handle.h>
 #include <cassert>
 #include <chrono>
 #include <concepts>
@@ -128,6 +129,14 @@ public:
     [[nodiscard]] CancelAndJoin<BlockingHandle> cancel_and_join() && {
         request_cancel();
         return CancelAndJoin<BlockingHandle>(std::move(*this));
+    }
+
+    // A copyable handle whose cancel() is request_cancel(). Empty for a
+    // moved-from handle; a detached handle still gives a working one, since
+    // detach() keeps the task. Finished once poll() has seen the task end.
+    [[nodiscard]] CancelHandle cancel_handle() const {
+        if (!m_state) return {};
+        return CancelHandle(m_task, m_finished);
     }
 
     // Dropping the handle no longer requests cancellation: the callable runs to

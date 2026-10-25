@@ -26,7 +26,7 @@ coro::Coro<void> compact(coro::TeamMember me, const Table& table, Out& out) {
 coro::JoinSet<void> set;
 for (coro::TeamMember& member : coro::make_team(k))
     set.spawn(compact(std::move(member), table, out));   // table and out outlive the drain
-co_await set.drain_or_cancel();
+co_await set.drain();
 ```
 
 [`parallel()`](parallel.md) builds one team per call and gives each part its member, so
@@ -773,9 +773,10 @@ Without a tag:
 
 ### Error precedence in `parallel()`
 
-When member 2 throws, the others fail with `TeamBroken`, and the `JoinSet` may see one
-of those failures first. `parallel()` reports the first error that is neither
-`TeamBroken` nor `TeamRoundBroken`, and one of those only if nothing else failed. A
+When member 2 throws, the others fail with `TeamBroken`, or end with `JoinCancelled`
+once the drain cancels them, and the `JoinSet` may see one of those failures first.
+`parallel()` reports the first error that is none of `TeamBroken`, `TeamRoundBroken`
+and `JoinCancelled`, and one of those only if nothing else failed. A
 `TeamUsageError` is reported like any other error. Code
 that spawns members itself should do the same; a `JoinSet` drain helper for this is an
 [open question](#open-questions).
@@ -1265,10 +1266,10 @@ benchmark needs one, or a stress-test-style executable that prints timings.
 prefix) and an elementwise `reduce` to a root follow the same two phases. No use for
 them yet.
 
-**A `JoinSet` drain that ranks the team's errors last.** `parallel()` needs the precedence rule
-internally. A `drain_or_cancel()` variant that applies it would let hand-spawned teams get
-it too, but it puts knowledge of the team's error types in `JoinSet`. A predicate argument
-("errors to rank last") is the general form.
+**A `JoinSet` drain that ranks the team's errors last.** `parallel()` applies the precedence
+rule through `set_ranks_last()`, a predicate ("errors to rank last") on its internal drain
+future, which keeps knowledge of the team's error types out of `JoinSet`. Making that
+predicate public on `drain()` would let hand-spawned teams get the rule too.
 
 **Breaking a round on purpose.** A member that loses a result to a late cancel, or that
 wants the others to retry a round for its own reasons, breaks the next round by

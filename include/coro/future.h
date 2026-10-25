@@ -66,7 +66,14 @@ concept Cancellable = Future<F> && requires(F& f) { f.cancel(); };
  *
  * **What it is for:** keeping `f` alive, with its progress, when a `select()` (or
  * `timeout()`, etc.) branch it was passed to loses, so that `f` can be polled again:
- * offered to the next round, or awaited later. That is the only reason to use it.
+ * offered to the next round, or awaited later through `co_await coro::ref(f)`. That is
+ * the only reason to use it.
+ *
+ * **Once polled, never move `f`:** after `f` has been polled through a `FutureRef`, keep
+ * reaching it through `coro::ref(f)`. `co_await f` or `std::move(f)` moves a future that
+ * has started, which a future does not allow (see doc/design/future_and_stream.md):
+ * it may have handed its own address to a waker, a callback or a list. A container
+ * holding `f` that reallocates moves it too: `coro::ref(vec[i])`, then `vec.push_back()`.
  *
  * **What it is not for:** if `f` should be cancelled when its branch loses, pass `f`
  * itself (`std::move(f)`), not `coro::ref(f)`. `select()` then cancels the losing branch

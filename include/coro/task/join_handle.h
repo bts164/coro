@@ -3,6 +3,7 @@
 #include <coro/detail/context.h>
 #include <coro/future.h>
 #include <coro/task/cancel_and_join.h>
+#include <coro/task/cancel_handle.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/task.h>
@@ -154,6 +155,14 @@ public:
         return CancelAndJoin<JoinHandle>(std::move(*this));
     }
 
+    /// @brief A copyable handle that can cancel this task, and outlives detach().
+    /// `Empty` for an empty, moved-from or detached handle, and `co_await` moves the
+    /// handle, so take this before awaiting. `Finished` once poll() has seen the task end.
+    [[nodiscard]] CancelHandle cancel_handle() const {
+        if (!m_state) return {};
+        return CancelHandle(m_task_ref, m_finished);
+    }
+
     /// @brief Cancels the task (if cancelOnDestroy) and registers with the enclosing scope.
     ///
     /// If inside a coroutine poll (t_current_coro != null), records a weak_ptr to the child
@@ -294,6 +303,13 @@ public:
     void cancel() noexcept {
         if (auto task = m_task_ref.lock())
             task->cancel_task();
+    }
+
+    /// @brief A copyable handle that can cancel the background task. `Empty` for an
+    /// empty or moved-from handle.
+    [[nodiscard]] CancelHandle cancel_handle() const {
+        if (!m_state) return {};
+        return CancelHandle(m_task_ref);
     }
 
     /// @brief Cancels the background task and registers with the enclosing CoroutineScope.

@@ -78,7 +78,7 @@ Coro<int> sum_of_squares(int n) {
             js.spawn(compute(i));
         int total = 0;
         while (auto result = co_await coro::next(js))
-            total += *result;
+            total += result->value();
         co_return total;
     });
 }
@@ -93,7 +93,7 @@ Coro<void> join_set_with_exception() {
         JoinSet<int> js;
         js.spawn(throwing_child());
         while (auto result = co_await coro::next(js))
-            (void)result;
+            result->value();  // rethrows the child's exception
     });
 }
 
@@ -393,7 +393,7 @@ Coro<bool> spawn_burst(std::atomic<int>& started) {
         js.spawn(hold_worker(started));
     bool all = true;
     while (auto held = co_await next(js))
-        all = held.value() && all;
+        all = held->value() && all;
     co_return all;
 }
 
@@ -485,7 +485,7 @@ Coro<bool> spawn_batch_of_holders(std::atomic<int>& started) {
     }
     bool all = true;
     while (auto held = co_await next(js))
-        all = held.value() && all;
+        all = held->value() && all;
     co_return all;
 }
 

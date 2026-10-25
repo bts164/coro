@@ -1529,7 +1529,8 @@ Coro<void> run_throwing(std::vector<TeamMember>& team, std::array<std::string, 3
     JoinSet<void> set;
     for (auto& m : team) set.spawn(throwing_member(std::move(m), got));
     try {
-        co_await set.drain();
+        // Wait: cancelling the others could stop them before they see TeamBroken.
+        co_await set.drain(OnError::Wait);
     } catch (const std::exception& e) {
         reported = e.what();
     }

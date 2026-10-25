@@ -200,11 +200,10 @@ echo server and client step by step, and the finished programs are in
 | Build | [Conan](https://conan.io) 2 and CMake 3.21 or later (3.31 for the tests) | Plain CMake with the dependencies installed by hand has never been confirmed to work |
 
 Conan fetches or builds the library's dependencies ([libwebsockets](https://libwebsockets.org)
-and, by default, [gperftools](https://github.com/gperftools/gperftools)). libwebsockets
-also needs the `libcap` development package from the system:
+and, by default, [gperftools](https://github.com/gperftools/gperftools)):
 
 ```bash
-sudo apt-get install build-essential git pkg-config libcap-dev python3-pip
+sudo apt-get install build-essential git pkg-config python3-pip
 pip install conan "cmake>=3.31"
 ```
 
@@ -213,6 +212,18 @@ The Conan profile has to select C++23. After `conan profile detect`, set this in
 
 ```ini
 compiler.cppstd=gnu23
+```
+
+libwebsockets links the system's `libcap` if it finds one, and coro then links it too. A
+link that fails with `cannot find -lcap` used a libwebsockets built where `libcap` was
+installed: install `libcap-dev`, or turn it off as below and rebuild libwebsockets with
+`--build="libwebsockets/*"`, since the setting doesn't change its package ID. A
+cross-compiling profile whose target has no `libcap` has to turn it off, or libwebsockets
+may find the build machine's:
+
+```ini
+[conf]
+libwebsockets/*:tools.cmake.cmaketoolchain:extra_variables={"LWS_WITH_LIBCAP": "OFF"}
 ```
 
 ## Using coro in your project

@@ -168,7 +168,7 @@ Coro<size_t> skynet_joinset(size_t my_num, size_t remaining) {
         js.spawn(skynet_joinset(my_num + i*(remaining/10), remaining/10));
     size_t sum = 0;
     while (auto item = co_await next(js)) {
-        sum += item.value();
+        sum += item->value();
     }
     #ifndef SKYNET_BENCHMARK_ITERATIONS
     size_t exp = SkynetLookup::instance[my_num, remaining];
@@ -219,7 +219,7 @@ public:
                 }
                 auto item = std::move(result).value();
                 if (item.has_value()) {
-                    m_sum += item.value();
+                    m_sum += item->value();
                     m_next.emplace(next(m_js.value()));
                     break;
                 }
@@ -298,7 +298,7 @@ Coro<size_t> skynet_mixed0(size_t my_num, size_t remaining) {
         js.spawn(skynet_mixed1(my_num + i*(remaining/10), remaining/10, std::make_index_sequence<10>{}));
     size_t sum = 0;
     while (auto item = co_await next(js)) {
-        sum += item.value();
+        sum += item->value();
     }
     #ifndef SKYNET_BENCHMARK_ITERATIONS
     size_t exp = SkynetLookup::instance[my_num, remaining];

@@ -31,13 +31,16 @@ concept ParallelFn =
     std::is_void_v<typename std::invoke_result_t<F&, TeamMember, Args&...>::OutputType>;
 
 /// A part fails with these once another part has thrown or been cancelled: that
-/// part's exception is the one parallel() reports.
+/// part's exception is the one parallel() reports. JoinCancelled is a part the first
+/// exception cancelled, which may finish before the part that threw.
 inline bool parallel_error_ranks_last(const std::exception_ptr& error) noexcept {
     try {
         std::rethrow_exception(error);
     } catch (const TeamBroken&) {
         return true;
     } catch (const TeamRoundBroken&) {
+        return true;
+    } catch (const JoinCancelled&) {
         return true;
     } catch (...) {
         return false;
@@ -119,7 +122,7 @@ private:
     // Spawns the k parts and creates the drain. Leaves m_drain set even if a spawn
     // throws, so that the parts already started are waited for.
     void start() {
-        m_drain.emplace(m_set.drain_or_cancel());
+        m_drain.emplace(m_set.drain());
         m_drain->set_ranks_last(&detail::parallel_error_ranks_last);
         // One batch for all k spawns: on WorkStealingExecutor they are pushed under one
         // lock and min(k, idle) workers are woken at once. Closed before poll()
@@ -150,7 +153,7 @@ private:
     F                           m_fn;
     std::tuple<Args...>         m_args;
     JoinSet<void>               m_set;
-    std::optional<detail::JoinSetDrainFuture<void, detail::DrainMode::CancelOnError>> m_drain;
+    std::optional<detail::JoinSetDrainFuture<void, void>> m_drain;
     std::exception_ptr          m_spawn_error;
     bool                        m_cancel_requested = false;
     bool                        m_finished         = false;

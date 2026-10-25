@@ -368,8 +368,8 @@ Coro<void> good() {
 **Reason:** A `std::vector<JoinHandle<T>>` requires the caller to know in advance how many
 tasks there are, await them in a fixed order, and manually manage errors and cancellation.
 `JoinSet` handles all of this: it stores handles internally, delivers results in completion
-order (not spawn order), provides a single `drain()` call for cleanup, and integrates with
-`select` via the `Stream` interface. It is also the correct structured-concurrency scope
+order (not spawn order), collects them all with a single `join_all()` or `drain()` call,
+and integrates with `select` via the `Stream` interface. It is also the correct structured-concurrency scope
 boundary — dropping a `JoinSet` cancels all pending children cleanly.
 
 ```cpp
@@ -385,7 +385,11 @@ JoinSet<int> js;
 for (auto& item : items)
     js.spawn(compute(item));
 while (auto r = co_await next(js))
-    results.push_back(*r);
+    results.push_back(r->value());  // rethrows that task's exception
+
+// Or all at once: one JoinResult per task, a failure in its result rather than thrown
+for (auto& r : co_await js.join_all())
+    if (r.has_value()) results.push_back(r.value());
 ```
 
 ### SP.2 — Use `build_task().name("...").spawn(f)` for named tasks
@@ -935,7 +939,7 @@ while (true) {
 }
 ```
 
-Two rules to remember when using `coro::ref()`:
+Rules to remember when using `coro::ref()`:
 
 1. **Lvalue only.** `coro::ref()` only accepts lvalues. Store the future in a named variable
    first; `coro::ref(spawn(f()))` is a compile error. This guarantees the underlying future
@@ -946,6 +950,10 @@ Two rules to remember when using `coro::ref()`:
    it by value: `select()` cancels the losing branch and waits for it to drain before it
    returns. Wrapping it in `coro::ref()` instead leaves it running, and stopping it
    becomes your job (`co_await std::move(task).cancel_and_join()` for a `JoinHandle`).
+4. **Never move `f` once it has been polled.** To await it later, write
+   `co_await coro::ref(f)`, not `co_await f`: awaiting `f` directly moves it into the
+   awaiter, and a future must stay in place once it has started. A container holding `f`
+   that reallocates moves it too: `coro::ref(vec[i])`, then `vec.push_back(...)`.
 
 ---
 

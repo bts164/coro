@@ -148,9 +148,11 @@ Running; it is dropped when `poll()` returns. It is not stored anywhere.
 
 ## JoinSet tasks
 
-`JoinSet::spawn()` allocates a `JoinSetTask<F>` covering the executor-facing `TaskBase`
-and the result-holding `TaskState<T>`. Unlike a regular spawned task, there is no
-`JoinHandle` — the consumer reads results via the `JoinSetSharedState`.
+`JoinSet::spawn()` allocates a `JoinSetTask<F, Tag>` covering the executor-facing
+`TaskBase`, the result-holding `TaskState<T>`, and the node that links it into the set and
+holds its tag. Unlike a regular spawned task, there is no `JoinHandle`: the consumer reads
+results via the `JoinSetSharedState`. `spawn()` returns a [`CancelHandle`](#cancelhandle)
+instead, which can cancel the task but owns nothing.
 
 With executor-level ownership, `JoinSetSharedState::pending_handles` no longer needs
 to anchor each task's lifetime. It uses an intrusive list of raw `JoinSetTask*` pointers
@@ -159,9 +161,9 @@ insertion, removal, and iteration:
 
 ```mermaid
 graph TD
-    JS["JoinSet&lt;T&gt;"]
-    State["JoinSetSharedState&lt;T&gt;\n──────────────────────────\npending_handles: intrusive list\nidle_handles: intrusive list"]
-    Task["JoinSetTask&lt;F&gt;"]
+    JS["JoinSet&lt;T, Tag&gt;"]
+    State["JoinSetSharedState&lt;T, Tag&gt;\n──────────────────────────\npending_handles: intrusive list\nidle_handles: intrusive list"]
+    Task["JoinSetTask&lt;F, Tag&gt;"]
 
     JS -->|"m_state: shared_ptr — strong"| State
     State -->|"pending_handles: raw ptr — non-owning"| Task
@@ -179,10 +181,11 @@ freed. The consumer takes the reference when it pops the node (`next()` or a dra
 in its destructor.
 
 On `JoinSet` destruction, `cancel_pending()` iterates `pending_handles`, calls
-`cancel_task()` on each, and clears the list. No ownership transfer to a `CoroutineScope`
-is needed: the executor's owned list keeps every cancelled task alive, and the
-executor-level drain on shutdown ensures all cancelled tasks reach a terminal state
-before `block_on` returns.
+`cancel_task()` on each, and clears the list. Inside a coroutine it also registers each
+cancelled task with the enclosing `CoroutineScope` as a `weak_ptr`, so the parent waits
+for them. No ownership transfer is needed: the executor's owned list keeps every
+cancelled task alive, and the executor-level drain on shutdown ensures all cancelled
+tasks reach a terminal state before `block_on` returns.
 
 ---
 
@@ -232,6 +235,9 @@ On `JoinHandle` drop without `detach()` (with `cancelOnDestroy = true`): the can
 flag is set and the task will drain. The executor's owned list keeps it alive through
 the drain.
 
+A detached task can still be stopped before shutdown through a
+[`CancelHandle`](#cancelhandle) taken before `detach()`.
+
 On shutdown, the executor cancels all tracked tasks (including detached ones) and drains
 them before `block_on` returns. Detached tasks are therefore not truly "fire and forget"
 with respect to memory — they are cleaned up safely on shutdown — but they are decoupled
@@ -239,51 +245,86 @@ from any `CoroutineScope` and do not block their spawning coroutine from returni
 
 ---
 
-## Planned: `CancelHandle` (not yet implemented)
+## `CancelHandle`
 
-!!! tip "TODO: CancelHandle, a handle that can only cancel"
-    A copyable handle whose only operation is `cancel()`, like Tokio's `AbortHandle`.
-    The `JoinHandle` (or `StreamHandle`, `BlockingHandle`) stays the task's only owner and
-    the only way to get its result. A `CancelHandle` just lets other code ask the task to
-    stop.
+A copyable handle whose only operations are `cancel()` and `is_finished()`, like
+Tokio's `AbortHandle`. The `JoinHandle` (or `StreamHandle`, `BlockingHandle`) stays the
+task's only owner and the only way to get its result. A `CancelHandle` just lets other
+code ask the task to stop.
 
-    The main use is a detached task that should still be stoppable: take a
-    `CancelHandle` first, then `detach()`. Today a detached task can't be cancelled
-    before shutdown. `JoinSet::spawn` could also return one, as Tokio's does.
+The main use is a detached task that should still be stoppable: take a `CancelHandle`
+first, then `detach()`.
 
-    ```cpp
-    auto handle = coro::spawn(serve(conn));
-    coro::CancelHandle stop = handle.cancel_handle();
-    std::move(handle).detach();
-    // ... later, from any thread:
-    stop.cancel();
-    ```
+```cpp
+auto handle = coro::spawn(serve(conn));
+coro::CancelHandle stop = handle.cancel_handle();
+std::move(handle).detach();
+// ... later:
+stop.cancel();
+```
 
-    Design:
+Where one comes from:
 
-    - It holds a single `Weak<TaskBase>`, a Category 4 reference, and `cancel()` locks it
-      and calls the virtual `TaskBase::cancel_task()`. So it is not a template, one type
-      serves every kind of task, and the task needs no new fields.
-    - For a blocking task, `cancel_task()` already means "request": the callable sees it
-      at its next cancellation point, as with `BlockingHandle::request_cancel()`.
-    - It never keeps the task alive. After the task is freed, `lock()` fails and
-      `cancel()` does nothing.
-    - A cancel that arrives after the task has stored its result changes nothing:
-      `JoinHandle::poll()` returns the result whenever one is present, whatever the
-      `cancelled` flag says.
-    - `cancel()` is safe from any thread, because `cancel_task()` is.
-    - It is not a `Future`, so it does not satisfy `Cancellable`, and discarding one is
-      harmless (no `[[nodiscard]]`).
-    - Every handle type gets a `cancel_handle()` accessor. A default-constructed,
-      moved-from or detached handle returns an empty `CancelHandle`.
+| Source | Gives |
+|---|---|
+| `JoinSet::spawn()`, `JoinSetSpawnBuilder::spawn()` | A handle to the new task. Ignoring it is fine. |
+| `JoinHandle::cancel_handle()` | `Empty` for an empty, moved-from or detached handle; `Finished` once `poll()` has seen the task end. |
+| `StreamHandle::cancel_handle()` | A handle to the background task; `Empty` for an empty or moved-from handle. |
+| `BlockingHandle::cancel_handle()` | A handle to the blocking task, even after `detach()`: a detached `BlockingHandle` keeps its task and can still be awaited. |
 
-    Cancelling a task through a `CancelHandle` has the same effect as
-    `JoinHandle::cancel()`: an awaiting `JoinHandle` sees the task end as cancelled.
+`co_await handle` on an lvalue `JoinHandle` moves the handle into the awaiter, so a
+`cancel_handle()` taken afterwards is `Empty`. Take it before awaiting.
 
-    This replaces the dropped `CancellationToken` idea. Built-in cancellation already
-    reaches every task without code in the task, which an opt-in token can't. For a
-    graceful shutdown, where tasks choose how to wind down, use a `watch` channel that
-    the tasks `select` on.
+### States
+
+The handle keeps its own state, and every answer comes from it:
+
+| State | Meaning | `cancel()` | `is_finished()` |
+|---|---|---|---|
+| `Empty` | Default-constructed, moved-from, or taken from a handle with no task | does nothing | throws `std::logic_error` |
+| `Tracking` | The task may still be running | cancels the task, unless it has ended | asks the task |
+| `Finished` | The task has ended, with a value, an exception or cancelled | does nothing | `true` |
+
+`is_finished()` throws on an `Empty` handle because there is no task to answer for:
+`false` would say the task is running, and `true` that it ran.
+
+The task pointer is used only while `Tracking`. The moment `cancel()` or `is_finished()`
+sees the task has ended, the handle releases the pointer and becomes `Finished`, so a
+handle kept around does not pin the task's memory. (With `make_shared`, a `weak_ptr`
+keeps the whole allocation alive after the task is destroyed.) An expired pointer also
+means the task has ended, since the executor holds every task until then. A debug assert
+checks that the pointer is engaged only while `Tracking`.
+
+A moved-from handle is `Empty`: the move operations are hand-written so that it is not
+left `Tracking` with no task.
+
+### Behaviour
+
+- **One `Weak<TaskBase>`,** a Category 4 reference. `cancel()` locks it and calls the
+  virtual `TaskBase::cancel_task()`. So it is not a template, one type serves every
+  kind of task, and the task needs no new fields.
+- **Same effect as `JoinHandle::cancel()`:** the task ends as cancelled at its next
+  poll. An awaiting `JoinHandle` sees it end as cancelled, and a `JoinSet` reports it
+  with `JoinResult::is_cancelled()`. For a blocking task it is a request, seen at the
+  callable's next cancellation point, as with `BlockingHandle::request_cancel()`.
+- **A late cancel changes nothing.** A cancel that arrives after the task has stored its
+  result is ignored: `JoinHandle::poll()` returns the result whenever one is present,
+  whatever the `cancelled` flag says.
+- **It never keeps the task alive.** After the task is freed, `lock()` fails and
+  `cancel()` does nothing.
+- **Dropping never cancels.** It is not a `Future`, so it does not satisfy
+  `Cancellable`, and discarding one is harmless. `JoinSet::spawn()`'s return is
+  therefore not `[[nodiscard]]`.
+- **Threads.** `cancel_task()` is safe from any thread, so copies of one handle may be
+  used on any threads at once. One object may not: `cancel()` and `is_finished()` are
+  `const` yet may release the pointer, which races with another call on the same
+  object. Give each thread its own copy; copying is cheap. A mutex in every handle would
+  cost more than the copy it saves.
+
+This replaces the dropped `CancellationToken` idea. Built-in cancellation already
+reaches every task without code in the task, which an opt-in token can't. For a
+graceful shutdown, where tasks choose how to wind down, use a `watch` channel that
+the tasks `select` on.
 
 ---
 
@@ -385,6 +426,7 @@ See [shared_ptr_cycles.md](../notes/shared_ptr_cycles.md) for the full cycle ana
 | `CoroutineScope::m_pending` | `vector<weak_ptr<TaskBase>>` | — non-owning | drain tracking only; executor's owned list provides lifetime |
 | `JoinSetSharedState::pending_handles` | intrusive list of `JoinSetTask*` | — non-owning | O(1) task lookup/removal; executor's owned list provides lifetime |
 | `StreamHandle` driver ref | `weak_ptr<TaskBase>` | — non-owning | cancel-on-drop only; executor's owned list provides lifetime |
+| `CancelHandle::m_task` | `weak_ptr<TaskBase>` | 4 — cancel only | engaged only while `Tracking`; released once the handle sees the task end |
 
 ---
 
@@ -547,8 +589,17 @@ outlives its members must unlink them at completion:
 |---|---|
 | `TaskState::waker`, leaf future, channel, timer and I/O waker fields (`weak_ptr<Waker>`) | `Weak<Waker>`, 8 bytes |
 | `StreamHandle`'s driver reference (`weak_ptr<TaskBase>`) | `Weak<TaskBase>`, 8 bytes |
+| `CancelHandle::m_task` (`weak_ptr<TaskBase>`) | `Rc<TaskBase>`, 8 bytes, released as today once the handle sees the task end |
 | `CoroutineScope::m_pending` (`vector<weak_ptr<TaskBase>>`) | An intrusive list, unlinked by the child at completion, as `JoinSet` does |
 | `JoinSetSharedState::pending_handles` (raw pointers today) | Unchanged, except that linking a node takes a weak count and unlinking it releases the count |
+
+A `CancelHandle` is the one holder that has to become strong. It belongs to the
+user and may be kept for as long as they like, long after the task ends, so no rule can
+make it release its reference in time. A strong reference keeps the task's memory alive
+until the handle is dropped or sees the task end, as the `weak_ptr` does today through
+`make_shared`'s shared allocation; the task's future is already destroyed by then. It
+then no longer satisfies "never keeps the task alive" in
+[`CancelHandle`](#behaviour); that text changes with the switch.
 
 Intrusive links are the only place raw task pointers remain. They adjust the weak count
 explicitly when they link and unlink, so the abort check covers them too.
@@ -632,8 +683,8 @@ for following the two rules above.
 - **Changes:** the `Waker` base and every `Waker` subclass (`TaskBase`,
   `BlockingWaker`, and the test mocks); every field and parameter typed `Rc<Waker>`,
   `Weak<Waker>`, `Rc<TaskBase>` or `Weak<TaskBase>`, including the executor queues,
-  `Context` and the owned lists; `JoinHandle`, `StreamHandle`, `CoroutineScope` and
-  `JoinSet`'s nodes.
+  `Context` and the owned lists; `JoinHandle`, `StreamHandle`, `CancelHandle`,
+  `CoroutineScope` and `JoinSet`'s nodes.
 - **Unchanged:** `Rc` and `Weak` for types that are not wakers, such as
   `JoinSetSharedState` and channel state. These stay `std::shared_ptr` off Pico.
 - **The atomics convention:** the strong and weak counts are atomics,

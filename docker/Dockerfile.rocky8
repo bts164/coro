@@ -20,9 +20,8 @@ ENV CONAN_HOME=/root/.conan2
 # is gcc-toolset-15. The sanitizer packages are what -fsanitize links against; the
 # toolset's compiler does not bring them in.
 #
-# libcap-devel is here for the same reason it's in conanfile.py's
-# system_requirements(): libwebsockets' own CMakeLists.txt probes for it via
-# find_path/find_library at its own (Conan-driven) build time.
+# libcap-devel is left out on purpose, so that libwebsockets builds without
+# libcap here; the ubuntu2404 image has it, so CI covers both cases.
 #
 # perl is the full distribution, not perl-interpreter: OpenSSL, which Conan builds
 # from source here, configures itself with modules the interpreter alone lacks.
@@ -48,7 +47,6 @@ RUN dnf install -y epel-release && dnf install -y \
         perl \
         python3.12 \
         python3.12-pip \
-        libcap-devel \
         ca-certificates \
         diffutils \
         which \

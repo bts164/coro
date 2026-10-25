@@ -168,7 +168,7 @@ Lives in `include/coro/sync/mutex.h`.
 
 ## `void` support for `mpsc` and `CoroStream`
 
-`JoinSet<void>` already works correctly — it uses `std::conditional_t<std::is_void_v<T>, bool, std::optional<T>>` for its stream item type and has no internal value storage. `mpsc_channel<void>` and `CoroStream<void>` do not compile today because both store `T` values internally.
+`JoinSet<void>` already works correctly — it is a stream of `JoinResult<void>`, which carries a task's exception or cancellation but no value. `mpsc_channel<void>` and `CoroStream<void>` do not compile today because both store `T` values internally.
 
 For `mpsc<void>` the fix requires: replacing `std::deque<T>` with a count, removing the value field from `MpscSenderNode<T>`, changing `send(T)` / `try_send(T)` to zero-argument forms, and threading `if constexpr` or a `ValueOrUnit` type alias through `RecvFuture::poll()` and `_tryPromoteSender()`. Not difficult, just touching many sites.
 
@@ -178,10 +178,10 @@ The use case for both is real: multi-producer event notification where the signa
 
 ## `JoinSet` — completed result accumulation
 
-`JoinSet` removes a task from its internal task list when it completes, but the result is
-moved into a completion queue and held there until consumed via `next()`. In a long-running
-server that spawns a task per connection and never drains the set, completed results
-accumulate indefinitely — a slow memory leak proportional to total connections served.
+`JoinSet` removes a task from its pending list when it completes, but the completed task,
+with its result, is moved to an idle queue and held there until consumed via `next()`. In a
+long-running server that spawns a task per connection and never consumes the set, completed
+tasks accumulate indefinitely — a slow memory leak proportional to total connections served.
 
 The right fix is unclear and needs more consideration before committing to an API:
 
@@ -194,8 +194,10 @@ The right fix is unclear and needs more consideration before committing to an AP
   ready without blocking, called opportunistically by the spawner between spawns.
 
 Until resolved, callers using `JoinSet` in fire-and-forget patterns (e.g. one task per
-connection) should periodically call `next()` or `drain()` to keep the completion queue
-bounded, or use `spawn(...).detach()` instead if results are not needed at all.
+connection) should consume outcomes with `next()` as they arrive, for example in a
+`select()` alongside the accept loop, to keep the idle queue bounded. `drain()` and
+`join_all()` don't help here: they wait for every task, the running ones too. Or use
+`spawn(...).detach()` instead if results are not needed at all.
 
 ## `JoinSet` — `CoroStream<T>` producer support
 
@@ -269,18 +271,6 @@ All combinators are lazy (zero-cost wrappers satisfying `Stream`) and live in
 `include/coro/stream/` (new subdirectory). Each has a corresponding free function
 returning a `[[nodiscard]]` adaptor type.
 
-## `CancelHandle`
-
-A copyable handle that can request cancellation of a task and do nothing else, like
-Tokio's `AbortHandle`. The `JoinHandle` stays the task's only owner and the only way to
-get its result. The main use is a detached task that should still be stoppable. See
-[task_ownership.md](design/task_ownership.md#planned-cancelhandle-not-yet-implemented) for
-the design.
-
-A `CancellationToken` was considered and dropped: built-in cancellation already reaches
-every task with no code in the task, which a token cannot do. A graceful shutdown, where
-tasks choose how to wind down, is a `watch` channel the tasks `select` on.
-
 ## I/O primitives
 
 `TcpStream`/`TcpListener`, `WsStream`/`WsListener`, `UdpSocket`, `Pipe`, `File`,
@@ -318,3 +308,32 @@ Suggested events to instrument once logging exists:
 - `IoDriver` turns and timer wakeups
 - Worker thread start / stop
 - Injection queue drain counts (task budget enforcement)
+
+## Tutorials built from compiled code
+
+The code in `getting_started.md` is pasted into the guide, so it is checked only by
+review and can drift from the library. The examples have no walkthrough at all.
+
+The plan is to build every tutorial from code that compiles:
+
+- **One directory per step.** Each stage of a tutorial's example is a complete program
+  in its own directory, built by the examples' CMake and in CI. The reader gets a
+  runnable copy of every step, and a step that stops compiling fails the build.
+- **Snippets, not copies.** The tutorial pulls its code from those files with
+  `pymdownx.snippets` (`--8<-- "path/file.cpp:section"`, with section markers in the
+  source), so the text always shows the code that was compiled. `mkdocs.yml` doesn't
+  enable the extension yet, and `docs_dir: doc` leaves `examples/` outside the docs, so
+  the extension needs a `base_path` that reaches it.
+- **A tutorial per example.** Each example gets a `README.md` that builds it up step by
+  step and teaches a small set of features, assuming `getting_started.md`. That keeps
+  the guide to the core principles, and keeps every tutorial small enough to maintain.
+
+!!! tip "TODO: Compiled, step-by-step tutorials"
+    1. Enable `pymdownx.snippets` and decide where the step directories live.
+    2. Split `getting_started.md`'s examples into compiled steps and include them as
+       snippets.
+    3. Write the gRPC example's tutorial: one handler task per call, re-arming,
+       `JoinSet` tags to log a failed handler by RPC type, reaping, and a graceful
+       shutdown that never cancels a handler with a gRPC operation outstanding.
+    4. Add a "Where next" list at the end of `getting_started.md` linking each example
+       tutorial and naming what it teaches.

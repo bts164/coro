@@ -130,25 +130,36 @@ static Coro<int> run_server() {
     TcpListener listener = co_await TcpListener::bind("127.0.0.1", 8080);
     LOG(-1, "TCP echo server listening on 127.0.0.1:8080");
 
-    // JoinSet tracks all active sessions. Dropping it (on cancellation) cancels
-    // every in-flight session and waits for them to drain.
-    JoinSet<void> sessions;
+    // JoinSet tracks all active sessions, each tagged with its connection number.
+    // Dropping it (on cancellation) cancels every in-flight session and waits for
+    // them to drain.
+    JoinSet<void, int> sessions;
 
     for (int i = 0;; ++i) {
         try {
             auto sel = co_await coro::select(
                 listener.accept(),
-                // Reap finished sessions (rethrows if one threw). Gated: next() on
-                // an empty JoinSet resolves immediately and would busy-spin.
+                // Reap finished sessions. Gated: next() on an empty JoinSet
+                // resolves immediately and would busy-spin.
                 coro::when(!sessions.empty(), [&] { return coro::next(sessions); })
             );
             if (sel.index() == 0) {
                 TcpStream& stream = std::get<0>(sel).value;
                 LOG(-1, "Accepted new connection %d", i);
-                sessions.spawn(handle_connection(std::move(stream), i));
+                sessions.spawn(i, handle_connection(std::move(stream), i));
+                continue;
+            }
+            // A failed session is logged; the server keeps serving the others.
+            std::optional<JoinResult<void, int>>& done = std::get<1>(sel).value;
+            try {
+                if (done) done->value();  // rethrows if the session threw
+            } catch (const std::exception& e) {
+                LOG(done->tag(), "Session error: %s", e.what());
             }
         } catch (const std::exception& e) {
-            LOG(-1, "Session error: %s — shutting down", e.what());
+            // Only accept() reaches here: next() hands a session's failure back as
+            // its result instead of throwing it.
+            LOG(-1, "Listener error: %s — shutting down", e.what());
             co_return 1;
         }
     }

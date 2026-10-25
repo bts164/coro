@@ -115,7 +115,8 @@ coro::Coro<int> async_main(int argc, char* argv[]) {
     for (int i = 0; i < 10; ++i) {
         clients.spawn(run_client(i, message));
     }
-    co_await clients.drain();
+    // Waits for every client, letting the others run on if one fails.
+    co_await clients.drain(coro::OnError::Wait);
     LOG(-1, "All clients completed");
     co_return 0;
 }

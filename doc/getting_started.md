@@ -111,7 +111,8 @@ directly:
 // Tasks
 #include <coro/task/join_handle.h>        // JoinHandle<T>
 #include <coro/task/stream_handle.h>      // StreamHandle<T>
-#include <coro/task/join_set.h>           // JoinSet<T>
+#include <coro/task/join_set.h>           // JoinSet<T, Tag>, JoinResult
+#include <coro/task/cancel_handle.h>      // CancelHandle — stop one task without owning it
 #include <coro/task/spawn_builder.h>      // SpawnBuilder — returned by build_task()
 #include <coro/task/spawn_blocking.h>     // spawn_blocking()
 #include <coro/task/spawn_on.h>           // spawn_on(), with_context()
@@ -1204,14 +1205,16 @@ that finishes first is rarely the one we chose, so a finished session sits uncol
 an error in it goes unnoticed until its turn comes.
 
 `JoinSet` is a collection of tasks that is awaited as a whole. `co_await
-coro::next(sessions)` resolves with the next task to finish, whichever one that is,
-delivering its result or rethrowing its exception. The rest keep running. Tasks can be
-added at any time, so the set grows and shrinks as sessions come and go.
+coro::next(sessions)` resolves with the next task to finish, whichever one that is, as a
+`JoinResult`: the task's outcome, held rather than thrown. `r->value()` returns the value
+or rethrows the task's exception, and `r->has_value()` and `r->exception()` look without
+throwing. The rest keep running. Tasks can be added at any time, so the set grows and
+shrinks as sessions come and go.
 
 One behaviour to know up front: `next()` on an **empty** `JoinSet` does not wait for a
-task to be added. It resolves immediately with "nothing left" — `false` for a
-`JoinSet<void>`, `std::nullopt` otherwise — the same way any exhausted stream ends, which
-is what lets `while (co_await coro::next(sessions))` terminate. `sessions.empty()` reports
+task to be added. It resolves immediately with `std::nullopt`, the same way any
+exhausted stream ends, which is what lets `while (co_await coro::next(sessions))`
+terminate. `sessions.empty()` reports
 whether any task is currently pending or awaiting consumption, so you can check before
 asking. That matters as soon as `next(sessions)` is raced against another branch, which
 is where section 10 picks this up.
@@ -1240,10 +1243,19 @@ Dropping `sessions` at any point — whether `run_server` returns normally, thro
 cancelled — cancels every in-flight connection simultaneously and drains them before the
 frame is freed.
 
-When the opposite is wanted — let every task run to completion — `co_await
-sessions.drain()` waits for all of them. Results are discarded; if any task threw, the
-first exception is rethrown once they have all finished. It is the `JoinSet` counterpart
-of awaiting each `JoinHandle` in a loop, and reappears in section 14.
+Three awaitable operations wait for the whole set instead:
+
+- **`co_await sessions.join_all()`** returns every task's `JoinResult`, in completion
+  order, and never throws. It reappears in section 14.
+- **`co_await sessions.drain()`** discards the values and rethrows the first failure.
+- **`co_await sessions.shutdown()`** cancels every task, waits for them all, and ignores
+  their outcomes. It is dropping the set, but awaited, so the code after it runs only once
+  the tasks are gone. Section 15 uses it.
+
+By default, `join_all()` and `drain()` cancel the tasks still running as soon as one
+fails; pass `coro::OnError::Wait` to let them finish instead. The rule is that an
+operation that hands back outcomes never throws them, and one that hands back none throws
+the first failure.
 
 The same coroutine scope rules that govern individually spawned tasks and their `JoinHandle`s
 apply here too — a task spawned into a `JoinSet` still needs any referenced data to outlive
@@ -1407,32 +1419,48 @@ from the `co_await`.
 This is exactly what the section 8 loop was missing. Instead of awaiting `accept()` then
 `next(sessions)` sequentially, we race them — whichever fires first is handled and the loop
 continues immediately, keeping new connections and completed sessions serviced without
-either starving the other:
+either starving the other.
+
+The loop also needs to say *which* session failed. A `JoinSet` can carry a tag for each
+task: `JoinSet<void, int>` takes the tag first, as `spawn(i, ...)`, and the task's
+`JoinResult` hands it back as `tag()`, whatever its ending. A failed session is logged by
+its connection number, and the server carries on: one client's error is no reason to stop
+serving the rest.
 
 ```cpp
 coro::Coro<int> run_server() {
     coro::TcpListener listener = co_await coro::TcpListener::bind("127.0.0.1", 8080);
     std::printf("listening on 127.0.0.1:8080\n");
 
-    coro::JoinSet<void> sessions;
+    coro::JoinSet<void, int> sessions;  // each session tagged with its connection number
     for (int i = 0; ; ++i) {
         try {
-            // variant<SelectBranch<0, TcpStream>, SelectBranch<1, bool>>
+            // variant<SelectBranch<0, TcpStream>,
+            //         SelectBranch<1, std::optional<JoinResult<void, int>>>>
             auto sel = co_await coro::select(
                 listener.accept(),  // branch 0: new connection ready
-                // branch 1: a session completed (throws if it threw). Gated on
-                // !sessions.empty() — see "Selecting a branch that isn't always
-                // available" below for why an ungated coro::next(sessions) here
-                // would busy-spin while sessions is empty.
+                // branch 1: a session ended. Gated on !sessions.empty() — see
+                // "Selecting a branch that isn't always available" below for why an
+                // ungated coro::next(sessions) here would busy-spin while sessions
+                // is empty.
                 coro::when(!sessions.empty(), [&] { return coro::next(sessions); })
             );
             if (sel.index() == 0) {
                 coro::TcpStream& stream = std::get<0>(sel).value;
-                sessions.spawn(handle_connection(std::move(stream), i));
+                sessions.spawn(i, handle_connection(std::move(stream), i));
+                continue;
             }
-            // branch 1: session completed normally — loop and accept more connections
+            // branch 1: log a session that failed, then loop and accept more
+            std::optional<coro::JoinResult<void, int>>& done = std::get<1>(sel).value;
+            try {
+                if (done) done->value();  // rethrows if the session threw
+            } catch (const std::exception& e) {
+                std::printf("[%d] session error: %s\n", done->tag(), e.what());
+            }
         } catch (const std::exception& e) {
-            std::printf("session error: %s — shutting down\n", e.what());
+            // Only accept() reaches here: next() hands a session's failure back
+            // as its result instead of throwing it.
+            std::printf("listener error: %s — shutting down\n", e.what());
             co_return 1;
         }
     }
@@ -1528,6 +1556,10 @@ exactly what a once-a-second progress line needs.
       `coro::ref(stream.write(...))` is a compile error.
     - If the `coro::ref(f)` branch wins and delivers a result, the result is moved out of `f`.
       Do not await `f` again — it is logically consumed even though it was not moved.
+    - Once `f` has been polled, never move it: a future must stay in place once it has
+      started. To await it later, write `co_await coro::ref(f)`, not `co_await f`, which
+      moves it. A container holding `f` that reallocates (`push_back` after
+      `coro::ref(vec[i])`) moves it too.
 
 #### Selecting a branch that isn't always available — `coro::when()`
 
@@ -2348,7 +2380,7 @@ static Coro<int> run_server() {
     TcpListener listener = co_await TcpListener::bind("127.0.0.1", 8080);
     std::printf("listening on 127.0.0.1:8080\n");
 
-    JoinSet<void> sessions;
+    JoinSet<void, int> sessions;  // tagged with the connection number
     for (int i = 0;; ++i) {
         try {
             auto sel = co_await coro::select(
@@ -2357,10 +2389,17 @@ static Coro<int> run_server() {
             );
             if (sel.index() == 0) {
                 TcpStream& stream = std::get<0>(sel).value;
-                sessions.spawn(handle_connection(std::move(stream), i));
+                sessions.spawn(i, handle_connection(std::move(stream), i));
+                continue;
+            }
+            std::optional<JoinResult<void, int>>& done = std::get<1>(sel).value;
+            try {
+                if (done) done->value();  // rethrows if the session threw
+            } catch (const std::exception& e) {
+                std::printf("[%d] session error: %s\n", done->tag(), e.what());
             }
         } catch (const std::exception& e) {
-            std::printf("session error: %s — shutting down\n", e.what());
+            std::printf("listener error: %s — shutting down\n", e.what());  // accept() failed
             co_return 1;
         }
     }
@@ -2412,7 +2451,8 @@ The same server, with timestamped log lines in place of the bare `printf` calls,
 
 The companion client connects to the server and runs N connections concurrently, each
 sending several messages with randomised delays between them. All connections are spawned
-into a `JoinSet` so `async_main` waits for every one to finish before returning.
+into a `JoinSet`, tagged with their client number, so `async_main` can wait for every one
+and report each failure by client.
 
 ```cpp
 #include <coro/coro.h>
@@ -2484,7 +2524,7 @@ static Coro<int> collect_results(MpscReceiver<std::string> rx) {
 coro::Coro<int> async_main(std::string message) {
     constexpr int num_clients = 10;
 
-    JoinSet<void> clients;
+    JoinSet<void, int> clients;  // tagged with the client number
 
     // Spawn all clients, each with a cloned sender.  The original tx is dropped
     // at the end of the lambda so the channel closes when the last task-owned
@@ -2492,25 +2532,30 @@ coro::Coro<int> async_main(std::string message) {
     MpscReceiver<std::string> rx = [&] {
         auto [tx, rx] = mpsc_channel<std::string>(num_clients * 5); // MpscSender<string>, MpscReceiver<string>
         for (int i = 0; i < num_clients; ++i)
-            clients.spawn(run_client(i, message, tx.clone()));
+            clients.spawn(i, run_client(i, message, tx.clone()));
         return rx;  // tx dropped here — channel closes when all task-owned clones drop
     }();
 
-    // Spawn the collector as a separate task with cancelOnDestroy(false).
-    // If clients.drain() throws, every client has already finished and dropped its
-    // sender, but replies may still be sitting in the channel. The collector is not
-    // cancelled — it stays alive, flushes whatever is left, and completes once it
-    // sees the channel closed. async_main cannot exit until the collector finishes.
     JoinHandle<int> collector = coro::spawn(collect_results(std::move(rx)));
-    collector.cancelOnDestroy(false);
 
-    // Waits for every client (section 8). If any threw, the first exception is
-    // rethrown here once they have all finished.
-    co_await clients.drain();
+    // Waits for every client (section 8) and never throws: one JoinResult per client.
+    // OnError::Wait lets the others run on when one fails.
+    int failed = 0;
+    for (JoinResult<void, int>& r : co_await clients.join_all(OnError::Wait)) {
+        try {
+            r.value();  // rethrows if that client threw
+        } catch (const std::exception& e) {
+            std::printf("client %d failed: %s\n", r.tag(), e.what());
+            ++failed;
+        }
+    }
 
+    // Every client has dropped its sender, so the collector finishes as soon as it
+    // has written the replies still in the channel.
     int written = co_await collector;
-    std::printf("all done — %d replies written to results.txt\n", written);
-    co_return 0;
+    std::printf("all done — %d replies written to results.txt, %d clients failed\n",
+                written, failed);
+    co_return failed == 0 ? 0 : 1;
 }
 
 int main(int argc, char* argv[]) {
@@ -2541,13 +2586,10 @@ A few things worth noting:
   only task-owned clones alive. When the last client exits — whether normally, by throwing,
   or by cancellation — the last clone is dropped, the channel closes, and the collector's
   `next(rx)` loop exits naturally with no explicit signal needed.
-- **`cancelOnDestroy(false)` for clean shutdown.** If a client times out, `clients.drain()`
-  still waits for the remaining clients, then rethrows the exception out of `async_main`.
-  That unwinds past `co_await collector`, dropping the collector's handle while replies
-  may still be buffered in the channel. The collector is not cancelled — it keeps running
-  until it has read them all and seen the channel close, and only then is `async_main`
-  allowed to exit. Without `cancelOnDestroy(false)`, the collector would be cancelled as
-  part of scope cleanup and the channel would never be fully drained.
+- **Outcomes, not exceptions.** `join_all()` hands back every client's outcome instead of
+  throwing the first failure, so one client timing out neither stops the others nor
+  skips `co_await collector`: the replies the others sent are still written. The tag
+  says which client failed.
 - **Data ownership.** Each `run_client` call receives its own copy of `message` and an
   owned sender. No sharing, no synchronization needed.
 
@@ -2822,10 +2864,10 @@ manually; the accept loop reaps finished handlers with the same `when()`-gated
 `next(peers)` branch as the section 10 server. `listener.accept()` never fails while the
 listener is alive, so the loop also races it against `SIGINT` (section 12) to give the
 server a way to stop. On Ctrl-C the server exits as soon as it can rather than waiting
-for clients to leave: the `JoinSet` is dropped, which cancels every peer handler still
-connected. Shutdown then flows through the channel: the accept loop drops its `iq_tx` clone; as each `handle_peer` is
-destroyed it drops its own clone; when the last clone is gone `blocking_next` returns
-`nullopt` and the compute worker exits. Nothing tells the worker to stop explicitly —
+for clients to leave: `peers.shutdown()` cancels every peer handler still connected and
+waits for them all. Shutdown then flows through the channel: each `handle_peer` drops its
+`iq_tx` clone as it is destroyed, then the accept loop drops its own; when the last clone
+is gone `blocking_next` returns `nullopt` and the compute worker exits. Nothing tells the worker to stop explicitly —
 the channel's sender count is the signal:
 
 ```cpp
@@ -2843,29 +2885,29 @@ static Coro<void> run_dsp(uint16_t port) {
     // Created once and lent to each select() with coro::ref(), so Ctrl-C is watched
     // continuously rather than only while a select() is in progress.
     auto interrupted = coro::signal(SIGINT);
-    {
-        JoinSet<void> peers;
-        for (;;) {
-            // std::variant<SelectBranch<0, WsStream>, SelectBranch<1, bool>, SelectBranch<2, void>>
-            auto sel = co_await select(
-                // Branch 0: a new peer connected.
-                listener.accept(),
-                // Branch 1: a peer handler finished — reap it so the JoinSet doesn't
-                // grow without bound. Disabled while there is nothing to reap.
-                coro::when(!peers.empty(), [&] { return coro::next(peers); }),
-                // Branch 2: Ctrl-C.
-                coro::ref(interrupted));
-            if (sel.index() == 2) break;
-            if (sel.index() == 0)
-                peers.spawn(handle_peer(std::move(std::get<0>(sel).value), iq_tx.clone()));
-            // index 1: nothing to do — next(peers) already removed the finished handler.
-        }
-        // peers dropped here — handlers still running are cancelled, and each drops
-        // its iq_tx clone as it is destroyed.
+    JoinSet<void> peers;
+    for (;;) {
+        // std::variant<SelectBranch<0, WsStream>,
+        //              SelectBranch<1, std::optional<JoinResult<void>>>,
+        //              SelectBranch<2, void>>
+        auto sel = co_await select(
+            // Branch 0: a new peer connected.
+            listener.accept(),
+            // Branch 1: a peer handler finished — reap it so the JoinSet doesn't
+            // grow without bound. Disabled while there is nothing to reap.
+            coro::when(!peers.empty(), [&] { return coro::next(peers); }),
+            // Branch 2: Ctrl-C.
+            coro::ref(interrupted));
+        if (sel.index() == 2) break;
+        if (sel.index() == 0)
+            peers.spawn(handle_peer(std::move(std::get<0>(sel).value), iq_tx.clone()));
+        // index 1: nothing to do — next(peers) already removed the finished handler.
     }
+    // Cancel the handlers still running and wait for them; each drops its iq_tx
+    // clone as it is destroyed.
+    co_await peers.shutdown();
 
-    // Drop our own sender clone so the worker exits once the last peer handler's
-    // clone is gone too.
+    // Drop our own sender clone, the last one left, so the worker exits.
     { auto dropped = std::move(iq_tx); }
     co_await std::move(worker);
 
@@ -3031,7 +3073,7 @@ Every failure in this guide is reported in one of three ways — an exception, a
 |---|---|
 | Inside a coroutine | An exception; it unwinds through each `co_await` exactly as through a function call |
 | I/O (`bind`, `accept`, `read`, `write`, …) | Throws `std::system_error` with the OS error code. End of stream is not an error: `read` returns `n == 0` |
-| A spawned task | Its exception is rethrown where the result is collected: `co_await handle`, `next(set)`, `set.drain()` |
+| A spawned task | Its exception is rethrown where the result is collected: `co_await handle`, `set.drain()`. `next(set)` and `set.join_all()` hand it back in a `JoinResult`, whose `value()` rethrows it |
 | A task whose handle was dropped or detached | Its result is discarded, exception included |
 | `select()`, `join()` | A throwing branch cancels the others; the exception is rethrown from the `co_await` |
 | `timeout()` | Not an error — branch 1 of the returned variant |

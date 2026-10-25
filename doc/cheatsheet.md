@@ -9,7 +9,7 @@
 #include <coro/future.h>            // Future/Cancellable concepts, coro::ref(), coro::never()
 #include <coro/runtime/runtime.h>   // Runtime, spawn(), build_task()
 #include <coro/task/join_handle.h>  // JoinHandle<T>
-#include <coro/task/join_set.h>     // JoinSet<T>
+#include <coro/task/join_set.h>     // JoinSet<T, Tag>, JoinResult, CancelHandle
 #include <coro/sync/join.h>         // join()
 #include <coro/sync/select.h>       // select()
 #include <coro/sync/when.h>         // when() — conditional select() branch
@@ -90,6 +90,11 @@ coro::JoinHandle<int> h =
     coro::build_task().name("my-task").spawn(compute());
 // fire and forget
 coro::spawn(compute()).detach();
+// detached but stoppable: take a CancelHandle first (before co_await, too)
+coro::JoinHandle<void> srv = coro::spawn(serve(conn));
+coro::CancelHandle stop = srv.cancel_handle();
+std::move(srv).detach();
+stop.cancel();  // any thread; dropping a CancelHandle never cancels
 
 {
     coro::JoinHandle<int> h = coro::spawn(compute());
@@ -99,21 +104,26 @@ coro::spawn(compute()).detach();
 ## JoinSet — dynamic fan-out
 
 ```cpp
-// results in completion order
-co_await coro::co_invoke([&]() -> coro::Coro<void> {
-    coro::JoinSet<int> js;
-    for (int i = 0; i < N; ++i)
-        js.spawn(compute(i));
-    // For JoinSet<void>, next() returns bool (true = completed,
-    // false = exhausted) since std::optional<void> is ill-formed.
-    while (std::optional<int> result = co_await coro::next(js))
-        use(*result);
-});
+coro::JoinSet<int> js;
+for (int i = 0; i < N; ++i)
+    js.spawn(compute(i));
+// one JoinResult<int> per task, in completion order
+while (std::optional<coro::JoinResult<int>> r = co_await coro::next(js))
+    use(r->value());  // rethrows its exception, or throws JoinCancelled
+// r->has_value(), r->exception(), r->is_cancelled() test without throwing
 
-// wait for all tasks; discard results
-co_await js.drain();
+// all at once — never throws: std::vector<JoinResult<int>>
+for (coro::JoinResult<int>& r : co_await js.join_all()) use(r.value());
+co_await js.drain();     // discard values; rethrow the first failure
+co_await js.shutdown();  // cancel all, wait, ignore outcomes
+// join_all/drain cancel the rest at a failure; OnError::Wait lets them run
+co_await js.drain(coro::OnError::Wait);
 
-js.empty();  // true iff no task is pending or awaiting consumption
+// tagged: spawn(tag, f); r->tag() survives a cancel
+coro::JoinSet<Reply, int> calls;
+coro::CancelHandle stop = calls.spawn(id, request(id));
+js.cancel_all();  // cancel without waiting; tasks still reported
+js.empty();       // true iff no task is pending or awaiting consumption
 ```
 
 ## join — concurrent fixed fan-out

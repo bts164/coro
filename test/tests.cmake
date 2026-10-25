@@ -46,6 +46,7 @@ coro_test(runtime/test_task_budget.cpp           DESKTOP PICO_STUB ON_TARGET run
 
 # task/
 coro_test(task/test_join_handle.cpp              DESKTOP PICO_STUB ON_TARGET runtime)
+coro_test(task/test_cancel_handle.cpp            DESKTOP PICO_STUB ON_TARGET core)
 coro_test(task/test_join_set.cpp                 DESKTOP PICO_STUB ON_TARGET core)
 coro_test(task/test_stream_handle.cpp            DESKTOP PICO_STUB ON_TARGET core)
 coro_test(task/test_coro_scope.cpp               DESKTOP PICO_STUB ON_TARGET runtime)

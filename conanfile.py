@@ -1,8 +1,7 @@
-import os, sys
+import os, re, sys
 from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
-from conan.tools.system.package_manager import Apt, Dnf, PacMan, Brew
-from conan.tools.files import copy, update_conandata
+from conan.tools.files import copy, load, update_conandata
 
 # conan_version.py is a plain sibling module (not a Conan python_requires —
 # see its own file comment for why), shared with test/conanfile.py so the
@@ -144,13 +143,6 @@ class CoroRecipe(ConanFile):
     def configure(self):
         if self.settings.os != "baremetal" and self.options.shared:
             self.options.rm_safe("fPIC")
-
-    def system_requirements(self):
-        if self.settings.os == "baremetal":
-            return
-        Apt(self).install(["libcap-dev"])
-        Dnf(self).install(["libcap-devel"])
-        PacMan(self).install(["libcap"])
 
     def requirements(self):
         if self.settings.os == "baremetal":
@@ -309,7 +301,6 @@ class CoroRecipe(ConanFile):
             return
 
         self.cpp_info.libs = ["coro"]
-        self.cpp_info.system_libs = ["cap"]
         if self.options.with_gperftools:
             self.cpp_info.requires.append("gperftools::gperftools")
         if self.options.with_local_run_queue:
@@ -317,6 +308,19 @@ class CoroRecipe(ConanFile):
         if self.options.tracing == "tracy":
             self.cpp_info.requires.append("tracy::tracyclient")
         self.cpp_info.requires.append("libwebsockets::libwebsockets")
+        # lws links libcap whenever its build finds it, but its recipe doesn't
+        # tell consumers, so they would fail to link. Its lws_config.h records
+        # what the build found. This reads the lws binary the consumer links,
+        # which can be a newer build than the one a prebuilt shared coro has
+        # inside it; that one's libcap is recorded in libcoro.so itself (see
+        # cmake/deps/libwebsockets.cmake). Profiles that cross build without a
+        # target libcap turn it off in lws with
+        # libwebsockets/*:tools.cmake.cmaketoolchain:extra_variables={"LWS_WITH_LIBCAP": "OFF"}
+        lws = self.dependencies["libwebsockets"]
+        if lws.package_folder:
+            lws_config = load(self, os.path.join(lws.package_folder, "include", "lws_config.h"))
+            if re.search(r"^#define LWS_HAVE_LIBCAP\b", lws_config, re.MULTILINE):
+                self.cpp_info.system_libs.append("cap")
 
         self.cpp_info.set_property("cmake_find_package", "coro")
         self.cpp_info.set_property("cmake_find_package_multi", "coro")

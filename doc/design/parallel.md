@@ -106,9 +106,10 @@ share of `n` items) and the collectives: `sync()`, `all_reduce()`, `broadcast()`
 
 The first exception is rethrown once every part has finished. A part that throws ends,
 and destroying its member breaks the team, so the parts waiting in a collective fail
-with `TeamBroken`. The `JoinSet` may see one of those first. `parallel()` reports the
-first error that is neither `TeamBroken` nor `TeamRoundBroken`, and one of those only if
-nothing else failed. A `TeamUsageError` is reported like any other error.
+with `TeamBroken`, and the parts it cancels end with `JoinCancelled`. The `JoinSet` may
+see one of those first. `parallel()` reports the first error that is none of
+`TeamBroken`, `TeamRoundBroken` and `JoinCancelled`, and one of those only if nothing
+else failed. A `TeamUsageError` is reported like any other error.
 
 A part's exception is recorded before its frame, and the member in it, are destroyed,
 so the part's own error always reaches the drain first. An `fn` that isn't a coroutine
@@ -120,9 +121,9 @@ at once. `TeamBroken` is then the right report: it points at that bug.
 ## Design
 
 `ParallelFuture` is a hand-written future that lives in the caller's frame, like any
-awaited future. It is a `JoinSet<void>` and its `drain_or_cancel()` future (see
-[JoinSet](join_set.md#cancelling-without-dropping-cancel_all-and-drain_or_cancel)),
-with `fn` and `args` stored alongside:
+awaited future. It is a `JoinSet<void>` and its `drain()` future, which cancels the
+other parts at the first failure (see [JoinSet](join_set.md#bulk-operations)), with
+`fn` and `args` stored alongside:
 
 ```cpp
 template<typename F, typename... Args>
@@ -131,7 +132,7 @@ class ParallelFuture {
     F                           m_fn;
     std::tuple<Args...>         m_args;
     JoinSet<void>               m_set;
-    std::optional<detail::JoinSetDrainFuture<void, detail::DrainMode::CancelOnError>> m_drain;
+    std::optional<detail::JoinSetDrainFuture<void, void>> m_drain;
     std::exception_ptr          m_spawn_error;   // from starting a part
 };
 ```
@@ -160,7 +161,7 @@ sequenceDiagram
   return the exception, and only then can the caller's frame destroy the future with
   the args. The parts waiting in a collective would fail with `TeamBroken` regardless;
   the cancel stops the ones still computing between collectives. Choosing which error
-  to report is a predicate the drain is given (see [Errors](#errors)).
+  to report is a predicate the drain is given, `set_ranks_last()` (see [Errors](#errors)).
 - **A part fails to start** (`fn` or a spawn throws). The members not yet handed out are
   destroyed, which breaks the team for the parts already running, and those are
   cancelled. The drain still ends in ready or an error, and `poll()` reports the start

@@ -155,7 +155,7 @@ Coro<int> sum_of_squares(int n) {
 
         int total = 0;
         while (auto result = co_await coro::next(js))
-            total += *result;
+            total += result->value();
         co_return total;
     });
 }
@@ -180,7 +180,7 @@ Coro<void> join_set_with_exception() {
         JoinSet<int> js;
         js.spawn(throwing_child());
         while (auto result = co_await coro::next(js))
-            (void)result;
+            result->value();  // rethrows the child's exception
     });
 }
 

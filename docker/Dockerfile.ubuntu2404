@@ -16,9 +16,9 @@ ENV PICO_SDK_VERSION=2.2.0
 ENV CONAN_HOME=/root/.conan2
 
 # build-essential's default gcc/g++ on 24.04 is GCC 13 — same as the runner
-# image. libcap-dev is here for the same reason it's in conanfile.py's
-# system_requirements(): libwebsockets' own CMakeLists.txt probes for it via
-# find_path/find_library at its own (Conan-driven) build time.
+# image. libcap-dev is here so that libwebsockets links libcap, which coro's
+# package_info() then passes on to consumers; the rocky8 image leaves it out,
+# so CI covers both cases.
 #
 # Noble's apt cmake package is 3.28.3 — test/CMakeLists.txt requires >=3.31
 # (cmake_minimum_required), so cmake is deliberately left out here and
