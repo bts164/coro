@@ -494,6 +494,41 @@ The same applies to mutexes, file descriptors, and any other resource with an ex
 release step. `std::lock_guard`, `std::unique_lock`, RAII file wrappers, and similar
 handles all guarantee cleanup through their destructor — `try`/`catch` blocks do not.
 
+For a cleanup that has no RAII type of its own, such as undoing a count, restoring a
+setting or marking a state, use `coro::Defer` (`coro/defer.h`). It calls a function when
+its scope ends, however the scope ends, as Go's `defer` does:
+
+```cpp
+Coro<void> watch(WatchSender<Settings> settings) {
+    settings.send_if_modified([](Settings& s) { ++s.viewers; return true; });
+    Defer uncount([&settings] {
+        settings.send_if_modified([](Settings& s) { --s.viewers; return true; });
+    });
+    co_await serve_viewer();  // a cancel here still runs uncount
+}
+```
+
+!!! warning "Name the `Defer`"
+    `Defer([&] { ... });` with no name is a temporary, destroyed at the end of its
+    statement: the function runs at once, not when the scope ends. It is the same mistake
+    as an unnamed `std::lock_guard`. GCC and Clang warn about it, since the constructor is
+    `[[nodiscard]]`.
+
+A `Defer` is disarmed by exactly one of: the end of its scope, which calls the function;
+calling it, `uncount();`, which calls the function now; or `uncount.dismiss()`, which
+never calls it. Calling either on a disarmed `Defer` throws `std::logic_error`. After
+either, no exit calls the function, a cancel included, so call them only once no later
+`co_await` needs the function to cover it. For example, a path that is done sooner can
+call `uncount()` to release sooner, and a rollback can be dismissed once every step it
+would undo has succeeded.
+
+The deferred function is an ordinary lambda, not a coroutine, so capturing by reference is
+safe: the `Defer` and what it captures share a frame, and locals declared before it outlive
+it. It can't `co_await`. When the destructor runs it, it must not throw, since an exception
+escaping a destructor calls `std::terminate()`; an early call is ordinary code, and its
+exception reaches the caller. When a cancel destroys the frame, the function runs on
+whichever thread destroys it, which may not be the thread the coroutine last ran on.
+
 ### CA.2 — Do not assume cancelled futures stop immediately; they drain before completing
 
 **Reason:** Cancellation is cooperative and asynchronous, not instantaneous. When a future

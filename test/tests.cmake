@@ -23,13 +23,14 @@ coro_test(detail/test_frame_pool.cpp             DESKTOP PICO_STUB ON_TARGET cor
 coro_test(detail/test_poller.cpp                 DESKTOP)
 coro_test(detail/test_timer_queue.cpp            DESKTOP PICO_STUB ON_TARGET core)
 
-# Foundational types: coro.h, future.h, stream.h, co_invoke.h
+# Foundational types: coro.h, future.h, stream.h, co_invoke.h, defer.h
 coro_test(test_future.cpp                        DESKTOP PICO_STUB ON_TARGET core)
 coro_test(test_future_ref.cpp                    DESKTOP PICO_STUB ON_TARGET core)
 coro_test(test_stream.cpp                        DESKTOP PICO_STUB ON_TARGET core)
 coro_test(test_coro.cpp                          DESKTOP PICO_STUB ON_TARGET core)
 coro_test(test_coro_stream.cpp                   DESKTOP PICO_STUB ON_TARGET core)
 coro_test(test_co_invoke.cpp                     DESKTOP PICO_STUB ON_TARGET core)
+coro_test(test_defer.cpp                         DESKTOP PICO_STUB ON_TARGET core)
 
 # runtime/
 coro_test(runtime/test_runtime.cpp               DESKTOP PICO_STUB ON_TARGET runtime)

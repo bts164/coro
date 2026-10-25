@@ -11,6 +11,7 @@
 //   nc 127.0.0.1 8080
 
 #include <coro/coro.h>
+#include <coro/defer.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
@@ -56,12 +57,12 @@ using namespace std::chrono_literals;
         __LINE__, __ID__, ##__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// send_goodbye / FinalNotice
+// send_goodbye
 //
 // Last message to a client before its connection closes. send_goodbye takes
-// the stream by value — the goodbye task owns it. FinalNotice spawns it from a
-// destructor so it runs on every exit path of handle_connection: EOF, timeout,
-// or cancellation when the server shuts down.
+// the stream by value — the goodbye task owns it. handle_connection spawns it
+// from a Defer so it runs on every exit path: EOF, timeout, or cancellation
+// when the server shuts down.
 // ---------------------------------------------------------------------------
 static Coro<void> send_goodbye(TcpStream stream) {
     try {
@@ -72,20 +73,6 @@ static Coro<void> send_goodbye(TcpStream stream) {
     }
 }
 
-class FinalNotice {
-public:
-    FinalNotice(TcpStream& stream, int id) : m_stream(stream), m_id(id) {}
-    ~FinalNotice() {
-        LOG(m_id, "Connection closed");
-        // Not cancelled when the handle is dropped; the enclosing coroutine
-        // waits for it before its own completion becomes visible.
-        coro::spawn(send_goodbye(std::move(m_stream))).cancelOnDestroy(false);
-    }
-private:
-    TcpStream& m_stream;
-    int        m_id;
-};
-
 // ---------------------------------------------------------------------------
 // handle_connection
 //
@@ -94,7 +81,12 @@ private:
 // or cancellation.
 // ---------------------------------------------------------------------------
 static Coro<void> handle_connection(TcpStream stream, int id) {
-    FinalNotice notice(stream, id);
+    Defer goodbye([&stream, id] {
+        LOG(id, "Connection closed");
+        // Not cancelled when the handle is dropped; the enclosing coroutine
+        // waits for it before its own completion becomes visible.
+        coro::spawn(send_goodbye(std::move(stream))).cancelOnDestroy(false);
+    });
     LOG(id, "Connected");
     for (;;) {
         auto recv = co_await timeout(20s, stream.read(std::string(4096, '\0')));

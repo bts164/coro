@@ -906,7 +906,25 @@ coro::Coro<void> handle_connection(coro::TcpStream stream) {
 
 The same goes for anything else a `catch` or a trailing statement would normally undo:
 unlocking, closing, decrementing a counter, sending a final message. Put it in a
-destructor. Section 9 shows how to do that when the cleanup itself needs to `co_await`.
+destructor. When the cleanup has no RAII type of its own, `coro::Defer` (`coro/defer.h`)
+makes one from a lambda, which it calls when its scope ends, however the scope ends:
+
+```cpp
+coro::Coro<void> handle_connection(coro::TcpStream stream, std::atomic<int>& active) {
+    ++active;
+    coro::Defer uncount([&active] { --active; });
+    co_await serve(stream);
+}   // decremented on normal return, on an exception, and on cancellation
+```
+
+!!! warning "Name the `Defer`"
+    `coro::Defer([&active] { --active; });` with no name is a temporary, destroyed at the
+    end of its statement: the lambda runs at once, not when the scope ends. It is the same
+    mistake as an unnamed `std::lock_guard`, and GCC and Clang warn about it.
+
+A `Defer` can also be called early or dismissed; see
+[guideline CA.1](guidelines.md#ca1-use-raii-for-all-resources-owned-by-a-coroutine-frame).
+Section 9 shows what to do when the cleanup itself needs to `co_await`.
 
 ### The `JoinHandle` decides who cancels and who waits
 
@@ -1278,26 +1296,23 @@ Suppose every session needs to send the client one last goodbye frame as part of
 teardown — not just when `handle_connection` returns normally, but also if `sessions`
 cancels it: a slow client evicted by a timeout, or the whole `JoinSet` being dropped
 because `run_server` itself is shutting down. Whatever the trigger, the cleanup has to run
-every time, so the natural place to put it is a destructor on a per-connection RAII
-member — it fires on every exit path, cancelled or not, for free:
+every time, so the natural place to put it is a `Defer` (section 7) — it fires on every
+exit path, cancelled or not, for free:
 
 ```cpp
-class FinalNotice {
-public:
-    explicit FinalNotice(coro::TcpStream& stream) : m_stream(stream) {}
-    ~FinalNotice() {
-        co_await send_goodbye(m_stream);  // does not compile — destructors can't suspend
-    }
-private:
-    coro::TcpStream& m_stream;
-};
+coro::Coro<void> handle_connection(coro::TcpStream stream) {
+    coro::Defer goodbye([&stream] {
+        co_await send_goodbye(stream);  // does not compile — the lambda isn't a coroutine
+    });
+    co_await serve(stream);
+}
 ```
 
-This doesn't compile, and it's not specific to `coro` — no C++ destructor can `co_await`,
-because a destructor has no `co_await` machinery to suspend with in the first place.
-`send_goodbye` has to run somewhere else, as its own coroutine, but the destructor still
-needs a way to stop the current coroutine from being considered finished until that other
-coroutine completes.
+This doesn't compile, and it's not specific to `coro`. The lambda is called from the
+`Defer`'s destructor, and no C++ destructor can `co_await`, because a destructor has no
+`co_await` machinery to suspend with in the first place. `send_goodbye` has to run
+somewhere else, as its own coroutine, but the destructor still needs a way to stop the
+current coroutine from being considered finished until that other coroutine completes.
 
 Section 7 already gives us exactly that tool. Dropping a `JoinHandle` transfers its task into
 the current coroutine's scope, and the coroutine won't report a terminal result until every
@@ -1319,28 +1334,18 @@ coro::Coro<void> send_goodbye(coro::TcpStream stream) {
     }
 }
 
-class FinalNotice {
-public:
-    explicit FinalNotice(coro::TcpStream& stream) : m_stream(stream) {}
-
-    ~FinalNotice() {
+coro::Coro<void> handle_connection(coro::TcpStream stream) {
+    coro::Defer goodbye([&stream] {
         // spawn + drop with cancelOnDestroy(false): attaches send_goodbye() to the
         // enclosing coroutine's scope as a task that must complete, rather than one
         // that gets cancelled alongside everything else currently unwinding.
         // std::move hands the stream itself to the task, not a reference to it.
-        coro::spawn(send_goodbye(std::move(m_stream))).cancelOnDestroy(false);
-    }
-
-private:
-    coro::TcpStream& m_stream;
-};
-
-coro::Coro<void> handle_connection(coro::TcpStream stream) {
-    FinalNotice notice(stream);
+        coro::spawn(send_goodbye(std::move(stream))).cancelOnDestroy(false);
+    });
     co_await serve(stream);
-    // notice is destroyed once serve() finishes, normally or mid-cancellation.
-    // ~FinalNotice's spawned send_goodbye() becomes a new scope entry right here,
-    // so handle_connection isn't fully drained — and can't report a result —
+    // goodbye is destroyed once serve() finishes, normally or mid-cancellation.
+    // The send_goodbye() it spawns becomes a new scope entry right here, so
+    // handle_connection isn't fully drained — and can't report a result —
     // until send_goodbye also completes.
 }
 ```
@@ -1366,7 +1371,7 @@ It works because a destructor never needs to *wait* on the task it starts — it
 enclosing coroutine to wait on it, and the scope mechanism already provides that for free.
 
 Note that this delays *observation* of completion, not completion itself. By the time
-`~FinalNotice` runs, `handle_connection` has finished — none of its code will run again.
+`goodbye` runs, `handle_connection` has finished — none of its code will run again.
 What the pending `send_goodbye` delays is when a caller awaiting `handle_connection` (or,
 per section 8, a `JoinSet` waiting on it) sees the result. The trigger doesn't matter either:
 normal return, a timeout or a losing `select` branch (section 10), or shutdown on an OS
@@ -2214,7 +2219,7 @@ while (std::optional<coro::SignalEvent> event = co_await coro::next(sigs)) {
 ```
 
 A session cancelled by this shutdown path drains exactly the same way as one cancelled by
-a timeout or evicted by `select` — section 9 covers the `FinalNotice` pattern for running
+a timeout or evicted by `select` — section 9 covers the `Defer` pattern for running
 async cleanup (like a goodbye frame) from a destructor during that drain, and shutdown is
 just one more trigger for the same mechanism.
 
@@ -2308,6 +2313,7 @@ the centrepiece of section 15.
 
 ```cpp
 #include <coro/coro.h>
+#include <coro/defer.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
@@ -2341,20 +2347,12 @@ static Coro<void> send_goodbye(TcpStream stream) {
     }
 }
 
-// Sends the goodbye on every exit path of handle_connection: EOF, timeout, or
-// cancellation when the server shuts down.
-class FinalNotice {
-public:
-    explicit FinalNotice(TcpStream& stream) : m_stream(stream) {}
-    ~FinalNotice() {
-        coro::spawn(send_goodbye(std::move(m_stream))).cancelOnDestroy(false);
-    }
-private:
-    TcpStream& m_stream;
-};
-
 static Coro<void> handle_connection(TcpStream stream, int id) {
-    FinalNotice notice(stream);
+    // Sends the goodbye on every exit path: EOF, timeout, or cancellation when the
+    // server shuts down.
+    Defer goodbye([&stream] {
+        coro::spawn(send_goodbye(std::move(stream))).cancelOnDestroy(false);
+    });
     std::printf("[%d] connected\n", id);
     for (;;) {
         auto recv = co_await timeout(20s, stream.read(std::string(4096, '\0')));
@@ -3093,7 +3091,8 @@ That completes the tour. These are the points from the guide to carry into your 
 - **`spawn()` starts a task that runs independently**, possibly on another thread. Its
   `JoinHandle` is the only way to its result — value or exception.
 - **Dropping a handle cancels the task, and the coroutine that dropped it waits for it.**
-  A cancelled task runs only its destructors, so all cleanup must be RAII.
+  A cancelled task runs only its destructors, so all cleanup must be RAII; `coro::Defer`
+  covers a cleanup with no RAII type of its own.
 - **Never let a task refer to data in the frame that holds its handle.** Have the task own
   its data, or spawn it from an inner `co_invoke` coroutine. Wrap every capturing lambda
   coroutine in `co_invoke`.

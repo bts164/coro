@@ -14,6 +14,7 @@ include/coro/
 ├── coro.h              Coro<T> coroutine return type
 ├── coro_stream.h       CoroStream<T> async generator return type
 ├── co_invoke.h         co_invoke() helper — wraps a lambda as a Coro<T>
+├── defer.h             Defer — calls a function when its scope ends, cancellation included
 ├── future.h            Future concept + NextFuture adapter
 ├── stream.h            Stream concept + next() helper
 │
@@ -107,6 +108,10 @@ depends on. `coro.h` and `coro_stream.h` are the primary user-facing entry point
 declare functions returning `Coro<T>` or `CoroStream<T>`). `future.h` and `stream.h` define
 the concepts that appear in API signatures and template constraint errors, and `stream.h`
 exports the `next()` helper that users call in `co_await` loops.
+
+`co_invoke.h` and `defer.h` sit beside them: helpers used inside coroutine bodies that belong
+to none of the submodules below. `Defer` is the RAII handle guideline CA.1 asks for when a
+cleanup has no type of its own.
 
 ### `runtime/` — executor and event loop
 
