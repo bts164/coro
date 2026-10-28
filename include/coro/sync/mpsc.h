@@ -45,19 +45,26 @@ struct MpscReceiverNode {
     detail::Rc<coro::detail::Waker> waker;
 };
 
+/// @brief Which receiver handle the channel has, if any.
+enum class MpscReceiverState {
+    Active,    ///< An `MpscReceiver`: values are queued.
+    Inactive,  ///< An `InactiveMpscReceiver`: sends fail with their value, nothing is queued.
+    Dropped,   ///< Neither: the channel is closed from the receiver side.
+};
+
 /**
  * @brief Shared state for an mpsc channel.
  *
  * Protected by `mutex`. Allocated once at `mpsc_channel()` construction and held
- * via `shared_ptr` by all MpscSender and MpscReceiver handles.
+ * via `Rc` by every handle, weak senders and the inactive receiver included.
  */
 template<typename T>
 struct MpscShared {
     detail::Mutex                   mutex;
     std::deque<T>                   buffer;          ///< Bounded queue.
     size_t                          capacity;        ///< Maximum buffered values.
-    size_t                          sender_count  = 0;
-    bool                            receiver_alive = true;
+    size_t                          sender_count  = 0; ///< Strong senders only; weak senders aren't counted.
+    MpscReceiverState               receiver = MpscReceiverState::Active;
     coro::detail::IntrusiveList<>   sender_waiters; ///< Suspended senders (MpscSenderNode<T>*).
     std::optional<MpscReceiverNode> receiver_waiter; ///< At most one (single consumer).
 
@@ -68,13 +75,16 @@ struct MpscShared {
 
 template<typename T> class MpscSender;
 template<typename T> class MpscReceiver;
+template<typename T> class InactiveMpscReceiver;
+template<typename T> class WeakMpscSender;
 
 /**
  * @brief Future returned by `MpscSender<T>::send()`.
  *
  * Satisfies `Future<std::expected<void, T>>`. Resolves immediately if buffer
  * space is available; suspends if the buffer is full. If the receiver is dropped
- * while this future is suspended, it resolves with the unsent value in the error slot.
+ * or inactive, or is dropped or deactivated while this future is suspended, it
+ * resolves with the unsent value in the error slot.
  *
  * **Cancellation:** if dropped while suspended, the destructor acquires the channel
  * mutex and unlinks the intrusive node before the coroutine frame is freed.
@@ -119,7 +129,7 @@ public:
     /**
      * @brief Advances the send operation.
      *
-     * 1. Receiver dropped → return unsent value as error.
+     * 1. Receiver dropped or inactive → return unsent value as error.
      * 2. Receiver waiting → move value into buffer (guaranteed empty), wake receiver.
      * 3. Buffer has space → move value into buffer.
      * 4. Buffer full → link node into sender_waiters, return Pending.
@@ -133,8 +143,9 @@ public:
 
         std::unique_lock lock(m_shared->mutex);
 
-        // Woken because receiver was dropped while we were suspended.
-        if (!m_shared->receiver_alive) {
+        // Also reached when woken because the receiver was dropped or deactivated
+        // while we were suspended.
+        if (m_shared->receiver != detail::MpscReceiverState::Active) {
             m_shared->sender_waiters.remove(&m_node);
             return OutputType(std::unexpected(std::move(*m_node.value)));
         }
@@ -304,8 +315,9 @@ public:
      * @brief Sends @p value asynchronously.
      *
      * Returns an `MpscSendFuture` that resolves immediately if buffer space is
-     * available, or suspends until space opens up. If the receiver is dropped
-     * while suspended, resolves with `std::unexpected(value)`.
+     * available, or suspends until space opens up. If the receiver is dropped or
+     * inactive, or is dropped or deactivated while suspended, resolves with
+     * `std::unexpected(value)`.
      *
      * NOT ISR-SAFE: calls waker->wake() which touches shared_ptr ref-counts and
      * the executor queue. Use IsrChannel<T>::send_from_isr() from ISR context instead.
@@ -318,16 +330,19 @@ public:
      * @brief Attempts to send @p value without suspending.
      *
      * Returns `{}` on success. On failure returns `TrySendError<T>` carrying
-     * the unsent value and the reason (`Full` or `Disconnected`).
+     * the unsent value and the reason (`Full`, `Inactive` or `Disconnected`).
      *
      * NOT ISR-SAFE: calls waker->wake() on success. Use IsrChannel<T>::send_from_isr()
      * from ISR context instead.
      */
     std::expected<void, TrySendError<T>> try_send(T value) {
         std::unique_lock lock(m_shared->mutex);
-        if (!m_shared->receiver_alive)
+        if (m_shared->receiver == detail::MpscReceiverState::Dropped)
             return std::unexpected(TrySendError<T>(
                 TrySendError<T>::Kind::Disconnected, std::move(value)));
+        if (m_shared->receiver == detail::MpscReceiverState::Inactive)
+            return std::unexpected(TrySendError<T>(
+                TrySendError<T>::Kind::Inactive, std::move(value)));
         if (m_shared->buffer.size() >= m_shared->capacity)
             return std::unexpected(TrySendError<T>(
                 TrySendError<T>::Kind::Full, std::move(value)));
@@ -350,7 +365,19 @@ public:
      */
     [[nodiscard]] bool is_closed() const {
         std::lock_guard lock(m_shared->mutex);
-        return !m_shared->receiver_alive;
+        return m_shared->receiver == detail::MpscReceiverState::Dropped;
+    }
+
+    /**
+     * @brief Returns `true` if the receiver is inactive.
+     *
+     * A snapshot, as `is_closed()` is: the receiver may be activated or deactivated
+     * concurrently. For a producer that would rather not build a value nobody will
+     * queue.
+     */
+    [[nodiscard]] bool is_inactive() const {
+        std::lock_guard lock(m_shared->mutex);
+        return m_shared->receiver == detail::MpscReceiverState::Inactive;
     }
 
     /**
@@ -363,7 +390,24 @@ public:
         return MpscSender<T>(m_shared);
     }
 
+    /**
+     * @brief Creates a weak sender, which can become a sender while the channel is
+     * open but doesn't keep it open.
+     */
+    [[nodiscard]] WeakMpscSender<T> downgrade() const {
+        return WeakMpscSender<T>(m_shared);
+    }
+
 private:
+    friend class WeakMpscSender<T>;
+
+    struct AlreadyCounted {};
+
+    // For WeakMpscSender::upgrade(), which increments sender_count itself under the
+    // same lock as its check.
+    MpscSender(detail::Rc<detail::MpscShared<T>> shared, AlreadyCounted)
+        : m_shared(std::move(shared)) {}
+
     // Decrements sender_count and wakes the receiver if this was the last
     // sender. Shared between the destructor and move-assignment so both
     // close the channel through the same protocol.
@@ -408,7 +452,7 @@ public:
 
     // Hand-written rather than defaulted: a defaulted move-assignment would
     // just overwrite m_shared, dropping the old Rc without running the
-    // receiver_alive-clear-and-wake protocol below. std::swap is NOT
+    // receiver-drop-and-wake protocol below. std::swap is NOT
     // sufficient — if the right-hand side is a named object moved via
     // std::move rather than a genuine temporary, swapping just stashes the
     // old state inside that named object, deferring the close until it
@@ -467,6 +511,33 @@ public:
     }
 
     /**
+     * @brief Makes this receiver inactive: senders fail at once until it's activated.
+     *
+     * Drops every queued value, and fails every suspended `send()` with its value.
+     * The queue is swapped out under the lock and destroyed after unlocking, so a
+     * value's destructor may use the channel.
+     *
+     * Any `recv()` future of this receiver must already have been dropped.
+     *
+     * Race: a suspended sender woken here that isn't polled until after a later
+     * `activate()` queues its value for the new receiver rather than failing.
+     */
+    [[nodiscard]] InactiveMpscReceiver<T> deactivate() && {
+        std::deque<T> dropped;
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
+        {
+            std::lock_guard lock(m_shared->mutex);
+            m_shared->receiver = detail::MpscReceiverState::Inactive;
+            m_shared->receiver_waiter.reset();
+            dropped.swap(m_shared->buffer);
+            wakers = _unlinkSenders();
+        }
+        for (auto& w : wakers) w->wake();
+        dropped.clear();
+        return InactiveMpscReceiver<T>(std::move(m_shared));
+    }
+
+    /**
      * @brief Advances the stream by one item.
      */
     PollResult<std::optional<T>> poll_next(coro::detail::Context& ctx) {
@@ -510,7 +581,18 @@ private:
         return nullptr;
     }
 
-    // Clears receiver_alive and wakes any blocked senders. Shared between the
+    // Unlinks every suspended sender, leaving its value in its node for its
+    // MpscSendFuture::poll() to return. Caller holds the mutex.
+    std::vector<detail::Rc<coro::detail::Waker>> _unlinkSenders() {
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
+        while (auto* raw = m_shared->sender_waiters.pop_front()) {
+            auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
+            if (node->waker) wakers.push_back(std::move(node->waker));
+        }
+        return wakers;
+    }
+
+    // Marks the receiver dropped and wakes any blocked senders. Shared between the
     // destructor and move-assignment so both close the channel through the
     // same protocol.
     void close() {
@@ -518,11 +600,8 @@ private:
         std::vector<detail::Rc<coro::detail::Waker>> wakers;
         {
             std::lock_guard lock(m_shared->mutex);
-            m_shared->receiver_alive = false;
-            while (auto* raw = m_shared->sender_waiters.pop_front()) {
-                auto* node = static_cast<detail::MpscSenderNode<T>*>(raw);
-                if (node->waker) wakers.push_back(std::move(node->waker));
-            }
+            m_shared->receiver = detail::MpscReceiverState::Dropped;
+            wakers = _unlinkSenders();
         }
         for (auto& w : wakers) w->wake();
         m_shared = nullptr;
@@ -530,6 +609,105 @@ private:
 
     detail::Rc<detail::MpscShared<T>> m_shared;
     detail::MpscReceiverNode               m_recv_node;
+};
+
+/**
+ * @brief A receiver that receives nothing until it's activated. Move-only.
+ *
+ * While it exists, `try_send()` fails with `TrySendError::Kind::Inactive` and `send()`
+ * fails at once with its value; neither queues anything. Dropping it closes the channel
+ * from the receiver side, as dropping the receiver does.
+ *
+ * @tparam T The value type of the channel.
+ */
+template<typename T>
+class InactiveMpscReceiver {
+public:
+    InactiveMpscReceiver(const InactiveMpscReceiver&)            = delete;
+    InactiveMpscReceiver& operator=(const InactiveMpscReceiver&) = delete;
+    InactiveMpscReceiver(InactiveMpscReceiver&&)                 = default;
+
+    // Hand-written for the same reason as MpscReceiver's: the displaced handle
+    // must close its channel now, not whenever the moved-from object is destroyed.
+    InactiveMpscReceiver& operator=(InactiveMpscReceiver&& other) noexcept {
+        if (this != &other) {
+            close();
+            m_shared = std::move(other.m_shared);
+        }
+        return *this;
+    }
+
+    ~InactiveMpscReceiver() { close(); }
+
+    /**
+     * @brief Returns the receiver, which reads from the next value sent.
+     *
+     * If every sender has already dropped, its stream ends at once.
+     */
+    [[nodiscard]] MpscReceiver<T> activate() && {
+        {
+            std::lock_guard lock(m_shared->mutex);
+            m_shared->receiver = detail::MpscReceiverState::Active;
+        }
+        return MpscReceiver<T>(std::move(m_shared));
+    }
+
+private:
+    friend class MpscReceiver<T>;
+
+    explicit InactiveMpscReceiver(detail::Rc<detail::MpscShared<T>> shared)
+        : m_shared(std::move(shared)) {}
+
+    // No sender can be suspended while the receiver is inactive, and nothing is
+    // queued, so there is nobody to wake.
+    void close() {
+        if (!m_shared) return;
+        {
+            std::lock_guard lock(m_shared->mutex);
+            m_shared->receiver = detail::MpscReceiverState::Dropped;
+        }
+        m_shared = nullptr;
+    }
+
+    detail::Rc<detail::MpscShared<T>> m_shared;
+};
+
+/**
+ * @brief A sender that doesn't keep the channel open. Copyable.
+ *
+ * Isn't counted in `sender_count`, so the receiver's stream ends when the last
+ * `MpscSender` drops, whatever weak senders remain. For an actor that hands out its
+ * own address without keeping itself alive, or a registry of actors that shouldn't
+ * outlive them.
+ *
+ * @tparam T The value type of the channel.
+ */
+template<typename T>
+class WeakMpscSender {
+public:
+    /**
+     * @brief Returns a new sender while the channel has one, else `nullopt`.
+     *
+     * The check and the increment are under one lock, so once the last sender has
+     * dropped no upgrade can reopen the channel.
+     */
+    [[nodiscard]] std::optional<MpscSender<T>> upgrade() const {
+        if (!m_shared) return std::nullopt;
+        {
+            std::lock_guard lock(m_shared->mutex);
+            if (m_shared->sender_count == 0) return std::nullopt;
+            ++m_shared->sender_count;
+        }
+        return MpscSender<T>(m_shared, typename MpscSender<T>::AlreadyCounted{});
+    }
+
+private:
+    friend class MpscSender<T>;
+
+    explicit WeakMpscSender(detail::Rc<detail::MpscShared<T>> shared)
+        : m_shared(std::move(shared)) {}
+
+    detail::Rc<detail::MpscShared<T>> m_shared;
 };
 
 /**

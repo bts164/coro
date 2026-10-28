@@ -5,12 +5,14 @@
 #include <coro/sync/select.h>
 #include <coro/future.h>
 #include <coro/runtime/runtime.h>
+#include <memory>
 #include <string>
 #include <vector>
 
 using namespace coro;
 
 static_assert(Future<BroadcastRecvFuture<int>>);
+static_assert(Future<BroadcastReceiversActiveFuture<int>>);
 
 template<typename Traits>
 class BroadcastTest : public testing::Test {
@@ -366,3 +368,256 @@ TYPED_TEST(BroadcastTest, WorksWithStringPayload) {
     EXPECT_EQ(*rx1.try_recv(), "hello");
     EXPECT_EQ(*rx2.try_recv(), "hello");
 }
+
+// --- Releasing read values ---
+
+TYPED_TEST(BroadcastTest, ValueReleasedOnceEveryReceiverReadsIt) {
+    auto [tx, rx1] = broadcast_channel<std::shared_ptr<int>>(4);
+    auto rx2 = tx.subscribe();
+    auto value = std::make_shared<int>(1);
+    std::weak_ptr<int> watch = value;
+    EXPECT_TRUE(tx.send(std::move(value)).has_value());
+    { auto copy = rx1.try_recv(); EXPECT_TRUE(copy.has_value()); }
+    EXPECT_FALSE(watch.expired());  // rx2 hasn't read it yet
+    { auto last = rx2.try_recv(); EXPECT_TRUE(last.has_value()); }
+    EXPECT_TRUE(watch.expired());
+}
+
+TYPED_TEST(BroadcastTest, LastReaderMovesValueOut) {
+    auto [tx, rx] = broadcast_channel<std::shared_ptr<int>>(4);
+    tx.send(std::make_shared<int>(1));
+    auto r = rx.try_recv();
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->use_count(), 1);  // no copy left in the ring
+}
+
+TYPED_TEST(BroadcastTest, DroppingReceiverReleasesItsUnreadValues) {
+    auto [tx, rx1] = broadcast_channel<std::shared_ptr<int>>(4);
+    auto rx2 = tx.subscribe();
+    auto value = std::make_shared<int>(1);
+    std::weak_ptr<int> watch = value;
+    tx.send(std::move(value));
+    { auto copy = rx1.try_recv(); EXPECT_TRUE(copy.has_value()); }
+    { auto dropped = std::move(rx2); }
+    EXPECT_TRUE(watch.expired());
+}
+
+TYPED_TEST(BroadcastTest, DeactivatingReceiverReleasesItsUnreadValues) {
+    auto [tx, rx] = broadcast_channel<std::shared_ptr<int>>(4);
+    auto value = std::make_shared<int>(1);
+    std::weak_ptr<int> watch = value;
+    tx.send(std::move(value));
+    auto handle = std::move(rx).deactivate();
+    EXPECT_TRUE(watch.expired());
+    (void)handle;
+}
+
+TYPED_TEST(BroadcastTest, ReceiverSubscribedAfterSendDoesNotHoldValue) {
+    auto [tx, rx1] = broadcast_channel<std::shared_ptr<int>>(4);
+    auto value = std::make_shared<int>(1);
+    std::weak_ptr<int> watch = value;
+    tx.send(std::move(value));
+    auto rx2 = tx.subscribe();
+    { auto last = rx1.try_recv(); EXPECT_TRUE(last.has_value()); }
+    EXPECT_TRUE(watch.expired());
+    EXPECT_EQ(rx2.try_recv().error().kind, BroadcastRecvError::Kind::Empty);
+}
+
+// A lagged receiver is still counted in every value from the oldest remaining on,
+// so reading them, or dropping it, releases them.
+TYPED_TEST(BroadcastTest, LaggedReceiverReleasesRemainingValues) {
+    auto [tx, rx] = broadcast_channel<std::shared_ptr<int>>(2);
+    tx.send(std::make_shared<int>(1));
+    auto second = std::make_shared<int>(2);
+    auto third  = std::make_shared<int>(3);
+    std::weak_ptr<int> watch2 = second;
+    std::weak_ptr<int> watch3 = third;
+    tx.send(std::move(second));
+    tx.send(std::move(third));
+    EXPECT_EQ(rx.try_recv().error().kind, BroadcastRecvError::Kind::Lagged);
+    { auto v = rx.try_recv(); EXPECT_EQ(**v, 2); }
+    EXPECT_TRUE(watch2.expired());
+    EXPECT_FALSE(watch3.expired());
+    { auto dropped = std::move(rx); }
+    EXPECT_TRUE(watch3.expired());
+}
+
+TYPED_TEST(BroadcastTest, OverwriteReplacesUnreadValue) {
+    auto [tx, rx] = broadcast_channel<std::shared_ptr<int>>(1);
+    auto first = std::make_shared<int>(1);
+    std::weak_ptr<int> watch = first;
+    tx.send(std::move(first));
+    tx.send(std::make_shared<int>(2));
+    EXPECT_TRUE(watch.expired());
+    auto r = rx.try_recv();
+    EXPECT_EQ(r.error().kind, BroadcastRecvError::Kind::Lagged);
+    EXPECT_EQ(r.error().skipped, 1u);
+    EXPECT_EQ(**rx.try_recv(), 2);
+}
+
+TYPED_TEST(BroadcastTest, RecvFutureReleasesValueAfterLastRead) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto _ch = broadcast_channel<std::shared_ptr<int>>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
+        tx.send(std::make_shared<int>(5));
+        auto v = co_await rx.recv();
+        EXPECT_TRUE(v.has_value());
+        EXPECT_EQ(v->use_count(), 1);
+    }());
+}
+
+// --- Inactive receiver ---
+
+TYPED_TEST(BroadcastTest, InactiveReceiverIsCopyable) {
+    auto [tx, rx] = broadcast_channel<int>(4);
+    auto handle  = tx.inactive();
+    auto handle2 = handle;
+    handle = handle2;
+    (void)rx;
+}
+
+TYPED_TEST(BroadcastTest, InactiveReceiverIsNotCounted) {
+    auto [tx, rx] = broadcast_channel<int>(4);
+    auto from_tx = tx.inactive();
+    auto from_rx = std::move(rx).deactivate();
+    EXPECT_TRUE(tx.all_receivers_dropped());
+    auto r = tx.send(1);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), 1);
+    (void)from_tx; (void)from_rx;
+}
+
+TYPED_TEST(BroadcastTest, ActivateSeesOnlyFutureValues) {
+    auto [tx, rx] = broadcast_channel<int>(4);
+    auto handle = tx.inactive();
+    tx.send(1);
+    auto live = handle.activate();
+    EXPECT_FALSE(tx.all_receivers_dropped());
+    EXPECT_EQ(live.try_recv().error().kind, BroadcastRecvError::Kind::Empty);
+    auto r = tx.send(2);
+    EXPECT_EQ(*r, 2u);
+    EXPECT_EQ(*live.try_recv(), 2);
+    (void)rx;
+}
+
+TYPED_TEST(BroadcastTest, EachActivationIsIndependentReceiver) {
+    auto [tx, rx] = broadcast_channel<int>(4);
+    auto handle = std::move(rx).deactivate();
+    auto copy = handle;
+    auto live1 = handle.activate();
+    auto live2 = copy.activate();
+    EXPECT_EQ(*tx.send(3), 2u);
+    EXPECT_EQ(*live1.try_recv(), 3);
+    EXPECT_EQ(*live2.try_recv(), 3);
+}
+
+TYPED_TEST(BroadcastTest, InactiveReceiverDoesNotKeepChannelOpen) {
+    auto [tx, rx] = broadcast_channel<int>(4);
+    auto handle = tx.inactive();
+    { auto dropped = std::move(tx); }
+    auto live = handle.activate();
+    EXPECT_TRUE(live.all_senders_dropped());
+    EXPECT_EQ(live.try_recv().error().kind, BroadcastRecvError::Kind::Closed);
+    (void)rx;
+}
+
+TYPED_TEST(BroadcastTest, ActivatedReceiverReceivesAsync) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto _ch = broadcast_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto live = std::move(_ch.second).deactivate().activate();
+        auto producer = coro::spawn([](BroadcastSender<int> tx) -> Coro<void> {
+            tx.send(8);
+            co_return;
+        }(std::move(tx)));
+        auto v = co_await live.recv();
+        EXPECT_TRUE(v.has_value());
+        EXPECT_EQ(v.value_or(-1), 8);
+        co_await producer;
+        auto end = co_await live.recv();
+        EXPECT_FALSE(end.has_value());
+        EXPECT_EQ(end.error().kind, BroadcastRecvError::Kind::Closed);
+    }());
+}
+
+// --- receivers_active() ---
+
+TYPED_TEST(BroadcastTest, ReceiversActiveCompletesAtOnceWithReceiver) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto _ch = broadcast_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto rx = std::move(_ch.second);
+        co_await tx.receivers_active();
+        EXPECT_FALSE(tx.all_receivers_dropped());
+    }());
+}
+
+TYPED_TEST(BroadcastTest, ReceiversActiveWaitsForActivate) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto _ch = broadcast_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto handle = std::move(_ch.second).deactivate();
+        auto producer = coro::spawn([](BroadcastSender<int> tx) -> Coro<void> {
+            co_await tx.receivers_active();
+            EXPECT_TRUE(tx.send(4).has_value());
+        }(std::move(tx)));
+        auto live = handle.activate();
+        auto v = co_await live.recv();
+        EXPECT_EQ(v.value_or(-1), 4);
+        co_await producer;
+    }());
+}
+
+TYPED_TEST(BroadcastTest, ReceiversActiveWokenBySubscribe) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto _ch = broadcast_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        { auto dropped = std::move(_ch.second); }
+        auto waiter = coro::spawn([](BroadcastSender<int> tx) -> Coro<void> {
+            co_await tx.receivers_active();
+        }(tx.clone()));
+        auto rx = tx.subscribe();
+        co_await waiter;
+    }());
+}
+
+TYPED_TEST(BroadcastTest, ReceiversActiveCanBeReusedAfterCancelledSelect) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto _ch = broadcast_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto handle = std::move(_ch.second).deactivate();
+        struct ImmediateInt {
+            using OutputType = int;
+            PollResult<int> poll(detail::Context&) { return 99; }
+        };
+        auto r1 = co_await select(tx.receivers_active(), ImmediateInt{});
+        EXPECT_EQ(r1.index(), 1u);
+        auto live = handle.activate();
+        co_await tx.receivers_active();
+    }());
+}
+
+#ifndef CORO_PICO
+
+TEST(BroadcastSingleThreadedTest, ReceiversActiveSuspendsUntilActivate) {
+    Runtime rt(1);
+    rt.block_on([]() -> Coro<void> {
+        auto _ch = broadcast_channel<int>(4);
+        auto tx = std::move(_ch.first);
+        auto handle = std::move(_ch.second).deactivate();
+        bool done = false;
+        auto waiter = coro::spawn([](BroadcastSender<int> tx, bool& done) -> Coro<void> {
+            co_await tx.receivers_active();
+            done = true;
+        }(tx.clone(), done));
+        auto noop = coro::spawn([](int n) -> Coro<int> { co_return n; }(0));
+        co_await noop;
+        EXPECT_FALSE(done);
+        auto live = handle.activate();
+        co_await waiter;
+        EXPECT_TRUE(done);
+    }());
+}
+
+#endif

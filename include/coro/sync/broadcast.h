@@ -8,6 +8,7 @@
 #include <coro/detail/waker.h>
 #include <coro/sync/channel_error.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <expected>
@@ -31,12 +32,33 @@ struct BroadcastReceiverNode : coro::detail::IntrusiveListNode {
 };
 
 /**
+ * @brief Intrusive node for a suspended `receivers_active()`. Lives inside
+ * `BroadcastReceiversActiveFuture<T>`.
+ */
+struct BroadcastSenderNode : coro::detail::IntrusiveListNode {
+    detail::Rc<coro::detail::Waker> waker;
+};
+
+/**
+ * @brief One value in a broadcast channel's ring, and how many receivers have yet to read it.
+ *
+ * `remaining` is the number of receivers active at `send()` that haven't read the value
+ * or been dropped or deactivated since. The receiver that takes it to 0 empties the slot.
+ */
+template<typename T>
+struct RingSlot {
+    std::optional<T> value;
+    size_t           remaining = 0;
+};
+
+/**
  * @brief Shared state for a broadcast channel.
  *
  * `ring[seq % capacity]` holds the value sent with sequence number `seq`, once that send
- * has happened and before it has been overwritten by a later wraparound. `next_seq` is the
- * sequence number that will be assigned to the *next* `send()`. A receiver's cursor is a
- * sequence number: values at or above the cursor are unread by that receiver.
+ * has happened, until every receiver counted in it has read it or a later wraparound
+ * overwrites it. `next_seq` is the sequence number that will be assigned to the *next*
+ * `send()`. A receiver's cursor is a sequence number: values at or above the cursor are
+ * unread by that receiver, and each of them counts it in `remaining`.
  *
  * The oldest sequence number still held in the ring is `next_seq - capacity` (clamped to 0
  * before the ring has wrapped once). A receiver whose cursor falls below that has lagged —
@@ -46,12 +68,13 @@ struct BroadcastReceiverNode : coro::detail::IntrusiveListNode {
 template<typename T>
 struct BroadcastShared {
     detail::Mutex                  mutex;
-    std::vector<std::optional<T>>  ring;       ///< Fixed-capacity, allocated once at construction.
+    std::vector<RingSlot<T>>       ring;       ///< Fixed-capacity, allocated once at construction.
     size_t                         capacity;
     uint64_t                       next_seq = 0; ///< Sequence number assigned to the next send().
     size_t                         sender_count   = 0;
-    size_t                         receiver_count = 0;
+    size_t                         receiver_count = 0; ///< Active receivers only.
     coro::detail::IntrusiveList<>  receiver_waiters; ///< Suspended BroadcastRecvFuture nodes.
+    coro::detail::IntrusiveList<>  sender_waiters;   ///< Suspended receivers_active() nodes.
 
     explicit BroadcastShared(size_t cap) : ring(cap), capacity(cap) {}
 
@@ -59,12 +82,65 @@ struct BroadcastShared {
     uint64_t oldest_seq() const noexcept {
         return next_seq > capacity ? next_seq - capacity : 0;
     }
+
+    /**
+     * @brief Counts a new receiver and returns its starting cursor.
+     *
+     * Wakes every `receivers_active()` waiter when the count goes from 0 to 1.
+     */
+    uint64_t add_receiver() {
+        std::vector<detail::Rc<coro::detail::Waker>> wakers;
+        uint64_t start;
+        {
+            std::lock_guard lock(mutex);
+            if (receiver_count++ == 0) {
+                while (auto* raw = sender_waiters.pop_front()) {
+                    auto* node = static_cast<BroadcastSenderNode*>(raw);
+                    if (node->waker) wakers.push_back(std::move(node->waker));
+                }
+            }
+            start = next_seq;
+        }
+        for (auto& w : wakers) w->wake();
+        return start;
+    }
+
+    /**
+     * @brief Uncounts a receiver whose cursor is @p cursor, releasing every value it
+     * hadn't read: at most `capacity` slots.
+     *
+     * A value released here is destroyed while the mutex is held.
+     */
+    void remove_receiver(uint64_t cursor) {
+        std::lock_guard lock(mutex);
+        for (uint64_t seq = std::max(cursor, oldest_seq()); seq < next_seq; ++seq) {
+            auto& slot = ring[seq % capacity];
+            assert(slot.remaining > 0 && "broadcast slot released by a receiver it didn't count");
+            if (--slot.remaining == 0) slot.value.reset();
+        }
+        --receiver_count;
+    }
+
+    /**
+     * @brief Reads the value at @p seq for one receiver. Caller holds `mutex`.
+     *
+     * Copies it, unless this is the last receiver to read it, which moves it out.
+     */
+    T take(uint64_t seq) {
+        auto& slot = ring[seq % capacity];
+        assert(slot.value.has_value() && slot.remaining > 0);
+        if (--slot.remaining > 0) return *slot.value;
+        T val = std::move(*slot.value);
+        slot.value.reset();
+        return val;
+    }
 };
 
 } // namespace detail
 
 template<typename T> class BroadcastSender;
 template<typename T> class BroadcastReceiver;
+template<typename T> class InactiveBroadcastReceiver;
 
 /**
  * @brief Future returned by `BroadcastReceiver<T>::recv()`.
@@ -133,6 +209,60 @@ private:
 };
 
 /**
+ * @brief Future returned by `BroadcastSender<T>::receivers_active()`.
+ *
+ * Satisfies `Future<void>`. Resolves when the channel has at least one active receiver, at
+ * once if it already has. Never fails.
+ *
+ * **Cancellation:** if dropped while suspended, the destructor acquires the channel mutex
+ * and unlinks the intrusive node before the coroutine frame is freed.
+ *
+ * **Move safety:** moving is only valid before `poll()` has been called.
+ *
+ * @tparam T The value type of the channel.
+ */
+template<typename T>
+class BroadcastReceiversActiveFuture {
+public:
+    using OutputType = void;
+
+    explicit BroadcastReceiversActiveFuture(detail::Rc<detail::BroadcastShared<T>> shared)
+        : m_shared(std::move(shared)) {}
+
+    BroadcastReceiversActiveFuture(const BroadcastReceiversActiveFuture&)            = delete;
+    BroadcastReceiversActiveFuture& operator=(const BroadcastReceiversActiveFuture&) = delete;
+    BroadcastReceiversActiveFuture& operator=(BroadcastReceiversActiveFuture&&)      = delete;
+
+    // Only valid before poll() — the node must not be linked when moved.
+    BroadcastReceiversActiveFuture(BroadcastReceiversActiveFuture&& other) noexcept
+        : m_shared(std::move(other.m_shared))
+        , m_node(std::move(other.m_node))
+    {
+        assert(!m_node.prev && !m_node.next &&
+               "BroadcastReceiversActiveFuture moved while linked — undefined behaviour");
+    }
+
+    ~BroadcastReceiversActiveFuture() {
+        if (!m_shared) return;
+        std::lock_guard lock(m_shared->mutex);
+        m_shared->sender_waiters.remove(&m_node);
+    }
+
+    PollResult<void> poll(coro::detail::Context& ctx) {
+        std::lock_guard lock(m_shared->mutex);
+        m_shared->sender_waiters.remove(&m_node);
+        if (m_shared->receiver_count > 0) return PollReady;
+        m_node.waker = ctx.getWaker();
+        m_shared->sender_waiters.push_back(&m_node);
+        return PollPending;
+    }
+
+private:
+    detail::Rc<detail::BroadcastShared<T>> m_shared;
+    detail::BroadcastSenderNode            m_node;
+};
+
+/**
  * @brief Producer handle for a broadcast channel. Cloneable; each clone is independent.
  *
  * `send()` is synchronous and never suspends. The channel closes from the sender side only
@@ -143,8 +273,8 @@ private:
  * **Thread safety:** each instance must be used by at most one thread at a time. For
  * multi-threaded producers, give each thread its own clone.
  *
- * @tparam T The value type to send. Must be copy-constructible — every receiver reads its
- *           own copy out of the ring buffer.
+ * @tparam T The value type to send. Must be copy-constructible — every receiver but the
+ *           last to read a value reads its own copy out of the ring buffer.
  */
 template<typename T>
 class BroadcastSender {
@@ -181,9 +311,13 @@ public:
     /**
      * @brief Sends @p value to every current receiver synchronously.
      *
-     * If the ring buffer is full, the oldest slot is silently overwritten — receivers that
-     * hadn't yet read it observe this later as `Lagged` on their next `recv()`/`try_recv()`.
-     * `send()` itself never blocks or fails for this reason.
+     * The value is held until every current receiver has read it, or has been dropped or
+     * deactivated. If the ring buffer is full, the oldest slot is silently overwritten —
+     * receivers that hadn't yet read it observe this later as `Lagged` on their next
+     * `recv()`/`try_recv()`. `send()` itself never blocks or fails for this reason.
+     *
+     * An overwritten value is destroyed while the channel's mutex is held, so its destructor
+     * must not use this channel.
      *
      * @return The number of receivers notified on success, or `std::unexpected(value)` if
      *         there are currently zero receivers (nobody to deliver it to).
@@ -199,8 +333,9 @@ public:
             if (m_shared->receiver_count == 0)
                 return std::unexpected(std::move(value));
 
-            size_t idx = m_shared->next_seq % m_shared->capacity;
-            m_shared->ring[idx] = std::move(value);
+            auto& slot     = m_shared->ring[m_shared->next_seq % m_shared->capacity];
+            slot.value     = std::move(value);
+            slot.remaining = m_shared->receiver_count;
             ++m_shared->next_seq;
             notified = m_shared->receiver_count;
 
@@ -218,9 +353,26 @@ public:
      * no replay of channel history.
      */
     [[nodiscard]] BroadcastReceiver<T> subscribe() const {
-        std::lock_guard lock(m_shared->mutex);
-        ++m_shared->receiver_count;
-        return BroadcastReceiver<T>(m_shared, m_shared->next_seq);
+        return BroadcastReceiver<T>(m_shared, m_shared->add_receiver());
+    }
+
+    /**
+     * @brief Creates an inactive receiver: a handle that can become a receiver, but receives
+     * nothing and isn't counted until it does.
+     */
+    [[nodiscard]] InactiveBroadcastReceiver<T> inactive() const {
+        return InactiveBroadcastReceiver<T>(m_shared);
+    }
+
+    /**
+     * @brief Returns a future that completes when the channel has at least one active
+     * receiver, at once if it already has.
+     *
+     * For a task that reads one output only to make another: it waits for its own readers
+     * rather than polling.
+     */
+    [[nodiscard]] BroadcastReceiversActiveFuture<T> receivers_active() const {
+        return BroadcastReceiversActiveFuture<T>(m_shared);
     }
 
     /**
@@ -345,11 +497,8 @@ public:
             return std::unexpected(BroadcastRecvError{BroadcastRecvError::Kind::Lagged, skipped});
         }
 
-        if (m_cursor < m_shared->next_seq) {
-            T val = *m_shared->ring[m_cursor % m_shared->capacity];
-            ++m_cursor;
-            return val;
-        }
+        if (m_cursor < m_shared->next_seq)
+            return m_shared->take(m_cursor++);
 
         if (m_shared->sender_count == 0)
             return std::unexpected(BroadcastRecvError{BroadcastRecvError::Kind::Closed});
@@ -364,9 +513,17 @@ public:
      * receiver's current cursor position.
      */
     [[nodiscard]] BroadcastReceiver<T> resubscribe() const {
-        std::lock_guard lock(m_shared->mutex);
-        ++m_shared->receiver_count;
-        return BroadcastReceiver<T>(m_shared, m_shared->next_seq);
+        return BroadcastReceiver<T>(m_shared, m_shared->add_receiver());
+    }
+
+    /**
+     * @brief Makes this receiver inactive, releasing every value it hadn't read.
+     *
+     * Any `recv()` future of this receiver must already have been dropped.
+     */
+    [[nodiscard]] InactiveBroadcastReceiver<T> deactivate() && {
+        m_shared->remove_receiver(m_cursor);
+        return InactiveBroadcastReceiver<T>(std::move(m_shared));
     }
 
     /// @brief Current cursor (sequence number of the next value this receiver hasn't read).
@@ -375,28 +532,24 @@ public:
 private:
     friend class BroadcastSender<T>;
     friend class BroadcastRecvFuture<T>;
+    friend class InactiveBroadcastReceiver<T>;
 
-    // receiver_count is incremented by the caller (subscribe()/resubscribe()), which already
-    // holds m_shared->mutex at the call site — incrementing here too would double-lock the
-    // (non-recursive) mutex.
+    // receiver_count is incremented by the caller, through BroadcastShared::add_receiver(),
+    // which also gives the starting cursor under the same lock.
     BroadcastReceiver(detail::Rc<detail::BroadcastShared<T>> shared, uint64_t start_seq)
         : m_shared(std::move(shared)), m_cursor(start_seq) {}
 
     /// @brief Updates the cursor. Called by `BroadcastRecvFuture` on completion.
     void set_cursor(uint64_t seq) noexcept { m_cursor = seq; }
 
-    // Decrements receiver_count. Shared between the destructor and
-    // move-assignment so both close the channel through the same protocol.
+    // Decrements receiver_count and releases every value this receiver hadn't read.
+    // Shared between the destructor and move-assignment so both close the channel
+    // through the same protocol.
     void close() {
         if (!m_shared) return;
-        // Lock scoped to a nested block: resetting m_shared below may drop the
-        // last reference to BroadcastShared, destroying its mutex. That must
-        // happen after the lock_guard has already unlocked and gone out of
-        // scope — unlocking inline would otherwise touch freed memory.
-        {
-            std::lock_guard lock(m_shared->mutex);
-            --m_shared->receiver_count;
-        }
+        // remove_receiver() unlocks before returning: resetting m_shared below may
+        // drop the last reference to BroadcastShared, destroying its mutex.
+        m_shared->remove_receiver(m_cursor);
         m_shared = nullptr;
     }
 
@@ -423,10 +576,9 @@ BroadcastRecvFuture<T>::poll(coro::detail::Context& ctx) {
     }
 
     if (cursor < m_shared->next_seq) {
-        T val = *m_shared->ring[cursor % m_shared->capacity];
         m_rx.set_cursor(cursor + 1);
         m_shared->receiver_waiters.remove(&m_node);
-        return OutputType(std::move(val));
+        return OutputType(m_shared->take(cursor));
     }
 
     if (m_shared->sender_count == 0) {
@@ -440,6 +592,34 @@ BroadcastRecvFuture<T>::poll(coro::detail::Context& ctx) {
     m_shared->receiver_waiters.push_back(&m_node);
     return PollPending;
 }
+
+/**
+ * @brief A handle that can become a broadcast receiver. Copyable.
+ *
+ * Receives nothing and isn't counted, so `all_receivers_dropped()` and `send()`'s failure
+ * mean "nobody is reading now", whatever handles exist. It can't send, which is why it exists
+ * apart from `subscribe()` on a sender clone. It doesn't keep the channel open: a receiver
+ * activated after the last sender drops gets `Closed` from its first `recv()`.
+ *
+ * @tparam T The value type of the channel.
+ */
+template<typename T>
+class InactiveBroadcastReceiver {
+public:
+    /// @brief Returns a new receiver, which sees only values sent after this call.
+    [[nodiscard]] BroadcastReceiver<T> activate() const {
+        return BroadcastReceiver<T>(m_shared, m_shared->add_receiver());
+    }
+
+private:
+    friend class BroadcastSender<T>;
+    friend class BroadcastReceiver<T>;
+
+    explicit InactiveBroadcastReceiver(detail::Rc<detail::BroadcastShared<T>> shared)
+        : m_shared(std::move(shared)) {}
+
+    detail::Rc<detail::BroadcastShared<T>> m_shared;
+};
 
 /**
  * @brief Creates a linked (sender, receiver) pair with the given ring buffer capacity.

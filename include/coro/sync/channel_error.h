@@ -31,6 +31,7 @@ template<typename T>
 struct TrySendError {
     enum class Kind {
         Full,         ///< Buffer is full; the caller may retry later.
+        Inactive,     ///< Receiver is inactive; a retry succeeds only once it's activated.
         Disconnected, ///< Receiver was dropped; retrying will never succeed.
     } kind;
 

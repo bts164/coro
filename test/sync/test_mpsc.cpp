@@ -328,6 +328,194 @@ TYPED_TEST(MpscTest, MultipleSendersCapacity1NoDuplicates) {
     EXPECT_EQ(sum, 10 + 11 + 20 + 21 + 30 + 31);
 }
 
+// --- Inactive receiver ---
+
+TYPED_TEST(MpscTest, InactiveReceiverIsMovable) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto idle  = std::move(rx).deactivate();
+    auto idle2 = std::move(idle);
+    (void)tx; (void)idle2;
+}
+
+TYPED_TEST(MpscTest, TrySendInactiveWhileReceiverInactive) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto idle = std::move(rx).deactivate();
+    auto r = tx.try_send(42);
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, TrySendError<int>::Kind::Inactive);
+    EXPECT_EQ(r.error().value, 42);
+    (void)idle;
+}
+
+TYPED_TEST(MpscTest, IsInactiveAndIsClosedTellInactiveFromDropped) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    EXPECT_FALSE(tx.is_inactive());
+    auto idle = std::move(rx).deactivate();
+    EXPECT_TRUE(tx.is_inactive());
+    EXPECT_FALSE(tx.is_closed());
+    auto live = std::move(idle).activate();
+    EXPECT_FALSE(tx.is_inactive());
+    EXPECT_FALSE(tx.is_closed());
+    { auto dropped = std::move(live); }
+    EXPECT_FALSE(tx.is_inactive());
+    EXPECT_TRUE(tx.is_closed());
+}
+
+TYPED_TEST(MpscTest, DeactivateDropsQueuedValues) {
+    auto [tx, rx] = mpsc_channel<std::shared_ptr<int>>(4);
+    auto value = std::make_shared<int>(1);
+    std::weak_ptr<int> watch = value;
+    EXPECT_TRUE(tx.try_send(std::move(value)).has_value());
+    auto idle = std::move(rx).deactivate();
+    EXPECT_TRUE(watch.expired());
+    (void)idle;
+}
+
+TYPED_TEST(MpscTest, ActivateReadsFromNextValue) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    tx.try_send(1);
+    auto idle = std::move(rx).deactivate();
+    tx.try_send(2);  // fails: inactive
+    auto live = std::move(idle).activate();
+    EXPECT_EQ(live.try_recv().error(), ChannelError::Empty);
+    EXPECT_TRUE(tx.try_send(3).has_value());
+    auto r = live.try_recv();
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(*r, 3);
+}
+
+TYPED_TEST(MpscTest, DeactivateAndActivateRepeatedly) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto idle = std::move(rx).deactivate();
+    for (int i = 0; i < 3; ++i) {
+        auto live = std::move(idle).activate();
+        EXPECT_TRUE(tx.try_send(i).has_value());
+        EXPECT_EQ(*live.try_recv(), i);
+        idle = std::move(live).deactivate();
+        EXPECT_EQ(tx.try_send(i).error().kind, TrySendError<int>::Kind::Inactive);
+    }
+}
+
+TYPED_TEST(MpscTest, ActivateAfterAllSendersDroppedEndsAtOnce) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto idle = std::move(rx).deactivate();
+    { auto dropped = std::move(tx); }
+    auto live = std::move(idle).activate();
+    EXPECT_TRUE(live.all_senders_dropped());
+    EXPECT_EQ(live.try_recv().error(), ChannelError::SenderDropped);
+}
+
+TYPED_TEST(MpscTest, DroppingInactiveReceiverDisconnects) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    { auto idle = std::move(rx).deactivate(); }
+    EXPECT_TRUE(tx.is_closed());
+    EXPECT_EQ(tx.try_send(1).error().kind, TrySendError<int>::Kind::Disconnected);
+}
+
+TYPED_TEST(MpscTest, ReassigningLiveInactiveReceiverDropsOldChannelReceiver) {
+    auto chan_a = mpsc_channel<int>(4);
+    auto tx_a   = std::move(chan_a.first);
+    auto idle_a = std::move(chan_a.second).deactivate();
+    auto chan_b = mpsc_channel<int>(4);
+    auto idle_b = std::move(chan_b.second).deactivate();
+
+    idle_a = std::move(idle_b); // displaces the inactive receiver for channel A
+
+    EXPECT_TRUE(tx_a.is_closed());
+}
+
+TYPED_TEST(MpscTest, SendFailsAtOnceWhileReceiverInactive) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(4);
+        auto idle = std::move(rx).deactivate();
+        auto r = co_await tx.send(5);
+        EXPECT_FALSE(r.has_value());
+        EXPECT_EQ(r.error(), 5);
+        (void)idle;
+    }());
+}
+
+TYPED_TEST(MpscTest, ActivatedReceiverReceivesAsync) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(4);
+        auto live = std::move(rx).deactivate().activate();
+        auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            auto r = co_await tx.send(9);
+            EXPECT_TRUE(r.has_value());
+        }(std::move(tx)));
+        auto v = co_await live.recv();
+        EXPECT_TRUE(v.has_value());
+        EXPECT_EQ(v.value_or(-1), 9);
+        co_await producer;
+        auto end = co_await live.recv();
+        EXPECT_FALSE(end.has_value());
+    }());
+}
+
+// --- Weak sender ---
+
+TYPED_TEST(MpscTest, WeakSenderIsCopyable) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto weak  = tx.downgrade();
+    auto weak2 = weak;
+    weak = weak2;
+    (void)rx;
+}
+
+TYPED_TEST(MpscTest, UpgradeWhileOpenSends) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto weak = tx.downgrade();
+    auto strong = weak.upgrade();
+    EXPECT_TRUE(strong.has_value());
+    EXPECT_TRUE(strong->try_send(7).has_value());
+    EXPECT_EQ(*rx.try_recv(), 7);
+}
+
+TYPED_TEST(MpscTest, WeakSenderDoesNotKeepChannelOpen) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto weak = tx.downgrade();
+    { auto dropped = std::move(tx); }
+    EXPECT_TRUE(rx.all_senders_dropped());
+    EXPECT_EQ(rx.try_recv().error(), ChannelError::SenderDropped);
+    EXPECT_FALSE(weak.upgrade().has_value());
+}
+
+TYPED_TEST(MpscTest, UpgradedSenderKeepsChannelOpen) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto weak = tx.downgrade();
+    auto strong = weak.upgrade();
+    { auto dropped = std::move(tx); }
+    EXPECT_FALSE(rx.all_senders_dropped());
+    { auto dropped = std::move(strong); }
+    EXPECT_TRUE(rx.all_senders_dropped());
+    EXPECT_FALSE(weak.upgrade().has_value());
+}
+
+TYPED_TEST(MpscTest, MovedFromWeakSenderUpgradesToNothing) {
+    auto [tx, rx] = mpsc_channel<int>(4);
+    auto weak = tx.downgrade();
+    auto weak2 = std::move(weak);
+    EXPECT_FALSE(weak.upgrade().has_value());  // NOLINT(bugprone-use-after-move)
+    EXPECT_TRUE(weak2.upgrade().has_value());
+    (void)rx;
+}
+
+TYPED_TEST(MpscTest, RecvEndsWhenOnlyWeakSendersRemain) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(4);
+        auto weak = tx.downgrade();
+        auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
+            co_await tx.send(1);
+        }(std::move(tx)));
+        auto v1 = co_await rx.recv();
+        EXPECT_EQ(v1.value_or(-1), 1);
+        co_await producer;
+        auto v2 = co_await rx.recv();
+        EXPECT_FALSE(v2.has_value());
+        EXPECT_FALSE(weak.upgrade().has_value());
+    }());
+}
+
 // ---------------------------------------------------------------------------
 // Single-threaded-specific tests (rely on deterministic scheduling order)
 // ---------------------------------------------------------------------------
@@ -419,6 +607,25 @@ TEST(MpscSingleThreadedTest, ReceiverDroppedWhileSenderInWaiters) {
         co_await noop;
         { auto dropped = std::move(rx); }
         co_await h;
+    }(got_error));
+    EXPECT_TRUE(got_error);
+}
+
+TEST(MpscSingleThreadedTest, DeactivateFailsSuspendedSender) {
+    Runtime rt(1);
+    bool got_error = false;
+    rt.block_on([](bool& err) -> Coro<void> {
+        auto [tx, rx] = mpsc_channel<int>(1);
+        co_await tx.send(1);
+        auto h = coro::spawn([](MpscSender<int> tx, bool& err) -> Coro<void> {
+            auto r = co_await tx.send(2);
+            err = !r.has_value() && r.error() == 2;
+        }(tx.clone(), err));
+        auto noop = coro::spawn([](int n) -> Coro<int> { co_return n; }(0));
+        co_await noop;
+        auto idle = std::move(rx).deactivate();
+        co_await h;
+        EXPECT_FALSE(tx.is_closed());
     }(got_error));
     EXPECT_TRUE(got_error);
 }

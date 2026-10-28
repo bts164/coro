@@ -1,8 +1,6 @@
 # Channels
 
-Async channels for inter-task communication. `oneshot`, `mpsc`, and `watch` are
-implemented; `broadcast` is Phase 1 design only — see its section below for status and
-open questions before Phase 2 stubs are written.
+Async channels for inter-task communication: `oneshot`, `mpsc`, `watch` and `broadcast`.
 
 | Variant | Producers | Consumers | Buffering |
 |---|---|---|---|
@@ -11,14 +9,14 @@ open questions before Phase 2 stubs are written.
 | `watch` | N (cloneable sender) | N (cloneable receiver) | 1 — last value only |
 | `broadcast` | N (cloneable sender) | N (cloneable receiver) | bounded ring buffer, every value delivered to every receiver |
 
-All four live (or, for `broadcast`, will live) under `include/coro/sync/`. The interface
+All four live under `include/coro/sync/`. The interface
 and internal design follows Tokio's implementation as closely as C++ allows.
 
 ---
 
 ## Cross-Cutting Design
 
-These requirements apply to all three channel variants.
+These requirements apply to all four channel variants.
 
 ### Allocation model
 
@@ -83,6 +81,30 @@ T x = co_await rx;  // suspended here
 }
 // rx receives an error — channel closed with no value sent
 ```
+
+### Inactive receivers and weak senders
+
+A producer often makes something that consumers want only some of the time: a stage's output
+that a viewer reads only while it's open, or a derived computation worth doing only while its
+own output is read. The producer should skip the work while nobody reads, and the consumer
+should be able to start reading again later without asking the producer for anything.
+
+An **inactive receiver** is a handle that can become a receiver, and counts as nothing until
+it does. The producer learns that nobody reads from the counts it already has, a failed
+`try_send()` or `all_receivers_dropped()`, and needs no other signal. A **weak sender** is
+the converse for the sending side: it can become a sender while the channel is open, but
+doesn't keep it open.
+
+| Channel | Inactive receiver | Weak sender |
+|---|---|---|
+| `mpsc` | `InactiveMpscReceiver<T>` | `WeakMpscSender<T>` |
+| `broadcast` | `InactiveBroadcastReceiver<T>` | — |
+
+The models are async-broadcast's `InactiveReceiver` and tokio's `mpsc::WeakSender`. Unlike
+async-broadcast's `set_await_active`, nothing makes a send wait for a receiver to become
+active: a send with nobody to deliver to fails at once.
+
+`oneshot` and `watch` have neither, as nothing yet does work only while one is read.
 
 ### Thread safety
 
@@ -278,10 +300,15 @@ while (auto v = co_await coro::next(rx))
 
 - `MpscSender<T>` — `send(T)` returns `Future<void>`, suspends when the buffer is full;
   `try_send(T)` returns immediately. Cloneable. Dropping all senders closes the channel.
+  `downgrade()` returns a `WeakMpscSender<T>`.
 - `MpscReceiver<T>` — satisfies `Stream<T>`; yields items in send order; signals exhaustion
   when all senders are dropped. Dropping the receiver is a hard error for any suspended
   or future sender — `send()` returns `std::expected<void, T>` with the unsent value in
-  the error slot.
+  the error slot. `deactivate() &&` returns an `InactiveMpscReceiver<T>`.
+- `InactiveMpscReceiver<T>` — receives nothing; `activate() &&` returns the receiver.
+  Move-only.
+- `WeakMpscSender<T>` — doesn't keep the channel open; `upgrade()` returns a sender while
+  the channel is open. Copyable.
 
 ### Internal state
 
@@ -290,8 +317,8 @@ MpscShared<T>:
     mutex
     T[]               ring_buffer     // fixed-capacity, allocated once at construction
     size_t            head, tail, count
-    size_t            sender_count
-    bool              receiver_alive
+    size_t            sender_count    // strong senders only; weak senders aren't counted
+    ReceiverState     receiver        // Active, Inactive or Dropped
     IntrusiveList     sender_waiters  // SenderNode list — suspended senders
     std::optional     receiver_waiter // ReceiverNode — at most one suspended receiver
 ```
@@ -319,7 +346,7 @@ sufficient. No intrusive list, no dynamic allocation.
 ### Send algorithm
 
 1. **Lock.**
-2. Receiver dropped → unlock, return `std::unexpected(std::move(value))`.
+2. Receiver dropped or inactive → unlock, return `std::unexpected(std::move(value))`.
 3. Receiver is waiting (`receiver_waiter` is set) → move value to
    `receiver_waiter->destination`, wake it, clear `receiver_waiter`, unlock. Sender
    never suspends; value goes directly to the receiver's coroutine frame.
@@ -351,6 +378,56 @@ Values skip the ring buffer in two situations:
 
 The ring buffer's role is absorbing **bursts** — when producers run ahead of the consumer
 for a stretch. In steady state with balanced rates, the buffer may never be touched.
+
+### Inactive receiver
+
+```cpp
+auto [tx, rx] = coro::mpsc_channel<Block>(2);
+coro::InactiveMpscReceiver<Block> idle = std::move(rx).deactivate();
+
+// The producer: a full queue and an inactive receiver both drop the block.
+(void)tx.try_send(block);
+
+// The consumer, when it wants the input:
+coro::MpscReceiver<Block> live = std::move(idle).activate();
+// ... and when it doesn't any more:
+idle = std::move(live).deactivate();
+```
+
+For an output with one consumer that wants it only some of the time. A broadcast would also
+do it, but keeps a ring and a cursor per receiver for a consumer that needs neither.
+
+- `deactivate()` drops every queued value, so a value that owns a resource, such as a pooled
+  buffer, gives it back at once. It wakes every suspended sender, whose `send()` then fails
+  with its value. It swaps the queue out under the lock and destroys the values after
+  unlocking.
+- While the receiver is inactive, `try_send()` fails with `TrySendError::Kind::Inactive` and
+  `send()` fails at once with its value. Neither queues anything. A sender that needs to
+  tell inactive from dropped asks `is_closed()`.
+- `MpscSender::is_inactive() const` is a snapshot, as `is_closed()` is, for a producer that
+  would rather not build a value nobody will queue.
+- `activate()` returns the receiver, reading from the next value sent. If every sender has
+  dropped, its stream ends at once.
+- Dropping the inactive receiver closes the channel from the receiver side, as dropping the
+  receiver does: senders get `Disconnected`.
+
+### Weak sender
+
+```cpp
+coro::WeakMpscSender<Request> self = tx.downgrade();
+if (auto tx = self.upgrade()) (void)tx->try_send(req);  // the actor is still running
+```
+
+For an actor that hands out its own address without keeping itself alive, or a registry of
+actors that shouldn't outlive them.
+
+- `MpscSender::downgrade() const` makes one. It isn't counted in `sender_count`, so the
+  receiver's stream ends when the last strong sender drops, whatever weak senders remain.
+- `upgrade() const` returns `std::optional<MpscSender<T>>`: a new strong sender while
+  `sender_count` is above 0, else `nullopt`. The check and the increment are under one lock,
+  so once the count has reached 0 and the receiver has seen the end, no upgrade can reopen
+  the channel.
+- It holds the shared state's `Rc`, as every handle does, so the memory outlives the channel.
 
 ### Cancellation safety
 
@@ -456,8 +533,9 @@ receiver independently re-reads the value via `borrow()`.
 
 Multi-producer, multi-consumer channel. Every value sent is delivered to every receiver
 subscribed at the time it was sent — unlike `watch`, which only retains the latest value,
-`broadcast` retains up to `capacity` not-yet-seen-by-every-receiver values so receivers can
-each consume at their own pace. Send is synchronous (never suspends); receive is async.
+`broadcast` holds each value until every receiver subscribed when it was sent has read it,
+up to `capacity` values, so receivers can each consume at their own pace. Send is
+synchronous (never suspends); receive is async.
 `broadcast_channel(0)` throws `std::invalid_argument` — a zero-capacity channel can never
 hold a value for any receiver to read, and unlike a fixed-size buffer this isn't something
 the type system can rule out at compile time, so it's a recoverable runtime error rather
@@ -480,14 +558,17 @@ int b = (co_await rx2.recv()).value();  // 10 — both receivers see every value
   `std::expected<size_t, T>` — the number of receivers notified on success, or the unsent
   value back to the caller if there were zero receivers (nobody to deliver it to).
   `subscribe()` creates an independent receiver that sees only values sent after the call —
-  no replay of channel history. Cloneable; the channel closes from the sender side only
-  when the last sender clone is dropped.
+  no replay of channel history. `inactive()` creates an `InactiveBroadcastReceiver<T>`.
+  `receivers_active()` waits for at least one receiver. Cloneable; the channel closes from
+  the sender side only when the last sender clone is dropped.
 - `BroadcastReceiver<T>` — `recv()` returns `Future<std::expected<T, BroadcastRecvError>>`;
   `try_recv()` is the non-suspending equivalent; `resubscribe()` creates an independent
   receiver, also starting from "after this call." Not cloneable — there is no operation
   that hands back a second receiver sharing the same cursor; `resubscribe()` is the only
   way to get an additional handle, and it always starts fresh rather than at the
-  original's current position.
+  original's current position. `deactivate() &&` returns an `InactiveBroadcastReceiver<T>`.
+- `InactiveBroadcastReceiver<T>` — receives nothing and isn't counted; `activate()`
+  returns a new receiver. Copyable.
 
 !!! note "send() has one failure case, not two"
     `send()` fails only when there are zero current receivers — there is no "buffer full"
@@ -531,34 +612,96 @@ handle is a refcount bump, not a deep copy of the value.
 ```
 BroadcastShared<T>:
     mutex
-    RingSlot<T>[]     ring_buffer       // fixed-capacity, allocated once at construction
+    RingSlot<T>[]     ring              // fixed-capacity, allocated once at construction
     uint64_t          next_seq          // sequence number assigned to the next send()
     size_t            sender_count
-    size_t            receiver_count
+    size_t            receiver_count    // active receivers only
     IntrusiveList     receiver_waiters  // ReceiverNode list — suspended receivers
+    IntrusiveList     sender_waiters    // receivers_active() nodes — senders waiting for a receiver
 ```
 
 ```
 RingSlot<T>:
-    uint64_t          seq               // this slot's sequence number
-    T                 value
-    size_t            remaining_readers // decremented as each subscribed receiver reads it
+    std::optional<T>  value
+    size_t            remaining         // receivers active at send() that haven't read it
 ```
 
-Each `BroadcastReceiver` tracks its own `next_seq` cursor, initialised to the channel's
-`next_seq` at the time it was created (`subscribe()`/`resubscribe()`) — this is what makes
-a new receiver see only future values without any backlog-replay logic.
+`ring[seq % capacity]` holds the value sent with sequence number `seq`. Each
+`BroadcastReceiver` tracks its own cursor, initialised to the channel's `next_seq` at the
+time it was created (`subscribe()`, `resubscribe()` or `activate()`) — this is what makes a
+new receiver see only future values without any backlog-replay logic.
 
-`send()` writes a new `RingSlot` at the head, stamped with the current `next_seq` and a
-`remaining_readers` count equal to `receiver_count`; if the buffer was full, the oldest slot
-is evicted. It then wakes every entry in `receiver_waiters` — all of them, not just one,
-since every receiver needs a chance to observe the new value.
+`send()` stores nothing when `receiver_count` is 0. Otherwise it writes the value at
+`next_seq` with `remaining = receiver_count`, overwriting the oldest slot if the buffer was
+full, whatever its `remaining`. It then wakes every entry in `receiver_waiters` — all of
+them, not just one, since every receiver needs a chance to observe the new value.
 
-`recv()`/`try_recv()` read the slot at the receiver's cursor, decrement that slot's
-`remaining_readers`, and advance the cursor by one. If the cursor points behind the oldest
-slot still in the buffer (it was evicted before this receiver got to it), the call instead
-returns `BroadcastRecvError::Lagged` with the skipped count, and the cursor snaps to the
-oldest remaining slot.
+`recv()`/`try_recv()` read the slot at the receiver's cursor, decrement its `remaining`, and
+advance the cursor by one. Each reader copies the value, except the one that takes
+`remaining` to 0, which moves it out and leaves the slot empty. If the cursor points behind
+the oldest slot still in the buffer (it was overwritten before this receiver got to it), the
+call instead returns `BroadcastRecvError::Lagged` with the skipped count, and the cursor
+snaps to the oldest remaining slot.
+
+A receiver that is dropped or deactivated decrements every slot it hasn't read, from
+`max(cursor, oldest)` to `next_seq`, and empties those that reach 0: at most `capacity`
+slots, under one lock. So a value that owns a resource, such as a pooled buffer, is held
+only until the last receiver that will read it has, and not at all once no receiver is
+active.
+
+!!! danger "WARNING: A value's destructor must not use the channel it's in"
+    A released value is destroyed while the channel's mutex is held, so a destructor that
+    sends on, or receives from, the same channel deadlocks. A destructor that hands a buffer
+    back to a pool through a different channel is fine.
+
+### Inactive receiver
+
+```cpp
+auto [tx, rx] = coro::broadcast_channel<Row>(64);
+coro::InactiveBroadcastReceiver<Row> handle = std::move(rx).deactivate();  // or tx.inactive()
+
+// A viewer, later, from any copy of the handle:
+coro::BroadcastReceiver<Row> live = handle.activate();  // from the next value sent
+while (auto row = co_await live.recv()) show(*row);
+```
+
+- `activate() const` returns a new `BroadcastReceiver`, exactly as `subscribe()` does.
+- It's copyable. A copy is another handle to the same channel, so one holder can hand
+  handles to several consumers, each activating its own receiver. It can't send, which is
+  why it exists apart from `subscribe()` on a sender clone.
+- It isn't counted, so `all_receivers_dropped()` and `send()`'s failure mean "nobody is
+  reading now", whatever handles exist. No inactive count is kept: the broadcast doesn't
+  close from the receiver side, so nothing would read one.
+- It doesn't keep the channel open. When the last sender drops the channel closes, and a
+  receiver activated after that gets `Closed` from its first `recv()`.
+
+It holds only the `Rc` to the shared state: `activate()` is `subscribe()` without a sender.
+
+### Waiting for receivers
+
+```cpp
+for (;;) {
+    co_await rows_tx.receivers_active();          // nobody reads: no work at all
+    auto samples = samples_handle.activate();     // read the input only while needed
+    while (!rows_tx.all_receivers_dropped()) {
+        auto block = co_await samples.recv();
+        if (!block && block.error().kind == coro::BroadcastRecvError::Kind::Closed) co_return;
+        if (block) (void)rows_tx.send(compute(*block));
+    }
+}                                                 // samples dropped: the input stops for us
+```
+
+`receivers_active()` completes when the channel has at least one active receiver, at once if
+it already has. A task that reads one output only to make another waits for its own readers
+rather than polling, so demand passes upstream through a chain of tasks with no channel for
+it.
+
+- It's a hand-written future: `OutputType` is `void`, and its node lives in the caller's
+  frame, linked into `sender_waiters`.
+- `subscribe()` and `activate()` wake the whole list when they take `receiver_count` from
+  0 to 1.
+- Dropping it while suspended unlinks its node, as the receive futures do.
+- It never fails: the sender awaiting it keeps the channel open.
 
 ---
 
@@ -578,19 +721,20 @@ No message string. Richer error context belongs in the value type — see
 
 ### `TrySendError<T>`
 
-`try_send` can fail for two distinct reasons that callers need to distinguish:
+`try_send` can fail for three distinct reasons that callers need to distinguish:
 
 - **`Full`** — buffer is full; the caller may retry later.
+- **`Inactive`** — the receiver is inactive; a retry succeeds only once it's activated.
 - **`Disconnected`** — receiver was dropped; retrying will never succeed.
 
-Both cases return the unsent value to the caller. A plain `std::expected<void, T>`
+All three return the unsent value to the caller. A plain `std::expected<void, T>`
 cannot carry the reason alongside the value, so `try_send` returns
 `std::expected<void, TrySendError<T>>`:
 
 ```cpp
 template<typename T>
 struct TrySendError {
-    enum class Kind { Full, Disconnected } kind;
+    enum class Kind { Full, Inactive, Disconnected } kind;
     T value;  // the unsent value, always present on failure
 };
 ```
@@ -599,7 +743,7 @@ struct TrySendError {
 if (auto r = tx.try_send(std::move(v)); !r) {
     if (r.error().kind == TrySendError<T>::Kind::Disconnected)
         return;  // receiver gone — give up
-    // else: Full — buffer full, retry or drop
+    // else: Full or Inactive — retry or drop
     buffer_for_retry(std::move(r.error().value));
 }
 ```
@@ -620,3 +764,4 @@ struct BroadcastRecvError {
 `Kind::Empty` is `try_recv()`-only (nothing buffered right now); `recv()` never produces it
 — the same "try_recv only" convention `ChannelError::Empty` already uses. `Kind::Closed`
 means every sender has been dropped and the buffer is drained.
+
