@@ -147,21 +147,16 @@ ParsedConnect parse_connect(const std::string& packet) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Fixture — initialises lwIP once per process.
+// Fixture. Each test's runtime is built with PicoNetwork::Lwip, which starts lwIP
+// (once per process) and runs its timers; Runtime::poll() turns the driver, which
+// also drains the loopback queue the broker and the client talk over.
 // ---------------------------------------------------------------------------
 
 class MqttLoopback : public ::testing::Test {
 protected:
-    static void SetUpTestSuite() {
-        lwip_init();
-    }
-
     static void poll_until(coro::Runtime& rt, bool& flag, int max_iters = 100'000) {
-        for (int i = 0; i < max_iters && !flag; ++i) {
+        for (int i = 0; i < max_iters && !flag; ++i)
             rt.poll();
-            sys_check_timeouts();
-            netif_poll_all();
-        }
     }
 };
 
@@ -170,7 +165,7 @@ protected:
 // ---------------------------------------------------------------------------
 
 TEST_F(MqttLoopback, ConnectAccepted) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
 
@@ -199,7 +194,7 @@ TEST_F(MqttLoopback, ConnectAccepted) {
 }
 
 TEST_F(MqttLoopback, PublishQos0) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
 
@@ -236,7 +231,7 @@ TEST_F(MqttLoopback, PublishQos0) {
 }
 
 TEST_F(MqttLoopback, SubscribeAndReceive) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     std::string received_topic;
@@ -286,7 +281,7 @@ TEST_F(MqttLoopback, SubscribeAndReceive) {
 }
 
 TEST_F(MqttLoopback, SubscribeRefused) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
 
@@ -324,7 +319,7 @@ TEST_F(MqttLoopback, SubscribeRefused) {
 }
 
 TEST_F(MqttLoopback, SubscribeIgnoresNonMatchingTopic) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     std::string received_topic;
@@ -376,7 +371,7 @@ TEST_F(MqttLoopback, SubscribeIgnoresNonMatchingTopic) {
 }
 
 TEST_F(MqttLoopback, SubscribeDeliversMultipleMessages) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     std::vector<std::string> received_payloads;
@@ -429,7 +424,7 @@ TEST_F(MqttLoopback, SubscribeDeliversMultipleMessages) {
 }
 
 TEST_F(MqttLoopback, ConcurrentSubscriptionsToDistinctTopicsAreIndependent) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     std::string received_topic_a;
@@ -509,7 +504,7 @@ TEST_F(MqttLoopback, ConcurrentSubscriptionsToDistinctTopicsAreIndependent) {
 }
 
 TEST_F(MqttLoopback, SecondSubscribeToSameTopicGetsIndependentReceiverOnSameChannel) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     std::string payload1;
@@ -571,7 +566,7 @@ TEST_F(MqttLoopback, SecondSubscribeToSameTopicGetsIndependentReceiverOnSameChan
 }
 
 TEST_F(MqttLoopback, PublishQos1WaitsForPuback) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
 
@@ -611,7 +606,7 @@ TEST_F(MqttLoopback, PublishQos1WaitsForPuback) {
 }
 
 TEST_F(MqttLoopback, PublishThrowsAfterServerDisconnect) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool connected_done = false;
     std::optional<coro::MqttClient> client_opt;
 
@@ -669,7 +664,7 @@ TEST_F(MqttLoopback, PublishThrowsAfterServerDisconnect) {
 }
 
 TEST_F(MqttLoopback, ConnectWithLastWillSetsWillFlagAndFields) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     ParsedConnect parsed;
@@ -708,7 +703,7 @@ TEST_F(MqttLoopback, ConnectWithLastWillSetsWillFlagAndFields) {
 }
 
 TEST_F(MqttLoopback, ConnectWithoutLastWillLeavesWillFlagClear) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     ParsedConnect parsed;
@@ -742,7 +737,7 @@ TEST_F(MqttLoopback, ConnectWithoutLastWillLeavesWillFlagClear) {
 }
 
 TEST_F(MqttLoopback, ConnectWithCredentialsSetsUsernameAndPasswordFields) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     ParsedConnect parsed;
@@ -783,7 +778,7 @@ TEST_F(MqttLoopback, ConnectWithCredentialsSetsUsernameAndPasswordFields) {
 }
 
 TEST_F(MqttLoopback, ConnectWithoutCredentialsLeavesUsernameFlagsClear) {
-    coro::Runtime rt;
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
     bool done = false;
     std::exception_ptr caught;
     ParsedConnect parsed;

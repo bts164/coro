@@ -1,17 +1,19 @@
 # TCP Stream
 
 `TcpStream` (a connected byte stream) and `TcpListener` (a listening socket that accepts
-`TcpStream`s). On desktop both run on the [I/O Driver](io_driver.md): every operation is
-a non-blocking syscall on the calling thread, and an operation that would block waits for
-readiness from the driver. On Pico the same API runs over the lwIP raw TCP API (see
-[Pico (lwIP) backend](#pico-lwip-backend)).
+`TcpStream`s). Both run on the [I/O Driver](io_driver.md): every operation is a
+non-blocking "syscall" through the `sys/tcp.h` seam on the calling thread, and an
+operation that would block waits for readiness from the driver. The same code runs on
+every platform: on desktop the seam is POSIX sockets, and on Pico it is lwIP (see
+[On Pico](#on-pico)).
 
 ---
 
 ## Goals
 
-- **Same API on every platform.** `connect` and `bind` return `Coro`s on both backends,
-  and reads and writes take a `ByteBuffer` by value and hand it back.
+- **One implementation on every platform.** Only the `sys/tcp.h` functions differ.
+  `connect` and `bind` return `Coro`s, and reads and writes take a `ByteBuffer` by value
+  and hand it back.
 - **No allocation in the common case.** Reads, writes and accepts are hand-written leaf
   futures. When data is already buffered, the send buffer has room, or a connection is
   already queued, the first `poll()` completes the operation with no coroutine frame and
@@ -75,7 +77,7 @@ flowchart TD
     FUT["TcpReadFuture, TcpWriteFuture (detail/stream_io.h),<br/>TcpAcceptFuture, ConnectFuture: leaf futures"]
     ST["detail::SocketState<br/>shared with UdpSocket"]
     PIO["IoRegistration::poll_io(direction, ctx, op)"]
-    OPS["detail::sys TCP ops (backend seam)<br/>tcp_posix.cpp: socket, connect, listen, accept4, recv, send"]
+    OPS["detail::sys TCP ops (backend seam)<br/>tcp_posix.cpp: socket, connect, listen, accept4, recv, send<br/>tcp_lwip.cpp: lwIP raw TCP API"]
     API --> FUT
     API --> ST
     FUT --> PIO
@@ -109,6 +111,9 @@ does. Setup functions close the socket themselves before throwing, so nothing le
 
 Where `MSG_NOSIGNAL` does not exist, the socket is created with `SO_NOSIGPIPE` instead,
 so a write to a closed connection fails with `EPIPE` rather than killing the process.
+
+The lwIP implementation of each function is described in
+[Pico Port](pico_port.md#tcp).
 
 ---
 
@@ -237,42 +242,22 @@ Connections still in the kernel's backlog are reset.
 
 ---
 
-## Pico (lwIP) backend
+## On Pico
 
-With `CORO_TCP_BACKEND_LWIP` defined, `tcp_stream.h` and `tcp_listener.h` select a
-different class body over the lwIP raw TCP API (`src/io/lwip/tcp_stream_lwip.cpp`,
-`tcp_listener_lwip.cpp`). Callbacks fire on the executor thread from
-`cyw43_arch_poll()`, and `connect` resolves names through lwIP's DNS. See
-[Pico Port](pico_port.md), "Component design", for its shared state, destructor and
-connect sequence.
+`TcpStream` and `TcpListener` are the same classes and futures on Pico; only the
+`sys/tcp.h` functions are lwIP's (see [Pico Port](pico_port.md#tcp)). The differences a
+caller can see come from lwIP:
 
-`connect` and `accept` are `Coro`s. `read`, `read_exact` and `write` return hand-written
-futures, as on desktop, so a transfer costs no coroutine frame:
-
-| Future | Returned by | Output |
-|---|---|---|
-| `TcpReadFuture<Buf, false>` | `read()` | `pair<size_t, Buf>` |
-| `TcpReadFuture<Buf, true>` | `read_exact()` | `pair<size_t, Buf>` |
-| `TcpWriteFuture<Buf>` | `write()` | `pair<size_t, Buf>` |
-
-Each holds an `Rc<LwipTcpCtx>` and the caller's buffer. `tcp_stream.h` must not include
-lwIP's headers, so `poll()` forwards to `detail::lwip_tcp_poll_read()` or
-`lwip_tcp_poll_write()` in `tcp_stream_lwip.cpp`.
-
-- **Read** drains `rx_buf` into the buffer first. With data taken (and, for
-  `read_exact`, the buffer full) it is ready. Otherwise a connection error becomes
-  `PollError`, EOF returns what was read, and anything else stores `rx_waker` and
-  waits for `on_recv`. A read into an empty buffer returns 0 at once.
-- **Write** copies as much as `tcp_sndbuf()` allows with `tcp_write()`
-  (`TCP_WRITE_FLAG_COPY`). With the send buffer full it flushes once with `tcp_output()`,
-  and if there is still no room stores `tx_waker` and waits for `on_sent`. It flushes
-  again when the last byte is queued.
-- **Dropping** a pending read or write clears its waker from the connection. Bytes a
-  read already copied out are lost with its buffer, and bytes a write already queued are
-  still sent. This matches the desktop futures.
-
-As on desktop, one read and one write may be pending at once, but not two of either: the
-connection has one waker slot per direction.
+- **No network, no sockets.** On a `PicoNetwork::None` runtime, `connect` and `bind`
+  throw `std::system_error` with `ENETDOWN`.
+- **One address per name.** lwIP's DNS returns one IPv4 address, so `connect` and
+  `bind` have one address to try.
+- **IPv4 only.** An IPv6 literal fails with `EAFNOSUPPORT`.
+- **A smaller backlog.** The listener's backlog is capped at `MEMP_NUM_TCP_PCB`, since
+  every pending connection holds an lwIP pcb.
+- **Nagle is off.** Each write is flushed at once.
+- **Unread data is bounded by the TCP window.** A connection holds at most `TCP_WND`
+  unread bytes; the peer stops sending until the application reads.
 
 ---
 
@@ -291,7 +276,7 @@ connection has one waker slot per direction.
 
 ## Tests
 
-`test/io/test_tcp_stream.cpp` (`test_tcp_stream`, loopback ports 31001–31018).
+`test/io/test_tcp_stream.cpp` (`test_tcp_stream`, ports 31001–31035).
 `static_assert`s check that every TCP future is a `Future` and not `Cancellable`.
 
 | Test | Checks |
@@ -299,15 +284,30 @@ connection has one waker slot per direction.
 | `EchoRoundTrip{WorkStealing,CurrentThread,WorkSharing}` | Connect, accept and echo on each executor. |
 | `MultipleMessagesInOrder`, `ReadReturnsZeroAtEof`, `ReadExactStopsShortAtEof` | Ordering and EOF semantics of `read` and `read_exact`. |
 | `LargeWriteCompletesInPieces{WorkStealing,CurrentThread}` | An 8 MB `write()` exceeds the socket buffers, waits for write readiness repeatedly, and arrives intact. |
+| `SlowReaderClosesAndReopensWindow` | A reader that starts late: on lwIP the writer fills the receive window, and resumes as the reads reopen it. |
+| `WriteWaitsUntilPeerReads` | With no reader, a `write()` larger than the window and the send buffer together waits, and completes once the peer reads. |
 | `Ipv6Loopback` | Bind and connect on `::1` (skipped if IPv6 is unavailable). |
 | `ConnectRefusedThrowsOnAwait` | `ECONNREFUSED` surfaces as `std::system_error` at `co_await`. |
 | `BadAddressesThrowOnAwait` | `EADDRINUSE` on bind; an unresolvable name fails in `dns_error_category()`. |
 | `WriteToClosedPeerThrowsWithoutSigpipe` | Writing after the peer closed throws `EPIPE`/`ECONNRESET` and does not kill the process. |
+| `CloseWithUnreadDataResetsPeer` | Closing with bytes unread resets the connection, so the peer's read throws `ECONNRESET`. |
 | `ThrowsWithoutDriver` | `connect` and `bind` throw `std::logic_error` on a `CurrentThreadExecutor` with a `PollingParker`. |
 | `DroppedAcceptAcceptsNothing`, `DroppedReadLosesNoData` | An `accept` or `read` dropped mid-wait (it lost a `select` to a timer) consumes nothing. |
 | `StreamDroppedWhileReadPending` | A spawned read keeps the socket open after the `TcpStream` is destroyed, then completes. |
 | `AcceptWaitsOnWorkSharing` | An idle WorkSharing worker turning the driver wakes a pending accept. |
-| `ConcurrentReadAndWriteOnOneStream` | 1000 numbered messages with a read task and a write task on one stream on `Runtime(4)`. |
+| `ConcurrentReadAndWriteOnOneStream` | 1000 numbered messages with a read task and a write task on one stream. |
+| `BacklogQueuesConnectionsBeforeAccept` | Connections queue before `accept()`, which returns them in the order they connected. |
+| `ListenerDroppedResetsQueuedConnections` | Dropping a listener resets the connections it never accepted. |
+| `StreamsDroppedWithSegmentsInFlight` | Streams closed while their peers' data and FIN are in flight (on lwIP, queued on loopback): the peers see their connections end, and the listener keeps working. |
+| `ManySequentialConnections` | Connections one after another, on the board three times its pcbs, so each reuses the pcbs closed ones left. |
+| `LinkDelayWakesSleepingRuntime` (lwIP) | With every frame 100 ms in flight, the runtime sleeps after each send and lwIP's timer wakes it for the arrival. |
+| `LostSegmentIsRetransmitted` (lwIP) | A message's one segment is lost, and the retransmission timer resends it. |
+| `LostSegmentMidTransferIsRecovered` (lwIP) | A segment lost mid-transfer: the later ones arrive out of order, and every byte arrives once, in order. |
+| `PersistTimerRecoversLostWindowUpdates` (lwIP) | The reader's window closes and its updates are lost; the writer's zero-window probes find it open again. |
+| `RefusedSegmentIsSentAgain` (lwIP) | The link refuses a segment three times with nothing in flight, and the poll callback's retry sends it. |
+| `UnansweredConnectEndsAtTimeout` (lwIP) | A connect with every frame dropped ends at `timeout()`, and its SYN is never resent. |
+| `NoneModeSocketsThrowEnetdown` (lwIP) | On a `PicoNetwork::None` runtime, `TcpStream::connect`, `UdpSocket::bind` and a name's `lookup_host` throw `ENETDOWN`; a numeric `lookup_host` still answers. |
+| `LookupWithoutDnsServerFailsPromptly` (lwIP) | With no DNS server, a name fails at once in `dns_error_category()`; a numeric address still resolves. |
 
 Name resolution is covered in `test/io/test_lookup_host.cpp`:
 
@@ -319,14 +319,15 @@ Name resolution is covered in `test/io/test_lookup_host.cpp`:
 | `LookupHostTest.ConnectToUnresolvableNameThrowsDnsError` | `nonexistent.invalid` fails in `dns_error_category()`. |
 
 The lwIP backend is tested by the same file. `test/io/test_tcp_stream.cpp` is also built
-against lwIP on the host (`test_tcp_stream_pico`) and into the on-target firmware; its
-tests of the other executors, IPv6 and errno values are compiled for the desktop only.
-One test is lwIP-only: a read into an empty buffer returns 0 at once.
+against lwIP on the host (`test_tcp_stream_pico`) and into the on-target firmware. Its
+tests of the multi-threaded executors and IPv6 are compiled for the desktop only. The
+errno tests are shared: both backends throw `std::system_error` with the same errno.
 
-!!! warning "FIXME: the backends report errors with different exception types"
-    The desktop backend throws `std::system_error` carrying the errno; the lwIP backend
-    throws `std::runtime_error` with a message. `ConnectRefusedThrowsOnAwait` therefore
-    checks each differently, and portable code can only catch `std::exception`.
+The lwIP-only tests run over `TestNetif` (`test/test_netif.h`), a second netif that hands
+each frame back to the stack with its addresses swapped, so a connection to `10.99.0.2`
+arrives at `10.99.0.1`. It delivers from an lwIP timer rather than in the same service
+pass as loopback, and a per-frame policy delays, drops or refuses each frame: the paths a
+radio link takes, on a board without one.
 
 ---
 
@@ -337,9 +338,8 @@ One test is lwIP-only: a read into an empty buffer returns 0 at once.
 | `include/coro/io/tcp_stream.h`, `tcp_stream.hpp`, `src/io/tcp_stream.cpp` | `TcpStream`, `TcpIo`, `ConnectFuture` |
 | `include/coro/io/tcp_listener.h`, `src/io/tcp_listener.cpp` | `TcpListener`, `TcpAcceptFuture` |
 | `include/coro/detail/stream_io.h` | `FdReadFuture`, `FdWriteFuture` (shared with `Pipe`) |
-| `include/coro/detail/sys/tcp.h`, `src/detail/sys/tcp_posix.cpp` | TCP backend seam |
+| `include/coro/detail/sys/tcp.h` | TCP backend seam |
+| `src/detail/sys/posix/tcp_posix.cpp` | POSIX backend |
+| `src/detail/sys/lwip/tcp_lwip.cpp` | lwIP backend |
 | `include/coro/detail/socket_state.h`, `src/detail/socket_state.cpp` | `SocketState`, shared with `UdpSocket` |
-| `src/io/lwip/tcp_stream_lwip.cpp`, `tcp_listener_lwip.cpp` | Pico (lwIP) backend |
 | `test/io/test_tcp_stream.cpp` | Tests |
-
-`stream_io.h`, `socket_state.h` and `detail/sys/` are excluded from the Pico install.

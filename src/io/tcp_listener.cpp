@@ -1,4 +1,4 @@
-// Desktop TcpListener on the IoDriver. Every syscall goes through the backend seam in
+// TcpListener on the IoDriver. Every syscall goes through the backend seam in
 // include/coro/detail/sys/tcp.h. See doc/design/tcp_stream.md, "TcpListener".
 
 #include <coro/io/tcp_listener.h>

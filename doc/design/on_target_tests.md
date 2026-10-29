@@ -291,6 +291,18 @@ times at a fixed period:
 The test body is the same in both. `PICO_ON_DEVICE`, which the SDK defines for firmware
 and the stubs do not, selects the implementation.
 
+The function signals the primitive's notify fd, which on the host goes through the stub
+`async_context`. Its `set_work_pending()` is safe from another thread and wakes an
+executor waiting in the stub's `wait_for_work_until()`, as the real one does from an
+interrupt. See [Pico Port](pico_port.md#testing-on-the-host).
+
+!!! note "NOTE: the emulator must model the CPU's sleep"
+    On the board and in the emulator, an idle executor sleeps in
+    `async_context_wait_for_work_until()`, which waits with WFE until an interrupt or the
+    alarm that bounds the sleep. The emulator runs these images only if it models WFE
+    and the timer alarm that ends it. Check this the first time an image that sleeps
+    runs under rp2040js.
+
 ### Where GoogleTest comes from
 
 The desktop build takes GoogleTest from Conan. The firmware build compiles it from
@@ -313,8 +325,8 @@ source, fetched by CMake (`test/cmake/on_target_pico.cmake`), with the settings 
 - **Whole files** are chosen in `test/tests.cmake`, by the keywords on the file's line
   (see [Build](#build)).
 - **Individual tests** inside a shared file are guarded by the preprocessor. Today that
-  is `#ifndef CORO_PICO`, and in the socket tests `CORO_TCP_BACKEND_LWIP` and
-  `CORO_UDP_BACKEND_LWIP`, because what differs there is the socket backend.
+  is `#ifndef CORO_PICO`, and in the socket tests `CORO_SYS_LWIP`, because what differs
+  there is the `sys` backend.
 - **The runtime** a networking test uses is `NetRuntime` (`test/net_runtime.h`): the
   default runtime on the desktop, and on Pico one built with `PicoNetwork::Lwip` after
   starting lwIP once. A test body is then the same on every platform:

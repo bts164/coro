@@ -1,7 +1,8 @@
 #pragma once
 
-// Readiness-based I/O driver (epoll reactor), turned by the executor threads.
-// See doc/design/io_driver.md.
+// Readiness-based I/O driver, turned by the executor threads. The readiness source
+// is the sys layer's Poller: epoll on Linux, lwIP on the Pico SDK. See
+// doc/design/io_driver.md.
 //
 // IoDriver has no thread of its own. Executor threads call turn() — blocking when
 // they are idle, non-blocking when busy — and I/O futures use IoRegistration to
@@ -9,14 +10,17 @@
 // runtime's timer queue: the earliest deadline bounds turn()'s wait.
 
 #include <coro/detail/context.h>
+#include <coro/detail/intrusive_list.h>
+#include <coro/detail/mutex.h>
 #include <coro/detail/rc.h>
+#include <coro/detail/relaxed_state.h>
 #include <coro/detail/waker.h>
 #include <coro/detail/sys/poller.h>
 #include <coro/detail/timer_queue.h>
 #include <coro/runtime/clock.h>
 #include <coro/runtime/parker.h>
 
-#include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +34,7 @@ namespace coro {
 
 class IoDriver;
 class IoRegistration;
+class IoWaiter;
 
 /// A readiness direction. One waiter slot exists per direction.
 enum class IoDirection { Read, Write };
@@ -65,6 +70,57 @@ struct IoLevelReady {
     bool shutdown = false;
 };
 
+/**
+ * @brief One waiter on an IoRegistration's waiter list, for primitives that let any
+ * number of tasks wait on one object at once (the ISR primitives).
+ *
+ * Lives inside the waiting future, so a wait allocates nothing. Linked into the
+ * registration while waiting; the driver unlinks it when it wakes it, and marks it
+ * ready for that wake, so each woken waiter returns ready exactly once even if
+ * another waiter clears the shared readiness first. See doc/design/io_driver.md,
+ * "More than one waiter".
+ *
+ * WARNING: must not move while linked: the list holds its address. A future is
+ * pinned from its first poll (doc/design/future_and_stream.md), and only a poll
+ * links it, so a waiter inside a future never moves while linked. The move
+ * operations assert it.
+ */
+class IoWaiter {
+public:
+    IoWaiter() = default;
+    IoWaiter([[maybe_unused]] IoWaiter&& other) noexcept {
+        assert(!other.m_linked && "IoWaiter moved while linked (a future moved after its first poll)");
+    }
+    IoWaiter& operator=([[maybe_unused]] IoWaiter&& other) noexcept {
+        assert(!m_linked && !other.m_linked && "IoWaiter moved while linked");
+        return *this;
+    }
+    IoWaiter(const IoWaiter&)            = delete;
+    IoWaiter& operator=(const IoWaiter&) = delete;
+    ~IoWaiter() {
+        assert(!m_linked && "IoWaiter destroyed while linked: call IoRegistration::cancel_wait()");
+    }
+
+    /// True while linked into a registration's waiter list.
+    bool linked() const noexcept { return m_linked; }
+
+    // detail::IntrusiveList links. GUARDED BY the registration's ScheduledIo mutex.
+    IoWaiter* prev = nullptr;
+    IoWaiter* next = nullptr;
+
+private:
+    friend class IoDriver;
+    friend class IoRegistration;
+
+    // GUARDED BY the registration's ScheduledIo mutex, like everything below.
+    detail::Weak<detail::Waker> m_waker;
+    IoDirection                 m_direction = IoDirection::Read;
+    bool                        m_linked    = false;
+    // Set by dispatch() or shutdown() when it wakes (and unlinks) this waiter; the
+    // next poll_ready() returns ready and clears it.
+    bool                        m_ready     = false;
+};
+
 namespace detail {
 
 /**
@@ -79,7 +135,8 @@ private:
     friend class coro::IoDriver;
     friend class coro::IoRegistration;
 
-    std::mutex   m_mutex;
+    // std::mutex; a no-op on Pico (see detail/mutex.h).
+    Mutex        m_mutex;
     // Set once by IoDriver::add(), before the poller can report this registration.
     // True for a level-triggered registration, which uses the fields below
     // differently: see each one.
@@ -103,6 +160,10 @@ private:
     // Set by IoDriver::shutdown(): every poll_ready() from then on reports it.
     // GUARDED BY m_mutex.
     bool         m_shutdown = false;
+    // Waiters that wait through an IoWaiter rather than the per-direction slots:
+    // any number of them, in either direction. Edge-triggered only. See
+    // doc/design/io_driver.md, "More than one waiter". GUARDED BY m_mutex.
+    IntrusiveList<IoWaiter*> m_waiters;
 
     // Links in the driver's list of live registrations, which shutdown() walks.
     // GUARDED BY IoDriver::m_registrations_mutex.
@@ -124,7 +185,9 @@ private:
  */
 class IoDriver {
 public:
-    IoDriver();
+    /// `options` configure the platform's Poller (the lwIP backend's async_context;
+    /// nothing on POSIX).
+    explicit IoDriver(detail::sys::PollerOptions options = {});
     ~IoDriver();
 
     IoDriver(const IoDriver&)            = delete;
@@ -223,6 +286,10 @@ public:
      */
     bool is_shut_down() const noexcept { return m_shut_down.load(std::memory_order_acquire); }
 
+    /// The platform's Poller. For the backend's own objects (the lwIP backend's
+    /// sockets reach their Poller through it); not for primitives.
+    detail::sys::Poller& poller() noexcept { return m_poller; }
+
     /**
      * @brief Adds a timer that wakes `waker` once `deadline` has passed.
      *
@@ -259,6 +326,14 @@ private:
 
     static void dispatch(const detail::sys::Event& event);
 
+    // Unlinks every waiter on `io`'s list whose direction `readable`/`writable`
+    // (or `all`) covers, marking each ready, and appends its live waker to `out`,
+    // at most `limit` of them. Returns true if it stopped at the limit with
+    // matching waiters left. Caller holds io->m_mutex.
+    static bool take_listed_wakers(detail::ScheduledIo& io, bool readable, bool writable,
+                                   bool all, detail::Rc<detail::Waker>* out,
+                                   std::size_t limit, std::size_t& count);
+
     detail::sys::Poller    m_poller;
     // The PollWaker's events carry this object's address as their key. It is a
     // distinct object from every ScheduledIo, so the address can't collide.
@@ -270,14 +345,14 @@ private:
     // to turn or to shut down.
     //
     // Lock order: m_turn_mutex, then m_registrations_mutex.
-    std::mutex     m_turn_mutex;
+    detail::Mutex  m_turn_mutex;
     // Reused event buffer. GUARDED BY m_turn_mutex.
     std::vector<detail::sys::Event> m_events;
 
     // Registrations dropped since the last turn. An event batch fetched by a turn
     // that is still dispatching may name one of these, so they are only released at
     // the start of the NEXT turn. GUARDED BY m_release_mutex.
-    std::mutex     m_release_mutex;
+    detail::Mutex  m_release_mutex;
     std::vector<detail::Rc<detail::ScheduledIo>> m_pending_release;
     // m_pending_release.size(), readable without the lock. Written only under
     // m_release_mutex; read without it at the start of every turn so the common
@@ -285,7 +360,12 @@ private:
     // move to every worker that turns). A hint only: a stale zero just delays a
     // release to a later turn, which is always safe. Mirrors tokio's
     // num_pending_release.
-    std::atomic<std::size_t> m_pending_release_count{0};
+    detail::RelaxedState<std::size_t> m_pending_release_count{0};
+
+    // Listed waiters woken per batch: dispatch() collects at most this many wakers
+    // under a registration's mutex, wakes them outside it, and repeats. Bounds its
+    // stack use and keeps it from allocating, however many tasks wait.
+    static constexpr std::size_t kWakeBatch = 32;
 
     // A deregister() that brings the pending list to this size unparks the driver,
     // so the releases happen soon even if nothing else wakes it. Tokio uses 16 too.
@@ -301,7 +381,7 @@ private:
     // each end, never per operation.
     //
     // Lock order: m_registrations_mutex, then a ScheduledIo's m_mutex.
-    std::mutex           m_registrations_mutex;
+    detail::Mutex        m_registrations_mutex;
     detail::ScheduledIo* m_registrations = nullptr;   // GUARDED BY m_registrations_mutex
     // Set by shutdown(); add() refuses from then on. GUARDED BY m_registrations_mutex.
     bool                 m_closed = false;
@@ -311,7 +391,7 @@ private:
     // before blocking. Written once, by shutdown(), before it takes the turn and so
     // before it wakes anyone: a waiter woken by shutdown() sees it. An atomic rather
     // than a mutex because both readers are on a hot path.
-    std::atomic<bool>    m_shut_down{false};
+    detail::RelaxedState<bool> m_shut_down{false};
 };
 
 /**
@@ -439,6 +519,28 @@ public:
     IoLevelReady take_ready();
 
     /**
+     * @brief The waiter-list form of poll_ready(), for a primitive that allows any
+     * number of concurrent waiters on one direction. Edge-triggered only.
+     *
+     * Returns an event if `waiter` was woken since it was linked (once per wake),
+     * or if the direction is ready; otherwise links `waiter` (or, if it is already
+     * linked, refreshes its waker) and returns `std::nullopt`. Once the driver has
+     * been shut down it returns an event with `shutdown` set. Executor-safe on any
+     * thread, like poll_ready().
+     *
+     * Precondition: `waiter` is not linked to another registration.
+     */
+    std::optional<IoReadyEvent> poll_ready(IoDirection direction, detail::Context& ctx,
+                                           IoWaiter& waiter);
+
+    /**
+     * @brief Unlinks `waiter` if it is linked, and forgets a wake it has not
+     * consumed. The owner of a waiter calls it before the waiter is destroyed, for
+     * example from a dropped future's destructor. Idempotent.
+     */
+    void cancel_wait(IoWaiter& waiter) noexcept;
+
+    /**
      * @brief Runs the readiness handshake around one non-blocking operation.
      *
      * `op()` performs the syscall and returns `std::expected<T, int>`, the error being
@@ -470,9 +572,30 @@ public:
         }
     }
 
+    /**
+     * @brief The waiter-list form of poll_io(): the same loop, waiting through
+     * `waiter` (see poll_ready(direction, ctx, waiter)).
+     */
+    template<typename Op>
+    auto poll_io(IoDirection direction, detail::Context& ctx, IoWaiter& waiter, Op&& op)
+        -> std::optional<std::invoke_result_t<Op&>>
+    {
+        for (;;) {
+            auto ready = poll_ready(direction, ctx, waiter);
+            if (!ready) return std::nullopt;
+            if (ready->shutdown)
+                return std::invoke_result_t<Op&>(std::unexpect, detail::sys::kDriverShutDown);
+            auto result = op();
+            if (result || !detail::sys::would_block(result.error())) return result;
+            // As in the slot form: readiness that arrived after op() saw EAGAIN
+            // bumped the tick, so clear_ready() leaves it set and the loop retries.
+            clear_ready(*ready);
+        }
+    }
+
 private:
     IoDriver*               m_driver = nullptr;
-    detail::sys::RawFd              m_fd = -1;
+    detail::sys::RawFd              m_fd = detail::sys::kInvalidFd;
     detail::Rc<detail::ScheduledIo> m_io;
 };
 

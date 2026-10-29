@@ -6,7 +6,7 @@
 // with EPERM; a disk read is always "ready" and then blocks). EINTR is retried here.
 //
 // Current backends:
-//   POSIX: src/detail/sys/file_posix.cpp
+//   POSIX: src/detail/sys/posix/file_posix.cpp
 //
 // See doc/design/file_io.md.
 

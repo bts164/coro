@@ -28,7 +28,7 @@ endif()
 add_library(coro_pico_mqtt STATIC
     ${CORO_ROOT}/src/pico/mqtt.cpp
 )
-target_include_directories(coro_pico_mqtt PRIVATE ${CORO_ROOT}/src/io/lwip ${CORO_PICO_LWIPOPTS_INCLUDE_DIR})
+target_include_directories(coro_pico_mqtt PRIVATE ${CORO_PICO_LWIPOPTS_INCLUDE_DIR})
 target_link_libraries(coro_pico_mqtt PUBLIC coro_pico)
 # Needed for <lwip/apps/mqtt.h> et al. — same as coro_pico's own PRIVATE link
 # below; coro_pico doesn't re-export these (they're PRIVATE there too), so

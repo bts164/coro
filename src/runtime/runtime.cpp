@@ -1,12 +1,12 @@
 #include <coro/runtime/runtime.h>
+#include <coro/runtime/current_thread_executor.h>
 #ifdef CORO_PICO
-#include <coro/runtime/current_thread_executor.h>
+#include <pico/async_context.h>
+#include <pico/async_context_poll.h>
 #include <pico/cyw43_arch.h>
+#include <pico/lwip_nosys.h>
 #include <pico/time.h>
-#include <lwip/netif.h>
-#include <lwip/timeouts.h>
 #else
-#include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/work_stealing_executor.h>
 #endif
 #include <exception>
@@ -23,42 +23,70 @@ namespace {
 } // namespace
 
 #ifdef CORO_PICO
-namespace {
-// Delivers packets sent to 127.0.0.1 or to the device's own address. lwIP only
-// queues those in a NO_SYS build, and neither the SDK nor the CYW43 driver drains
-// the queue.
-void deliver_loopback() {
-#if defined(ENABLE_LOOPBACK) && ENABLE_LOOPBACK && !LWIP_NETIF_LOOPBACK_MULTITHREADING
-    netif_poll_all();
-#endif
-}
-} // namespace
+// The async_context the runtime runs on, and what it started there. See PicoNetwork
+// in runtime.h and doc/design/pico_port.md, "Runtime on Pico".
+struct Runtime::PicoContext {
+    PicoNetwork          network;
+    // The runtime's own context (Lwip, None). Unused with Cyw43, whose context
+    // belongs to the CYW43 driver.
+    async_context_poll_t own{};
+    async_context_t*     context = nullptr;
+    // True if this runtime started lwIP on `own` (Lwip), and so stops it again.
+    bool                 started_lwip = false;
+};
 
-Runtime::Runtime(PicoNetwork network) {
-    // See PicoNetwork in runtime.h. The modes differ in what is called, not in a
-    // flag checked on every iteration, because cyw43_arch_poll() must not be called
-    // at all unless cyw43_arch_init() ran.
-    std::function<void()> poll_fn;
-    switch (network) {
-    case PicoNetwork::None:
-        poll_fn = [] {};
-        break;
-    case PicoNetwork::Lwip:
-        // cyw43_arch_poll() would run lwIP's timers; here nothing else does.
-        poll_fn = [] {
-            sys_check_timeouts();
-            deliver_loopback();
-        };
-        break;
-    case PicoNetwork::Cyw43:
-        poll_fn = [] {
-            cyw43_arch_poll();
-            deliver_loopback();
-        };
-        break;
+void Runtime::PicoContextDeleter::operator()(PicoContext* pico) const noexcept {
+    if (pico->started_lwip) lwip_nosys_deinit(pico->context);
+    if (pico->network != PicoNetwork::Cyw43 && pico->context != nullptr)
+        async_context_deinit(pico->context);
+    delete pico;
+}
+
+std::unique_ptr<Runtime::PicoContext, Runtime::PicoContextDeleter>
+Runtime::make_context(PicoNetwork network) {
+    std::unique_ptr<PicoContext, PicoContextDeleter> pico(new PicoContext{network});
+    if (network == PicoNetwork::Cyw43) {
+        // Created by cyw43_arch_init(), which runs lwIP on it.
+        pico->context = cyw43_arch_async_context();
+        if (pico->context == nullptr)
+            throw std::logic_error(
+                "coro::Runtime(PicoNetwork::Cyw43): cyw43_arch_init() has not been "
+                "called; firmware without the radio uses PicoNetwork::Lwip or None");
+        // A threadsafe_background context runs lwIP and the notify workers in an
+        // interrupt, racing the executor on the Poller's ready list and the sockets'
+        // buffers. Only a poll context runs them inside async_context_poll().
+        if (pico->context->type->type != ASYNC_CONTEXT_POLL)
+            throw std::logic_error(
+                "coro::Runtime(PicoNetwork::Cyw43): the CYW43 driver's async_context is "
+                "not a poll context; link pico_cyw43_arch_lwip_poll, not "
+                "pico_cyw43_arch_lwip_threadsafe_background");
+        return pico;
     }
-    auto exec = std::make_unique<CurrentThreadExecutor>(
-        std::make_unique<PollingParker>(std::move(poll_fn)));
+    if (!async_context_poll_init_with_defaults(&pico->own))
+        throw std::runtime_error("coro::Runtime: async_context_poll_init_with_defaults() failed");
+    pico->context = &pico->own.core;
+    if (network == PicoNetwork::Lwip) {
+        // lwIP's timers become a worker on this context, which also bounds the
+        // driver's sleep. lwip_init() itself runs only the first time.
+        if (!lwip_nosys_init(pico->context))
+            throw std::runtime_error("coro::Runtime: lwip_nosys_init() failed");
+        pico->started_lwip = true;
+    }
+    return pico;
+}
+
+detail::sys::PollerOptions Runtime::poller_options(PicoContext& pico) noexcept {
+    detail::sys::PollerOptions options;
+    options.context = pico.context;
+    options.lwip    = pico.network != PicoNetwork::None;
+    return options;
+}
+
+Runtime::Runtime(PicoNetwork network)
+    : m_context(make_context(network))
+    , m_io_driver(poller_options(*m_context))
+{
+    auto exec = std::make_unique<CurrentThreadExecutor>(this);
     m_current_thread_executor = exec.get();
     m_executor = std::move(exec);
 }
@@ -78,11 +106,23 @@ void Runtime::shutdown() noexcept {
     m_current_thread_executor->run_until(
         [this] { return !m_current_thread_executor->has_tasks(); });
     set_current_runtime(prev);
+    // As on desktop, last: no task of this runtime is left, and a waiter it does not
+    // own (a task of another runtime) is woken and fails instead of waiting for good.
+    m_io_driver.shutdown();
     m_shut_down = true;
 }
 
 bool Runtime::poll() {
-    return m_current_thread_executor->poll_ready_tasks();
+    // An entry point like block_on(): tasks it polls, and sockets they create, find
+    // this runtime.
+    Runtime* const prev = t_current_runtime;
+    set_current_runtime(this);
+    const bool polled = m_current_thread_executor->poll_ready_tasks();
+    // Never sleeps: zero wait. Runs the radio, lwIP and the notify workers, delivers
+    // their readiness, and fires due timers.
+    m_io_driver.turn(std::chrono::nanoseconds{0});
+    set_current_runtime(prev);
+    return polled;
 }
 
 PicoClock::time_point PicoClock::now() noexcept {
@@ -90,23 +130,13 @@ PicoClock::time_point PicoClock::now() noexcept {
 }
 
 detail::TimerId Runtime::add_timer(Instant deadline, detail::Weak<detail::Waker> waker) {
-    return m_current_thread_executor->add_timer(deadline, std::move(waker));
+    return m_io_driver.add_timer(deadline, std::move(waker));
 }
 
 void Runtime::cancel_timer(detail::TimerId id) noexcept {
-    // Also reached from ~CurrentThreadExecutor() if it still holds a task (a
-    // standalone executor; a Runtime drains its tasks in shutdown() first). Its
-    // timer queue is still alive then; see the member order in
-    // current_thread_executor.h.
-    m_current_thread_executor->cancel_timer(id);
-}
-
-void Runtime::register_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker) {
-    m_current_thread_executor->add_isr_poll(entry, std::move(waker));
-}
-
-void Runtime::remove_isr_poll(IsrPollEntry* entry) {
-    m_current_thread_executor->remove_isr_poll(entry);
+    // Also reached from the executor's destructor, if it still holds a task; the
+    // driver outlives it (see the member order in runtime.h).
+    m_io_driver.cancel_timer(id);
 }
 #else
 Runtime::Runtime(std::size_t num_threads)

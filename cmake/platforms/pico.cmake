@@ -1,7 +1,8 @@
 # cmake/platforms/pico.cmake
 #
 # Defines coro_core and coro_pico CMake targets for the Raspberry Pi Pico (RP2040/RP2350).
-# Backend: CORO_PICO executor + CORO_TCP_BACKEND_LWIP.
+# Backend: CORO_PICO (single-threaded platform) + CORO_SYS_LWIP (lwIP under the I/O
+# driver's sys layer). See doc/design/pico_port.md.
 #
 # Prerequisites (caller must do these before including this file):
 #   include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
@@ -15,7 +16,7 @@
 #   target_link_libraries(my_firmware PRIVATE coro_pico)
 #
 # lwipopts.h: coro_pico owns it. By default it's generated from
-# src/io/lwip/lwipopts.h.in (see doc/design/lwip_config.md for why this is
+# src/detail/sys/lwip/lwipopts.h.in (see doc/design/lwip_config.md for why this is
 # centralized rather than left to each application). To supply a completely
 # custom file instead — for tuning beyond what CORO_PICO_WITH_MQTT covers —
 # set CORO_PICO_LWIPOPTS_DIR to a directory containing your own lwipopts.h
@@ -39,13 +40,14 @@ else()
     option(CORO_PICO_WITH_MQTT "Bake LWIP_MQTT 1 into the bundled default lwipopts.h" OFF)
     set(LWIP_MQTT ${CORO_PICO_WITH_MQTT})
     set(_CORO_LWIPOPTS_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/coro_pico_lwipopts)
-    configure_file(${_CORO_SRC}/io/lwip/lwipopts.h.in
+    configure_file(${_CORO_SRC}/detail/sys/lwip/lwipopts.h.in
         ${_CORO_LWIPOPTS_GEN_DIR}/lwipopts.h)
     set(CORO_PICO_LWIPOPTS_INCLUDE_DIR ${_CORO_LWIPOPTS_GEN_DIR})
 endif()
 
 # ---------------------------------------------------------------------------
-# coro_pico — full coro stack for Pico W: portable core + executor + lwIP TCP.
+# coro_pico — full coro stack for Pico W: portable core, executor, I/O driver, and
+# the lwIP sys backend under it.
 #
 # All sources are compiled into one archive to avoid circular-dependency
 # link-order issues between the core (which references CurrentThreadExecutor)
@@ -65,28 +67,39 @@ add_library(coro_pico STATIC
     ${_CORO_SRC}/runtime/executor.cpp
     ${_CORO_SRC}/runtime/runtime.cpp
     ${_CORO_SRC}/runtime/current_thread_executor.cpp
-    ${_CORO_SRC}/io/lwip/tcp_stream_lwip.cpp
-    ${_CORO_SRC}/io/lwip/tcp_listener_lwip.cpp
+    ${_CORO_SRC}/runtime/io_driver.cpp
+    ${_CORO_SRC}/detail/socket_state.cpp
+    ${_CORO_SRC}/detail/sys/lwip/poller_lwip.cpp
+    ${_CORO_SRC}/detail/sys/lwip/socket_lwip.cpp
+    ${_CORO_SRC}/detail/sys/lwip/notify_lwip.cpp
+    ${_CORO_SRC}/detail/sys/lwip/tcp_lwip.cpp
+    ${_CORO_SRC}/detail/sys/lwip/udp_lwip.cpp
+    ${_CORO_SRC}/detail/sys/lwip/dns_lwip.cpp
+    ${_CORO_SRC}/io/circular_byte_buffer.cpp
+    ${_CORO_SRC}/io/lookup_host.cpp
     ${_CORO_SRC}/io/socket_address.cpp
-    ${_CORO_SRC}/io/lwip/udp_socket_lwip.cpp
+    ${_CORO_SRC}/io/tcp_stream.cpp
+    ${_CORO_SRC}/io/tcp_listener.cpp
+    ${_CORO_SRC}/io/udp_socket.cpp
 )
 target_include_directories(coro_pico PUBLIC  ${_CORO_INCLUDE})
 # CORO_PICO_LWIPOPTS_INCLUDE_DIR is PUBLIC, not PRIVATE: lwipopts.h must be
 # visible to any target that #includes Pico SDK/lwIP headers (e.g.
 # <pico/cyw43_arch.h>), not just to coro_pico's own .cpp files — see
 # doc/design/lwip_config.md ("coro owns lwipopts.h exclusively... transitively
-# through coro"). ${_CORO_SRC}/io/lwip stays PRIVATE — it's coro's own
-# internal lwIP-backend headers, not meant for consumers.
-target_include_directories(coro_pico PRIVATE ${_CORO_SRC}/io/lwip)
+# through coro"). The lwIP backend's own headers (src/detail/sys/lwip/) are
+# included by relative path and are not meant for consumers.
 target_include_directories(coro_pico PUBLIC  ${CORO_PICO_LWIPOPTS_INCLUDE_DIR})
 target_compile_features(coro_pico PUBLIC cxx_std_23)
-target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP CORO_UDP_BACKEND_LWIP)
+target_compile_definitions(coro_pico PUBLIC CORO_PICO CORO_SYS_LWIP)
 # Coroutine frame pooling (CoroPromiseBase's pooled operator new/delete in
 # coro.h) is experimental and off by default. To opt in:
 #   target_compile_definitions(coro_pico PUBLIC CORO_PICO_FRAME_POOL)
 # See doc/design/pico_port.md's "Coroutine frame pooling" section.
 # pico_stdlib and pico_cyw43_arch_lwip_poll are PRIVATE — they supply include
 # paths for compiling our sources but must NOT be bundled into the archive.
+# pico_cyw43_arch_lwip_poll also brings pico_async_context_poll and pico_lwip_nosys,
+# which the Runtime and the lwIP Poller use.
 # Applications must link them directly (see examples/pico/CMakeLists.txt).
 target_link_libraries(coro_pico PRIVATE pico_stdlib pico_cyw43_arch_lwip_poll)
 

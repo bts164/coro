@@ -77,11 +77,12 @@ if(CORO_PLATFORM STREQUAL "pico")
         install(TARGETS coro_pico_mqtt)
     endif()
     # The following are POSIX/libwebsockets-only, or are desktop-only Executor
-    # implementations other than CurrentThreadExecutor (the only Executor pico uses)
-    # — none have a CORO_PICO backend-flag fallback, unlike tcp_stream.h/tcp_listener.h
-    # which are whole-file #ifdef CORO_TCP_BACKEND_LWIP/IoDriver. Excluded so they can't
-    # be included at all on the pico package, rather than relying on a header guard
-    # to produce a clean error if a user includes one by mistake.
+    # implementations other than CurrentThreadExecutor (the only Executor pico uses).
+    # Excluded so they can't be included at all on the pico package, rather than
+    # relying on a header guard to produce a clean error if a user includes one by
+    # mistake. The I/O driver, the sockets and the sys seams are shared, so they are
+    # installed. The patterns match by file name, so "signal.h", "file.h" and
+    # "pipe.h" also leave out the desktop-only sys seams of those names.
     install(DIRECTORY include/coro
         DESTINATION include
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
@@ -90,17 +91,10 @@ if(CORO_PLATFORM STREQUAL "pico")
         PATTERN "ws_listener.h" EXCLUDE
         PATTERN "file.h" EXCLUDE
         PATTERN "file.hpp" EXCLUDE
-        PATTERN "lookup_host.h" EXCLUDE
         PATTERN "work_sharing_executor.h" EXCLUDE
         PATTERN "work_stealing_executor.h" EXCLUDE
-        # epoll-based I/O driver (doc/design/io_driver.md) — desktop only; Pico
-        # drives lwIP through CurrentThreadExecutor's PollFn instead.
-        PATTERN "io_driver.h" EXCLUDE
-        PATTERN "socket_state.h" EXCLUDE
-        PATTERN "stream_io.h" EXCLUDE
         PATTERN "pipe.h" EXCLUDE
         PATTERN "pipe.hpp" EXCLUDE
-        PATTERN "sys" EXCLUDE
         # spawn_blocking.h declares BlockingPool unconditionally (no CORO_PICO guard)
         # and calls Runtime::blocking_pool(), which only exists in the non-CORO_PICO
         # Runtime — desktop-only, would fail to compile on pico. blocking_task.h and
@@ -148,14 +142,15 @@ else()
         src/task/fiber.cpp
         # detail/
         src/detail/fiber_context_posix.cpp
-        src/detail/sys/dns_posix.cpp
-        src/detail/sys/file_posix.cpp
-        src/detail/sys/pipe_posix.cpp
-        src/detail/sys/signal_posix.cpp
-        src/detail/sys/poller_epoll.cpp
-        src/detail/sys/socket_posix.cpp
-        src/detail/sys/tcp_posix.cpp
-        src/detail/sys/udp_posix.cpp
+        src/detail/sys/posix/dns_posix.cpp
+        src/detail/sys/posix/file_posix.cpp
+        src/detail/sys/posix/notify_posix.cpp
+        src/detail/sys/posix/pipe_posix.cpp
+        src/detail/sys/posix/signal_posix.cpp
+        src/detail/sys/posix/poller_epoll.cpp
+        src/detail/sys/posix/socket_posix.cpp
+        src/detail/sys/posix/tcp_posix.cpp
+        src/detail/sys/posix/udp_posix.cpp
         src/detail/socket_state.cpp
         src/detail/timer_queue.cpp
         # sync/
@@ -201,9 +196,7 @@ else()
     #
     # include/coro/io/lwip/ is excluded for the same reason, just not caught by the
     # "pico" pattern above since it lives directly under io/ rather than under pico/.
-    # lwip_callback_result.h backs the lwIP TCP backend (tcp_stream_lwip.cpp) and
-    # pico/mqtt.cpp — the desktop build always uses the IoDriver backend instead (see
-    # tcp_stream.h's CORO_TCP_BACKEND_LWIP #ifdef), so it has no use here either.
+    # lwip_callback_result.h backs pico/mqtt.cpp, which has no use here either.
     install(DIRECTORY include/coro
         DESTINATION include
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"

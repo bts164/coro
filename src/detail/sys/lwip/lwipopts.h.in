@@ -49,8 +49,8 @@
 
 // Loopback — 127.0.0.1 and the device's own address reach the device itself, as
 // they do on a desktop OS. Looped packets are queued and delivered by
-// netif_poll_all(), which Runtime calls every loop iteration (runtime.cpp);
-// nothing else in a NO_SYS build drains that queue.
+// netif_poll_all(), which the lwIP Poller calls until the queue is empty
+// (src/detail/sys/lwip/poller_lwip.cpp); nothing else in a NO_SYS build drains it.
 #define LWIP_HAVE_LOOPIF            1
 #define LWIP_NETIF_LOOPBACK         1
 
@@ -59,6 +59,12 @@
 #define TCP_WND                     (8 * TCP_MSS)
 #define TCP_SND_BUF                 (8 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
+
+// Required by coro's lwIP sys backend (doc/design/lwip_config.md, "Settings the sys
+// backend requires"): SOF_REUSEADDR on listeners, as SO_REUSEADDR on POSIX, and lwIP
+// enforcing a listener's backlog until accept() takes each connection.
+#define SO_REUSE                    1
+#define TCP_LISTEN_BACKLOG          1
 
 // mDNS / DNS-SD — advertises the device as <hostname>.local on the LAN
 #define LWIP_MDNS_RESPONDER         1

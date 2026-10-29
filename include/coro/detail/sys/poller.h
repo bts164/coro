@@ -7,7 +7,10 @@
 // types and nothing else. See doc/design/io_driver.md, "The sys layer".
 //
 // Current backends:
-//   Linux: epoll (src/detail/sys/poller_epoll.cpp)
+//   Linux: epoll (src/detail/sys/posix/poller_epoll.cpp)
+//   lwIP on the Pico SDK (CORO_SYS_LWIP): a ready list fed by lwIP's callbacks, run and
+//     slept on the SDK's async_context (src/detail/sys/lwip/poller_lwip.cpp). See
+//     doc/design/pico_port.md, "The lwIP sys backend".
 //
 // Contract every backend must provide:
 //   - Edge-triggered delivery (Trigger::Edge, the default). An event is only
@@ -25,14 +28,51 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <vector>
 
+#ifdef CORO_SYS_LWIP
+// The Pico SDK's async_context (pico/async_context.h). Declared here so that this
+// header, which public headers include, does not pull in the SDK.
+struct async_context;
+#endif
+
 namespace coro::detail::sys {
 
+#ifdef CORO_SYS_LWIP
+/// The lwIP backend's analogue of an open file. Defined in
+/// src/detail/sys/lwip/io_object.h; opaque everywhere else.
+struct IoObject;
+
+/// Native handle type for a pollable I/O object. On lwIP there is no boundary
+/// between user space and a kernel for a number to cross, so the handle is the
+/// object itself.
+using RawFd = IoObject*;
+
+/// The handle of no object.
+inline constexpr RawFd kInvalidFd = nullptr;
+
+/// How the lwIP Poller is run. Filled in by the Pico Runtime from its PicoNetwork.
+struct PollerOptions {
+    /// The SDK async_context the Poller runs (async_context_poll()) and sleeps on
+    /// (async_context_wait_for_work_until()). Must outlive the Poller.
+    async_context* context = nullptr;
+    /// True when lwIP has been initialised and runs on `context`. Socket and DNS
+    /// creation fail with ENETDOWN otherwise, and the loopback queue is not drained.
+    bool lwip = false;
+};
+#else
 /// Native handle type for a pollable I/O object. `int` on POSIX; a Windows backend
 /// would make this `SOCKET`.
 using RawFd = int;
+
+/// The handle of no object.
+inline constexpr RawFd kInvalidFd = -1;
+
+/// Backend-specific construction options. POSIX needs none.
+struct PollerOptions {};
+#endif
 
 /// True if `err` (an errno value) means "the operation would block": the non-blocking
 /// syscall found nothing to do, and the caller should wait for readiness.
@@ -79,7 +119,7 @@ struct Event {
  */
 class Poller {
 public:
-    Poller();
+    explicit Poller(PollerOptions options = {});
     ~Poller();
 
     Poller(const Poller&)            = delete;
@@ -116,14 +156,43 @@ public:
     /// @throws std::system_error on failure other than EINTR.
     void poll(std::vector<Event>& out, std::optional<std::chrono::nanoseconds> timeout);
 
+#ifdef CORO_SYS_LWIP
+    /// Records readiness on `obj` (IoObject's kReadable, kWritable, kError, kHup
+    /// bits) and queues it for the next poll() if it is registered. Called by the
+    /// backend's lwIP callbacks and async_context workers, on the executor's
+    /// thread. Several calls before a poll() produce one Event.
+    void mark_ready(IoObject* obj, uint8_t bits) noexcept;
+
+    /// The async_context this Poller runs on.
+    async_context* context() const noexcept { return m_context; }
+#endif
+
 private:
+#ifdef CORO_SYS_LWIP
+    // One pass of the SDK context and the loopback queue, then the teardown
+    // deferred during it. See poll().
+    void service();
+    // True while lwIP's loopback queue holds a packet.
+    bool loopback_pending() const noexcept;
+    // Unlinks `obj` from the ready list.
+    void unlink_ready(IoObject* obj) noexcept;
+
+    async_context* m_context = nullptr;
+    bool           m_lwip    = false;
+    // FIFO of objects with readiness to report, through IoObject::next_ready.
+    IoObject*      m_ready_head = nullptr;
+    IoObject*      m_ready_tail = nullptr;
+#else
     RawFd m_fd = -1;  // the epoll instance
+#endif
 };
 
 /**
  * @brief Wakes a thread blocked in Poller::poll() from any thread.
  *
  * Linux: an eventfd registered (readable) with the poller under a caller-chosen key.
+ * lwIP: a notify object (sys/notify.h) registered the same way; wake() marks its
+ * async_context worker pending, which ends a sleeping poll().
  * When poll() returns an Event carrying that key, the driver calls reset().
  */
 class PollWaker {
@@ -147,7 +216,11 @@ public:
 
 private:
     Poller& m_poller;
+#ifdef CORO_SYS_LWIP
+    RawFd   m_fd = kInvalidFd;  // a notify object, registered under the waker's key
+#else
     RawFd   m_fd = -1;  // eventfd
+#endif
 };
 
 } // namespace coro::detail::sys

@@ -141,7 +141,7 @@ int wait_with_timeout(int epfd, epoll_event* events,
 // Poller
 // ---------------------------------------------------------------------------
 
-Poller::Poller() {
+Poller::Poller(PollerOptions) {
     m_fd = ::epoll_create1(EPOLL_CLOEXEC);
     if (m_fd < 0) throw_errno("epoll_create1");
 }

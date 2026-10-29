@@ -1,6 +1,7 @@
 #include <coro/runtime/io_driver.h>
 #include <coro/detail/trace.h>
 
+#include <array>
 #include <cassert>
 #include <stdexcept>
 #include <utility>
@@ -48,8 +49,9 @@ inline void receive_from_poller([[maybe_unused]] const void* io) noexcept {
 // IoDriver
 // ---------------------------------------------------------------------------
 
-IoDriver::IoDriver()
-    : m_unpark(m_poller, &m_unpark_key)
+IoDriver::IoDriver(detail::sys::PollerOptions options)
+    : m_poller(options)
+    , m_unpark(m_poller, &m_unpark_key)
 {}
 
 // Members tear down in reverse order: pending releases, then m_unpark (which
@@ -168,6 +170,16 @@ void IoDriver::shutdown() noexcept {
                 wakers.push_back(std::move(reader));
             if (auto writer = std::exchange(io->m_writer, {}).lock())
                 wakers.push_back(std::move(writer));
+            // Every listed waiter, whatever its direction. Into the vector rather
+            // than in batches like dispatch(): shutdown() may allocate.
+            std::array<detail::Rc<detail::Waker>, kWakeBatch> batch;
+            for (;;) {
+                std::size_t count = 0;
+                const bool more = take_listed_wakers(*io, true, true, true,
+                                                     batch.data(), batch.size(), count);
+                for (std::size_t i = 0; i < count; ++i) wakers.push_back(std::move(batch[i]));
+                if (!more) break;
+            }
         }
     }
     // Wake outside m_registrations_mutex and the ScheduledIo mutexes, as dispatch()
@@ -196,6 +208,27 @@ void IoDriver::cancel_timer(detail::TimerId id) noexcept {
     m_timers.cancel(id);
 }
 
+bool IoDriver::take_listed_wakers(detail::ScheduledIo& io, bool readable, bool writable,
+                                  bool all, detail::Rc<detail::Waker>* out,
+                                  std::size_t limit, std::size_t& count) {
+    count = 0;
+    IoWaiter* waiter = io.m_waiters.front();
+    while (waiter != nullptr) {
+        IoWaiter* const next = waiter->next;
+        const bool match = all ||
+            (waiter->m_direction == IoDirection::Read ? readable : writable);
+        if (match) {
+            if (count == limit) return true;
+            io.m_waiters.remove(waiter);
+            waiter->m_linked = false;
+            waiter->m_ready  = true;
+            if (auto w = std::exchange(waiter->m_waker, {}).lock()) out[count++] = std::move(w);
+        }
+        waiter = next;
+    }
+    return false;
+}
+
 void IoDriver::dispatch(const detail::sys::Event& event) {
     auto* io = static_cast<detail::ScheduledIo*>(event.key);
     receive_from_poller(io);  // pairs with add(); a no-op outside TSan
@@ -206,8 +239,14 @@ void IoDriver::dispatch(const detail::sys::Event& event) {
     const bool readable = event.readable || event.error || event.hup;
     const bool writable = event.writable || event.error || event.hup;
 
+    // The slot wakers plus listed waiters, woken outside the lock: wake() enqueues
+    // into an executor and must not nest inside ScheduledIo's mutex. In batches, so
+    // that any number of listed waiters is woken without allocating.
+    std::array<detail::Rc<detail::Waker>, kWakeBatch> listed;
     detail::Rc<detail::Waker> reader;
     detail::Rc<detail::Waker> writer;
+    std::size_t count = 0;
+    bool more;
     {
         std::lock_guard lock(io->m_mutex);
         if (io->m_level) {
@@ -221,25 +260,40 @@ void IoDriver::dispatch(const detail::sys::Event& event) {
             io->m_readable = io->m_readable || readable;
             io->m_writable = io->m_writable || writable;
             reader = io->m_reader.lock();
-        } else if (readable) {
-            io->m_readable = true;
-            reader = std::exchange(io->m_reader, {}).lock();
-        }
-        if (!io->m_level && writable) {
-            io->m_writable = true;
-            writer = std::exchange(io->m_writer, {}).lock();
+        } else {
+            if (readable) {
+                io->m_readable = true;
+                reader = std::exchange(io->m_reader, {}).lock();
+            }
+            if (writable) {
+                io->m_writable = true;
+                writer = std::exchange(io->m_writer, {}).lock();
+            }
         }
         ++io->m_tick;
+        more = take_listed_wakers(*io, readable, writable, false,
+                                  listed.data(), listed.size(), count);
     }
 
-    // Wake outside the lock: wake() enqueues into an executor and must not nest
-    // inside ScheduledIo's mutex.
-    //
     // Race (benign): the waiter may already have re-polled between the unlock above
     // and these calls, seen the readiness, and moved on. The wake is then spurious,
     // which tasks already tolerate.
     if (reader) reader->wake();
     if (writer) writer->wake();
+    for (;;) {
+        for (std::size_t i = 0; i < count; ++i) {
+            listed[i]->wake();
+            listed[i] = nullptr;
+        }
+        if (!more) break;
+        // Race (benign): waiters linked since the first batch match too, and are
+        // woken by this event although they arrived after it. Each one's next poll
+        // just runs its operation, which decides; at worst one spurious wake. Woken
+        // waiters are unlinked, so restarting from the head never wakes one twice.
+        std::lock_guard lock(io->m_mutex);
+        more = take_listed_wakers(*io, readable, writable, false,
+                                  listed.data(), listed.size(), count);
+    }
 }
 
 detail::Rc<detail::ScheduledIo> IoDriver::add(detail::sys::RawFd fd, detail::sys::Interest interest,
@@ -293,6 +347,14 @@ void IoDriver::deregister(detail::sys::RawFd fd, detail::Rc<detail::ScheduledIo>
         std::lock_guard lock(io->m_mutex);
         io->m_reader.reset();
         io->m_writer.reset();
+        // Every waiter's future holds a share of whatever owns this registration,
+        // so none can still be linked. Unlinked anyway in release builds, so that
+        // the list never points into a destroyed future.
+        assert(io->m_waiters.empty() && "IoRegistration deregistered with linked IoWaiters");
+        while (IoWaiter* waiter = io->m_waiters.pop_front()) {
+            waiter->m_linked = false;
+            waiter->m_waker.reset();
+        }
     }
     // Race: a turn() on another thread may have fetched an event naming `io` just
     // before deregister_fd() above, and may be about to dispatch it. Keeping `io`
@@ -337,7 +399,7 @@ IoRegistration::~IoRegistration() {
 
 IoRegistration::IoRegistration(IoRegistration&& other) noexcept
     : m_driver(std::exchange(other.m_driver, nullptr))
-    , m_fd(std::exchange(other.m_fd, -1))
+    , m_fd(std::exchange(other.m_fd, detail::sys::kInvalidFd))
     , m_io(std::move(other.m_io))
 {}
 
@@ -345,7 +407,7 @@ IoRegistration& IoRegistration::operator=(IoRegistration&& other) noexcept {
     if (this != &other) {
         deregister();
         m_driver = std::exchange(other.m_driver, nullptr);
-        m_fd     = std::exchange(other.m_fd, -1);
+        m_fd     = std::exchange(other.m_fd, detail::sys::kInvalidFd);
         m_io     = std::move(other.m_io);
     }
     return *this;
@@ -390,7 +452,7 @@ void IoRegistration::deregister() noexcept {
     m_driver->deregister(m_fd, std::move(m_io));
     m_io     = nullptr;
     m_driver = nullptr;
-    m_fd     = -1;
+    m_fd     = detail::sys::kInvalidFd;
 }
 
 void IoRegistration::set_interest(detail::sys::Interest interest) {
@@ -409,6 +471,61 @@ void IoRegistration::set_waker(detail::Weak<detail::Waker> waker) {
     // another thread wakes either the old waker or this one, never a torn value.
     std::lock_guard lock(m_io->m_mutex);
     m_io->m_reader = std::move(waker);
+}
+
+std::optional<IoReadyEvent> IoRegistration::poll_ready(IoDirection direction,
+                                                       detail::Context& ctx,
+                                                       IoWaiter& waiter) {
+    assert(m_io && "poll_ready() on an empty IoRegistration");
+    assert(!m_io->m_level && "poll_ready() on a level-triggered IoRegistration");
+    std::lock_guard lock(m_io->m_mutex);
+    if (m_io->m_shutdown) {
+        if (waiter.m_linked) {
+            m_io->m_waiters.remove(&waiter);
+            waiter.m_linked = false;
+            waiter.m_waker.reset();
+        }
+        waiter.m_ready = false;
+        return IoReadyEvent{direction, m_io->m_tick, true};
+    }
+    // Woken by dispatch(), which unlinked it: ready once, whatever the shared
+    // readiness says now. Another waiter may have cleared it since; this one's
+    // operation decides. See doc/design/io_driver.md, "More than one waiter".
+    if (std::exchange(waiter.m_ready, false))
+        return IoReadyEvent{direction, m_io->m_tick};
+    if (waiter.m_linked) {
+        // Still waiting: the task may have been polled for another reason.
+        waiter.m_waker = ctx.get_weak_waker();
+        return std::nullopt;
+    }
+    const bool ready = direction == IoDirection::Read ? m_io->m_readable
+                                                      : m_io->m_writable;
+    if (ready)
+        return IoReadyEvent{direction, m_io->m_tick};
+    // Linked under the same lock dispatch() takes, so an event either happened
+    // before this check (we returned ready above) or will find this waiter.
+    waiter.m_direction = direction;
+    waiter.m_waker     = ctx.get_weak_waker();
+    waiter.m_linked    = true;
+    m_io->m_waiters.push_back(&waiter);
+    return std::nullopt;
+}
+
+void IoRegistration::cancel_wait(IoWaiter& waiter) noexcept {
+    if (!m_io) {
+        assert(!waiter.m_linked && "IoWaiter linked to a deregistered IoRegistration");
+        return;
+    }
+    std::lock_guard lock(m_io->m_mutex);
+    if (waiter.m_linked) {
+        m_io->m_waiters.remove(&waiter);
+        waiter.m_linked = false;
+    }
+    // Race (benign): dispatch() may have unlinked this waiter and taken its waker
+    // just before; that wake then reaches a task whose future is gone, a spurious
+    // wake it tolerates.
+    waiter.m_ready = false;
+    waiter.m_waker.reset();
 }
 
 IoLevelReady IoRegistration::take_ready() {

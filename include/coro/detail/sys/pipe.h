@@ -5,7 +5,7 @@
 // EAGAIN means "wait for readiness and retry" (IoRegistration::poll_io).
 //
 // Current backends:
-//   POSIX: src/detail/sys/pipe_posix.cpp
+//   POSIX: src/detail/sys/posix/pipe_posix.cpp
 //
 // See doc/design/pipe_streaming.md, "The sys/pipe.h seam".
 

@@ -109,8 +109,7 @@ directly:
 #include <coro/runtime/clock.h>           // Clock, Instant — deadlines for sleep_until()/timeout_at()
 
 // Tasks
-#include <coro/task/join_handle.h>        // JoinHandle<T>
-#include <coro/task/stream_handle.h>      // StreamHandle<T>
+#include <coro/task/join_handle.h>        // JoinHandle<T>, StreamHandle<T>
 #include <coro/task/join_set.h>           // JoinSet<T, Tag>, JoinResult
 #include <coro/task/cancel_handle.h>      // CancelHandle — stop one task without owning it
 #include <coro/task/spawn_builder.h>      // SpawnBuilder — returned by build_task()

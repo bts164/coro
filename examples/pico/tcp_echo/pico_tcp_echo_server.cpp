@@ -124,8 +124,12 @@ int main() {
     std::printf("WiFi connected. IP: %s  Starting echo server on port %d...\n",
                 ip4addr_ntoa(netif_ip4_addr(netif_default)), BIND_PORT);
 
-    coro::Runtime rt;
-    rt.block_on(run_server());
+    {
+        // Scoped: the runtime runs on the CYW43 driver's async_context, which
+        // cyw43_arch_deinit() destroys, so it must be gone first.
+        coro::Runtime rt;
+        rt.block_on(run_server());
+    }
 
     cyw43_arch_deinit();
     return 0;

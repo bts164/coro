@@ -1,76 +1,602 @@
 # Pico Port
 
-Stripped-down port of the coro library to Raspberry Pi Pico W (RP2040/RP2350),
-targeting the Pico SDK with `CYW43_ARCH_POLL` mode. Provides `CurrentThreadExecutor`,
-`TcpStream`, `TcpListener`, `sleep_for`, and `timeout` — enough to run coroutines
-with async TCP I/O, timers, and hardware IRQ integration on bare metal.
+The port of coro to the Raspberry Pi Pico W (RP2040/RP2350), on the Pico SDK in
+`CYW43_ARCH_POLL` mode. It runs the same `Runtime`, `CurrentThreadExecutor`,
+[`IoDriver`](io_driver.md) and socket types as the desktop build. What differs is
+underneath the driver's `sys` layer: on a desktop the operating system's network stack
+sits there, and on Pico lwIP does.
 
 ## Scope
 
 | Included | Excluded |
 |---|---|
-| `Coro<T>` / `JoinHandle<T>` / `JoinSet<T>` — coroutine return types | `WorkStealingExecutor` / `WorkSharingExecutor` |
-| `spawn()` — task spawning and joining | `File` / `WsStream` |
-| `CurrentThreadExecutor` — single-threaded run loop | `spawn_blocking` (no thread pool) |
-| `TcpStream` — async TCP client (lwIP backend) | |
-| `TcpListener` — async TCP server (lwIP backend) | |
-| `mpsc`, `oneshot`, `watch`, `select`, `join` — sync primitives | |
-| `sleep_for` / `timeout` — timer-queue based, no ISR | |
+| `Coro<T>`, `JoinHandle<T>`, `JoinSet<T>`, `spawn()` | `WorkStealingExecutor`, `WorkSharingExecutor` |
+| `CurrentThreadExecutor` on the `IoDriver` | `spawn_blocking` and the blocking pool (no threads) |
+| `TcpStream`, `TcpListener`, `UdpSocket` (lwIP `sys` backend) | `File`, `Pipe`, signals |
+| `lookup_host` (lwIP DNS) | `WsStream`, `WsListener` |
+| `sleep_for`, `timeout`, `IntervalTimer` (the driver's timer queue) | `blocking_wait`, `blocking_next` |
+| `mpsc`, `oneshot`, `watch`, `broadcast`, `select`, `join`, fibers | |
+| `IsrEvent`, `IsrChannel<T>`, `IsrSemaphore` | |
+| Optional: `coro_pico_hal` (DMA, GPIO), `coro_pico_mqtt` | |
 
-All coroutine machinery in `include/coro/detail/` and `include/coro/sync/` is
-portable C++20/23 with no platform dependencies and compiles as-is.
+All coroutine machinery in `include/coro/detail/` and `include/coro/sync/` is portable
+C++20/23 and compiles unchanged.
 
 ---
 
 ## Architecture
 
-### Compile-time feature flags
+### Compile-time flags
 
 | Flag | Effect |
 |---|---|
-| `CORO_PICO` | Selects `CurrentThreadExecutor`, no-op mutex stubs, `SleepFuture` timer queue, no epoll `IoDriver` |
-| `CORO_TCP_BACKEND_LWIP` | Selects lwIP TCP backend for `TcpStream` / `TcpListener` |
+| `CORO_PICO` | The single-threaded platform: no-op `detail::Mutex`, non-atomic `Rc`/`Weak`/`RelaxedState`, `PicoClock`, the ISR primitives, and the Pico `Runtime` constructor |
+| `CORO_SYS_LWIP` | Selects the lwIP backend of the `sys` layer: `sys::RawFd` is an `IoObject*`, and `Poller`, `PollWaker` and the socket and DNS seams are implemented over lwIP |
 
-Both flags are set automatically by `cmake/platforms/pico.cmake`.
+`cmake/platforms/pico.cmake` sets both. The host-side tests build `CORO_SYS_LWIP`
+against a host build of lwIP, so the lwIP backend is tested on the development machine
+as well as on the board.
 
-### How the existing library maps to the Pico SDK
+No public header depends on `CORO_SYS_LWIP`. `TcpStream`, `TcpListener` and `UdpSocket`
+have one declaration and one implementation; only `src/detail/sys/lwip/` changes.
 
-| Desktop | Pico SDK equivalent |
-|---|---|
-| `IoDriver::turn()` (`epoll_wait`) | `cyw43_arch_poll()` |
-| Non-blocking socket fd registered with the `IoDriver` | lwIP `tcp_pcb*` |
-| `IoDriver` timer queue (`detail::TimerQueue`) | `CurrentThreadExecutor` timer queue (`detail::TimerQueue` + `time_us_64()`) |
-| `IoDriver` eventfd unpark | Not needed — single-threaded cooperative scheduling; ISR path uses `IsrEvent` volatile flags |
-| Readiness futures woken by the `IoDriver` | `LwipCallbackResult` (no mutex; see below) |
-| Executor threads that turn the `IoDriver` | `CurrentThreadExecutor` (runs on calling thread) |
-
-### Event loop
-
-`Runtime::block_on()` drives everything:
+### Layering
 
 ```mermaid
 flowchart TD
-    Start([block_on]) --> Check{state.terminated?}
-    Check -->|yes| End([return])
-    Check -->|no| Poll[poll_ready_tasks]
-    Poll --> Timers[check_expired_timers]
-    Timers --> WiFi[cyw43_arch_poll]
-    WiFi --> Check
+    P["TcpStream, TcpListener, UdpSocket, lookup_host<br/>(one implementation)"]
+    S["SocketState, FdReadFuture, FdWriteFuture"]
+    R["IoRegistration: poll_io handshake"]
+    D["IoDriver: ScheduledIo, dispatch, timers"]
+    subgraph sys["sys layer"]
+        PX["POSIX: epoll Poller, eventfd,<br/>recv / send / accept4"]
+        LW["lwIP: ready-list Poller, IoObject,<br/>receive rings / tcp_write / udp_sendto"]
+    end
+    P --> S --> R --> D
+    P --> sys
+    D --> sys
 ```
 
-`cyw43_arch_poll()` processes pending WiFi chip events and fires any pending lwIP
-callbacks (TCP recv, sent, err) synchronously on the calling thread before returning.
-`check_expired_timers()` fires wakers for any `sleep_for` / `timeout` deadlines that
-have passed since the last iteration.
+The desktop and Pico builds differ only inside the `sys` box:
+
+| Piece | Desktop (POSIX) | Pico (lwIP) |
+|---|---|---|
+| `sys::RawFd` | `int` file descriptor | `IoObject*` |
+| Socket state | The kernel's | An `IoObject` subclass: the lwIP pcb, received data, error state |
+| Readiness source | epoll | lwIP callbacks put the `IoObject` on the `Poller`'s ready list |
+| Kernel event queue | The epoll instance | The Pico SDK's poll-mode `async_context` |
+| Blocking wait in `Poller::poll()` | `ppoll()` on the epoll fd | `async_context_wait_for_work_until()` |
+| `PollWaker` | An eventfd | A when-pending worker on the `async_context` |
+| ISR → task | (none) | Each ISR primitive signals its notify fd, an `IoObject` with its own when-pending worker |
+| Non-blocking operations | `recv`, `send`, `accept4`, ... | `src/detail/sys/lwip/*.cpp` over the lwIP raw API |
+| Name resolution | `getaddrinfo` on the blocking pool | lwIP DNS, as a query registered with the driver |
+| Who turns the driver | Executor threads | `CurrentThreadExecutor`, through `IoDriverParker` |
+
+### The event loop
+
+`Runtime::block_on()` runs `CurrentThreadExecutor`'s loop, the same loop as on a desktop
+`Runtime(1)`:
+
+```mermaid
+flowchart TD
+    Start([block_on]) --> Done{task done?}
+    Done -->|yes| End([return])
+    Done -->|no| Batch[run a batch of ready tasks]
+    Batch --> Turn["IoDriverParker::park(max_wait)<br/>= IoDriver::turn(max_wait)"]
+    subgraph turn["IoDriver::turn"]
+        Poll["Poller::poll(timeout)<br/>async_context_poll: CYW43, lwIP, notify workers<br/>sleep if nothing is ready"]
+        Dispatch[dispatch events: set readiness, wake]
+        Timers[fire expired timers]
+        Poll --> Dispatch --> Timers
+    end
+    Turn --> Poll
+    Timers --> Done
+```
+
+`max_wait` is zero while a task is ready, so a busy loop turns the driver without
+sleeping. When nothing is ready the driver's earliest timer bounds the wait, and the CPU
+sleeps in `Poller::poll()` until a timer is due or a wake source reports work (see
+[Wake sources](#wake-sources)). The loop is the desktop `CurrentThreadExecutor`'s,
+step for step: ISR signals reach tasks from inside the turn, not from a separate step.
+
+### `Runtime` on Pico
+
+The Pico `Runtime` owns an `IoDriver` and a `CurrentThreadExecutor` whose parker turns
+it, as a desktop `Runtime(1)` does. It has no blocking pool. `turns_io_driver()` is
+true, so sockets and timers take the same paths as on a desktop.
+
+Every Pico `Runtime` runs on a poll-mode `async_context` (`pico_async_context`): the
+SDK's event queue, which plays the epoll instance's part. Its constructor takes a
+`PicoNetwork`, which says where that context comes from and what runs on it. The
+context and the `PicoNetwork` reach the driver as the backend's `sys::PollerOptions`:
+
+| `PicoNetwork` | `async_context` | Runs on it | The application must first call |
+|---|---|---|---|
+| `Cyw43` (default) | The CYW43 driver's: `cyw43_arch_async_context()` | The CYW43 driver, lwIP's timers, coro's workers | `cyw43_arch_init()` |
+| `Lwip` | The `Runtime`'s own, on which it calls `lwip_nosys_init()` | lwIP's timers, coro's workers | nothing |
+| `None` | The `Runtime`'s own | coro's workers | nothing |
+
+In every mode `Poller::poll()` also drains lwIP's loopback queue; see
+[lwIP configuration](lwip_config.md#loopback).
+
+An `async_context` belongs to the core that created it, and the SDK panics if it is
+polled from another core. The `Runtime` must therefore be constructed and run on the
+core that called `cyw43_arch_init()`.
+
+`Runtime::shutdown()` drains the tasks, then calls `IoDriver::shutdown()`, as on
+desktop. Destroying the `Runtime` withdraws its workers from the context; with `Lwip`
+and `None` it then deinitialises its own context.
+
+!!! danger "WARNING: destroy a `Cyw43` runtime before `cyw43_arch_deinit()`"
+    With `PicoNetwork::Cyw43` the `Runtime`'s workers live on the CYW43 driver's
+    `async_context`, which `cyw43_arch_deinit()` destroys. A `Runtime` still alive at
+    that point withdraws its workers from a destroyed context when it is destroyed.
+    Give the runtime a scope that ends before `cyw43_arch_deinit()` (see
+    [Usage example](#usage-example)). The order mirrors construction:
+    `cyw43_arch_init()`, then the `Runtime`; the `Runtime` gone, then
+    `cyw43_arch_deinit()`.
+
+**No network, no sockets.** A `PicoNetwork::None` runtime does not initialise or run
+lwIP, so a socket could never complete, and creating one would call into an
+uninitialised lwIP. Every `sys` function that creates a socket or a DNS query
+(`tcp_connect_start()`, `tcp_listen()`, `udp_open()`, `dns_start()`) therefore checks
+the backend's "lwIP is running" flag, which the `Poller` sets only for `Cyw43` and
+`Lwip`, and fails with `ENETDOWN` before it touches lwIP. Like any other setup failure,
+that reaches the caller as a `std::system_error` thrown at the `co_await` of
+`TcpStream::connect()`, `TcpListener::bind()`, `UdpSocket::bind()` or `lookup_host()`.
+Notify fds need no network, so the ISR primitives work in every mode.
+
+**`Runtime::poll()`** is for firmware that keeps its own main loop instead of calling
+`block_on()`. It runs one batch of ready tasks and then turns the driver with a zero
+wait, so one call does everything a pass of `block_on()`'s loop does except sleep:
+
+```cpp
+coro::Runtime rt;
+// ... spawn tasks ...
+while (true) {
+    rt.poll();
+    // other firmware work
+}
+```
+
+---
+
+## The lwIP `sys` backend
+
+### Why lwIP sits below `sys`
+
+On a desktop, the kernel owns each socket: it buffers received data, tracks the
+connection, and reports readiness through epoll. A task makes a non-blocking syscall and
+waits for readiness only when the syscall would block. On Pico, lwIP does the kernel's
+job, but its raw API is shaped differently: received data is pushed into a `recv`
+callback as pbufs, and send-buffer space is announced by a `sent` callback.
+
+The lwIP backend adapts that to the kernel's shape. Each socket is an `IoObject` that
+holds what the kernel would hold (the pcb, the received data, the error state). lwIP's
+callbacks update it and mark it ready, and the `sys` functions (`tcp_try_read`,
+`udp_try_send`, ...) are "syscalls" on it that either complete or report `EAGAIN`.
+Everything above `sys` is then the desktop code, unchanged.
+
+lwIP's own sockets and netconn APIs are not an option: both require `NO_SYS=0`, an RTOS
+with threads.
+
+### `IoObject` and `RawFd`
+
+```cpp
+namespace coro::detail::sys {
+
+/// The lwIP backend's analogue of an open file: one per socket or DNS query.
+/// Touched only on the executor's thread.
+struct IoObject {
+    enum class Kind : uint8_t { Tcp, TcpListener, Udp, DnsQuery, Notify };
+
+    // Bits of `flags`. The first four are readiness seen since the object was last
+    // reported, set by lwIP callbacks; kQueued means it is on the Poller's ready list,
+    // which keeps it there at most once.
+    static constexpr uint8_t kReadable = 1u << 0;
+    static constexpr uint8_t kWritable = 1u << 1;
+    static constexpr uint8_t kError    = 1u << 2;
+    static constexpr uint8_t kHup      = 1u << 3;
+    static constexpr uint8_t kQueued   = 1u << 4;
+
+    // Set by Poller::register_fd(): the ScheduledIo* reported in this object's Events.
+    // Null while unregistered.
+    void*     key        = nullptr;
+    // The Poller's ready list.
+    IoObject* next_ready = nullptr;
+    // The Poller it is registered with, which lwIP callbacks report readiness to;
+    // null while unregistered.
+    Poller*   poller     = nullptr;
+    Kind      kind;
+    uint8_t   flags      = 0;
+};
+
+using RawFd = IoObject*;
+inline constexpr RawFd kInvalidFd = nullptr;   // -1 on POSIX
+
+}
+```
+
+`LwipTcp`, `LwipListener`, `LwipUdp`, `LwipDnsQuery` and `LwipNotify` derive from it. A `sys`
+function casts its `RawFd` to the type it expects with `static_cast`, and debug builds
+assert the `kind` first. `close_socket()` switches on `kind` to release the lwIP
+resources, then deletes the object.
+
+A pointer, not an integer: POSIX numbers its files because the number crosses the
+boundary between user space and the kernel. Here there is no boundary, so the handle can
+be the object itself, with no table to look it up in.
+
+The flags share one byte rather than five `bool`s. With 32-bit pointers the base is
+16 bytes instead of 20, every socket's object being that much smaller, and recording
+readiness is a single OR of the callback's bits. One byte is one memory location, so
+two threads must not write different bits of it without a common lock. That holds
+because only the executor's thread touches an `IoObject`, and dual-core work (see
+[Dual-core wakes](#dual-core-wakes)) must revisit it.
+
+### `Poller`
+
+The lwIP `Poller` keeps an intrusive FIFO of ready `IoObject`s.
+
+- **`register_fd(fd, key, interest, Trigger::Edge)`** stores `key` in the object. The
+  interest set is ignored, as epoll's is for error and hang-up: every readiness change
+  is reported. Registration needs no queueing, because a new `ScheduledIo` starts ready
+  in both directions, so the first operation always tries the "syscall".
+- **`register_fd(..., Trigger::Level)`** fails with `ENOTSUP`. Level-triggered
+  registrations serve libraries that own a socket themselves (libwebsockets), and none
+  runs on lwIP.
+- **`deregister_fd(fd)`** clears `key` and unlinks the object from the ready list, so a
+  closed socket never appears in a batch. The driver's deferred release
+  ([Registration lifetime](io_driver.md#registration-lifetime-and-stale-events)) still
+  applies on top of that.
+- **`mark_ready(obj, bits)`**, called by lwIP callbacks with `kReadable`, `kWritable`,
+  `kError` and `kHup` as needed, ORs the bits into `obj->flags`, and appends the object
+  to the ready list unless `kQueued` is already set. Several callbacks in one pass
+  produce one `Event`.
+
+`poll(out, timeout)`:
+
+```
+service()                                   // see below
+if the ready list is empty and timeout != 0:
+    async_context_wait_for_work_until(ctx, now + timeout)   // no limit if nullopt
+    service()
+move every ready object with a key to `out` as an Event, clearing its flags
+if the PollWaker's worker ran: add an Event carrying the PollWaker's key
+
+service():
+    async_context_poll(ctx)                 // CYW43, lwIP timers, coro's workers
+    while lwIP's loopback queue is not empty:
+        netif_poll_all()
+```
+
+- **Callbacks run inside `poll()`.** `async_context_poll()` runs the CYW43 driver and
+  lwIP's timers, which run lwIP's callbacks synchronously, so every callback runs on the
+  executor's thread, inside the turn. See [Callback rules](#callback-rules).
+- **Always service before sleeping.** The SDK recomputes the context's next timer
+  deadline only at the end of `async_context_poll()`, and the sleep is bounded by it.
+- **The loopback queue is drained to empty.** lwIP queues packets for the device's own
+  addresses until `netif_poll_all()`, and processing one can queue another (a SYN
+  produces a SYN-ACK). The loopback queue is not an `async_context` wake source, so the
+  `Poller` must not sleep while it holds anything. It checks the netif's `loop_first`
+  (present with `LWIP_NETIF_LOOPBACK`).
+- **`PollWaker`** is a when-pending worker on the context. `wake()` is
+  `async_context_set_work_pending()`, which may be called from any core or IRQ; its
+  `do_work` records that it ran, and `reset()` clears that. Like an eventfd, a `wake()`
+  made while nobody sleeps is kept (see [Wake sources](#wake-sources)).
+- **No locks.** Everything above runs on the executor's thread. The `Poller` contract's
+  "thread-safe registration" holds trivially.
+- **Teardown during `service()` is deferred.** Code that runs inside `service()` can drop
+  the last reference to an I/O object. For example, an `LwipCallbackResult` wake (MQTT)
+  can drop the last reference to a task, whose futures then close their sockets or
+  deregister their notify fds. Neither is safe at that point:
+  `async_context_remove_when_pending_worker()` would edit the worker list while
+  `async_context_poll()` is walking it, and `tcp_close()` would run inside one of lwIP's
+  own callbacks. So a flag marks the service pass (module-level state of the lwIP
+  backend: a Pico has one thread, so one pass runs at a time), and while it is set:
+    - `deregister_fd()` does everything that touches only the object itself: it clears
+      the key, unlinks the object from the ready list, and, for a notify object, clears
+      its context pointer, so later signals are dropped. It then appends the object to a
+      deferred list instead of removing its worker from the context.
+    - `close_socket()` appends the object to the same list instead of releasing its lwIP
+      resources and deleting it.
+
+  The end of `service()`, after the loopback drain, finishes the deferred work in the
+  order it was requested: it removes the workers, then closes and deletes the objects.
+  Outside `service()` both run at once.
+
+### Wake sources
+
+`async_context_wait_for_work_until()` waits on the context's semaphore until a deadline:
+the earlier of the driver's `timeout` and the context's next at-time worker. The only
+thing that releases the semaphore early is `async_context_set_work_pending()`. An
+interrupt that does not call it wakes the core, which finds no permit and goes back to
+sleep.
+
+So the rule is the eventfd rule on desktop: **anything that can make a task runnable
+from outside the executor's thread calls `async_context_set_work_pending()` when it
+happens.** The set of such things is small and closed:
+
+| Source | How it wakes the sleep |
+|---|---|
+| Wi-Fi traffic: sockets, DNS, and lwIP applications such as MQTT | The CYW43 driver's interrupt marks its worker pending |
+| lwIP's timers: retransmits, DNS retries, MQTT keep-alive | At-time workers on the context bound the sleep |
+| coro's timers (`sleep_for`, `timeout`) | The driver passes the earliest deadline as the sleep's limit |
+| ISR primitives (`IsrEvent`, `IsrChannel<T>`, `IsrSemaphore`), and through them the HAL (DMA, GPIO) | Each signal function signals the primitive's notify fd, whose worker is marked pending; see [Notify objects](#notify-objects) |
+| `IoDriver::unpark()` | `PollWaker::wake()` marks its worker pending |
+| Packets to the device's own address | Not a wake source: the `Poller` drains the loopback queue before it sleeps |
+
+lwIP applications such as MQTT need nothing of their own: they run inside lwIP, so
+everything that drives them is already on the list. A user ISR reaches a task only
+through an ISR primitive, which [ISR Safety](isr_safety.md) already requires, so it is
+covered too.
+
+The context's semaphore is binary and latched (`sem_init(&sem, 1, 1)`). A release made
+while the executor is awake leaves a permit, so the next wait returns at once: a wake
+that lands between the last check and the sleep costs one extra turn, never a lost
+wake.
+
+!!! warning "WARNING: a library polled from the main loop stalls while the CPU sleeps"
+    Anything that expects to be called from the firmware's main loop (TinyUSB in polled
+    mode, `tud_task()`, for example) does not run while the executor sleeps, and nothing
+    wakes the executor for it. Run it as an `async_context` worker, which then also
+    needs a wake source, or drive it from a task. `pico_stdio_usb` services USB from its
+    own interrupt and needs neither.
+
+!!! note "NOTE: the sleep is WFE"
+    `sem_acquire_block_until()` waits with WFE, using the default alarm pool for its
+    timeout, so `PICO_TIME_DEFAULT_ALARM_POOL_DISABLED` must stay unset. The core is
+    clock-gated while it waits. The chip's dormant and deep-sleep modes are not used.
+
+### Callback rules
+
+Every lwIP callback the backend registers:
+
+- runs on the executor's thread, inside `Poller::poll()`, inside `IoDriver::turn()`;
+- touches only its own `IoObject` and the `Poller`'s ready list (through `mark_ready()`);
+- never calls `wake()`, never runs a task, and never frees the `IoObject` (only
+  `close_socket()` does, except for an orphaned DNS query; see
+  [Name resolution](#name-resolution)).
+
+A socket's waiter is woken only in `IoDriver::dispatch()`, exactly as on desktop.
+`close_socket()` detaches every callback (`tcp_arg(pcb, nullptr)` and friends) before it
+deletes the object, so no callback can reach a freed one.
+
+A notify object's worker follows the same rules: it only calls `mark_ready()`.
+
+One other thing that runs inside `poll()` does wake tasks directly:
+`LwipCallbackResult` (used by MQTT). It runs on the executor's thread, inside the turn,
+where a wake only enqueues the task, which is why `dispatch()`'s wakes are safe there
+too.
+
+### Received data: per-socket buffers
+
+lwIP hands received data to a `recv` callback as pbufs from `PBUF_POOL`, the pool the
+CYW43 driver also receives every frame into. The callback copies the data into a buffer
+owned by the socket and frees the pbuf at once, so unread data never holds pool buffers
+and the radio can always receive, for every connection.
+
+- **TCP** copies each pbuf into the connection's receive ring, a `CircularByteBuffer`
+  of `TCP_WND` bytes allocated when the first data arrives. `tcp_try_read()` copies out
+  of the ring and then calls `tcp_recved()` for the bytes it took.
+- **UDP** copies each datagram into the socket's receive ring of `CORO_LWIP_UDP_RX_BYTES`
+  bytes (default 8192), as a record: its length, its sender, then its payload.
+  `udp_try_recv()` takes one record, copies its payload into the caller's buffer
+  (truncated to fit, as `recvfrom()` does) and discards the rest of the record.
+
+**Flow control is TCP's own.** The callback does not call `tcp_recved()`; only a read
+does. lwIP shrinks a connection's receive window by every byte it hands to the callback
+and grows it by every byte `tcp_recved()` reports, and it advertises the window to the
+peer in every ACK. A slow reader therefore closes the window, and the peer stops
+sending until the application reads. Bytes received but not yet read never exceed
+`TCP_WND`, which is why the ring needs no more.
+
+**UDP is bounded by the ring.** A datagram that does not fit in the ring's free space
+is dropped, as a kernel drops one at a full `SO_RCVBUF`.
+
+**Allocation inside a callback never throws.** A connection's ring is allocated by its
+first `recv` callback, so an idle connection costs nothing, and the `tcp_accept`
+callback allocates the `LwipTcp` itself. An exception must not unwind through lwIP's C
+code, so both allocate with `std::nothrow` and report failure the way lwIP expects:
+
+| Allocation fails in | Returns | lwIP then |
+|---|---|---|
+| `tcp_recv` (the ring) | `ERR_MEM`, keeping the pbuf | Holds the data as the pcb's refused data and offers it again on a later timer tick |
+| `tcp_accept` (the `LwipTcp`) | `ERR_MEM` | Aborts the new connection; the peer sees a reset |
+
+A UDP socket allocates its ring in `udp_open()`, outside any callback, where a failure
+throws `std::bad_alloc` as usual.
+
+Each received byte is copied twice: from the pbuf into the socket's ring, then from the
+ring into the caller's buffer. Sends copy once: `tcp_write(..., TCP_WRITE_FLAG_COPY)` and
+the pbuf `udp_try_send()` fills. Sending without the copy would lend the caller's buffer
+to lwIP until the data is acknowledged, which would make dropping a pending write
+unsafe.
+
+!!! tip "PERF: keep pbufs while the pool has room"
+    The first copy could be skipped by queueing the pbufs themselves on the socket and
+    copying them into the ring only when the pool runs low. The receive queue would then
+    hold both forms in order, switching to copying would have to move the queued pbufs
+    into the ring first, and the pool's free count needs `MEMP_STATS`. The copy it saves
+    runs much faster than the radio delivers data, so this is worth doing only if a
+    profile shows it.
+
+### TCP
+
+`LwipTcp` holds the pcb, the receive ring, the end-of-stream flag, the pending
+errno, and its connection state.
+
+| Seam function | lwIP implementation |
+|---|---|
+| `tcp_connect_start(peer)` | `tcp_new_ip_type()`, install the callbacks, `tcp_connect()`. A synchronous failure aborts the pcb and throws |
+| `tcp_try_finish_connect(fd)` | 0 once the connected callback has run; the pending errno if the connect failed; otherwise `EAGAIN` |
+| `tcp_listen(local, backlog)` | `tcp_new_ip_type()`, `SOF_REUSEADDR`, `tcp_bind()`, `tcp_listen_with_backlog()` |
+| `tcp_try_accept(listener)` | Pop the oldest queued connection and call `tcp_backlog_accepted()`; `EAGAIN` if none |
+| `tcp_try_read(fd, ...)` | Copy from the receive ring, then `tcp_recved()` for the bytes taken. Empty: the pending errno, else 0 at end of stream, else `EAGAIN` |
+| `tcp_try_write(fd, ...)` | `tcp_write()` up to `tcp_sndbuf()`, then `tcp_output()`. No room, or `ERR_MEM`: `EAGAIN` |
+
+| Callback | Effect on the `LwipTcp` | Marks |
+|---|---|---|
+| `tcp_connect`'s connected callback | Connected | writable |
+| `tcp_recv`, data | Copy into the receive ring; free the pbuf | readable |
+| `tcp_recv`, null pbuf | End of stream | readable, hup |
+| `tcp_sent` | — | writable |
+| `tcp_poll` (periodic) | — | writable, if a write is waiting and `tcp_sndbuf()` has room |
+| `tcp_err` | pcb gone (lwIP has freed it); errno recorded | error |
+
+- **Bytes before errors.** `tcp_try_read()` returns buffered bytes before it reports the
+  pending error or end of stream. A reset that arrives right behind the last data
+  segment does not discard data the peer sent.
+- **Writes and acknowledgements.** `EAGAIN` from a full send buffer means data is in
+  flight, so `tcp_sent` follows. `ERR_MEM` can also come from lwIP's segment pools with
+  nothing in flight; the `tcp_poll` callback then marks the socket writable on lwIP's
+  next poll interval, so a write never waits for an event that cannot come.
+- **Nagle is disabled** on every connection (`tcp_nagle_disable()`). `tcp_try_write()`
+  flushes with `tcp_output()` after each write, so a small write goes out at once.
+- **Connect errors.** A reset during the handshake is `ECONNREFUSED`, as on desktop. The
+  desktop `ConnectFuture` runs unchanged: it waits for write readiness and calls
+  `tcp_try_finish_connect()`.
+- **Close.** `close_socket()` detaches the callbacks, frees the receive ring and calls
+  `tcp_close()`, falling back to `tcp_abort()` if that fails. lwIP sends a reset instead
+  of a FIN when unread data is discarded, as Linux does. If `tcp_err` already freed the
+  pcb, only the object is freed. A close requested inside the `Poller`'s `service()` (and
+  so possibly inside an lwIP callback) runs when `service()` ends; see
+  [Poller](#poller).
+
+**Listener.** `LwipListener` holds the listening pcb and a FIFO of accepted
+`LwipTcp`s. The `tcp_accept` callback builds the `LwipTcp` and installs its callbacks at
+once, so data that arrives before the application calls `accept()` is queued, not lost.
+It calls `tcp_backlog_delayed()` on the new pcb, which makes lwIP enforce the backlog
+until `tcp_try_accept()` hands the connection out, and marks the listener readable.
+
+- A queued connection that failed before it was accepted is closed and skipped, as
+  `accept4()`'s `ECONNABORTED` is on desktop.
+- The backlog is capped at `MEMP_NUM_TCP_PCB`, since every pending connection holds a
+  pcb.
+- Closing the listener aborts every connection still queued (the kernel resets its
+  backlog the same way) and closes the listening pcb.
+
+### UDP
+
+`LwipUdp` holds the pcb, the receive ring, and whether `connect()` was called.
+
+| Seam function | lwIP implementation |
+|---|---|
+| `udp_open(local)` | `udp_new_ip_type()`, `udp_bind()`, `udp_recv()` (installed for the socket's lifetime; it copies each datagram into the receive ring and frees the pbuf) |
+| `udp_connect(fd, peer)` | `udp_connect()`; lwIP then filters out other senders |
+| `udp_try_send(fd, ..., dest)` | `pbuf_alloc(PBUF_TRANSPORT, PBUF_RAM)`, copy, `udp_sendto()` (or `udp_send()` for `dest == nullptr`) |
+| `udp_try_recv(fd, ..., sender)` | Take one record from the receive ring; `EAGAIN` if empty |
+| `udp_try_recv_segments(...)` | As `udp_try_recv()`, with the segment size equal to the byte count |
+| `udp_set_broadcast(fd, on)` | Nothing: lwIP checks no broadcast flag with `IP_SOF_BROADCAST` at its default of 0 |
+| `udp_set_membership(fd, group, iface, join)` | `igmp_joingroup_netif()` / `igmp_leavegroup_netif()` on `netif_default`; `iface` is ignored, as a Pico has one interface |
+| `udp_set_segment_size()`, `udp_set_gro()` | Fail with `ENOTSUP`, as on any desktop other than Linux |
+
+**Sends never wait.** `udp_sendto()` is synchronous, so `udp_try_send()` completes or
+fails and never reports `EAGAIN`. An exhausted pool is `ENOBUFS`, an error rather than a
+wait, because no callback would ever report the socket writable again. A send with
+`dest == nullptr` on an unconnected socket fails with `EDESTADDRREQ`, and an IPv6
+address with `EAFNOSUPPORT`.
+
+`close_socket()` uninstalls the receive callback, calls `udp_remove()` and frees the
+receive ring.
+
+### Notify objects
+
+`sys/notify.h` is the driver's eventfd seam (see
+[I/O Driver](io_driver.md#the-sys-layer)), and the ISR primitives are built on it (see
+[ISR Safety](isr_safety.md#waiting-on-the-driver)). On lwIP a notify fd is an
+`LwipNotify`: an `IoObject` that embeds its own `async_when_pending_worker_t` and the
+context it is attached to.
+
+| Operation | lwIP implementation |
+|---|---|
+| `notify_open()` | Allocate an `LwipNotify`, attached to no context |
+| `register_fd()` | Store the key; set the object's context to the `Poller`'s, and add its worker to the context (`async_context_add_when_pending_worker()`) |
+| `notify_signal(fd)` | If the object has a context: `async_context_set_work_pending(ctx, &worker)`. Safe from an ISR, on either core |
+| The worker's `do_work` | `mark_ready(obj, kReadable)`, on the executor's thread inside `async_context_poll()` |
+| `deregister_fd()` | Clear the object's context and key, then remove the worker from the context (after `service()` returns, if called inside it; see [Poller](#poller)) |
+| `close_socket()` | Delete the object (it is already deregistered; deferred in the same way) |
+
+- **Each signal is an edge.** The SDK clears `work_pending` before it calls `do_work`, so
+  every signal after that runs the worker again and reports the object again. Several
+  signals before the worker runs produce one `Event`, which is all the driver needs:
+  the primitive's own state records how many there were.
+- **Only the signalled object runs.** `async_context_poll()` runs the workers whose
+  `work_pending` is set, so a signal costs one worker call, not a scan of every
+  primitive.
+- **A signal while unattached is dropped**, because the object has no context. Nothing is
+  waiting then (see [ISR Safety](isr_safety.md#the-wait)), and the primitive's state
+  records the signal for the next wait.
+- **The worker must leave the context before the context dies.** Deregistration
+  detaches it, and a notify fd is deregistered when its primitive's last waiter leaves,
+  which is always before the `Runtime` is destroyed.
+
+### Name resolution
+
+`lookup_host()` resolves a numeric address inline on every platform. A name goes to the
+`sys/dns.h` seam, which has two forms, selected by `sys::kResolverBlocks`:
+
+- **Blocking (POSIX).** `resolve_host()` calls `getaddrinfo()` on the blocking pool.
+- **Registered query (lwIP).** `dns_start(host)` creates an `LwipDnsQuery` and calls
+  `dns_gethostbyname()`. `lookup_host()` registers it in a `SocketState` and waits on
+  `poll_io(Read, dns_try_result)`, like any other socket. The found callback stores the
+  address, or "not found" in `dns_category()`, and marks the query readable. An answer
+  already in lwIP's cache (`ERR_OK` from `dns_gethostbyname()`) marks it readable at
+  once.
+
+lwIP's DNS has no cancel. A `lookup_host()` dropped mid-query closes its query, and
+`close_socket()` then only marks it orphaned. The found callback, which lwIP always
+calls eventually (with a failure after its retries), frees an orphaned query instead of
+marking it ready. lwIP returns one IPv4 address, so `connect()` and `bind()` have one
+address to try.
+
+### Error mapping
+
+Every `sys` function reports an errno, so errors reach the caller as the
+`std::system_error` they are on desktop. lwIP's `err_t` values map as lwIP's own
+`err_to_errno()` table does:
+
+| `err_t` | errno |
+|---|---|
+| `ERR_MEM`, `ERR_BUF` | `ENOBUFS` (a send) or `ENOMEM` |
+| `ERR_TIMEOUT` | `ETIMEDOUT` |
+| `ERR_RTE` | `EHOSTUNREACH` |
+| `ERR_VAL`, `ERR_ARG` | `EINVAL` |
+| `ERR_USE` | `EADDRINUSE` |
+| `ERR_ALREADY` | `EALREADY` |
+| `ERR_ISCONN` | `EISCONN` |
+| `ERR_CONN`, `ERR_CLSD` | `ENOTCONN` |
+| `ERR_ABRT` | `ECONNABORTED` |
+| `ERR_RST` | `ECONNRESET` (`ECONNREFUSED` during a connect) |
+| `ERR_IF` | `EIO` |
+
+### Races
+
+There are no threads, so the races are about ordering within the one loop:
+
+- **Data that arrives before registration.** An accepted connection may receive data in
+  the same `cyw43_arch_poll()` that accepted it. The callbacks are already installed, so
+  the data is queued. Its readiness flags are set with no key, which reports nothing,
+  but the new `ScheduledIo` starts ready, so the first read finds the data.
+- **Readiness after `EAGAIN`.** A callback runs only inside `poll()`, never between a
+  "syscall" returning `EAGAIN` and `clear_ready()`. The tick handshake still runs, and
+  never has a lost wake to prevent.
+- **pcb freed under a socket.** lwIP frees the pcb before it calls `tcp_err`. The
+  callback nulls the `LwipTcp`'s pcb, and every `sys` function checks it.
+- **Socket closed while queued on the ready list.** `deregister_fd()` unlinks it.
+- **Object torn down from inside `service()`.** A task dropped by a wake inside
+  `async_context_poll()` or an lwIP callback closes its sockets and notify fds there.
+  The `Poller` defers removing workers and closing pcbs until `service()` ends, so
+  neither the SDK's worker list nor lwIP's callback is changed under its own feet (see
+  [Poller](#poller)).
 
 ---
 
 ## Synchronisation and ISR safety
 
-### `detail::Mutex` — no-op on Pico
+### `detail::Mutex`: a no-op on Pico
 
-On all non-Pico targets `detail::Mutex` / `detail::SharedMutex` are thin aliases for
-`std::mutex` / `std::shared_mutex`. On Pico they are **no-ops** — all methods are empty:
+On all non-Pico targets `detail::Mutex` / `detail::SharedMutex` are aliases for
+`std::mutex` / `std::shared_mutex`. On Pico they are **no-ops**:
 
 ```cpp
 class Mutex {
@@ -83,59 +609,47 @@ public:
 
 This is correct because `CurrentThreadExecutor` is **cooperative and single-threaded**.
 `co_await` is the only yield point: no two coroutines ever run concurrently, so no
-mutual exclusion is needed to protect channel state, wakers, or the ready queue. IRQ
-handlers communicate with coroutines exclusively via `IsrEvent` and `IsrChannel<T>`
-(described below), not by calling coro sync primitives directly.
+mutual exclusion is needed to protect channel state, wakers, the ready queue, or the
+`IoDriver`'s registration and timer state (the driver's locks are `detail::Mutex`). IRQ
+handlers communicate with coroutines only through `IsrEvent`, `IsrChannel<T>` and
+`IsrSemaphore` (described below), never by calling coro sync primitives directly.
 
-#### History: why spin locks were used and then removed
+#### Why not hardware spin locks
 
-The initial Pico port implemented `detail::Mutex` using `spin_lock_blocking()` /
-`spin_unlock()` from the Pico SDK, sharing a single hardware spin lock (number 16)
-across every mutex instance. This approach disabled IRQs for the entire duration of each
-lock-guarded critical section.
+A spin-lock `Mutex` (`spin_lock_blocking()`, which disables IRQs) would let ISR handlers
+and core-1 code call coro APIs directly. It would also tie IRQ liveness to coro's lock
+scopes, and those scopes contain application code. Application code may legitimately do
+slow I/O that needs an IRQ handler to make progress, and with IRQs disabled it
+deadlocks. For example, in the `pico_ws2812_tcp` example:
 
-The intent was to allow ISR handlers and core-1 code to safely call coro APIs (channel
-send, waker wake, etc.) directly. In practice, this caused a class of hard-to-diagnose
-deadlocks: coro mutexes protect channel state that is accessed deep inside application
-logic (e.g. inside a `WatchSender::borrow_mut()` scope). Application code running under
-these locks may legitimately perform slow I/O — I2C writes, `printf` via USB-CDC — that
-depend on IRQ handlers to make progress. With IRQs disabled for the duration of the lock,
-those handlers could never run, deadlocking the whole system.
+1. `display_loop` calls `rx.borrow_and_update()`, which would take the `detail::Mutex`
+   and disable IRQs.
+2. Inside the lock, `lcd.write()` issues an I2C transaction (~640 µs per character).
+3. The I2C peripheral fires a TX-empty IRQ to advance the transfer, but IRQs are
+   disabled.
+4. `i2c_write_blocking` spins forever waiting for the IRQ flag. USB-CDC `printf` needs
+   IRQ service too, and blocks once its TX buffer fills.
 
-A concrete example from the `pico_ws2812_tcp` example:
-
-1. `display_loop` called `rx.borrow_and_update()` (acquires `detail::Mutex` → IRQs disabled)
-2. Inside the lock, `lcd.write()` issued an I2C transaction (~640 µs per character)
-3. The I2C peripheral fired a TX-empty IRQ to advance the transfer — but IRQs were disabled
-4. `i2c_write_blocking` spun forever waiting for the IRQ flag
-5. USB-CDC `printf` later in the loop also requires IRQ service; filling the TX buffer blocked
-6. Entire system deadlocked
-
-The root cause is that the spin-lock approach coupled IRQ liveness to coro internal lock
-scopes, making any I/O inside a lock-guarded section unsafe. The correct fix is to
-recognise that these locks are unnecessary in the first place.
+The locks are unnecessary in the first place, so they are no-ops.
 
 !!! warning "WARNING: Core-1 task dispatch would require revisiting this decision"
     No-op mutexes are correct *only* as long as all coro operations (spawning tasks,
-    sending on channels, waking futures) happen on the same core as the executor. If a
-    future feature adds the ability to dispatch tasks or send on channels from core 1,
-    every `detail::Mutex` guard site would need to become a real critical section again.
-    Any core-1 integration must audit this before landing.
+    sending on channels, waking futures, registering sockets) happen on the same core as
+    the executor. A feature that dispatches tasks or sends on channels from core 1 must
+    turn every `detail::Mutex` guard site back into a real critical section.
 
 #### Cortex-M0+ atomics
 
-`std::atomic` operations in coro internals (e.g. `SchedulingState` CAS in `TaskBase`)
-use IRQ-disable (`CPSID I / CPSIE I`) on Cortex-M0+ because M0+ lacks the `LDREX` /
-`STREX` load-linked / store-conditional instructions. The libatomic fallback disables IRQs
-for approximately 4–6 instructions per operation. This is safe and correct; the brief
-IRQ-disable window is far too short to cause the deadlock class described above.
+`std::atomic` operations in coro internals use IRQ-disable (`CPSID I / CPSIE I`) on
+Cortex-M0+, because M0+ lacks the `LDREX` / `STREX` instructions. The libatomic fallback
+disables IRQs for roughly 4–6 instructions per operation, far too short to cause the
+deadlock above.
 
 ### Non-atomic refcounting and scheduling state (`Rc<T>` / `Weak<T>` / `RelaxedState<T>`)
 
-The same single-threaded, no-ISR-touches-this argument that justifies the no-op `Mutex`
-above (and the IRQ-disable fallback for `std::atomic` noted just above) also applies to
-task ownership and scheduling-state fields, which on desktop/server still go through
-fully atomic `std::shared_ptr`/`std::weak_ptr` and `std::atomic<T>`.
+The argument that makes `Mutex` a no-op also covers task ownership and scheduling-state
+fields, which on desktop go through `std::shared_ptr`/`std::weak_ptr` and
+`std::atomic<T>`.
 
 `coro::detail::Rc<T>` / `Weak<T>` ([`detail/rc.h`](../../include/coro/detail/rc.h)) are
 conditional aliases:
@@ -150,77 +664,75 @@ template<typename T> using Weak = std::weak_ptr<T>;
 #endif
 ```
 
-On Pico, `Rc<T>`/`Weak<T>` are a plain non-atomic intrusive-refcount pointer covering only
-the subset of `shared_ptr`/`weak_ptr`'s API the library actually uses: `make_rc<T>(...)`,
+On Pico, `Rc<T>`/`Weak<T>` are a plain non-atomic intrusive-refcount pointer covering
+only the subset of `shared_ptr`/`weak_ptr`'s API the library uses: `make_rc<T>(...)`,
 copy/move, `reset()`, an aliasing constructor (for `JoinHandle<T>`/`StreamHandle<T>`
-holding a view into the same allocation as the owning task — see
+holding a view into the same allocation as the owning task; see
 [task_ownership.md](task_ownership.md)), and `Weak<T>::lock()`. There is no generic
-`enable_rc_from_this<T>` — `TaskBase` grows a private `Weak<TaskBase> m_self` member plus
+`enable_rc_from_this<T>`: `TaskBase` has a private `Weak<TaskBase> m_self` member plus
 `set_self()`/`shared_from_this()`/`weak_from_this()` under `CORO_PICO`, set once at each
 task-creation call site right after the controlling `Rc<TaskImpl<F>>` is constructed.
 Call-site syntax is identical on both platforms; only construction differs.
 
 `RelaxedState<T>` ([`detail/relaxed_state.h`](../../include/coro/detail/relaxed_state.h))
 does the same for scheduling fields (`TaskBase::scheduling_state`,
-`TaskState<T>::cancelled`, `StreamTaskImpl::m_cancelled`): it exposes the same
-`load`/`store`/`compare_exchange_strong` surface these call sites already use, backed by
-a plain `T` instead of `std::atomic<T>` on Pico (an alias for `std::atomic<T>` elsewhere),
-so no call-site changes beyond the field's declared type are needed.
+`TaskState<T>::cancelled`, `StreamTaskImpl::m_cancelled`) and for the `IoDriver`'s
+lock-free hints (the pending-release count and the shutdown flag). It exposes the
+`load`/`store`/`compare_exchange_strong` surface these call sites use, backed by a plain
+`T` on Pico and an alias for `std::atomic<T>` elsewhere.
 
 !!! warning "WARNING: `Rc<T>`/`Weak<T>`/`RelaxedState<T>` must never leave the executor thread"
-    The entire justification for dropping atomicity is that nothing outside the
-    `CurrentThreadExecutor`'s own thread ever touches one of these. If a future change
-    introduces multi-core task dispatch on Pico (see the core-1 warning above for `Mutex`),
-    this assumption breaks for all of `Mutex`, `Rc`/`Weak`, and `RelaxedState` at the same
-    time, and all three need revisiting together.
+    Dropping atomicity is justified only because nothing outside the
+    `CurrentThreadExecutor`'s own thread touches one of these. Multi-core task dispatch
+    on Pico (see the core-1 warning above) breaks this for `Mutex`, `Rc`/`Weak` and
+    `RelaxedState` at once, and all three need revisiting together.
 
-### Coroutine frame pooling (`FramePool`) — experimental, off by default
+### Coroutine frame pooling (`FramePool`): experimental, off by default
 
 !!! note "NOTE: disabled unless CORO_PICO_FRAME_POOL is defined"
     This feature is experimental. It is gated behind its own opt-in flag,
-    `CORO_PICO_FRAME_POOL`, separate from `CORO_PICO` — `cmake/platforms/pico.cmake` does
-    **not** define it, so real Pico builds get the plain heap allocator unless an
-    application explicitly adds
-    `target_compile_definitions(coro_pico PUBLIC CORO_PICO_FRAME_POOL)`.
+    `CORO_PICO_FRAME_POOL`, separate from `CORO_PICO`. `cmake/platforms/pico.cmake` does
+    **not** define it, so firmware gets the plain heap allocator unless an application
+    adds `target_compile_definitions(coro_pico PUBLIC CORO_PICO_FRAME_POOL)`.
 
 When enabled, `CoroPromiseBase` ([`include/coro/coro.h`](../../include/coro/coro.h))
-overrides `operator new`/`operator delete` to route small/medium coroutine frame
+overrides `operator new`/`operator delete` to route small and medium coroutine frame
 allocations through `FramePool<SlotSize, SlotCount>`
 ([`detail/frame_pool.h`](../../include/coro/detail/frame_pool.h)) instead of the general
-heap allocator. `FramePool` is a fixed-size-class intrusive-freelist allocator — the same
-technique tcmalloc/jemalloc use for small allocations, narrowed to a single-threaded
-target with a closed, known set of coroutine frame sizes (no locking needed, for the same
-reason `Mutex` is a no-op here). Both `operator new` and `operator delete` fall back to
-`::operator new`/`::operator delete` whenever a pool doesn't fit the request or is
-exhausted, so correctness never depends on the configured slot sizes/counts being
-right — only the performance win does. `FramePool` itself is platform-agnostic and
-unit-tested on desktop ([`test/detail/test_frame_pool.cpp`](../../test/detail/test_frame_pool.cpp));
-only its use as a promise-type allocator is gated behind `CORO_PICO_FRAME_POOL`. The host
-test suite (`test_pico_suite`) enables the flag so the pooling/`Coro<T>` integration stays
-exercised even though it's off by default for real firmware builds.
+heap allocator. `FramePool` is a fixed-size-class intrusive-freelist allocator, the
+technique tcmalloc and jemalloc use for small allocations, narrowed to a single-threaded
+target with a closed set of coroutine frame sizes (no locking, for the same reason
+`Mutex` is a no-op). Both operators fall back to `::operator new`/`::operator delete`
+whenever a pool doesn't fit the request or is exhausted, so correctness never depends on
+the configured slot sizes and counts; only the performance gain does. `FramePool` itself
+is platform-agnostic and unit-tested on desktop
+([`test/detail/test_frame_pool.cpp`](../../test/detail/test_frame_pool.cpp)). The host
+test suite (`test_pico_suite`) enables the flag so the pooling/`Coro<T>` integration
+stays exercised.
 
-### ISR → coroutine communication: `IsrEvent` and `IsrChannel<T>`
+### ISR → coroutine communication: `IsrEvent`, `IsrChannel<T>`, `IsrSemaphore`
 
-The **only supported** way to signal a coroutine from an ISR is via `IsrEvent` or
-`IsrChannel<T>` (declared in `include/coro/sync/isr_event.h`).
+The **only supported** way to signal a coroutine from an ISR is through `IsrEvent`,
+`IsrChannel<T>` or `IsrSemaphore` (declared in `include/coro/sync/isr_event.h`).
 
 !!! danger "WARNING: All other coro APIs are undefined behavior from ISR"
     Calling `oneshot::send()`, `mpsc::send()`, `watch::send()`, `event::set()`,
     `CancellationToken::cancel()`, or any other coro sync primitive from an ISR is
-    **undefined behavior** — even if it appears to work on single-core RP2040 today.
-    These APIs call `waker->wake()`, which calls `shared_from_this()` and
-    `Executor::enqueue()`. While those operations happen to use IRQ-safe spin locks on
-    RP2040, the library makes no guarantee about ISR safety for any API other than
-    `IsrEvent` and `IsrChannel<T>`. Do not rely on it. A future executor implementation,
-    a dual-core configuration, or a port to a different MCU can silently break code
-    that calls these APIs from ISR context. See `doc/isr_safety.md` for the full analysis.
+    **undefined behavior**, even if it appears to work on single-core RP2040. These APIs
+    call `waker->wake()`, which calls `shared_from_this()` and `Executor::enqueue()`. The
+    library makes no ISR-safety guarantee for any API other than the ISR primitives. A
+    different executor, a dual-core configuration, or a port to another MCU can silently
+    break code that relies on it. See [ISR Safety](isr_safety.md) for the full analysis.
 
 `IsrEvent` signals that something happened (DMA complete, GPIO edge, timer tick).
-`IsrChannel<T>` additionally transfers a trivially-copyable value (ADC reading, byte
-received, encoder count). The ISR writes a `volatile` flag (and for `IsrChannel<T>`,
-the value with a `__DMB()` release fence) and returns immediately — it never touches
-the scheduler, wakers, or `shared_ptr` ref-counts. The executor discovers the flag
-once per event loop iteration and wakes the waiting coroutine.
+`IsrChannel<T>` additionally transfers a trivially copyable value (ADC reading, byte
+received, encoder count), and `IsrSemaphore` counts events. The ISR updates the
+primitive's state under the primitive's own hardware spin lock, then signals the
+primitive's notify fd, which marks its worker pending on the `async_context` and ends
+the executor's sleep. It never touches the scheduler, wakers, or reference counts. The
+notify fd is an ordinary driver registration, so the driver's `dispatch()` wakes the
+waiting coroutines, inside the turn, on the executor's thread (see
+[ISR Safety](isr_safety.md#waiting-on-the-driver)).
 
 ```cpp
 // Shared between ISR and coroutine — must outlive both.
@@ -233,21 +745,21 @@ extern "C" void dma_irq_handler() {
 
 coro::Coro<void> do_dma_transfer() {
     // configure and start DMA here ...
-    co_await g_dma_done.wait();   // yields until ISR signals; at most one loop iteration of latency
+    co_await g_dma_done.wait();   // sleeps until the ISR signals
     // DMA complete; buffer is ready
 }
 ```
 
-See `doc/isr_safety.md` for the full `IsrEvent` / `IsrChannel<T>` design, including
-the multi-core memory-barrier note for `IsrChannel<T>::send_from_isr()`.
+See [ISR Safety](isr_safety.md) for the full design, including the multi-core
+memory-barrier note for `IsrChannel<T>::send_from_isr()`.
 
 ---
 
 ## Optional HAL layer: `coro_pico_hal`
 
 `coro_pico_hal` is an **optional** cmake target, separate from `coro_pico`, that provides
-async wrappers for RP2040 hardware peripherals (DMA, SPI, I2C, ADC). Applications that
-only need TCP coroutines do not need it.
+async wrappers for RP2040 hardware peripherals (DMA, GPIO). Applications that only need
+networking do not need it.
 
 ```cmake
 # Link the HAL layer in addition to the core:
@@ -257,7 +769,7 @@ target_link_libraries(my_firmware PRIVATE coro_pico coro_pico_hal hardware_dma)
 The HAL layer depends on `coro_pico` (for `IsrEvent`) and on SDK hardware libraries
 (`hardware_dma`, etc.). It lives in `src/pico/hal/` and `include/coro/pico/hal/`.
 
-### `AsyncDmaTransfer` — RAII async DMA channel
+### `AsyncDmaTransfer`: RAII async DMA channel
 
 `AsyncDmaTransfer` claims one DMA channel on construction, performs an async transfer
 whose future completes when the DMA IRQ fires (via `IsrEvent`), and releases the channel
@@ -288,8 +800,7 @@ public:
     int channel() const;
 
     // Configures and starts the transfer described by ctrl/read_addr/write_addr/count.
-    // The returned future completes when the DMA IRQ fires; at most one executor
-    // loop iteration of latency between IRQ and resumption.
+    // The returned future completes when the DMA IRQ fires.
     // Cancellable: if the future is destroyed before it completes, the in-progress
     // transfer is aborted immediately via dma_channel_abort() (synchronous and safe).
     [[nodiscard]] DmaWaitFuture transfer(
@@ -341,25 +852,11 @@ handler is registered once (via `irq_add_shared_handler`) when the first
     is released, however, before calling `signal_from_isr()` on the looked-up
     `IsrEvent*`, because holding one striped spin lock while acquiring another
     (`IsrEvent`'s own internal lock) risks a same-core self-deadlock if the
-    two alias the same underlying hardware lock — the striped pool's contract
+    two alias the same underlying hardware lock; the striped pool's contract
     forbids nesting them. This leaves a narrow window where an
     `AsyncDmaTransfer` destructed on another core between the dispatch lookup
     and the call is a use-after-free; see the identical, more fully explained
-    tradeoff in `doc/design/gpio_pin.md`'s matching warning for `GpioPin`.
-    This is deferred until a concrete need arises.
-
-
-### `LwipCallbackResult` — no mutex needed for lwIP callbacks
-
-`LwipCallbackResult` (used for DNS resolution and TCP connect) stores a waker and a
-result value but uses no mutex. This is safe because `CYW43_ARCH_POLL` guarantees that
-all lwIP callbacks fire synchronously inside `cyw43_arch_poll()`, which runs on the
-executor thread. There is no separate I/O thread and no concurrent access.
-
-!!! warning "CYW43_ARCH_THREADSAFE_BACKGROUND incompatibility"
-    If you switch to `CYW43_ARCH_THREADSAFE_BACKGROUND`, lwIP callbacks can arrive from
-    core 1 or a background IRQ. `LwipCallbackResult` would then need a `detail::Mutex`
-    guard around `waker` and `value`. The entire port is designed around `CYW43_ARCH_POLL`.
+    tradeoff in [GPIO Pin](gpio_pin.md)'s matching warning for `GpioPin`.
 
 ---
 
@@ -367,11 +864,10 @@ executor thread. There is no separate I/O thread and no concurrent access.
 
 `coro_pico_mqtt` is an **optional** cmake target, separate from both `coro_pico` and
 `coro_pico_hal`, that wraps lwIP's `apps/mqtt` client (`lwip/apps/mqtt.h`) as coroutine
-APIs. Applications that don't need MQTT do not link it, and lwIP's MQTT app itself stays
+APIs. Applications that don't need MQTT do not link it, and lwIP's MQTT app stays
 compiled out unless `LWIP_MQTT` is enabled in `lwipopts.h`.
 
-It depends only on `coro_pico` (for `LwipCallbackResult` and the lwIP backend already
-used by `TcpStream`) — not on `coro_pico_hal`, since MQTT has nothing to do with DMA/SPI/I2C.
+It depends only on `coro_pico`, not on `coro_pico_hal`.
 
 ```cmake
 # Link the MQTT module in addition to the core:
@@ -385,11 +881,14 @@ target_link_libraries(my_firmware PRIVATE coro_pico coro_pico_mqtt)
 
 ### Wrapping pattern
 
-Same shape as `TcpStream`'s lwIP wrapping (no mutex needed — every lwIP MQTT callback
-fires synchronously inside `cyw43_arch_poll()`, on the executor thread):
+lwIP's MQTT client opens and owns its TCP connection itself, so it is wrapped above lwIP
+directly rather than through the `sys` backend. Its callbacks fire inside
+`cyw43_arch_poll()`, which runs in the driver's `Poller::poll()`, on the executor's
+thread. A callback that completes an operation wakes the waiting task directly, which,
+like a wake from `dispatch()`, only enqueues it.
 
-- **Connect** (`mqtt_client_connect()` + `mqtt_connection_cb_t`) is one-shot — wrapped
-  with `LwipCallbackResult<mqtt_connection_status_t>`, exactly like `TcpStream::connect()`.
+- **Connect** (`mqtt_client_connect()` + `mqtt_connection_cb_t`) is one-shot, wrapped
+  with `LwipCallbackResult<mqtt_connection_status_t>` (see below).
   `connect()` also accepts optional Last Will and Testament parameters, forwarded
   directly to `mqtt_connect_client_info_t::will_topic`/`will_msg`/`will_qos`/`will_retain`;
   an empty `will_topic` (the default) disables the LWT entirely. It likewise accepts
@@ -397,7 +896,7 @@ fires synchronously inside `cyw43_arch_poll()`, on the executor thread):
   an empty `username` (the default) omits both fields (lwIP only sends a password
   alongside a user name, so a non-empty `password` with an empty `username` is ignored).
 - **Publish acknowledgement** (`mqtt_publish()`'s per-call request callback, used for
-  QoS 1/2) is also one-shot per call — same `LwipCallbackResult` pattern.
+  QoS 1/2) is also one-shot per call, with the same `LwipCallbackResult` pattern.
 - **Incoming messages** are different: `mqtt_set_inpub_callback()` registers a single
   pair of callbacks (`mqtt_incoming_publish_cb_t` / `mqtt_incoming_data_cb_t`) for the
   *whole client*, firing repeatedly for the life of the connection. `MqttCtx` keeps one
@@ -405,16 +904,15 @@ fires synchronously inside `cyw43_arch_poll()`, on the executor thread):
   `std::unordered_map<std::string, BroadcastSender<MqttMessage>>`; `on_incoming_data()`
   looks up the incoming message's topic in that map and `send()`s into the single
   matching entry (or drops the message if nobody has ever subscribed to that topic).
-  `subscribe(topic, qos, capacity)` finds-or-creates the map entry for `topic` and
-  returns `entry.subscribe()`'s `BroadcastReceiver<MqttMessage>` — already filtered to
+  `subscribe(topic, qos, capacity)` finds or creates the map entry for `topic` and
+  returns `entry.subscribe()`'s `BroadcastReceiver<MqttMessage>`, already filtered to
   that exact topic, since every message reaching that channel was looked up by it.
   Any number of topics, and any number of receivers per topic (via repeated
-  `subscribe()` calls on the same topic string), may be live concurrently — there is no
-  single-consumer restriction here, unlike `TcpStream::read()`. Map entries are never
-  evicted when their receiver count drops to zero: `MqttCtx` holds the entry's only
-  sender clone, so the channel stays valid for a later `subscribe()` on the same topic
-  to reattach to without re-sending a wire-level SUBSCRIBE. This iteration is exact
-  topic-string match only — no MQTT wildcard (`+`/`#`) filters.
+  `subscribe()` calls on the same topic string), may be live concurrently. Map entries
+  are never evicted when their receiver count drops to zero: `MqttCtx` holds the entry's
+  only sender clone, so the channel stays valid for a later `subscribe()` on the same
+  topic to reattach to without re-sending a wire-level SUBSCRIBE. Topic matching is
+  exact string match only, with no MQTT wildcard (`+`/`#`) filters.
 
 ```cpp
 // include/coro/pico/mqtt.h
@@ -442,8 +940,8 @@ public:
 
     // Sends SUBSCRIBE and returns a receiver of every message that arrives on `topic`
     // from this point onward. Concurrent subscriptions to distinct topics, and
-    // multiple receivers on the same topic, are both fully supported — see the
-    // per-topic channel map note above.
+    // multiple receivers on the same topic, are both supported; see the per-topic
+    // channel map above.
     [[nodiscard]] coro::Coro<coro::BroadcastReceiver<MqttMessage>> subscribe(
         std::string_view topic, uint8_t qos = 0, size_t capacity = 8);
 
@@ -475,111 +973,12 @@ sequenceDiagram
     end
 ```
 
-!!! note "NOTE: QoS 2 and persistent sessions are out of scope for the first cut"
-    lwIP's `apps/mqtt` itself only implements QoS 0/1 publish acknowledgement and does
-    not support persistent sessions (`CONNECT` always sends `clean_session = 1`). The
-    coro wrapper doesn't add anything beyond what lwIP already provides.
-
-!!! warning "WARNING: CYW43_ARCH_THREADSAFE_BACKGROUND incompatibility"
-    Same caveat as `LwipCallbackResult` above — the no-mutex design assumes
-    `CYW43_ARCH_POLL`. Under `CYW43_ARCH_THREADSAFE_BACKGROUND`, the incoming-message
-    callbacks could fire from a different thread than the one draining the `mpsc`
-    channel, which would need a real `detail::Mutex` guard to be safe.
-
----
-
-## File structure
-
-```
-cmake/platforms/
-  pico.cmake                    Platform include: defines coro_pico STATIC library
-  pico_hal.cmake                Optional HAL layer: defines coro_pico_hal (DMA, SPI, ...)
-  pico_mqtt.cmake                Optional MQTT module: defines coro_pico_mqtt (lwIP apps/mqtt)
-
-include/coro/
-  detail/mutex.h                Platform-portable mutex: no-op stubs on Pico (cooperative
-                                scheduling makes locking unnecessary), std::mutex elsewhere
-  sync/
-    isr_event.h                 IsrEvent / IsrChannel<T> — ISR-to-coroutine primitives
-    sleep.h                     SleepFuture — timer-queue based on Pico, IoDriver timers on desktop
-  pico/
-    pico_executor.h             CurrentThreadExecutor class (timer queue, ready queue)
-    pico_callback_result.h      PicoCallbackResult / PicoFuture — legacy; used by
-                                older pico_tcp_stream.h. New code uses LwipCallbackResult.
-    hal/
-      dma.h                     AsyncDmaTransfer — RAII async DMA channel (coro_pico_hal)
-    mqtt.h                       MqttClient — coroutine wrapper over lwIP apps/mqtt (coro_pico_mqtt)
-  io/
-    tcp_stream.h                TcpStream — dispatches to lwIP or epoll backend
-    tcp_listener.h              TcpListener — dispatches to lwIP or epoll backend
-    lwip/
-      lwip_callback_result.h    LwipCallbackResult<Args...> + lwip_wait() helper
-
-src/
-  pico_executor.cpp             CurrentThreadExecutor + timer queue implementation
-  runtime.cpp                   Runtime::add_timer() (Pico gate)
-  pico/hal/
-    dma.cpp                     AsyncDmaTransfer + DMA_IRQ_0 dispatch table
-  pico/
-    mqtt.cpp                     MqttClient implementation (coro_pico_mqtt)
-  io/lwip/
-    lwip_tcp_ctx.h              LwipTcpCtx internal struct (shared between stream + listener)
-    tcp_stream_lwip.cpp         TcpStream lwIP implementation
-    tcp_listener_lwip.cpp       TcpListener lwIP implementation
-
-examples/pico/
-  CMakeLists.txt                Standalone Pico SDK build
-  lwipopts.h                    lwIP configuration (DHCP, TCP, NO_SYS=1)
-  wifi_credentials.h.example    Template — copy to wifi_credentials.h (gitignored)
-  pico_tcp_echo_server.cpp      TCP echo server example
-  pico_tcp_echo_client.cpp      TCP echo client example
-  pico_ws2812_tcp.cpp           WS2812B LED controller with TCP command interface
-  ws2812_gui.py                 PyQt6 desktop GUI for the LED controller
-  requirements.txt              Python dependencies (pip install -r requirements.txt)
-  README.md                     Build instructions
-```
-
----
-
-## Component design
-
-### `CurrentThreadExecutor`
-
-The same executor as on desktop (see [Executor Design](executor_design.md),
-"CurrentThreadExecutor"), with the same CAS state machine
-(`Notified → Running → Idle / RunningAndNotified`). What differs on Pico:
-
-- **Parker.** A `PollingParker` around `cyw43_arch_poll()`, which never blocks, so the
-  loop busy-polls.
-- **Single-threaded.** No other threads. `m_ready_mutex` is a `detail::Mutex` — a no-op
-  on Pico; see [Synchronisation](#synchronisation-and-isr-safety). Wakers from ISR
-  handlers must go through `IsrEvent` / `IsrChannel<T>`, not direct `enqueue()` calls.
-- **No `std::condition_variable` in the run loop.** `wait_for_completion()` polls
-  `state.terminated` in a loop rather than blocking on a condvar.
-- **Timer queue.** There is no `IoDriver`, so timers go to the executor's own
-  `detail::TimerQueue`: `Runtime::add_timer()` forwards to
-  `CurrentThreadExecutor::add_timer()`, and `check_expired_timers()` fires wakers on each
-  loop iteration. No hardware alarm or ISR is used — resolution is bounded by poll loop
-  latency (sub-millisecond in practice).
-- **`Runtime` is the public entry point.** Users call `rt.block_on(coro)`, not
-  `CurrentThreadExecutor` methods directly. `CurrentThreadExecutor` is an internal implementation detail.
-
-### `sleep_for` / `timeout` (Pico)
-
-`SleepFuture` is the same code as on desktop (see [Timers](timers.md)). Its deadline is
-a `coro::Instant` from `coro::Clock`, which on Pico reads `time_us_64()`. On the first
-pending `poll()` it calls `current_runtime().add_timer(deadline, waker)`, which lands in
-the executor's queue, and keeps the `TimerId` it returns to cancel the timer if dropped. `check_expired_timers()` fires the waker once the deadline has
-passed; the next `poll()` returns `PollReady`.
-
-`timeout<F>` is implemented on top of `sleep_for` and works unchanged on Pico because
-it only depends on `SleepFuture` and `select`.
-
 ### `LwipCallbackResult<Args...>`
 
-One-shot bridge between an lwIP C callback and an awaiting coroutine. Stores a `Waker`
-pointer set by `poll()` and an `optional<tuple<Args...>>` result set by `complete()`.
-No mutex is needed (see [Synchronisation](#synchronisation-and-isr-safety) above).
+A one-shot bridge between an lwIP C callback and an awaiting coroutine, for lwIP
+applications (such as MQTT) that own their own connections. It stores a waker set by
+`poll()` and an `optional<tuple<Args...>>` result set by `complete()`, with no mutex:
+under `CYW43_ARCH_POLL` every lwIP callback runs on the executor's thread.
 
 ```mermaid
 sequenceDiagram
@@ -588,82 +987,106 @@ sequenceDiagram
     participant E as CurrentThreadExecutor
 
     C->>C: allocate LwipCallbackResult on frame
-    C->>L: start async op (tcp_connect, dns_gethostbyname, ...)
+    C->>L: start async op (mqtt_client_connect, mqtt_publish, ...)
     C->>E: co_await lwip_wait(result) → suspend, store waker
     L-->>C: callback fires: result.complete(args...)
     Note over C: waker->wake() called
     E->>C: enqueue task → next poll() returns PollReady
 ```
 
-### `LwipTcpCtx` — TCP stream shared state
+!!! note "NOTE: QoS 2 and persistent sessions are out of scope"
+    lwIP's `apps/mqtt` only implements QoS 0/1 publish acknowledgement and does not
+    support persistent sessions (`CONNECT` always sends `clean_session = 1`). The coro
+    wrapper adds nothing beyond what lwIP provides.
 
-Internal struct shared between a `TcpStream` and the three lwIP callbacks registered
-on its PCB (`on_recv`, `on_sent`, `on_err`). Owned by `std::shared_ptr`.
+!!! warning "WARNING: the port requires `CYW43_ARCH_POLL`"
+    Under `CYW43_ARCH_THREADSAFE_BACKGROUND`, lwIP callbacks run from a background IRQ
+    or the other core. The lwIP backend's callbacks, `LwipCallbackResult` and `MqttCtx`
+    all rely on callbacks running on the executor's thread.
 
-```mermaid
-stateDiagram-v2
-    [*] --> Connected : accept() / connect() completes
-    Connected --> Connected : on_recv (data appended to rx_buf)
-    Connected --> Connected : on_sent (tx_waker woken)
-    Connected --> EOF : on_recv(p == nullptr)
-    Connected --> Errored : on_err (lwIP frees PCB before callback)
-    EOF --> [*]
-    Errored --> [*]
+---
+
+## Executor and timers on Pico
+
+### `CurrentThreadExecutor`
+
+The same executor as on desktop (see [Executor Design](executor_design.md),
+"CurrentThreadExecutor"), built by the `Runtime` with an `IoDriverParker`. What differs
+on Pico:
+
+- **Single-threaded.** There are no other threads. `m_inject_mutex` is a no-op
+  `detail::Mutex` (see [Synchronisation](#synchronisation-and-isr-safety)). Wakes from
+  ISR handlers go through the ISR primitives, never through `enqueue()`.
+- **Nothing Pico-specific in the loop.** ISR primitives are driver registrations, like
+  sockets, and neither the executor nor the `Runtime` has an ISR-specific API. The
+  executor's loop is the desktop one.
+- **`Runtime` is the public entry point.** Users call `rt.block_on(coro)` or
+  `rt.poll()`, not `CurrentThreadExecutor` methods.
+
+### `sleep_for` / `timeout`
+
+`SleepFuture` is the same code as on desktop (see [Timers](timers.md)). Its deadline is
+a `coro::Instant` from `coro::Clock`, which on Pico is `PicoClock`, reading
+`time_us_64()`. `current_runtime().add_timer()` puts it on the driver's timer queue,
+and the earliest deadline bounds the driver's sleep, so a timer wakes a sleeping CPU.
+`timeout<F>` is built on `sleep_for` and `select` and needs nothing Pico-specific.
+
+---
+
+## File structure
+
+```
+cmake/platforms/
+  pico.cmake                    Defines coro_pico (CORO_PICO, CORO_SYS_LWIP)
+  pico_hal.cmake                Optional HAL layer: coro_pico_hal (DMA, GPIO)
+  pico_mqtt.cmake               Optional MQTT module: coro_pico_mqtt
+
+include/coro/
+  detail/mutex.h                No-op mutex on Pico, std::mutex elsewhere
+  detail/sys/poller.h           RawFd, Poller, PollWaker: one declaration, two backends
+  detail/sys/{socket,tcp,udp,dns,notify}.h
+                                Socket, DNS and notify seams, implemented by both backends
+  sync/isr_event.h              IsrEvent, IsrChannel<T>, IsrSemaphore, on notify fds
+  io/lwip/lwip_callback_result.h
+                                LwipCallbackResult<Args...> + lwip_wait() (MQTT)
+  pico/hal/dma.h, gpio.h        coro_pico_hal
+  pico/mqtt.h                   MqttClient (coro_pico_mqtt)
+
+src/
+  runtime/runtime.cpp           Pico Runtime: async_context, IoDriver, CurrentThreadExecutor,
+                                PicoClock
+  detail/sys/lwip/
+    io_object.h                 IoObject, LwipTcp, LwipListener, LwipUdp, LwipDnsQuery,
+                                LwipNotify; the receive-ring helpers and the
+                                deferred-teardown hooks the files below share
+    poller_lwip.cpp             Poller (ready list, async_context poll and sleep, loopback
+                                drain, deferred teardown), PollWaker
+    socket_lwip.cpp             close_socket(), parse_ipv4/6(), err_t → errno,
+                                SocketAddress ↔ ip_addr_t
+    tcp_lwip.cpp                sys/tcp.h over the lwIP raw TCP API
+    udp_lwip.cpp                sys/udp.h over the lwIP raw UDP API
+    dns_lwip.cpp                sys/dns.h over lwIP DNS
+    notify_lwip.cpp             sys/notify.h on async_context workers
+  io/lwip/lwipopts.h.in         coro's lwIP configuration (see lwip_config.md)
+  pico/hal/                     coro_pico_hal
+  pico/mqtt.cpp, mqtt_ctx.h     coro_pico_mqtt
+
+examples/pico/
+  tcp_echo/                     TCP echo server and client
+  ws2812_tcp/                   WS2812B LED controller with a TCP command interface
+  pico_led/                     LED effects
 ```
 
-**Receive:** `on_recv` copies pbuf data into `rx_buf` (`std::vector<uint8_t>`),
-calls `tcp_recved()` to open the window, and wakes `rx_waker`. `read()` drains up to
-`buf.size()` bytes per call; multiple `on_recv` firings accumulate in `rx_buf`.
-
-**Transmit:** `write()` loops calling `tcp_write(..., TCP_WRITE_FLAG_COPY)` in chunks
-sized to `tcp_sndbuf()`. When the send buffer fills, it flushes with `tcp_output()` and
-suspends on `tx_waker` until `on_sent` fires.
-
-**Error:** `on_err` is called by lwIP after a fatal error; lwIP frees the PCB *before*
-the callback returns, so `on_err` sets `pcb = nullptr`. All code that touches the PCB
-checks `errored` or `pcb != nullptr` first.
-
-**Accept race:** callbacks must be set up immediately in `on_accept`, not deferred to
-when the application calls `accept()`. Data can arrive in the same `cyw43_arch_poll()`
-pass that establishes the connection — registering `tcp_recv` in `on_accept` prevents
-that data from being silently dropped.
-
-### `TcpStream` destructor
-
-Uses `tcp_close()` rather than `tcp_abort()`. `tcp_abort()` sends an RST and discards
-the send buffer immediately; `tcp_close()` sends FIN and lets the peer receive any data
-already in flight. `tcp_abort()` is used only as a fallback if `tcp_close()` returns
-an error.
-
-### TCP connect sequence
-
-```mermaid
-sequenceDiagram
-    participant C as coroutine
-    participant L as lwIP / cyw43
-    participant E as CurrentThreadExecutor
-
-    C->>L: dns_gethostbyname(host, dns_cb)
-    C->>E: suspend (co_await lwip_wait(dns_result))
-    L-->>C: dns_cb: dns_result.complete(addr)
-    E->>C: wake → re-poll
-
-    C->>L: tcp_connect(pcb, addr, port, conn_cb)
-    C->>E: suspend (co_await lwip_wait(conn_result))
-    L-->>C: conn_cb: conn_result.complete(ERR_OK)
-    E->>C: wake → re-poll
-
-    C->>L: register tcp_recv / tcp_sent / tcp_err on pcb
-    C-->>C: co_return TcpStream(ctx)
-```
+The socket types, `SocketState`, `stream_io.h`, `IoDriver` and `IoRegistration` are the
+desktop files, compiled into `coro_pico` as they are.
 
 ---
 
 ## CMake integration
 
-`cmake/platforms/pico.cmake` defines a single `coro_pico` STATIC library containing
-all sources (portable core + executor + lwIP TCP). All sources are merged into one
-archive to avoid circular linker ordering between the core (which references
+`cmake/platforms/pico.cmake` defines a single `coro_pico` STATIC library containing all
+sources (portable core, executor, driver, lwIP `sys` backend). All sources are merged
+into one archive to avoid circular linker ordering between the core (which references
 `CurrentThreadExecutor`) and the executor (which references core symbols).
 
 ```cmake
@@ -679,11 +1102,7 @@ pico_sdk_init()
 set(CORO_ROOT /path/to/coro)
 include(${CORO_ROOT}/cmake/platforms/pico.cmake)
 
-# lwipopts.h must be visible when compiling coro_pico lwIP sources
-target_include_directories(coro_pico PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-
 add_executable(my_firmware main.cpp)
-target_include_directories(my_firmware PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(my_firmware PRIVATE coro_pico pico_stdlib pico_cyw43_arch_lwip_poll)
 pico_enable_stdio_usb(my_firmware 1)
 pico_add_extra_outputs(my_firmware)   # generates .uf2 / .bin / .hex
@@ -696,27 +1115,44 @@ pico_add_extra_outputs(my_firmware)   # generates .uf2 / .bin / .hex
     errors (the SDK uses OBJECT libraries internally).
 
 !!! note "PICO_BOARD"
-    Set `PICO_BOARD=pico_w` (not the default `pico`) — the `pico` board has no CYW43
+    Set `PICO_BOARD=pico_w` (not the default `pico`): the `pico` board has no CYW43
     WiFi chip and `cyw43_arch.h` will not be found. Set it as an environment variable
     or pass `-DPICO_BOARD=pico_w` to cmake.
 
-`lwipopts.h` must be provided by the application project. Minimum recommended settings:
+`coro_pico` owns `lwipopts.h`; see [lwIP configuration](lwip_config.md).
 
-```c
-#define NO_SYS                  1
-#define MEM_LIBC_MALLOC         1
-#define LWIP_ARP                1
-#define LWIP_ETHERNET           1
-#define LWIP_DHCP               1
-#define LWIP_DNS                1
-#define LWIP_TCP                1
-#define LWIP_UDP                1
-#define MEMP_NUM_TCP_PCB        8
-#define MEMP_NUM_TCP_PCB_LISTEN 2
-#define TCP_MSS                 1460
-#define TCP_SND_BUF             (4 * TCP_MSS)
-#define TCP_WND                 (4 * TCP_MSS)
-```
+---
+
+## Testing on the host
+
+The Pico code is also built for the development machine (`test_pico_suite`, and the
+socket tests against a host build of lwIP), with the Pico SDK replaced by stubs in
+`test/pico/stub/`. The lwIP backend runs on the SDK's `async_context`, so the stubs
+include one: `pico/async_context.h`, `pico/async_context_poll.h` and `pico/lwip_nosys.h`,
+implemented in `test/pico/stub/async_context_stub.cpp`.
+
+The stub has the SDK's types and field names (`async_context_t`,
+`async_context_poll_t`, `async_when_pending_worker_t`, `async_at_time_worker_t`), so
+the lwIP backend compiles unchanged against it. It must reproduce exactly the
+behaviour the backend relies on:
+
+| SDK behaviour | Stub |
+|---|---|
+| `async_context_set_work_pending()` may be called from any context | Sets the worker's `work_pending` under the stub's `std::mutex`, then releases the permit. Callable from any thread: `IsrTrigger` signals from a thread on the host (see [Interrupts in tests](on_target_tests.md#interrupts-in-tests)) |
+| The wait's semaphore is binary, latched, and starts with a permit (`sem_init(&sem, 1, 1)`) | A `bool` permit, initially true, and a `std::condition_variable`. A release while the permit is set changes nothing |
+| `async_context_wait_for_work_until(until)` waits for a permit or the earlier of `until` and the next at-time worker, and consumes the permit | `wait_until()` on the condition variable with that deadline |
+| `async_context_poll()` runs every due at-time worker, then every when-pending worker whose flag is set, clearing the flag before `do_work`; it recomputes the next deadline at the end | The same, with flags read and cleared under the mutex and `do_work` called outside it |
+| Polling or adding and removing workers from another core panics | The context records the thread that initialised it, and asserts every poll, add and remove comes from that thread |
+| `lwip_nosys_init(ctx)` runs lwIP's timers as an at-time worker | Calls `lwip_init()` and adds an at-time worker that calls `sys_check_timeouts()` and re-adds itself `sys_timeouts_sleeptime()` later |
+
+`cyw43_arch_async_context()` returns a stub context created by the stub
+`cyw43_arch_init()`, and `cyw43_arch_poll()` polls it, so a `PicoNetwork::Cyw43`
+runtime also runs on the host, with no radio.
+
+On the host the "interrupt" is a real thread, so a test exercises the cross-core
+reasoning (state under the primitive's lock, then a signal through the context's mutex)
+under ThreadSanitizer, which the board, with one core and real interrupts, cannot. The
+same test files run on the board against the real SDK.
 
 ---
 
@@ -750,14 +1186,13 @@ static Coro<void> handle(TcpStream stream) {
 static Coro<void> run_server() {
     TcpListener listener = co_await TcpListener::bind("0.0.0.0", 8080);
     JoinSet<void> sessions;
-    for (int i = 0;;) {
+    for (;;) {
         auto result = co_await coro::timeout(5s, listener.accept());
         if (result.index() != 0) {
             std::printf("still waiting...\n");
             continue;
         }
         sessions.spawn(handle(std::move(std::get<0>(result).value)));
-        ++i;
     }
 }
 
@@ -769,8 +1204,12 @@ int main() {
                                        CYW43_AUTH_WPA2_AES_PSK, 15000);
     std::printf("IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_default)));
 
-    coro::Runtime rt;
-    rt.block_on(run_server());
+    {
+        // Scoped so the runtime is destroyed before cyw43_arch_deinit() destroys the
+        // async_context it runs on (see "Runtime on Pico").
+        coro::Runtime rt;
+        rt.block_on(run_server());
+    }
 
     cyw43_arch_deinit();
 }
@@ -780,152 +1219,78 @@ int main() {
 
 ## Known limitations and future work
 
-### Single active read and write per stream
+### IPv4 only
 
-`LwipTcpCtx` stores one `rx_waker` and one `tx_waker`. Calling `read()` from two
-concurrent tasks on the same stream would silently overwrite the waker and lose
-wakeups. Document and enforce single-consumer usage per direction; the same restriction
-exists in the desktop `TcpStream`.
+The lwIP backend creates IPv4 pcbs, and `lwipopts.h.in` does not enable `LWIP_IPV6`.
+An `Ipv6Address` passed to any socket call fails with `EAFNOSUPPORT`. Dual-stack would
+use `IPADDR_TYPE_ANY` pcbs and `ip_addr_t` throughout; lwIP's DNS already returns an
+`ip_addr_t` that can hold either family.
 
-### `rx_buf` memory pressure
+### Dual-core wakes
 
-Incoming data is eagerly copied from pbufs into a `std::vector<uint8_t>`. On a busy
-stream this allocation grows until `read()` drains it. For memory-constrained
-applications consider capping `rx_buf` at a fixed size and pausing `tcp_recv` (by
-returning `ERR_WOULDBLOCK`) when it fills.
+Everything on Pico runs on the executor's core. If core 1 ever runs code that wakes core
+0's tasks, two things change:
 
-### Busy-poll loop — no CPU idle / WFI
+- **The executor's state needs real locks.** See the core-1 warnings under
+  [Synchronisation](#synchronisation-and-isr-safety).
+- **A wake must reach a sleeping core.** This half needs nothing new.
+  `PollWaker::wake()` is `async_context_set_work_pending()`, whose `sem_release()`
+  takes a hardware spin lock and notifies both cores, so `unpark()` from core 1 ends
+  core 0's sleep in `Poller::poll()`, latched like an eventfd (see
+  [Wake sources](#wake-sources)). ISR signals on core 1 already work this way.
 
-`CurrentThreadExecutor::wait_for_completion()` spins unconditionally:
+The reverse direction, core 0 waking a core-1 thread, would back a `CORO_PICO` `Waker`
+for [`blocking_wait`/`blocking_next`](blocking_wait.md#excluded-on-coro_pico--for-now),
+letting a compute loop on core 1 park until core 0 (or an ISR) wakes it. A
+`pico_sync` semaphore per blocked waiter fits: core 1 blocks in
+`sem_acquire_blocking()`, and the waker's `wake()` is `sem_release()`.
 
-```cpp
-while (!done) {
-    poll_ready_tasks();
-    check_expired_timers();
-    cyw43_arch_poll();
-}
-```
+### More `sys` primitives on Pico
 
-The RP2040 core runs at 125 MHz and never enters a low-power state, even when every
-task is parked and no network or timer events are pending. On USB- or wall-powered
-devices this is usually acceptable, but **battery-powered applications will see
-significantly reduced runtime** compared to an executor that sleeps between events.
+The lwIP backend makes Pico's `sys` layer a small operating system of its own, so it can
+offer other fd types modelled on Linux's, each an `IoObject` kind with readiness reported
+through the `Poller` like a socket. Add one when a higher-level primitive or peripheral
+driver can be built on it.
 
-The fix is to call `__wfi()` (Wait For Interrupt) at the bottom of the loop when the
-ready queue is empty, no timers are near-expiry, and no ISR events are pending. The
-CYW43 WiFi chip drives a GPIO IRQ that wakes the CPU when a network event arrives, so
-the executor would be woken promptly. Key implementation considerations:
+!!! tip "TODO: a pipe fd"
+    The `pipe` analog: an ISR-safe single-producer, single-consumer byte ring that the
+    ISR writes and that is readable while it holds data. It would implement the
+    `IsrRingBuffer` TODO in [ISR Safety](isr_safety.md#limitations), and make UART RX,
+    PIO RX or USB-CDC byte streams read with the same `stream_io.h` futures as
+    `TcpStream` and `Pipe`.
 
-- The "nothing pending" check must be atomic with the decision to sleep — a waker
-  enqueue between the check and `__wfi()` must not be lost. On single-core this is
-  solved by disabling IRQs briefly during the check, then using `__wfi()` which
-  re-enables them atomically.
-- The nearest timer deadline gives the maximum sleep duration; a hardware alarm
-  (`add_alarm_at()`) should wake the CPU at that deadline if no earlier IRQ fires.
-- `cyw43_arch_poll()` must still be called at least once after every wakeup to drain
-  any buffered WiFi events before re-evaluating the idle condition.
+!!! tip "TODO: a counting notify fd (maybe)"
+    The analog of `eventfd` with its counter and `EFD_SEMAPHORE` mode. `IsrSemaphore`
+    would become a thin wrapper over it. With the hardware spin lock behind a small
+    abstraction, the ISR primitives could also run on desktop over a real eventfd, for
+    signalling from foreign threads, C callbacks or signal handlers. `IsrEvent`
+    (broadcast) and `IsrChannel<T>` (a value slot) do not map onto a counter, so weigh
+    that gain before adding it.
 
-**Single-core implementation (simple):** When the executor runs exclusively on core 0
-and ISRs communicate only via `IsrEvent::signal_from_isr()` (a volatile write — no
-`wake()` call), nothing can enqueue a task to the ready queue from outside the executor
-loop. If the loop reaches the idle check and the queue is empty, it stays empty until a
-hardware IRQ fires and wakes the CPU. No special atomicity is required:
+`timerfd` is not needed, since the driver's timer queue covers it, and `signalfd` and
+`inotify` have no Pico counterpart.
 
-```cpp
-if (ready_queue_empty() && no_timers_near() && no_isr_events_pending()) {
-    __wfi();   // safe: nothing can enqueue between this check and the sleep
-}
-```
-
-**Dual-core implementation (requires doorbell):** If core 1 runs user code that calls
-`wake()` on core 0 tasks, a lost-wakeup race exists: core 1 may enqueue a task between
-core 0's "queue is empty" check and the `__wfi()` instruction. The RP2040 fix is the
-**SIO inter-processor FIFO** — writing to `sio_hw->fifo_wr` raises `SIO_IRQ_PROC0` on
-core 0, waking it from WFI. `CurrentThreadExecutor::enqueue()` would write the doorbell
-after pushing to the ready queue, mirroring the eventfd unpark the desktop `IoDriver` uses.
-
-!!! tip "TODO: Implement WFI idle in CurrentThreadExecutor"
-    Implementing this would materially reduce power consumption on battery-powered
-    Pico W projects. Single-core change is confined to `CurrentThreadExecutor::wait_for_completion()`.
-    Dual-core additionally requires a SIO FIFO doorbell write in `CurrentThreadExecutor::enqueue()`.
-    No changes to coroutine user code are needed in either case.
-
-    The same doorbell would also back a `CORO_PICO` `Waker` for
-    [`blocking_wait`/`blocking_next`](blocking_wait.md#excluded-on-coro_pico--for-now),
-    letting a compute loop on core 1 park until core 0 (or an ISR) wakes it — currently
-    excluded on `CORO_PICO` for lack of this backend, deferred as its own design
-    discussion.
-
-### Sharing more code with the desktop build
-
-The executor, timers and clock are already shared: Pico and desktop run the same
-`CurrentThreadExecutor`, `detail::TimerQueue`, `SleepFuture` and `coro::Clock`, and differ
-only in the `Parker` (`PollingParker` around `cyw43_arch_poll()` here, the `IoDriver` on
-desktop). What still diverges is the socket layer: `tcp_stream.h`, `tcp_listener.h` and
-`udp_socket.h` are each two whole-file `#ifdef` halves, with the lwIP backend in
-`src/io/lwip/`.
-
-!!! note "NOTE: an lwIP `IoDriver` is not the goal"
-    The desktop [`IoDriver`](io_driver.md) is readiness-based: a future makes the
-    non-blocking syscall itself and registers an fd only on `EAGAIN`. The lwIP raw API is
-    callback-based: there are no fds, received data arrives as pbufs in a `recv` callback,
-    and sends are acknowledged through a `sent` callback. An `IoDriver` implementation for
-    lwIP would have to fake fds and readiness on top of those callbacks, adding a layer
-    without removing any lwIP-specific code. The seam to share is one level up, at the
-    socket classes.
-
-None of the following is needed for correctness.
-
-!!! tip "TODO: Share the socket class declarations between backends"
-    Keep one `TcpStream` / `TcpListener` / `UdpSocket` declaration and move the backend
-    difference into the state object each one holds, in the way the desktop classes
-    already sit on `detail/sys/*.h`. The two `#ifdef` halves could then no longer drift
-    apart in signatures or documentation.
-
-!!! tip "TODO: Give Pico a blocking Parker"
-    Implement the WFI idle described in
-    [Busy-poll loop](#busy-poll-loop-no-cpu-idle-wfi) as a `Parker`, replacing
-    `PollingParker`. The `Parker` interface already has the `park(max_wait)` / `unpark()`
-    shape it needs; the nearest timer deadline bounds the wait as it does on desktop.
-
-!!! tip "TODO: Move the Pico timer queue and ISR polls into a Pico driver object"
-    On Pico the timer queue and the ISR poll list live in `CurrentThreadExecutor`, and
-    `Runtime` reaches them through `#ifdef CORO_PICO` branches. Putting them behind a small
-    driver object owned by `Runtime`, alongside the parker, would give `Runtime` the same
-    shape on both platforms.
-
-!!! warning "FIXME: Not verified on hardware since the desktop I/O rewrite"
-    After the desktop build moved to the `IoDriver`, the Pico libraries (`coro_pico`,
-    `coro_pico_hal`) cross-compile cleanly for `pico_w` and the host-side Pico tests pass,
-    but nothing has been flashed and run. The compile and the host tests don't exercise
-    real lwIP or the CYW43 driver; run one of the `examples/pico` targets on a board
-    before relying on the port.
-
-### Timer resolution
-
-`sleep_for` / `timeout` resolution is bounded by poll loop iteration time rather than
-a hardware alarm. In practice the loop is tight (sub-millisecond), but the Pico SDK's
-`add_alarm_in_us()` / hardware timer could provide sub-100µs resolution if needed.
-
-### IPv6
-
-`tcp_new()` creates an IPv4-only PCB. For dual-stack, replace with
-`tcp_new_ip_type(IPADDR_TYPE_ANY)` and use `ip_addr_t` throughout. lwIP's DNS resolver
-already returns an `ip_addr_t` that holds either address family.
+The HAL (`GpioPin`, `AsyncDmaTransfer`) stays on the public ISR primitives rather than
+using `sys` directly. The primitives hold the state that makes a wait lossless (the
+epoch a DMA transfer's `start()` captures, the edge count `GpioPin::edges()` needs), and
+the driver's registration, waiter and pinning rules are implemented once inside them.
+If a driver ever wants to supply its own state, such as a peripheral's status register,
+factor the primitives' common core (notify fd, registration share, `IoWaiter`) into an
+internal helper with a pluggable check, and build the driver on that.
 
 ### Potential future primitives
 
 | Primitive | Layer | Notes |
 |---|---|---|
 | GPIO edge | `coro_pico_hal` | `gpio_set_irq_enabled_with_callback` → `IsrEvent::signal_from_isr()` |
-| DMA completion | `coro_pico_hal` | `AsyncDmaTransfer` — implemented; see above |
+| DMA completion | `coro_pico_hal` | `AsyncDmaTransfer`; see above |
 | UART async RX | `coro_pico_hal` | PIO or SDK UART RX IRQ → `IsrChannel<uint8_t>::send_from_isr()` |
 | I2C / SPI async | `coro_pico_hal` | DMA-backed transfers via `AsyncDmaTransfer` |
 | ADC burst | `coro_pico_hal` | DMA from ADC FIFO via `AsyncDmaTransfer` |
 | TLS | `coro_pico` | mbedTLS layered over `TcpStream` |
-| MQTT | `coro_pico_mqtt` | `MqttClient` over lwIP `apps/mqtt` — see [Optional MQTT module](#optional-mqtt-module-coro_pico_mqtt) above |
+| MQTT | `coro_pico_mqtt` | `MqttClient` over lwIP `apps/mqtt`; see [Optional MQTT module](#optional-mqtt-module-coro_pico_mqtt) |
 
-The `IsrEvent` / `IsrChannel<T>` pattern is the required integration point for all
-hardware peripherals that need ISR → coroutine signalling. For peripherals that do not
-involve an ISR (e.g. blocking SPI in a spawned coroutine), no special primitive is
-needed.
+The ISR primitives are the integration point for every peripheral that signals a
+coroutine from an interrupt, and the reason an interrupt can end the executor's sleep
+(see [Wake sources](#wake-sources)). A peripheral driven without an ISR (for example
+blocking SPI in a spawned coroutine) needs no special primitive.

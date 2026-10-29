@@ -2,9 +2,9 @@
 
 #include <coro/runtime/executor.h>
 #include <coro/runtime/clock.h>
+#include <coro/runtime/io_driver.h>
 #include <coro/detail/timer_queue.h>
 #ifndef CORO_PICO
-#include <coro/runtime/io_driver.h>
 #include <coro/task/spawn_on.h>
 #include <coro/task/spawn_blocking.h>
 #include <condition_variable>
@@ -18,9 +18,6 @@
 #include <coro/detail/task.h>
 #include <coro/detail/task_state.h>
 #include <coro/detail/rc.h>
-#ifdef CORO_PICO
-#include <coro/detail/isr_flag.h>
-#endif
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -33,30 +30,27 @@ namespace coro {
 class CurrentThreadExecutor;  // forward declaration for Runtime::m_current_thread_executor
 
 /**
- * @brief What the Pico Runtime's event loop drives on each iteration, besides tasks
- * and timers.
+ * @brief Which Pico SDK `async_context` the Pico Runtime runs on, and what runs on it.
  *
- * `coro::pico` links the CYW43 driver and lwIP whichever is chosen; this only decides
- * what is called.
+ * The runtime's I/O driver runs the context (`async_context_poll()`) and sleeps on it
+ * (`async_context_wait_for_work_until()`); see doc/design/pico_port.md, "Runtime on
+ * Pico". `coro::pico` links the CYW43 driver and lwIP whichever is chosen.
  */
 enum class PicoNetwork {
-    /// Nothing. For firmware that uses neither Wi-Fi nor sockets. Sockets must not be
-    /// used on this runtime: nothing would ever complete them.
+    /// The runtime's own context, with nothing but coro on it. For firmware that
+    /// uses neither Wi-Fi nor sockets: creating a socket or resolving a name throws
+    /// `std::system_error` with ENETDOWN. The ISR primitives work.
     None,
 
-    /// lwIP without the radio: lwIP's timers (`sys_check_timeouts()`) and its
-    /// loopback queue. For a board with no CYW43 chip, or one whose radio is never
+    /// The runtime's own context, on which it starts lwIP (`lwip_nosys_init()`)
+    /// without the radio. For a board with no CYW43 chip, or one whose radio is never
     /// started. Sockets work over `127.0.0.1`, and over any interface the application
-    /// adds and feeds itself. The application must call `lwip_init()` once before the
-    /// first socket call; nothing else does when `cyw43_arch_init()` is not used.
+    /// adds and feeds itself. The application calls nothing first.
     Lwip,
 
-    /// The CYW43 Wi-Fi driver and lwIP, through `cyw43_arch_poll()`, plus lwIP's
-    /// loopback queue. Requires `cyw43_arch_init()` to have been called before the
-    /// runtime first runs: `cyw43_arch_poll()` reads driver state that only it sets
-    /// up, so calling it without is undefined behaviour, not a wasted call. A Wi-Fi
-    /// connection made later from a task (`cyw43_arch_wifi_connect_async()`) is fine;
-    /// it is this poll that makes it progress.
+    /// The CYW43 driver's context (`cyw43_arch_async_context()`), which runs the radio
+    /// and lwIP. Construct the runtime after `cyw43_arch_init()`, on the same core,
+    /// and destroy it before `cyw43_arch_deinit()`, which destroys that context.
     Cyw43,
 };
 #endif
@@ -76,8 +70,15 @@ Runtime& current_runtime();
  *
  * `Runtime` is not copyable or movable.
  *
- * In the Pico port (`CORO_PICO`), the Runtime owns a @ref CurrentThreadExecutor and
- * exposes `poll()` to service the ready queue from the firmware event loop.
+ * In the Pico port (`CORO_PICO`), the Runtime owns the Pico SDK `async_context` it
+ * runs on (or borrows the CYW43 driver's), an I/O driver whose lwIP Poller runs and
+ * sleeps on it, and a @ref CurrentThreadExecutor that parks in that driver. It has no
+ * blocking pool, and exposes `poll()` for firmware that keeps its own main loop. See
+ * doc/design/pico_port.md, "Runtime on Pico".
+ *
+ * WARNING: run a Pico Runtime on the core that constructed it. Its async_context
+ * belongs to that core, and the SDK panics when lwIP takes the context's lock from the
+ * other one.
  */
 class Runtime {
 public:
@@ -93,47 +94,37 @@ public:
     /// @brief Calls shutdown().
     ~Runtime();
 
+    /// @brief Returns the runtime's I/O driver. See doc/design/io_driver.md.
+    IoDriver& io_driver() { return m_io_driver; }
+
+    /// @brief Always true: the executor parks in the driver. Here for code shared with
+    /// the desktop build.
+    bool turns_io_driver() const noexcept { return true; }
+
+    /// @brief True once shutdown() has shut the I/O driver down. See the desktop
+    /// overload.
+    bool io_shut_down() const noexcept { return m_io_driver.is_shut_down(); }
+
     /// @brief Adds a timer that wakes `waker` once `deadline` has passed, on the
-    /// CurrentThreadExecutor's queue. Used by SleepFuture.
+    /// driver's queue: its deadline bounds the CPU's sleep. Used by SleepFuture.
     /// @return The id to pass to cancel_timer().
+    /// @throws std::runtime_error if the runtime has shut down.
     detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
 
     /// @brief Cancels a timer added by add_timer(). Does nothing if it has already
     /// fired or been cancelled.
     void cancel_timer(detail::TimerId id) noexcept;
 
-    /// @brief Always false here: with one thread and no blocking pool, nothing can
-    /// be waiting on a timer once shutdown() has drained the tasks. See the desktop
-    /// overload.
-    bool io_shut_down() const noexcept { return false; }
-
-    /// @brief Registers an ISR-safe waiter to be peeked once per event loop iteration.
+    /// @brief One pass of the event loop without sleeping: runs one batch of ready
+    /// tasks, then turns the I/O driver with a zero wait (which runs the radio and
+    /// lwIP, fires due timers, and delivers ISR signals). Returns true if any task was
+    /// polled. Like block_on(), makes this the current runtime while it runs.
     ///
-    /// `entry`'s non-mutating is_ready() is checked once per loop iteration; when it
-    /// returns true, the waker is fired (the registration is NOT removed here -- see
-    /// doc/design/isr_safety.md, "Multiple waiters"). Called by IsrWaitFuture and
-    /// friends — do not call directly. Must be called from the executor thread (i.e.
-    /// from inside a coroutine), never from an ISR.
-    void register_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker);
-
-    /// @brief Removes an ISR poll registration.
-    ///
-    /// Called by the owning waiter's destructor/move-assignment once its wait
-    /// completes or is cancelled. Prevents the executor from dereferencing an
-    /// IsrPollEntry* whose backing object may have been destroyed. Matched by
-    /// `entry`'s own identity, so this always removes exactly the caller's own
-    /// registration, even when other waiters share the same underlying flag/count.
-    void remove_isr_poll(IsrPollEntry* entry);
-
-    /// @brief Drains the coroutine ready queue once. Returns true if any task was polled.
-    ///
-    /// For firmware that runs its own main loop instead of `block_on()`. It runs
-    /// tasks only: it fires no timers and drives no part of the network, whatever
-    /// @ref PicoNetwork the runtime was built with. The loop must do that itself:
+    /// For firmware that keeps its own main loop instead of calling `block_on()`:
     /// @code
     /// while (true) {
     ///     rt.poll();
-    ///     cyw43_arch_poll();
+    ///     // other firmware work
     /// }
     /// @endcode
     bool poll();
@@ -369,6 +360,21 @@ private:
     bool m_shut_down = false;
 
 #ifdef CORO_PICO
+    // The SDK async_context and what the runtime started on it; defined in
+    // runtime.cpp, which keeps the SDK's headers out of this one.
+    struct PicoContext;
+    struct PicoContextDeleter { void operator()(PicoContext* context) const noexcept; };
+    static std::unique_ptr<PicoContext, PicoContextDeleter> make_context(PicoNetwork network);
+    static detail::sys::PollerOptions poller_options(PicoContext& context) noexcept;
+
+    // Declaration order matters for destruction (members destroyed in reverse order):
+    //   m_context  — destroyed last: the driver's Poller runs on it, and removes its
+    //                workers from it as it is destroyed.
+    //   m_io_driver — outlives the executor, whose tasks own futures that own
+    //                IoRegistrations, as on desktop.
+    //   m_executor — destroyed first.
+    std::unique_ptr<PicoContext, PicoContextDeleter> m_context;
+    IoDriver                  m_io_driver;
     CurrentThreadExecutor*    m_current_thread_executor = nullptr;
     std::unique_ptr<Executor> m_executor;
 #else

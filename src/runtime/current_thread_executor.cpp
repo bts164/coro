@@ -8,11 +8,10 @@
 #include <stdexcept>
 #include <vector>
 
-#ifdef CORO_PICO
-#include <coro/detail/fiber_context.h>
-#else
 #include <coro/runtime/io_driver.h>
 #include <coro/runtime/runtime.h>
+#ifdef CORO_PICO
+#include <coro/detail/fiber_context.h>
 #endif
 
 namespace coro {
@@ -76,14 +75,12 @@ CurrentThreadExecutor::CurrentThreadExecutor(std::unique_ptr<Parker> parker,
     assert(m_parker && "CurrentThreadExecutor needs a Parker");
 }
 
-#ifndef CORO_PICO
 CurrentThreadExecutor::CurrentThreadExecutor(Runtime* rt)
     : CurrentThreadExecutor(std::make_unique<IoDriverParker>(rt->io_driver()))
 {
     m_turns_io_driver = true;
     m_runtime         = rt;
 }
-#endif
 
 CurrentThreadExecutor::~CurrentThreadExecutor() {
     // Here, not left to the member destructors: the list holds its references in the
@@ -321,41 +318,6 @@ void CurrentThreadExecutor::check_expired_timers() {
     m_timers.fire_expired();
 }
 
-#ifdef CORO_PICO
-void CurrentThreadExecutor::add_isr_poll(IsrPollEntry*               entry,
-                                         detail::Rc<detail::Waker>  waker) {
-    m_isr_polls.push_back({entry, std::move(waker)});
-}
-
-void CurrentThreadExecutor::remove_isr_poll(IsrPollEntry* entry) {
-    // Matched by entry identity, not by any state it reads -- so with multiple
-    // waiters sharing the same underlying flag/count, each has a distinct
-    // IsrPollEntry* and removing one can never deregister another. See
-    // doc/design/isr_safety.md, "Multiple waiters".
-    auto it = std::find_if(m_isr_polls.begin(), m_isr_polls.end(),
-                           [entry](const IsrPollRegistration& e) { return e.entry == entry; });
-    if (it != m_isr_polls.end()) {
-        *it = std::move(m_isr_polls.back());
-        m_isr_polls.pop_back();
-    }
-}
-
-void CurrentThreadExecutor::check_isr_events() {
-    // Pure peek: is_ready() takes the entry's paired hardware spin lock
-    // internally (see doc/design/isr_safety.md, "Cross-core ISR delivery")
-    // but never mutates anything. It only decides whether to fire this tick's
-    // wake -- the real, consuming claim happens exactly once, inside the real
-    // Future::poll(), invoked only via the woken task's own top-down
-    // traversal (Coro<T>::poll()'s spurious-wake guard). So this loop never
-    // removes entries itself: nothing here resolves a wait, so there's
-    // nothing to react to by removing one. Removal stays with the owning
-    // waiter's destructor, exactly as before.
-    for (auto& reg : m_isr_polls) {
-        if (reg.entry->is_ready())
-            reg.waker->wake();
-    }
-}
-#endif // CORO_PICO
 
 void CurrentThreadExecutor::begin_shutdown() {
     std::vector<detail::Rc<detail::TaskBase>> tasks;
@@ -453,9 +415,6 @@ void CurrentThreadExecutor::run_loop(Done&& done) {
         // Always reaches the parker, with a zero wait while tasks are queued: a
         // batch is the unit between two looks at outside events.
         park_once();
-#ifdef CORO_PICO
-        check_isr_events();
-#endif
     }
 }
 

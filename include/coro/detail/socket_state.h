@@ -1,8 +1,9 @@
 #pragma once
 
-// Desktop only: the state every IoDriver-backed fd (UdpSocket, TcpStream, TcpListener,
-// and Pipe, whose FIFO fd needs exactly the same handling) shares with its in-flight
-// futures. See doc/design/udp_socket.md, "Desktop (IoDriver) backend", and
+// The state every IoDriver-backed fd (UdpSocket, TcpStream, TcpListener, a lookup_host
+// query on lwIP, and Pipe, whose FIFO fd needs exactly the same handling) shares with
+// its in-flight futures. See doc/design/udp_socket.md, "SocketState: who owns the
+// socket", and
 // doc/design/io_driver.md, "Registration lifetime and stale events".
 
 #include <coro/detail/sys/poller.h>

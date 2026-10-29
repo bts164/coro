@@ -8,7 +8,7 @@
 // backend".
 //
 // Current backends:
-//   POSIX: src/detail/sys/udp_posix.cpp
+//   POSIX: src/detail/sys/posix/udp_posix.cpp
 //
 // The try_ functions never block. They return the byte count, or an errno; a
 // would_block() errno means "wait for readiness and retry" (see

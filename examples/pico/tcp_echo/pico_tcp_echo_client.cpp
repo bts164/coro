@@ -99,8 +99,12 @@ int main() {
     }
     std::printf("WiFi connected\n");
 
-    coro::Runtime rt;
-    rt.block_on(run_client(0, "hello pico"));
+    {
+        // Scoped: the runtime runs on the CYW43 driver's async_context, which
+        // cyw43_arch_deinit() destroys, so it must be gone first.
+        coro::Runtime rt;
+        rt.block_on(run_client(0, "hello pico"));
+    }
 
     cyw43_arch_deinit();
     return 0;

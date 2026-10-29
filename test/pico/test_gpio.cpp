@@ -17,8 +17,10 @@ using namespace std::chrono_literals;
 // Helpers
 // ---------------------------------------------------------------------------
 
+// A runtime without networking: the tests raise the IRQs by hand, and need neither
+// lwIP nor the radio.
 static Runtime make_rt() {
-    return Runtime{};
+    return Runtime{PicoNetwork::None};
 }
 
 // Fires a GPIO IRQ for `pin` from a background thread after a short delay,

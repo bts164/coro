@@ -1,6 +1,6 @@
 #pragma once
 
-// Template method bodies for the desktop TcpStream. Included at the bottom of
+// Template method bodies for TcpStream. Included at the bottom of
 // tcp_stream.h; never include this file directly.
 //
 // The futures themselves are the shared byte-stream futures in

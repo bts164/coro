@@ -30,9 +30,8 @@ include/coro/
 │   └── work_stealing_executor.h
 │
 ├── task/               tokio::task — task spawning and handles
-│   ├── join_handle.h
+│   ├── join_handle.h       JoinHandle<T>, and StreamHandle<T>, the consumer end of a spawned stream
 │   ├── join_set.h          JoinSet<T> — dynamic collection of homogeneous tasks
-│   ├── stream_handle.h     StreamHandle<T> — consumer end of a spawned stream
 │   ├── spawn_blocking.h    spawn_blocking() + BlockingHandle + BlockingPool
 │   ├── spawn_builder.h     SpawnBuilder + StreamSpawnBuilder
 │   └── yield_now.h         yield_now() — give the executor the thread back once
@@ -91,10 +90,11 @@ src/
 │   ├── file.cpp
 │   ├── pipe.cpp
 │   ├── signal.cpp
-│   ├── circular_byte_buffer.cpp
-│   └── lwip/                    Pico lwIP TCP backend (CORO_PICO)
-│       ├── tcp_stream_lwip.cpp
-│       └── tcp_listener_lwip.cpp
+│   └── circular_byte_buffer.cpp
+├── detail/sys/                  The sys layer: one directory per backend
+│   ├── posix/                   POSIX backend: *_posix.cpp, poller_epoll.cpp
+│   └── lwip/                    lwIP backend (CORO_SYS_LWIP): poller, tcp, udp, dns,
+│                                and lwipopts.h.in, coro's lwIP configuration (Pico)
 └── pico/
     └── hal/dma.cpp              RP2040 DMA helpers (CORO_PICO)
 ```

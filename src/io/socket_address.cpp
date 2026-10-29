@@ -1,36 +1,24 @@
+// SocketAddress parsing and formatting. The text-to-octets step is the sys layer's
+// (sys::parse_ipv4/parse_ipv6), so this file is the same on every backend.
+
 #include <coro/io/socket_address.h>
+#include <coro/detail/sys/socket.h>
 #include <cstdio>
 #include <cstring>
 #include <type_traits>
-
-#ifdef CORO_PICO
-#include <lwip/ip4_addr.h>
-#else
-#include <arpa/inet.h>
-#endif
 
 namespace coro {
 
 namespace {
 
 std::optional<Ipv4Address> parse_ipv4(std::string_view host) {
-    // inet_pton/ip4addr_aton both require a NUL-terminated C string.
+    // The backends' parsers require a NUL-terminated C string.
     std::string s(host);
-
-#ifdef CORO_PICO
-    ip4_addr_t addr;
-    if (!ip4addr_aton(s.c_str(), &addr)) return std::nullopt;
     Ipv4Address result;
-    std::memcpy(result.octets.data(), &addr.addr, 4);
+    if (!detail::sys::parse_ipv4(s.c_str(), result.octets)) return std::nullopt;
     return result;
-#else
-    Ipv4Address result;
-    if (inet_pton(AF_INET, s.c_str(), result.octets.data()) != 1) return std::nullopt;
-    return result;
-#endif
 }
 
-#ifndef CORO_PICO
 std::optional<Ipv6Address> parse_ipv6(std::string_view host) {
     // Strip a "%<scope>" zone suffix (numeric interface index only) before
     // handing the address portion to inet_pton, which doesn't understand it.
@@ -49,11 +37,10 @@ std::optional<Ipv6Address> parse_ipv6(std::string_view host) {
 
     std::string s(addr_part);
     Ipv6Address result;
-    if (inet_pton(AF_INET6, s.c_str(), result.octets.data()) != 1) return std::nullopt;
+    if (!detail::sys::parse_ipv6(s.c_str(), result.octets)) return std::nullopt;
     result.scope_id = scope_id;
     return result;
 }
-#endif
 
 // Renders 16 raw octets as compressed IPv6 text (e.g. "fe80::1"), matching the
 // canonical form from RFC 5952: the longest run of two or more zero groups is
@@ -108,16 +95,11 @@ std::optional<SocketAddress> SocketAddress::parse(std::string_view host, uint16_
         return std::nullopt;
     }
 
-#ifdef CORO_PICO
-    // No IPv6 support on the lwIP backend (LWIP_IPV6 is 0 in this project's
-    // lwipopts.h) — see doc/design/udp_socket.md's "Known limitations" section.
-    (void)port;
-    return std::nullopt;
-#else
+    // The lwIP backend has no IPv6 (LWIP_IPV6 is 0 in coro's lwipopts.h), so its
+    // parse_ipv6() always fails and this returns nullopt.
     if (auto v6 = parse_ipv6(host))
         return SocketAddress{*v6, port};
     return std::nullopt;
-#endif
 }
 
 std::string SocketAddress::to_string() const {

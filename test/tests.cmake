@@ -21,6 +21,9 @@ coro_test(detail/test_intrusive_list.cpp         DESKTOP PICO_STUB ON_TARGET cor
 coro_test(detail/test_rc.cpp                     DESKTOP PICO_STUB ON_TARGET core)
 coro_test(detail/test_frame_pool.cpp             DESKTOP PICO_STUB ON_TARGET core)
 coro_test(detail/test_poller.cpp                 DESKTOP)
+# sys/notify.h on both backends: the eventfd on the desktop, the async_context worker
+# in the Pico configuration on the host and on the board.
+coro_test(detail/test_notify.cpp                 DESKTOP PICO_STUB ON_TARGET core)
 coro_test(detail/test_timer_queue.cpp            DESKTOP PICO_STUB ON_TARGET core)
 
 # Foundational types: coro.h, future.h, stream.h, co_invoke.h, defer.h
@@ -81,15 +84,15 @@ coro_test(sync/test_isr_event.cpp                PICO_STUB ON_TARGET sync)
 
 # io/ — TCP and UDP are one file each for every backend: the desktop sockets, lwIP
 # built for the host (test_tcp_stream_pico, test_udp_socket_pico), and lwIP on the
-# board, where they use the loopback interface and no radio.
+# board, where they use the loopback interface and a test link (test_netif.h), and
+# no radio.
 coro_test(io/test_file.cpp                       DESKTOP)
 coro_test(io/test_lookup_host.cpp                DESKTOP)
 coro_test(io/test_pipe.cpp                       DESKTOP)
-# Not on the board: circular_byte_buffer.cpp is not part of the Pico library.
-coro_test(io/test_circular_byte_buffer.cpp       DESKTOP)
+coro_test(io/test_circular_byte_buffer.cpp       DESKTOP PICO_STUB ON_TARGET core)
 coro_test(io/test_signal.cpp                     DESKTOP)
-coro_test(io/test_tcp_stream.cpp                 DESKTOP HOST_LINK coro_lwip_tcp ON_TARGET net)
-coro_test(io/test_udp_socket.cpp                 DESKTOP HOST_LINK coro_lwip_udp ON_TARGET net)
+coro_test(io/test_tcp_stream.cpp                 DESKTOP HOST_LINK coro_pico_core ON_TARGET net)
+coro_test(io/test_udp_socket.cpp                 DESKTOP HOST_LINK coro_pico_core ON_TARGET net)
 coro_test(io/test_ws_stream.cpp                  DESKTOP)
 # lws itself, without coro: the assumption the client contexts rest on.
 coro_test(io/test_lws_context_recreate.cpp       DESKTOP)

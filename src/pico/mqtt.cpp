@@ -3,9 +3,9 @@
 // Compile as part of the application via the coro_pico_mqtt cmake target:
 //   target_link_libraries(my_app PRIVATE coro_pico coro_pico_mqtt)
 //
-// All lwIP MQTT callbacks fire synchronously on the executor thread during
-// cyw43_arch_poll() (Pico) / sys_check_timeouts() (host test builds), same
-// pattern as tcp_stream_lwip.cpp.
+// All lwIP MQTT callbacks fire on the executor's thread, inside the IoDriver's
+// turn, where the runtime's async_context runs lwIP: the same as the sockets of the
+// lwIP sys backend (src/detail/sys/lwip/).
 
 #include <coro/pico/mqtt.h>
 #include <coro/io/lwip/lwip_callback_result.h>

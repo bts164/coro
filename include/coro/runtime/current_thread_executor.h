@@ -3,9 +3,9 @@
 // Single-threaded executor that drives coroutine tasks on the calling thread and
 // waits for outside events through a Parker.
 //
-// The scheduling loop is platform-agnostic; the platform-specific piece is the
-// injected Parker: PollingParker(cyw43_arch_poll) on Pico W (never blocks), or
-// IoDriverParker on desktop (blocks in epoll when idle). Timers use coro::Clock.
+// The scheduling loop is platform-agnostic, and so is its Parker under a Runtime: an
+// IoDriverParker, which blocks in the I/O driver when idle (in epoll on desktop,
+// asleep on the Pico SDK's async_context on Pico). Timers use coro::Clock.
 // See doc/design/executor_design.md, "CurrentThreadExecutor".
 
 #include <coro/runtime/executor.h>
@@ -16,7 +16,6 @@
 #include <coro/detail/task_state.h>
 #include <coro/detail/waker.h>
 #include <coro/detail/rc.h>
-#include <coro/detail/isr_flag.h>
 #include <coro/detail/timer_queue.h>
 #include <coro/runtime/clock.h>
 #include <chrono>
@@ -55,12 +54,11 @@ class Runtime;
  * events are looked at before that task runs again.
  *
  * `max_wait` is zero while tasks are ready, otherwise the time until the next
- * timer in this executor's own queue, otherwise unlimited. On desktop the parker
- * is an @ref IoDriverParker, so an idle executor blocks in epoll and I/O events
- * are dispatched on this thread. A desktop Runtime puts its timers in the
+ * timer in this executor's own queue, otherwise unlimited. Under a Runtime the
+ * parker is an @ref IoDriverParker, so an idle executor blocks in the I/O driver
+ * and I/O events are dispatched on this thread. A Runtime puts its timers in the
  * driver's queue rather than this one, and `turn()` bounds its own wait by them;
- * this executor's queue serves Pico and a standalone executor. On Pico it is a @ref PollingParker around `cyw43_arch_poll()`, which
- * never blocks, so the loop busy-polls.
+ * this executor's queue serves a standalone executor.
  *
  * There are two ready queues. A wake made on the thread that is running the loop
  * goes onto the local queue, which only that thread touches and which has no lock.
@@ -101,12 +99,10 @@ public:
         : CurrentThreadExecutor(std::move(parker), event_interval, global_queue_interval)
     { m_runtime = rt; }
 
-#ifndef CORO_PICO
-    /// Desktop default, used by `Runtime(1)` and
-    /// `Runtime(std::in_place_type<CurrentThreadExecutor>)`: an IoDriverParker on
-    /// `rt->io_driver()`.
+    /// The default under a Runtime, used by `Runtime(1)`,
+    /// `Runtime(std::in_place_type<CurrentThreadExecutor>)` and the Pico Runtime: an
+    /// IoDriverParker on `rt->io_driver()`.
     explicit CurrentThreadExecutor(Runtime* rt);
-#endif
 
     /// Releases every task still owned. Defined in the .cpp.
     ~CurrentThreadExecutor() override;
@@ -127,14 +123,13 @@ public:
     /// WARNING: not callable from an interrupt handler on Pico. An interrupt taken
     /// while the loop runs would pass the "is this the loop's thread" test and push
     /// onto the local queue in the middle of the loop's own use of it. Interrupt
-    /// handlers set an IsrEvent/IsrChannel flag instead; see doc/design/isr_safety.md.
+    /// handlers signal an ISR primitive instead; see doc/design/isr_safety.md.
     void enqueue(detail::Rc<detail::TaskBase> task) override;
 
     /// @brief Runs the event loop until `state.terminated`.
     ///
     /// Alternates between running a batch of ready tasks, firing expired
-    /// timers, and parking. Whether parking blocks depends on the Parker: on
-    /// Pico (PollingParker) it never does, so the loop busy-polls.
+    /// timers, and parking. Whether parking blocks depends on the Parker.
     void wait_for_completion(detail::TaskStateBase& state) override;
 
     /// True only when built by `CurrentThreadExecutor(Runtime*)`, whose parker turns
@@ -169,7 +164,7 @@ public:
 
     /// @brief Adds a timer to this executor's own queue: `waker` fires once
     /// `deadline` has passed. Thread-safe; unparks the executor if it is parked
-    /// for a later deadline. Used by `Runtime::add_timer()` on Pico.
+    /// for a later deadline. For an executor built without a Runtime.
     /// @return The id to pass to cancel_timer().
     detail::TimerId add_timer(Instant deadline, detail::Weak<detail::Waker> waker);
 
@@ -180,27 +175,6 @@ public:
     /// @brief Fires wakers for any timers whose deadline has passed.
     /// Called from wait_for_completion() on every loop iteration.
     void check_expired_timers();
-
-#ifdef CORO_PICO
-    /// @brief Registers an ISR-safe waiter to be peeked once per event loop iteration.
-    ///
-    /// `entry` must outlive the registration (removed via remove_isr_poll() from the
-    /// waiter's own destructor/move, same as today). Keyed by `entry`'s own identity,
-    /// not by any state it reads — so multiple waiters sharing the same underlying
-    /// flag/count each get their own, independently removable registration. See
-    /// doc/design/isr_safety.md, "Multiple waiters". Safe to call from the executor
-    /// thread only (not from an ISR — registration happens inside the coroutine, not
-    /// the ISR).
-    void add_isr_poll(IsrPollEntry* entry, detail::Rc<detail::Waker> waker);
-    void remove_isr_poll(IsrPollEntry* entry);
-
-    /// @brief Scans registered ISR waiters; fires wakers for any whose is_ready()
-    /// peek returns true. Never removes entries itself -- nothing here resolves a
-    /// wait, so there's nothing to react to by removing one; removal stays with the
-    /// owning waiter's destructor. Called from wait_for_completion() on every loop
-    /// iteration, after parking.
-    void check_isr_events();
-#endif // CORO_PICO
 
 private:
     /// Held for as long as a thread runs the loop: claims the loop for that thread
@@ -236,8 +210,8 @@ private:
     /// the executor is shutting down.
     void notify_shutdown_progress() noexcept;
 
-    /// The owning Runtime. Null for a standalone executor and on Pico, where the
-    /// executor is the only place tasks live and nobody needs telling.
+    /// The owning Runtime. Null for a standalone executor. Told of shutdown progress
+    /// on desktop only: on Pico the executor is the only place tasks live.
     Runtime* m_runtime = nullptr;
 
     std::unique_ptr<Parker> m_parker;
@@ -290,15 +264,6 @@ private:
     // Set by begin_shutdown(), never cleared. GUARDED BY m_owned_mutex.
     bool                  m_closed = false;
 
-#ifdef CORO_PICO
-    struct IsrPollRegistration {
-        IsrPollEntry*               entry;   // non-owning; entry outlives the registration
-        detail::Rc<detail::Waker>   waker;
-    };
-    // Written from coroutine context (executor thread) only; read from
-    // check_isr_events() on the same thread. No synchronisation needed.
-    std::vector<IsrPollRegistration> m_isr_polls;
-#endif // CORO_PICO
 };
 
 } // namespace coro

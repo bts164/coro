@@ -1,63 +1,5 @@
 #pragma once
 
-#ifdef CORO_TCP_BACKEND_LWIP
-
-// ---------------------------------------------------------------------------
-// lwIP-backed TcpListener (CORO_TCP_BACKEND_LWIP)
-// ---------------------------------------------------------------------------
-
-#include <coro/coro.h>
-#include <coro/io/tcp_stream.h>
-#include <coro/detail/rc.h>
-#include <cstdint>
-#include <memory>
-#include <string>
-
-namespace coro {
-
-namespace detail { struct LwipListenCtx; }
-
-/**
- * @brief Async TCP server. Obtain via `co_await TcpListener::bind(host, port)`.
- *
- * Each call to accept() waits for the next incoming connection and returns a
- * TcpStream. Only one accept() may be in flight at a time.
- *
- * **Destruction:** aborts any queued pending connections and wakes a suspended
- * accept() with a closed error.
- */
-class TcpListener {
-public:
-    TcpListener(TcpListener&&) noexcept;
-    TcpListener& operator=(TcpListener&&) noexcept;
-    TcpListener(const TcpListener&)            = delete;
-    TcpListener& operator=(const TcpListener&) = delete;
-
-    ~TcpListener();
-
-    /**
-     * @brief Binds to host:port and starts listening.
-     *
-     * host must be a dotted-decimal IPv4 string or "0.0.0.0".
-     * @throws std::runtime_error on bind or listen failure.
-     */
-    [[nodiscard]] static Coro<TcpListener> bind(std::string host, uint16_t port);
-
-    /**
-     * @brief Waits for the next incoming connection.
-     * @throws std::runtime_error if the listener has been closed.
-     */
-    [[nodiscard]] Coro<TcpStream> accept();
-
-private:
-    explicit TcpListener(detail::Rc<detail::LwipListenCtx> impl);
-
-    detail::Rc<detail::LwipListenCtx> m_impl;
-};
-
-} // namespace coro
-
-#else // !CORO_TCP_BACKEND_LWIP — desktop implementation on the IoDriver
 
 #include <coro/coro.h>
 #include <coro/detail/context.h>
@@ -94,8 +36,10 @@ private:
  *
  * Obtain via `co_await TcpListener::bind(host, port)`; each `co_await accept()`
  * returns the next incoming `TcpStream`. See doc/design/tcp_stream.md, "TcpListener".
- * Requires an executor that turns the IoDriver (`Runtime(n)` for any n); `bind()`
- * throws `std::logic_error` otherwise.
+ * Requires a Runtime whose executor turns the IoDriver (every Runtime does; a
+ * CurrentThreadExecutor given its own Parker does not); `bind()` throws
+ * `std::logic_error` otherwise. On a Pico runtime without lwIP
+ * (`PicoNetwork::None`) it throws `std::system_error` with ENETDOWN.
  *
  * **Concurrency:** only one `accept()` may be in flight at a time.
  *
@@ -140,5 +84,3 @@ private:
 };
 
 } // namespace coro
-
-#endif // CORO_TCP_BACKEND_LWIP

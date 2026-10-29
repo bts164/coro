@@ -31,7 +31,7 @@ IoDriver& socket_io_driver(const char* what) {
     if (!rt.turns_io_driver())
         throw std::logic_error(std::string(what) +
             ": this Runtime's executor doesn't turn the IoDriver (a CurrentThreadExecutor "
-            "with its own Parker?); use Runtime(n)");
+            "with its own Parker?); use a Runtime built with its default executor");
     return rt.io_driver();
 }
 

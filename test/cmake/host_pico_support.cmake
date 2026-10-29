@@ -7,23 +7,22 @@
 # Included from test/CMakeLists.txt, so relative paths here are relative to test/.
 
 # ---------------------------------------------------------------------------
-# CurrentThreadExecutor tests — no hardware, no epoll driver.
+# coro_pico_core — the Pico configuration of coro, built for the host.
 #
-# Compiles the portable coro core from source with CORO_PICO defined (selects
-# CurrentThreadExecutor in runtime.cpp) and CORO_TCP_BACKEND_LWIP (selects
-# lwIP TCP implementation in tcp_stream.h / tcp_listener.h).
-# cyw43_arch_poll() is a no-op stub and time_us_64() reads the host clock. These
-# tests run alongside the regular suite and catch regressions in core library
-# changes that would break the Pico port.
+# The library coro_pico is on the board (cmake/platforms/pico.cmake), compiled from
+# source with CORO_PICO and CORO_SYS_LWIP: the CurrentThreadExecutor on the
+# IoDriver, the sockets, and the lwIP sys backend under them. The Pico SDK is
+# replaced by the stubs in pico/stub/: a host async_context (async_context_stub.cpp,
+# see doc/design/pico_port.md, "Testing on the host"), pico_lwip_nosys over it, and
+# time_us_64() on the host clock. lwIP itself is real (lwip_host, below).
 #
-# Links lwip_host (defined below): the Pico Runtime calls lwIP itself in its
-# PicoNetwork::Lwip and Cyw43 modes, as it does on the board, so runtime.cpp needs
-# lwIP's headers to compile and its timers and loopback queue to link.
-# ---------------------------------------------------------------------------
-# coro_pico_core — portable coro core + current_thread_executor.
+# The PICO_STUB suite, the socket tests (test_tcp_stream_pico, test_udp_socket_pico)
+# and the MQTT tests all link it.
+#
 # Cannot use the installed coro::coro package (desktop backends, wrong flags) and
 # OBJECT libraries don't cross Conan package boundaries, so core sources are
 # compiled directly from the source tree.
+# ---------------------------------------------------------------------------
 set(CORO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_library(coro_pico_core STATIC
     ${CORO_SRC}/task/waker.cpp
@@ -34,7 +33,22 @@ add_library(coro_pico_core STATIC
     ${CORO_SRC}/runtime/executor.cpp
     ${CORO_SRC}/runtime/runtime.cpp
     ${CORO_SRC}/runtime/current_thread_executor.cpp
+    ${CORO_SRC}/runtime/io_driver.cpp
     ${CORO_SRC}/detail/fiber_context_pico.cpp
+    ${CORO_SRC}/detail/socket_state.cpp
+    ${CORO_SRC}/detail/sys/lwip/poller_lwip.cpp
+    ${CORO_SRC}/detail/sys/lwip/socket_lwip.cpp
+    ${CORO_SRC}/detail/sys/lwip/notify_lwip.cpp
+    ${CORO_SRC}/detail/sys/lwip/tcp_lwip.cpp
+    ${CORO_SRC}/detail/sys/lwip/udp_lwip.cpp
+    ${CORO_SRC}/detail/sys/lwip/dns_lwip.cpp
+    ${CORO_SRC}/io/circular_byte_buffer.cpp
+    ${CORO_SRC}/io/lookup_host.cpp
+    ${CORO_SRC}/io/socket_address.cpp
+    ${CORO_SRC}/io/tcp_stream.cpp
+    ${CORO_SRC}/io/tcp_listener.cpp
+    ${CORO_SRC}/io/udp_socket.cpp
+    pico/stub/async_context_stub.cpp
     pico/stub/cyw43_arch_stub.cpp
 )
 target_include_directories(coro_pico_core PUBLIC
@@ -46,7 +60,7 @@ target_include_directories(coro_pico_core PUBLIC
 # section). Enabled here so FramePool.CoroFrameRoundTripsThroughPool in
 # test_frame_pool.cpp keeps exercising the integration even though real Pico
 # builds (cmake/platforms/pico.cmake) don't enable it by default.
-target_compile_definitions(coro_pico_core PUBLIC CORO_PICO CORO_TCP_BACKEND_LWIP CORO_PICO_FRAME_POOL)
+target_compile_definitions(coro_pico_core PUBLIC CORO_PICO CORO_SYS_LWIP CORO_PICO_FRAME_POOL)
 target_compile_features(coro_pico_core PUBLIC cxx_std_20)
 target_link_libraries(coro_pico_core PUBLIC lwip_host)
 
@@ -73,12 +87,12 @@ target_compile_definitions(coro_pico_hal_core PUBLIC CORO_PICO CORO_PICO_TEST)
 target_compile_features(coro_pico_hal_core PUBLIC cxx_std_20)
 
 # ---------------------------------------------------------------------------
-# Real lwIP TCP tests — host NO_SYS loopback.
+# lwip_host — real lwIP, NO_SYS, built for the host.
 #
-# Downloads lwIP from source and builds it with lwipopts.h configured for
-# NO_SYS mode. Links tcp_stream_lwip.cpp / tcp_listener_lwip.cpp against
-# real lwIP so io/test_tcp_stream.cpp runs actual TCP through the stack, driven
-# by a Runtime built with PicoNetwork::Lwip.
+# Downloads lwIP from source and builds it with pico/lwip_host/lwipopts.h, so the
+# socket tests (io/test_tcp_stream.cpp, io/test_udp_socket.cpp) run actual TCP and
+# UDP through the stack over its loopback interface, on a Runtime built with
+# PicoNetwork::Lwip.
 #
 # Requires: cmake 3.14+ (FetchContent). No extra system packages needed.
 # ---------------------------------------------------------------------------
@@ -125,52 +139,18 @@ target_include_directories(lwip_host PUBLIC
     pico/lwip_host         # lwipopts.h lives here
 )
 
-# coro lwIP TCP sources compiled against real lwIP.
-add_library(coro_lwip_tcp STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip/tcp_stream_lwip.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip/tcp_listener_lwip.cpp
-)
-target_include_directories(coro_lwip_tcp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip
-)
-target_link_libraries(coro_lwip_tcp PUBLIC coro_pico_core lwip_host)
-
-# ---------------------------------------------------------------------------
-# Real lwIP UDP tests — host NO_SYS loopback.
-#
-# Same shape as coro_lwip_tcp above: links udp_socket_lwip.cpp (plus the
-# shared socket_address.cpp, which needs lwip/ip4_addr.h under CORO_PICO)
-# against the same lwip_host used by the TCP tests.
-# ---------------------------------------------------------------------------
-add_library(coro_lwip_udp STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/socket_address.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip/udp_socket_lwip.cpp
-)
-target_include_directories(coro_lwip_udp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip
-)
-# CORO_UDP_BACKEND_LWIP selects udp_socket.h's lwIP branch; without it, the
-# header falls through to its #else (IoDriver) branch and pulls in the epoll
-# driver, which this pico-core-based target never links against.
-target_compile_definitions(coro_lwip_udp PUBLIC CORO_UDP_BACKEND_LWIP)
-target_link_libraries(coro_lwip_udp PUBLIC coro_pico_core lwip_host)
-
 # ---------------------------------------------------------------------------
 # MQTT client tests — host NO_SYS loopback, real lwIP apps/mqtt.
 #
-# coro_lwip_mqtt links src/pico/mqtt.cpp against the same lwip_host used above
-# (now also built with apps/mqtt/mqtt.c) plus coro_lwip_tcp, since the test
-# fixture's fake broker is itself a coro::TcpListener-based server that parses
-# the MQTT wire format by hand (lwIP has no broker implementation to test
-# against, only the client wrapped here).
+# coro_lwip_mqtt links src/pico/mqtt.cpp against coro_pico_core (and its lwip_host,
+# built with apps/mqtt/mqtt.c too), since the test fixture's fake broker is itself a
+# coro::TcpListener-based server that parses the MQTT wire format by hand (lwIP has
+# no broker implementation to test against, only the client wrapped here).
 # ---------------------------------------------------------------------------
 add_library(coro_lwip_mqtt STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/pico/mqtt.cpp
 )
-target_include_directories(coro_lwip_mqtt PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/io/lwip
-)
-target_link_libraries(coro_lwip_mqtt PUBLIC coro_lwip_tcp)
+target_link_libraries(coro_lwip_mqtt PUBLIC coro_pico_core)
 
 # ---------------------------------------------------------------------------
 # Unicorn test of the real ARMv6-M switch_context()/init_fiber_entry()/

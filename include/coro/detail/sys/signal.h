@@ -15,7 +15,7 @@
 // cooperation from other threads.
 //
 // Current backends:
-//   POSIX: src/detail/sys/signal_posix.cpp
+//   POSIX: src/detail/sys/posix/signal_posix.cpp
 
 #include <coro/detail/sys/socket.h>
 

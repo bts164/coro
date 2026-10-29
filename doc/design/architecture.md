@@ -239,9 +239,8 @@ Runs its task loop directly on the calling thread, with no threads of its own.
 ```
 loop:
   run a batch             // poll up to event_interval (61) ready tasks
-  check_expired_timers()  // fire sleep_for / timeout wakers in the executor's own queue
-  parker.park(max_wait)   // wait for outside events
-  check_isr_events()      // Pico only: wake tasks an interrupt handler signalled
+  check_expired_timers()  // only without a Runtime: the executor's own timer queue
+  parker.park(max_wait)   // wait for outside events: turns the IoDriver
 ```
 
 - **Two ready queues.** A wake made on the thread that is running the loop goes onto a
@@ -254,10 +253,10 @@ loop:
   looked at before that task runs again.
 - **`max_wait`** is zero while a task is ready; otherwise the time until the executor's
   next timer, or no limit.
-- **The `Parker` is the platform-specific part.** On desktop it is an `IoDriverParker`:
-  an idle executor blocks in `epoll_wait`, and I/O events and timers are dispatched on
-  this thread. On Pico it is a `PollingParker` around the network poll function, which
-  never blocks, so the loop busy-polls.
+- **The `Parker` is an `IoDriverParker`** on desktop and on Pico: an idle executor
+  blocks in the driver (in `epoll_wait` on desktop, asleep in the lwIP `Poller` on
+  Pico), and I/O events and timers are dispatched on this thread. The platform-specific
+  part is under the driver's `sys` layer, not in the executor.
 - **One thread runs the loop at a time.** The same thread may nest `block_on()`; a
   second thread that tries gets `std::logic_error`.
 
@@ -766,51 +765,57 @@ annotation turns silent bugs into compile-time warnings.
 ## MCU Platforms
 
 The library supports Raspberry Pi Pico / Pico W (RP2040, Cortex-M0+) via the `CORO_PICO`
-preprocessor flag. The MCU build replaces the desktop runtime model with a single-thread,
-poll-driven model that requires no RTOS, no epoll driver, and no blocking pool.
+and `CORO_SYS_LWIP` preprocessor flags. The MCU build runs the desktop runtime model on
+one thread, with no RTOS and no blocking pool. lwIP takes the place of the operating
+system's network stack, beneath the I/O driver's `sys` layer, so the driver, the socket
+types and the executor are the desktop code. See [Pico Port](pico_port.md).
 
 ### `Runtime` on Pico
 
-`Runtime` owns only a `CurrentThreadExecutor`. There is no `IoDriver` and no
-`BlockingPool`. Networking I/O (TCP, if used) is handled by lwIP + CYW43, polled by
-`cyw43_arch_poll()` from the executor's `Parker` once per pass of its loop.
+`Runtime` owns an `IoDriver` and a `CurrentThreadExecutor` that parks in it, as a
+desktop `Runtime(1)` does. There is no `BlockingPool`. The driver's `Poller` runs the
+Pico SDK's `async_context`, which runs the CYW43 driver, lwIP's timers and the ISR
+primitives' notify workers. When nothing is ready it sleeps the CPU in
+`async_context_wait_for_work_until()` until the earliest timer, or until a wake source
+(the radio, an ISR primitive, an unpark) marks work pending.
 
-`rt.block_on(coro)` is the entry point: it runs tasks, fires timers, polls the network
-and checks the ISR events until the given coroutine completes.
+`rt.block_on(coro)` is the entry point: it runs tasks and turns the driver (network,
+timers, ISR signals) until the given coroutine completes.
 
 Firmware that must keep its own main loop can call `rt.poll()` in it. That runs one
-batch of ready tasks and nothing else: it fires no timers and polls no network, so the
-loop has to do those itself.
+batch of ready tasks and turns the driver once without sleeping:
 
 ```cpp
 coro::Runtime rt;
 // ... install handlers, spawn tasks ...
 while (true) {
     rt.poll();
-    cyw43_arch_poll();
     // other platform event handling
 }
 ```
 
 ### ISR safety
 
-The `CORO_PICO` build adds `IsrEvent` and `IsrChannel<T>` (`coro/sync/isr_event.h`) —
-the only two coro API calls safe to make from an interrupt service routine. Everything
-else touches `shared_ptr` ref-counts, atomic scheduling state, or `detail::Mutex`, which
-on Cortex-M0+ all route through the `pico_atomic` global spin-lock — ISR-deadlock-prone.
+The `CORO_PICO` build adds `IsrEvent`, `IsrChannel<T>` and `IsrSemaphore`
+(`coro/sync/isr_event.h`), whose signal functions are the only coro API calls safe to
+make from an interrupt service routine. Everything else touches `shared_ptr`
+ref-counts, atomic scheduling state, or `detail::Mutex`, which on Cortex-M0+ all route
+through the `pico_atomic` global spin-lock — ISR-deadlock-prone.
 
-The design keeps the ISR path minimal: the ISR writes a `volatile` flag (and for
-`IsrChannel<T>`, a value with a `__DMB()` release fence) and returns immediately. The
-executor discovers the signal once per pass of its loop (after each park) and wakes the waiting coroutine
-from safe executor context.
+The design keeps the ISR path minimal: the ISR updates the primitive's state under its
+own hardware spin lock, signals the primitive's notify fd (the driver's eventfd analog,
+which ends the executor's sleep), and returns. Each ISR primitive is an ordinary driver
+registration, so the driver wakes its waiting coroutines inside its turn, on the
+executor's thread.
 
-See `doc/isr_safety.md` for the complete policy and implementation details.
+See [ISR Safety](isr_safety.md) for the complete policy and implementation details.
 
 ### Conditional compilation
 
-Headers and source files gate MCU-specific code on `#ifdef CORO_PICO`. Desktop code is
-unaffected. The Pico CMake build sets this flag; it is not defined in standard desktop
-builds.
+Headers and source files gate single-threaded MCU code on `#ifdef CORO_PICO`, and the
+lwIP `sys` backend is selected by `CORO_SYS_LWIP`. Nothing above the `sys` layer depends
+on `CORO_SYS_LWIP`. The Pico CMake build sets both flags; neither is defined in standard
+desktop builds.
 
 ---
 
@@ -828,7 +833,7 @@ include/coro/
     runtime.h               Runtime — owns executor, IoDriver, BlockingPool
     executor.h              Executor interface
     current_thread_executor.h       CurrentThreadExecutor — calling-thread loop; parks in the I/O driver
-    parker.h                        Parker / PollingParker
+    parker.h                        Parker / PollingParker (a non-blocking parker, for tests)
     io_driver.h                     IoDriver, IoRegistration, IoDriverParker
     work_sharing_executor.h         WorkSharingExecutor
     work_stealing_executor.h        WorkStealingExecutor

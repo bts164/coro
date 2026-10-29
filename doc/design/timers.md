@@ -9,9 +9,9 @@ timers are part of the driver's design: see [I/O Driver](io_driver.md), "Timers"
 
 ## Goals
 
-- **One implementation for every platform.** No `#ifdef`: on desktop the timer goes to
-  the `IoDriver`, whose earliest deadline bounds its wait; on Pico it goes to the
-  `CurrentThreadExecutor`'s own queue.
+- **One implementation for every platform.** No `#ifdef`: the timer goes to the
+  `IoDriver`, whose earliest deadline bounds its wait, on desktop and on Pico (where the
+  wait is the CPU's sleep).
 - **Nanosecond resolution, no thread hop.** A sleep is a heap entry on the thread that
   already blocks in the driver. It is not rounded to milliseconds and costs no
   cross-thread round trip.
@@ -84,7 +84,7 @@ sequenceDiagram
     participant Q as TimerQueue
     S->>S: poll(): now < deadline
     S->>R: add_timer(deadline, weak waker)
-    R->>Q: insert (driver on desktop, executor on Pico)
+    R->>Q: insert (the driver's queue)
     Q-->>S: TimerId
     Note over Q: deadline passes, and the thread turning the driver fires it
     Q-->>S: wake (task re-polled)
@@ -132,10 +132,10 @@ The runtime must outlive the future, as it already must for any future that hold
 `IoRegistration`. `Runtime` destroys its executor, and with it every task and its
 futures, before the driver that owns the queue.
 
-`Runtime::add_timer()` sends the timer to the driver on desktop and to the executor on
-Pico. On a desktop `Runtime` whose executor never turns the driver (a
-`CurrentThreadExecutor` given its own `Parker`), it throws `std::logic_error`, because
-the timer could never fire. That exception propagates from the first pending `poll()`.
+`Runtime::add_timer()` sends the timer to the driver. On a `Runtime` whose executor
+never turns the driver (a `CurrentThreadExecutor` given its own `Parker`), it throws
+`std::logic_error`, because the timer could never fire. That exception propagates from
+the first pending `poll()`.
 
 Once the runtime has shut down, its queue is closed. Closing wakes every timer still in
 it, whatever the deadline. A `SleepFuture` polled again before its deadline therefore

@@ -35,7 +35,7 @@ this design tries to solve.
 that genuinely varies by feature (currently just `LWIP_MQTT`) is controlled
 by a `coro` Conan option (`with_mqtt`), which:
 
-- Drives `#cmakedefine01 LWIP_MQTT` in `src/io/lwip/lwipopts.h.in`, expanded
+- Drives `#cmakedefine01 LWIP_MQTT` in `src/detail/sys/lwip/lwipopts.h.in`, expanded
   via `configure_file()` in `cmake/platforms/pico.cmake` into
   `${CMAKE_CURRENT_BINARY_DIR}/coro_pico_lwipopts/lwipopts.h` (mirrored by
   the plain CMake variable `CORO_PICO_WITH_MQTT` for non-Conan / source
@@ -70,34 +70,79 @@ to the device's own address, reaches the device itself, as it does on a desktop.
 
 lwIP does not deliver a looped packet when it is sent. In a build without an operating
 system it puts the packet on a queue and waits for `netif_poll_all()` to be called.
-Neither the Pico SDK nor the CYW43 driver calls it, so the Pico `Runtime` does, on
-every loop iteration.
+Neither the Pico SDK nor the CYW43 driver calls it, so the lwIP `Poller` does, every time
+it polls, until the queue is empty. The queue is not an `async_context` wake source, so
+the `Poller` never sleeps while it holds a packet (see [Pico Port](pico_port.md#poller)).
 
-What the runtime drives is chosen when it is constructed, with `coro::PicoNetwork`:
+How lwIP is run is chosen when the runtime is constructed, with `coro::PicoNetwork`:
 
-| `PicoNetwork` | Each loop iteration calls | The application must first call |
+| `PicoNetwork` | lwIP runs on | The application must first call |
 |---|---|---|
-| `Cyw43` (default) | `cyw43_arch_poll()`, `netif_poll_all()` | `cyw43_arch_init()` |
-| `Lwip` | `sys_check_timeouts()`, `netif_poll_all()` | `lwip_init()` |
-| `None` | nothing | nothing |
+| `Cyw43` (default) | The CYW43 driver's `async_context`, set up by `cyw43_arch_init()` | `cyw43_arch_init()` |
+| `Lwip` | The `Runtime`'s own `async_context`, set up by the `Runtime` with `lwip_nosys_init()` | nothing |
+| `None` | Nothing: lwIP is not initialised | nothing |
 
 `Lwip` is lwIP without the radio. Loopback is the only interface unless the application
 adds its own, and it works on a plain Pico. The on-target networking tests use it.
 
-!!! danger "WARNING: a `PicoNetwork::None` runtime must not be used with sockets"
-    That runtime drives no part of the network stack: no lwIP timer fires and no
-    looped packet is delivered, so a socket operation on it never completes.
+!!! note "NOTE: a `PicoNetwork::None` runtime has no sockets"
+    That runtime does not initialise or run lwIP. Creating a socket or resolving a name
+    on it throws `std::system_error` with `ENETDOWN` at the `co_await`, before lwIP is
+    touched (see [Pico Port](pico_port.md#runtime-on-pico)).
 
-!!! danger "WARNING: the default runtime requires `cyw43_arch_init()`"
-    `cyw43_arch_poll()` on a board where the driver was never initialised is undefined
-    behaviour. Firmware that does not start the radio must construct the runtime with
-    `PicoNetwork::Lwip` or `PicoNetwork::None`.
+!!! danger "WARNING: the default runtime lives between `cyw43_arch_init()` and `cyw43_arch_deinit()`"
+    It runs on the CYW43 driver's `async_context`, which only `cyw43_arch_init()`
+    creates and `cyw43_arch_deinit()` destroys. Construct it after the first and
+    destroy it before the second. Firmware that does not start the radio must construct
+    the runtime with `PicoNetwork::Lwip` or `PicoNetwork::None`.
 
 !!! note "NOTE: the loopback queue has no length limit"
     `LWIP_LOOPBACK_MAX_PBUFS` is left at lwIP's default of 0, which means unlimited.
-    The queue is emptied once per loop iteration, so it holds only what tasks send to
-    the device itself between two suspension points. Each queued packet is a copy
-    allocated from the heap.
+    The queue is emptied on every poll, so it holds only what tasks send to the device
+    itself between two driver turns. Each queued packet is a copy allocated from the
+    heap.
+
+## Receive memory
+
+The lwIP `sys` backend copies received data out of each pbuf into a buffer owned by the
+socket and frees the pbuf in the same callback (see
+[Pico Port](pico_port.md#received-data-per-socket-buffers)). The two kinds of memory
+involved are sized separately:
+
+- **`PBUF_POOL`** is what the CYW43 driver receives every frame into. Pool buffers are
+  held only while a callback runs, never while data waits for a reader, so
+  `PBUF_POOL_SIZE` covers frames in flight and nothing else. Unread data on one socket
+  cannot starve the radio for the others.
+- **Socket buffers** come from the heap, and each has a fixed bound:
+
+```
+heap for received data  <=  (TCP connections with data × TCP_WND)
+                          + (UDP sockets × CORO_LWIP_UDP_RX_BYTES)
+```
+
+A TCP connection's ring is `TCP_WND` bytes, allocated when its first data arrives. It
+can never overflow: lwIP's receive window, which the application reopens only by reading
+(`tcp_recved()`), stops the peer once `TCP_WND` bytes are unread. A UDP socket's ring is
+`CORO_LWIP_UDP_RX_BYTES` (default 8192), allocated when it is bound; a datagram that
+does not fit is dropped.
+
+With the bundled `TCP_WND` of 8 × 1460 bytes, each TCP connection that has received data
+costs about 11.4 KB of heap. `TCP_WND` therefore trades per-connection throughput
+against RAM. The pool size only needs to change if the radio itself drops frames under
+load.
+
+## Settings the `sys` backend requires
+
+| Setting | Value | Why |
+|---|---|---|
+| `NO_SYS` | 1 | The raw API, driven from the executor's thread |
+| `LWIP_TCP`, `LWIP_UDP`, `LWIP_DNS`, `LWIP_IGMP` | 1 | The socket types, `lookup_host()` and multicast |
+| `SO_REUSE` | 1 | `SOF_REUSEADDR` on listeners, matching `SO_REUSEADDR` on desktop |
+| `TCP_LISTEN_BACKLOG` | 1 | `tcp_backlog_delayed()`/`tcp_backlog_accepted()`, so lwIP enforces the listener's backlog until `accept()` |
+| `LWIP_TIMERS` | 1 | lwIP's timers run as an at-time worker on the `async_context` (`pico_lwip_nosys`), which also bounds the CPU's sleep |
+| `LWIP_NETIF_LOOPBACK` | 1 | The `Poller` checks each netif's `loop_first` to drain the loopback queue before it sleeps |
+
+A custom `lwipopts.h` must keep these.
 
 ## Future: packages split out of `coro` itself
 

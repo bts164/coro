@@ -1,6 +1,5 @@
-// Desktop UdpSocket on the IoDriver. Every syscall goes through the backend seam
-// in include/coro/detail/sys/udp.h. See doc/design/udp_socket.md, "Desktop
-// (IoDriver) backend".
+// UdpSocket on the IoDriver. Every socket call goes through the backend seam in
+// include/coro/detail/sys/udp.h (POSIX or lwIP). See doc/design/udp_socket.md.
 
 #include <coro/io/udp_socket.h>
 #include <coro/detail/sys/udp.h>

@@ -117,6 +117,9 @@ class CoroRecipe(ConanFile):
         self.requires("gtest/[>=1.14.0 <2]")
         self.requires("libunicorn/2.1.4")
 
+    def build_requirements(self):
+        self.tool_requires("cmake/3.31.12")
+
     def layout(self):
         # Keeps the firmware build apart from the desktop one, which would
         # otherwise share build/Release and the "conan-release" preset name:

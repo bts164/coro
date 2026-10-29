@@ -352,8 +352,8 @@ platform-neutral; how it waits for outside events is an injected `Parker`
 
 | Parker | Wait | Used by |
 |---|---|---|
-| `IoDriverParker` | Blocks in `IoDriver::turn()`; I/O events and timers are dispatched on this thread | desktop `Runtime(1)` |
-| `PollingParker` | Calls `cyw43_arch_poll()` once and never blocks, so the loop busy-polls | Pico `Runtime` |
+| `IoDriverParker` | Blocks in `IoDriver::turn()`; I/O events and timers are dispatched on this thread | desktop `Runtime(1)`, Pico `Runtime` |
+| `PollingParker` | Calls a function once and never blocks, so the loop busy-polls | an executor built without a `Runtime` (tests) |
 
 It keeps two ready queues, as Tokio's current-thread scheduler does. The thread that
 runs the loop has a local queue that only it touches, with no lock. Every other thread
@@ -416,8 +416,9 @@ local queue by the loop when the poll returns.
     `shutdown()` do.
 
     On Pico there are no threads, `detail::Mutex` does nothing, and interrupt handlers
-    never call `wake()` or `enqueue()`: they set a flag that the loop reads in
-    `check_isr_events()` (see [ISR Safety](isr_safety.md)). If an interrupt handler is
+    never call `wake()` or `enqueue()`: they set a flag and signal the primitive's notify
+    fd, and the driver wakes the waiting tasks from inside its turn, on the loop's thread
+    (see [ISR Safety](isr_safety.md#waiting-on-the-driver)). If an interrupt handler is
     ever allowed to enqueue, it must take the inject path, with a mutex that masks
     interrupts, and must not rely on `t_running_executor`, which is set on the very
     core it interrupted.
@@ -433,7 +434,6 @@ run_loop(done):
         check_expired_timers()
         if done(): break                    // the batch may have finished the root task
         park_once()                         // always calls the parker
-        check_isr_events()                  // Pico
 
 run_batch():                                // also what poll_ready_tasks() does
     repeat up to event_interval times:
@@ -470,13 +470,13 @@ park_once():
   runnable would shut out every wake from another thread until the batch ends. With an
   empty local queue the inject queue is looked at straight away.
 - **Both are constructor arguments** with Tokio's values as defaults. Tests pass small
-  ones. On Pico a batch also sets how often `cyw43_arch_poll()` and
-  `check_isr_events()` run while tasks stay ready, so a smaller `event_interval` may
+  ones. On Pico a batch also sets how often the network and the ISR primitives' notify
+  workers run (both inside the driver's turn) while tasks stay ready, so a smaller `event_interval` may
   suit it; measure before changing it.
 - **The executor picks the wait.** Zero when either queue has a task; otherwise the
-  time until the next deadline in its own timer queue, or no limit. On a desktop
-  `Runtime` its timers live in the driver's queue instead, and `turn()` bounds its own
-  wait by them (see [Timers](timers.md)).
+  time until the next deadline in its own timer queue, or no limit. Under a `Runtime`
+  its timers live in the driver's queue instead, and `turn()` bounds its own wait by
+  them (see [Timers](timers.md)).
 - **All injected tasks are taken at once.** Tokio's current-thread scheduler takes one
   per interval. Here they are all moved under one lock, in order, onto the back of the
   local queue: there is no other worker to leave them for, and it is one lock for the
@@ -811,7 +811,7 @@ enqueue(task):
 | **Self-wake detection** | `RunningAndNotified` CAS in `TaskBase::wake()` | `RunningAndNotified` CAS in `TaskBase::wake()` |
 | **Local enqueue path** | Direct to `m_local`, no lock (loop thread only), no unpark | Direct to `m_local_queue[t_worker_index]`, no lock (owning worker only) |
 | **Remote enqueue path** | `m_inject` under `m_inject_mutex` + `parker.unpark()` if parked | `m_injection_queue` + `m_cv.notify_one()` (+ `driver.unpark()`) |
-| **Idle wait** | `Parker::park()`: blocks in the I/O driver (desktop) or busy-polls (Pico) | One worker turns the I/O driver; the others wait on `m_cv` |
+| **Idle wait** | `Parker::park()`: blocks in the I/O driver (epoll on desktop, a CPU sleep on Pico) | One worker turns the I/O driver; the others wait on `m_cv` |
 | **wait_for_completion** | Drives the poll loop on the calling thread | Delegates entirely to `state.wait_until_done()` |
 
 ---

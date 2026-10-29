@@ -80,14 +80,12 @@ tear, and ordering between the flag and any payload is enforced with a `dmb` (se
 That assumption breaks on RP2040's second core. Nothing prevents an ISR from firing on
 core 1 while the `CurrentThreadExecutor` is running on core 0 — that is genuine
 concurrent execution, not preemption, and a `volatile bool` gives no atomicity or
-ordering guarantee for genuinely concurrent access under the C++ memory model. Today
-this is low-risk in practice: the executor busy-polls, so the worst case is the
-executor's check lands one poll-loop iteration before the flag write completes — never
-observed, caught next iteration. **That stops being true once `wfi`-based idle parking
-lands** (planned, see `pico_port.md`): if the executor parks with `wfi` between poll
-iterations, a flag write that lands in the parking window has no guaranteed mechanism
-to wake the core, and the race becomes a real, user-visible missed signal rather than a
-one-iteration delay.
+ordering guarantee for genuinely concurrent access under the C++ memory model.
+
+A flag also has to *wake* the executor, which sleeps in the I/O driver's
+`Poller::poll()` whenever it has nothing to run (see [Pico Port](pico_port.md#poller)).
+A flag written between the executor's last check and its sleep would otherwise be a
+real, user-visible missed signal. See [Waiting on the driver](#waiting-on-the-driver).
 
 !!! danger "WARNING: do not fix this with std::atomic"
     The obvious-looking fix — making the flag `std::atomic<bool>` — was considered and
@@ -164,16 +162,16 @@ and `detail::Mutex` — all of which involve the `pico_atomic` spin-lock describ
 above.
 
 The solution is to keep the ISR path minimal and push all scheduling work onto the
-executor loop:
+executor's thread:
 
-- The ISR writes a flag (and for `IsrChannel<T>`, a value) and returns immediately.
-  It never touches the scheduler, wakers, or any ref-counted object.
-- The executor checks each registered waiter's readiness once per event loop
-  iteration — a non-mutating peek, see `IsrPollEntry::is_ready()` under "Multiple
-  waiters" below. When a peek comes back true, it fires that waiter's waker from
-  executor context — where all the normal scheduling machinery is safe to use.
-  The peek never consumes anything itself; see "Multiple waiters" for why that
-  has to be true and where the actual consuming logic lives instead.
+- The ISR writes a flag (and for `IsrChannel<T>`, a value) and signals the primitive's
+  notify fd, the driver's eventfd analog, and returns. It never touches the scheduler,
+  wakers, or any ref-counted object.
+- Each primitive is an I/O object on the [I/O Driver](io_driver.md), like a socket: the
+  signal makes its notify fd readable, and the driver wakes its waiters from inside the
+  turn, on the executor's thread, where all the normal scheduling machinery is safe to
+  use. The woken waiter's own `poll()` does the claim. See
+  [Waiting on the driver](#waiting-on-the-driver).
 
 This is the same pattern as MicroPython's `ThreadSafeFlag`, which solves the
 identical problem on the same hardware:
@@ -195,7 +193,133 @@ class ThreadSafeFlag(io.IOBase):
 
 The ISR writes one integer and returns. The event loop discovers the change
 through its normal polling pass. It completely sidesteps the spin-lock concern
-by never entering that code from ISR context.
+by never entering that code from ISR context. coro adds one step that MicroPython's
+busy loop does not need: telling a sleeping loop to look, which is what the notify fd
+does.
+
+---
+
+## Waiting on the driver
+
+Each ISR primitive is an I/O object on the driver, built the way the desktop signal
+handling is built on its self-pipe: the interrupt side only makes a handle readable,
+and everything else is an ordinary driver wait. The handle is a **notify fd** from the
+`sys/notify.h` seam, the driver's eventfd analog (see
+[I/O Driver](io_driver.md#the-sys-layer)). The `Runtime` and the executor know nothing
+about ISRs.
+
+```cpp
+// Every ISR primitive has one, besides its own state and spin lock.
+class detail::IsrNotifier {
+    sys::RawFd               m_fd = sys::kInvalidFd;
+                             // Opened by the first wait, closed by ~primitive.
+                             // Written under the primitive's lock; the ISR reads it
+                             // under that lock (fd_locked()).
+    Weak<NotifyRegistration> m_registration;
+                             // The fd's registration with the driver, while any
+                             // waiter holds it. Executor thread only (acquire()).
+};
+
+// detail::NotifyRegistration is { IoRegistration reg; }, shared by Rc. The waiting
+// half every wait future shares (a registration share and an IoWaiter) is
+// detail::IsrWaitCore.
+```
+
+### The signal
+
+Every signal function updates its state under its spin lock, reads `m_notify` under the
+same lock, releases it, and then signals:
+
+```cpp
+void signal_from_isr() noexcept {
+    uint32_t save = spin_lock_blocking(m_lock);
+    ++m_epoch;
+    const detail::sys::RawFd notify = m_notifier.fd_locked();
+    spin_unlock(m_lock, save);
+    detail::isr_signal(notify);   // notify_signal(), if the fd exists yet
+}
+```
+
+On Pico, `notify_signal()` is `async_context_set_work_pending()` on the notify object's
+own worker, which the SDK documents as safe from an IRQ and which ends the executor's
+sleep in `Poller::poll()`. The worker then runs on the executor's thread and reports the
+notify fd readable to the driver (see
+[Pico Port](pico_port.md#notify-objects)). A signal with no notify fd yet (no wait has
+started) only updates the state, which the first wait's first poll reads.
+
+!!! danger "WARNING: signal the notify fd after releasing the primitive's spin lock"
+    On Pico, `notify_signal()` reaches `sem_release()`, which takes a spin lock from the
+    SDK's striped pool, and so does every ISR primitive. Two striped locks can be the
+    same hardware lock, which is not recursive, so nesting them can deadlock the core.
+    `notify_signal()` is always the last step of a signal function, after its
+    `spin_unlock()`.
+
+### The wait
+
+A wait future holds a share of the primitive's registration and an `IoWaiter`, the
+driver's per-waiter node (see
+[I/O Driver](io_driver.md#more-than-one-waiter)), which lets any number of waiters wait
+on one primitive. Its `poll()`:
+
+1. On the first poll, runs the primitive's claim under its spin lock: compare the epoch
+   (`IsrEvent`), take the value (`IsrChannel<T>`) or take one count (`IsrSemaphore`).
+   If that succeeds the wait is over, with no registration at all.
+2. Otherwise takes a share of the registration (`IsrNotifier::acquire()`): the
+   existing one if a waiter holds it, or, if none does, it opens the notify fd (the
+   first time only) and registers it with the current runtime's driver, keeping only
+   a weak reference in the primitive.
+3. Runs `reg.poll_io(IoDirection::Read, ctx, m_waiter, op)`, where `op` is the same
+   claim, returning success or `EAGAIN` if there is nothing for this waiter.
+
+Running the claim before waiting matters with several waiters: another waiter may
+have cleared the shared readiness after a signal this one has not yet seen, so a
+waiter that linked without looking could wait for a signal that already happened.
+
+Dropping the future unlinks its waiter (`cancel_wait()`) and drops its share.
+
+**No signal is lost.** This is the driver's readiness handshake, unchanged:
+
+- A new registration starts ready, so the first poll runs `op` before waiting, and finds
+  any signal that came before the registration existed.
+- A signal between `op` returning `EAGAIN` and `clear_ready()` makes the notify fd
+  readable, which bumps the registration's tick, so `clear_ready()` leaves it ready and
+  `poll_io()` runs `op` again.
+- On Pico the `async_context`'s semaphore is binary and latched: a signal made while
+  the executor is awake leaves the permit, so the next sleep returns at once. A signal
+  between the executor's last poll and its sleep costs one extra turn, never a lost
+  wake.
+
+**The registration lives while the primitive has waiters.** The first waiter registers
+the notify fd and the last one to leave deregisters it. ISR primitives are often globals
+or members of long-lived objects (`AsyncDmaTransfer`, `GpioPin`), and a registration
+must not outlive its driver, which a global would at static destruction. Tied to its
+waiters, which are futures that die with their tasks, the registration is always gone
+before the `Runtime`. A signal raised while nothing is registered needs no wake, since
+no one waits; the primitive's state records it. The cost is one registration per wait
+cycle when the primitive has one waiter at a time.
+
+The notify fd itself lives as long as the primitive, so an ISR never signals a closed
+one: the primitive must already outlive every ISR that signals it.
+
+**The future is pinned once polled.** Its `IoWaiter` is linked into the driver's list by
+address, and only `poll()` links it. Coro's future contract already pins a future from
+its first poll (see
+[Future and Stream](future_and_stream.md#movable-until-the-first-poll-pinned-after)),
+so the wait futures' move operations only assert that the waiter is not linked; they
+never re-link.
+
+**Cross-core.** `notify_signal()` from an ISR on core 1 reaches `sem_release()`, which
+takes a hardware spin lock and notifies both cores, so it wakes core 0 out of its sleep.
+The state the ISR wrote is ordered for the waiter by the primitive's own spin lock,
+which `op` takes.
+
+!!! warning "WARNING: an ISR on the other core can race the last waiter leaving"
+    On Pico, deregistering a notify fd detaches its worker from the `async_context`. An
+    ISR on core 1 that is mid-way through `notify_signal()` at that moment marks a
+    detached worker pending, which does nothing, or, if the `Runtime` is destroyed in
+    the same instant, touches a destroyed context. This is the same narrow window as
+    the DMA dispatch table's (see [GPIO Pin](gpio_pin.md)), and is left open for the
+    same reason.
 
 ---
 
@@ -260,11 +384,15 @@ public:
 
     // ISR-safe. Takes the dedicated hardware spin lock (disables IRQs on this
     // core, spins on the SIO register for cross-core exclusion — see
-    // "Cross-core ISR delivery" above), bumps the epoch, releases.
+    // "Cross-core ISR delivery" above), bumps the epoch, releases, then signals
+    // the notify fd (see "Waiting on the driver").
     void signal_from_isr() noexcept {
         uint32_t save = spin_lock_blocking(m_lock);
         ++m_epoch;
+        const detail::sys::RawFd notify = m_notify;
         spin_unlock(m_lock, save);
+        if (notify != detail::sys::kInvalidFd)
+            detail::sys::notify_signal(notify);
     }
 
     // The future itself, not a Coro wrapping it: no coroutine frame, no allocation.
@@ -277,6 +405,9 @@ private:
 
     spin_lock_t*  m_lock;
     uint64_t      m_epoch = 0;
+    // See "Waiting on the driver".
+    detail::sys::RawFd                       m_notify = detail::sys::kInvalidFd;
+    detail::Weak<detail::NotifyRegistration> m_registration;
 };
 ```
 
@@ -306,13 +437,12 @@ Same reasoning applies to `IsrChannel<T>`'s `m_flag`/`m_value` and
 `IsrWaitFuture` is `IsrEvent`'s waiter — the two sit at the same level (one
 owns the ISR-shared state, the other is its executor-facing waiter), so
 `IsrWaitFuture` reaches `m_epoch`/`m_lock` directly via friendship rather than
-through an indirection struct. No separate "ref" type is needed to keep
-`IsrEvent`'s details out of the executor either — the executor only ever
-sees the `IsrPollEntry` interface (below), never `IsrEvent` itself.
+through an indirection struct. Neither the executor nor the driver sees
+`IsrEvent`'s details: the driver sees only a notify fd and a waiter.
 
 `IsrWaitFuture`'s constructor captures the current epoch as `m_baseline`, and
-both `is_ready()` and `poll()` are purely `m_epoch != m_baseline` — a
-non-mutating comparison, never a claim. This is what makes broadcast to any
+its `poll()`'s operation is purely `m_epoch != m_baseline`: a non-mutating
+comparison, never a claim. This is what makes broadcast to any
 number of concurrent waiters correct with no coordination between them: each
 one independently compares the same shared epoch against its own baseline,
 so every waiter started before a given `signal_from_isr()` resolves on it,
@@ -342,13 +472,12 @@ and none of them can accidentally consume it on another's behalf.
     captured once at construction, not relative to a single shared bit that
     every waiter has to agree on the state of.
 
-On first `co_await`, `IsrWaitFuture` registers itself (as an `IsrPollEntry`,
-see "Multiple waiters" below) with the executor and suspends. The executor
-peeks each registered entry's readiness once per event loop iteration — a
-non-mutating check under the paired spin lock — and when a peek comes back
-true it fires that waiter's real waker; the resumed coroutine's own poll then
-re-reads the epoch and resolves. The ISR never touches the scheduler — it
-takes its own dedicated lock, bumps one counter, and returns.
+On its first poll, `IsrWaitFuture` takes a share of the event's driver
+registration and waits on it with its own `IoWaiter` (see
+[The wait](#the-wait)). A signal makes the notify fd readable, the driver wakes
+every linked waiter, and each resumed future's poll re-reads the epoch and
+resolves. The ISR never touches the scheduler: it takes its own dedicated lock,
+bumps one counter, releases it, and signals the notify fd.
 
 ### `IsrChannel<T>` — reusable single-slot channel, one value claimed per send
 
@@ -374,7 +503,10 @@ public:
         uint32_t save = spin_lock_blocking(m_lock);
         m_value = value;
         m_flag  = true;
+        const detail::sys::RawFd notify = m_notify;
         spin_unlock(m_lock, save);
+        if (notify != detail::sys::kInvalidFd)
+            detail::sys::notify_signal(notify);
     }
 
     // The claim (check flag, copy value, clear flag) all happens inside
@@ -391,6 +523,8 @@ private:
     spin_lock_t*  m_lock;
     bool          m_flag = false;
     T             m_value{};
+    detail::sys::RawFd                       m_notify = detail::sys::kInvalidFd;
+    detail::Weak<detail::NotifyRegistration> m_registration;
 };
 ```
 
@@ -424,7 +558,10 @@ public:
     void release_from_isr() noexcept {
         uint32_t save = spin_lock_blocking(m_lock);
         if (m_count != UINT32_MAX) ++m_count;
+        const detail::sys::RawFd notify = m_notify;
         spin_unlock(m_lock, save);
+        if (notify != detail::sys::kInvalidFd)
+            detail::sys::notify_signal(notify);
     }
 
     // Suspends until the count is nonzero, then claims one unit (decrements
@@ -443,11 +580,14 @@ private:
 
     spin_lock_t*  m_lock;
     uint32_t      m_count = 0;
+    detail::sys::RawFd                       m_notify = detail::sys::kInvalidFd;
+    detail::Weak<detail::NotifyRegistration> m_registration;
 };
 ```
 
 Same dedicated-spin-lock discipline as `IsrEvent`/`IsrChannel<T>` — the ISR
-takes the lock, does one bounded-time integer update, and releases.
+takes the lock, does one bounded-time integer update, releases, and wakes the
+executor.
 `IsrSemaphoreWaitFuture::poll()` takes the same lock and, if `m_count != 0`,
 decrements it and returns `PollReady`; otherwise it returns `PollPending`.
 This is a **claim**, not a broadcast — the counter is not `IsrEvent`-shaped:
@@ -472,7 +612,7 @@ coro::IsrEvent g_dma_done;
 
 void dma_irq_handler() {
     dma_irqn_acknowledge_channel(0, MY_DMA_CHANNEL);
-    g_dma_done.signal_from_isr();   // one locked increment; done
+    g_dma_done.signal_from_isr();   // one locked increment, then wakes the executor
 }
 
 coro::Coro<void> do_dma_transfer(uint8_t* buf, size_t len) {
@@ -484,93 +624,39 @@ coro::Coro<void> do_dma_transfer(uint8_t* buf, size_t len) {
 
 ### Multiple waiters
 
-**The executor's poll table is a peek, not a claim.** Every ISR-safe
-primitive's waiter (`IsrWaitFuture`, `IsrChannelWaitFuture<T>`,
-`IsrSemaphoreWaitFuture`) implements a small non-mutating interface:
+Any number of tasks may wait on one primitive at once. Each wait future embeds its own
+`IoWaiter`, and the driver keeps every waiting one on the registration's waiter list
+(see [I/O Driver](io_driver.md#more-than-one-waiter)). A signal makes the notify fd
+readable, and the driver wakes **every** linked waiter, marking each one ready for this
+wake.
 
-```cpp
-// coro/detail/isr_flag.h
-class IsrPollEntry {
-public:
-    virtual ~IsrPollEntry() = default;
+**The waking and the claiming are separate.** The driver's wake only reschedules each
+task for a fresh top-down `poll()` pass; it reads nothing of the primitive and resolves
+nothing. The claim happens in the woken future's own `poll()`, in the operation it
+passes to `poll_io()`, under the primitive's spin lock, and only there. `Coro<T>::poll()`
+re-polls whatever future the coroutine is suspended at on every poll of its task, and a
+leaf future must tolerate being polled while pending, so this one path is the only
+caller of the mutating check. Two waiters never race inside it, because the spin lock
+serialises them.
 
-    // Non-mutating. Executor-thread only, called once per event loop
-    // iteration for every currently-registered entry. Must never consume,
-    // decrement, or clear anything -- it only decides whether this entry's
-    // real waker is worth firing this tick. Deliberately not named `poll`:
-    // unlike Future::poll(Context&), which advances state and must not be
-    // called again after Ready, is_ready() is designed to be called
-    // repeatedly and changes nothing.
-    virtual bool is_ready() const = 0;
-};
-```
+What differs between primitives is only what that operation does:
 
-Each waiter registers `this` (it already implements `is_ready()`, no
-separate wrapper object needed) together with its real task waker via
-`add_isr_poll(IsrPollEntry*, Rc<Waker>)`, and deregisters via
-`remove_isr_poll(IsrPollEntry*)` from its own destructor — same as today,
-except keyed by the waiter's own identity (a unique pointer per
-registration) instead of the shared flag address. That alone fixes the
-`remove_isr_poll` bug above: with multiple waiters sharing one flag, each
-still has its own distinct `IsrPollEntry*`, so removing one can never
-deregister another — no multimap keyed by flag needed, a plain
-`std::vector<Entry>` with removal by entry-pointer identity is correct
-as-is.
+- **`IsrEvent`**: it compares `m_epoch != m_baseline` and has no side effect. Broadcast
+  is the correct semantics here: the event carries no payload, every waiter
+  legitimately wants to know the same thing happened, and nothing is consumed, so every
+  waiter resolving on the same signal is correct, not a race.
+- **`IsrChannel<T>`** and **`IsrSemaphore`**: one signal carries exactly one unit (a
+  value, or one count) that belongs to exactly *one* waiter. Every waiter is woken and
+  gets a chance, and each one's operation re-checks and claims under the lock
+  (decrementing `m_count`, or clearing `m_flag` and copying `m_value`). A waiter that
+  loses the race finds the unit gone and returns `EAGAIN`, so `poll_io()` clears
+  readiness and links it again for the next signal. No retry loop is needed in
+  `acquire()`/`receive()`.
 
-`check_isr_events()` becomes:
-
-```cpp
-for (auto& reg : m_isr_polls)
-    if (reg.entry->is_ready())
-        reg.waker->wake();
-```
-
-— no removal here either. `wake()` only reschedules the owning task for a
-fresh top-down `poll()` pass (see `doc/poll_vs_continuation.md`); it does not
-resolve anything itself.
-
-**The actual claim happens exactly once, and it already has a home:**
-`Coro<T>::poll()`'s existing spurious-wake guard
-(`include/coro/coro.h`, `if (promise.m_poll_current) { ... promise.m_poll_current->poll() ... }`)
-re-polls whatever future the coroutine is currently suspended at on *every*
-poll of the root task, regardless of why it was scheduled — spurious wakes
-included, by contract (`doc/future.h`: "`poll()` must not be called again
-after it returns `PollReady`..." governs calls *after* Ready, not repeated
-calls while `Pending`, which every leaf future must already tolerate). This
-is not new machinery to add; it is the reason `IsrPollEntry::is_ready()` is
-allowed to be a shallow peek in the first place. When `wake()` fires and the
-root traversal reaches the suspended `co_await`, this guard calls the real
-`IsrWaitFuture`/`IsrChannelWaitFuture<T>`/`IsrSemaphoreWaitFuture::poll()` —
-which does the real, mutating, locked check-and-consume — exactly once, and
-only through this single path. Two independent pollers can never race for
-the same claim, because only one caller (the coroutine's own traversal) is
-ever allowed to call the mutating `poll()`; the executor's `is_ready()` peek
-never touches the shared state beyond reading it.
-
-This is also why removal never needs to happen from inside
-`check_isr_events()`: nothing there ever resolves a wait, so there's nothing
-to react to by removing an entry mid-loop. Removal stays exactly where it
-already is — the owning `IsrWaitFuture`/etc.'s destructor, called once its
-`co_await` actually completes (or is cancelled).
-
-What differs between primitives is only what `is_ready()` checks and what
-the real `poll()` claims:
-
-- **`IsrEvent`** — `is_ready()` and `poll()` both just compare `m_epoch !=
-  m_baseline`; neither one has a side effect. Broadcast is the correct
-  semantics here: it carries no payload, every waiter legitimately wants to
-  know the same thing happened, and nothing is consumed, so every waiter
-  resolving on the same signal is correct, not a race.
-- **`IsrChannel<T>`** and **`IsrSemaphore`** carry exactly one unit (a value,
-  or one count) that belongs to exactly *one* waiter. `is_ready()` still
-  just peeks (`m_flag` / `m_count != 0`) so every waiter gets woken and gets
-  a chance, but each one's real `poll()` re-checks and claims under the lock
-  — decrementing `m_count`, or clearing `m_flag` and copying `m_value` —
-  before returning `PollReady`. A waiter that loses the race (another
-  `poll()` claimed first) simply observes the now-consumed state and returns
-  `PollPending` again, naturally retried on the next real signal — no
-  explicit retry loop needed in `acquire()`/`receive()` themselves, since the
-  spurious-wake guard above already re-polls automatically.
+A waiter that arrives after a signal and clears readiness does not strand the waiters
+that signal already woke: each woken waiter returns ready once, whatever the shared
+readiness says (the per-waiter flag described in
+[I/O Driver](io_driver.md#more-than-one-waiter)).
 
 ### Limitations
 
@@ -587,5 +673,7 @@ the real `poll()` claims:
     the ISR and drained by the coroutine. Useful for high-frequency producers
     (UART RX bytes, ADC samples) where each event carries a value that can't
     be reconstructed the way `GpioPin::edges()` reconstructs edge direction
-    from parity, and none should be dropped.
+    from parity, and none should be dropped. For bytes, the natural form is a
+    Pico `sys` pipe fd read through the shared byte-stream futures; see
+    [Pico Port](pico_port.md#more-sys-primitives-on-pico).
 

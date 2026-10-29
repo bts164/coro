@@ -7,8 +7,9 @@ So neither goes through the [I/O Driver](io_driver.md). Each operation runs as o
 on the Runtime's blocking pool ([`spawn_blocking`](spawn_blocking.md)), as tokio does
 for `tokio::fs` and `lookup_host`.
 
-Both are desktop only. On Pico, `TcpStream::connect` resolves names through lwIP
-itself, and there is no `File`.
+`File` is desktop only. `lookup_host()` runs on Pico too, where lwIP's DNS client is
+asynchronous and a query waits on the driver like a socket; see
+[`lookup_host`](#lookup_host).
 
 ---
 
@@ -46,8 +47,8 @@ seams, in the style of the driver's [`sys` layer](io_driver.md#the-sys-layer):
 
 | Seam | Functions | POSIX backend |
 |---|---|---|
-| `detail/sys/file.h` | `file_open`, `file_read`, `file_write`, `file_sync`, `file_close` | `src/detail/sys/file_posix.cpp` |
-| `detail/sys/dns.h` | `resolve_host(host, port)`, `dns_category()` | `src/detail/sys/dns_posix.cpp` |
+| `detail/sys/file.h` | `file_open`, `file_read`, `file_write`, `file_sync`, `file_close` | `src/detail/sys/posix/file_posix.cpp` |
+| `detail/sys/dns.h` | `resolve_host(host, port)`, `dns_category()` | `src/detail/sys/posix/dns_posix.cpp` |
 
 Unlike the socket seams, these are ordinary blocking calls. `EINTR` is retried inside
 the backend. `file_read`/`file_write` take an `offset`: negative means the file position
@@ -140,15 +141,22 @@ std::vector<coro::SocketAddress> addrs = co_await coro::lookup_host("example.com
 
 - **Numeric literals** (`"127.0.0.1"`, `"::1"`, `"fe80::1%3"`) are parsed by
   `SocketAddress::parse` and returned at once, without a pool hop.
-- **Anything else** goes to `sys::resolve_host` on the blocking pool:
-  `getaddrinfo(AF_UNSPEC, SOCK_STREAM)`, so `/etc/hosts`, nsswitch and search domains
-  apply. Addresses come back in the resolver's preference order, each with `port`.
+- **Anything else** goes to the `sys/dns.h` seam, which has one of two forms, chosen by
+  the backend's `sys::kResolverBlocks`:
+    - **Blocking (POSIX).** `sys::resolve_host` runs on the blocking pool:
+      `getaddrinfo(AF_UNSPEC, SOCK_STREAM)`, so `/etc/hosts`, nsswitch and search
+      domains apply. Addresses come back in the resolver's preference order, each with
+      `port`.
+    - **Registered query (lwIP).** `sys::dns_start` starts a lookup and returns a
+      `RawFd` for it. `lookup_host` registers it in a `SocketState` and waits for read
+      readiness, then takes the result with `sys::dns_try_result`. lwIP returns one
+      IPv4 address. See [Pico Port](pico_port.md#name-resolution).
 - **Errors** are `std::system_error`, thrown at `co_await`. A resolver failure is in
   `dns_error_category()` (category name `coro.dns`, `gai_strerror` messages; "no
   addresses" is `EAI_NONAME`). `EAI_SYSTEM` is reported as its `errno` in
   `std::system_category()`.
-- **Dropping the future** doesn't cancel the lookup. It finishes on the pool and the
-  result is discarded.
+- **Dropping the future** doesn't cancel the lookup. It finishes on the pool (POSIX) or
+  in lwIP (Pico), and the result is discarded.
 
 `TcpStream::connect`, `TcpListener::bind` and `UdpSocket::bind` take a host string and
 resolve it with `lookup_host`. They try each address in order and rethrow the last
@@ -213,8 +221,8 @@ failure if all of them fail, as tokio does.
 |---|---|
 | `include/coro/io/file.h`, `file.hpp`, `src/io/file.cpp` | `FileMode`, `detail::FileState`, `File` |
 | `include/coro/io/lookup_host.h`, `src/io/lookup_host.cpp` | `lookup_host()`, `dns_error_category()` |
-| `include/coro/detail/sys/file.h`, `src/detail/sys/file_posix.cpp` | File backend seam |
-| `include/coro/detail/sys/dns.h`, `src/detail/sys/dns_posix.cpp` | Resolver backend seam |
+| `include/coro/detail/sys/file.h`, `src/detail/sys/posix/file_posix.cpp` | File backend seam |
+| `include/coro/detail/sys/dns.h`, `src/detail/sys/posix/dns_posix.cpp`, `src/detail/sys/lwip/dns_lwip.cpp` | Resolver backend seam |
 | `test/io/test_file.cpp`, `test/io/test_lookup_host.cpp` | Tests |
 
-`file.h`, `file.hpp` and `lookup_host.h` are excluded from the Pico install.
+`file.h` and `file.hpp` are excluded from the Pico install.

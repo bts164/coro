@@ -1,6 +1,6 @@
 #pragma once
 
-// Template method bodies for the desktop UdpSocket. Included at the bottom of
+// Template method bodies for UdpSocket. Included at the bottom of
 // udp_socket.h; never include this file directly.
 //
 // Every future here is a leaf future (no cancel()): while pending it holds only a

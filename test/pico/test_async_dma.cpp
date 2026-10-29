@@ -18,9 +18,10 @@ using namespace std::chrono_literals;
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Makes a Runtime backed by CurrentThreadExecutor with a wall-clock time source.
+// A runtime without networking: the tests raise the IRQs by hand, and need neither
+// lwIP nor the radio.
 static Runtime make_rt() {
-    return Runtime{};
+    return Runtime{PicoNetwork::None};
 }
 
 // Fires the DMA_IRQ_0 handler from a background thread after a short delay,

@@ -279,5 +279,5 @@ suites run on every executor.
 | File | Contents |
 |---|---|
 | `include/coro/io/signal.h`, `src/io/signal.cpp` | `SignalEvent`, `SignalFuture`, `SignalStream`, `detail::SignalState`, the registry |
-| `include/coro/detail/sys/signal.h`, `src/detail/sys/signal_posix.cpp` | Handler and self-pipe backend seam |
+| `include/coro/detail/sys/signal.h`, `src/detail/sys/posix/signal_posix.cpp` | Handler and self-pipe backend seam |
 | `test/io/test_signal.cpp` | Tests |

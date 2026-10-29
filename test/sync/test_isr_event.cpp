@@ -1,9 +1,15 @@
 #include <gtest/gtest.h>
 #include "executor_traits.h"
 #include "isr_trigger.h"
+#include <coro/runtime/clock.h>
 #include <coro/sync/isr_event.h>
+#include <coro/sync/select.h>
+#include <coro/sync/sleep.h>
+#include <coro/sync/timeout.h>
 #include <chrono>
 #include <atomic>
+#include <cstdint>
+#include <vector>
 
 using namespace coro;
 using namespace std::chrono_literals;
@@ -165,6 +171,113 @@ TYPED_TEST(IsrEventTest, SignalSeenWhileATaskKeepsTheLoopBusy) {
     EXPECT_TRUE(seen);
 }
 
+TYPED_TEST(IsrEventTest, FortyWaitersAllResolve) {
+    // More waiters than the driver wakes in one batch (IoDriver::kWakeBatch, 32).
+    // Each waits from the epoch before the trigger starts, so one that first runs
+    // after the signal still resolves on it.
+    constexpr int kWaiters = 40;
+    IsrEvent ev;
+    const uint64_t baseline = ev.epoch();
+    int resolved = 0;
+
+    {
+        IsrTrigger isr(5ms, 1, [&ev](int) { ev.signal_from_isr(); });
+
+        this->traits.rt.block_on([](IsrEvent& ev, uint64_t baseline, int& resolved) -> Coro<void> {
+            std::vector<JoinHandle<void>> waiters;
+            for (int i = 0; i < kWaiters; ++i) {
+                waiters.push_back(spawn([](IsrEvent& ev, uint64_t baseline, int& resolved) -> Coro<void> {
+                    auto r = co_await timeout(5s, ev.wait_from(baseline));
+                    if (r.index() == 0) ++resolved;
+                }(ev, baseline, resolved)));
+            }
+            for (auto& w : waiters) co_await w;
+        }(ev, baseline, resolved));
+    }
+    EXPECT_EQ(resolved, kWaiters);
+}
+
+TYPED_TEST(IsrEventTest, DroppedWaiterLeavesOthersWaiting) {
+    // A wait that loses a select() unlinks itself from the shared registration, and
+    // the waiter beside it still resolves. The next wait, made once both are gone,
+    // registers again. The signals are 50 ms apart, after the 5 ms the dropped wait
+    // gives up at; epoch baselines keep each wait on its own signal however late it
+    // starts.
+    IsrEvent ev;
+    const uint64_t baseline = ev.epoch();
+    bool dropped_gave_up = false, kept_done = false, later_done = false;
+
+    {
+        IsrTrigger isr(50ms, 2, [&ev](int) { ev.signal_from_isr(); });
+
+        this->traits.rt.block_on(
+            [](IsrEvent& ev, uint64_t baseline, bool& dropped_gave_up, bool& kept_done,
+               bool& later_done) -> Coro<void> {
+                auto kept = spawn([](IsrEvent& ev, uint64_t baseline, bool& done) -> Coro<void> {
+                    auto r = co_await timeout(5s, ev.wait_from(baseline));
+                    done = r.index() == 0;
+                }(ev, baseline, kept_done));
+
+                auto r = co_await select(ev.wait_from(baseline), sleep_for(5ms));
+                dropped_gave_up = r.index() == 1;
+                co_await kept;
+
+                auto later = co_await timeout(5s, ev.wait_from(baseline + 1));
+                later_done = later.index() == 0;
+            }(ev, baseline, dropped_gave_up, kept_done, later_done));
+    }
+    EXPECT_TRUE(dropped_gave_up);
+    EXPECT_TRUE(kept_done);
+    EXPECT_TRUE(later_done);
+}
+
+TEST(IsrEventRuntimes, EventUsedByTwoRuntimesInTurn) {
+    // The registration belongs to the runtime the first waiter ran on, and goes
+    // with the last waiter, so the next wait registers on whichever runtime it runs
+    // on. Both runtimes are alive throughout.
+    IsrEvent ev;
+    SingleThreadRuntime a;
+    SingleThreadRuntime b;
+    bool a_done = false, b_done = false;
+
+    auto wait_once = [](IsrEvent& ev, bool& done) -> Coro<void> {
+        auto r = co_await timeout(5s, ev.wait());
+        done = r.index() == 0;
+    };
+    {
+        IsrTrigger isr(5ms, 1, [&ev](int) { ev.signal_from_isr(); });
+        a.block_on(wait_once(ev, a_done));
+    }
+    {
+        IsrTrigger isr(5ms, 1, [&ev](int) { ev.signal_from_isr(); });
+        b.block_on(wait_once(ev, b_done));
+    }
+    EXPECT_TRUE(a_done);
+    EXPECT_TRUE(b_done);
+}
+
+TEST(IsrEventRuntimes, RuntimePollDeliversIsrSignals) {
+    // Firmware with its own main loop calls Runtime::poll() rather than block_on():
+    // it must deliver the interrupt's signal, and fire the sleep's timer after it.
+    // The runtime is declared after the event, so a waiter left by a failure goes
+    // first.
+    IsrEvent ev;
+    const uint64_t baseline = ev.epoch();
+    IsrTrigger isr(5ms, 1, [&ev](int) { ev.signal_from_isr(); });
+    SingleThreadRuntime rt;
+    bool done = false;
+
+    rt.spawn([](IsrEvent& ev, uint64_t baseline, bool& done) -> Coro<void> {
+        co_await ev.wait_from(baseline);
+        co_await sleep_for(10ms);
+        done = true;
+    }(ev, baseline, done)).detach();
+
+    const Instant deadline = Clock::now() + 5s;
+    while (!done && Clock::now() < deadline) rt.poll();
+    EXPECT_TRUE(done);
+}
+
 // ---------------------------------------------------------------------------
 // IsrChannel tests
 // ---------------------------------------------------------------------------
@@ -302,4 +415,41 @@ TYPED_TEST(IsrSemaphoreTest, ReleasesBeforeAcquireAreNotLost) {
     }(counter, acquired));
 
     EXPECT_EQ(acquired, 2);
+}
+
+TYPED_TEST(IsrSemaphoreTest, ReleaseNTimesWakesExactlyN) {
+    // Four acquires wait, the interrupt releases twice, and exactly two resolve: each
+    // claims one count, and the others wait again. Then two releases from the task
+    // let the rest finish.
+    constexpr int kWaiters  = 4;
+    constexpr int kReleases = 2;
+    IsrSemaphore sem;
+    int acquired = 0;
+    int after_settling = -1;
+
+    {
+        IsrTrigger isr(5ms, kReleases, [&sem](int) { sem.release_from_isr(); });
+
+        this->traits.rt.block_on(
+            [](IsrSemaphore& sem, int& acquired, int& after_settling) -> Coro<void> {
+                std::vector<JoinHandle<void>> waiters;
+                for (int i = 0; i < kWaiters; ++i) {
+                    waiters.push_back(spawn([](IsrSemaphore& sem, int& acquired) -> Coro<void> {
+                        auto r = co_await timeout(5s, sem.acquire());
+                        if (r.index() == 0) ++acquired;
+                    }(sem, acquired)));
+                }
+                const Instant deadline = Clock::now() + 5s;
+                while (acquired < kReleases && Clock::now() < deadline)
+                    co_await sleep_for(5ms);
+                // Long enough for a third waiter to have run, had it claimed anything.
+                co_await sleep_for(50ms);
+                after_settling = acquired;
+
+                for (int i = kReleases; i < kWaiters; ++i) sem.release_from_isr();
+                for (auto& w : waiters) co_await w;
+            }(sem, acquired, after_settling));
+    }
+    EXPECT_EQ(after_settling, kReleases);
+    EXPECT_EQ(acquired, kWaiters);
 }

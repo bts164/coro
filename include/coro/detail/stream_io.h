@@ -1,6 +1,6 @@
 #pragma once
 
-// Desktop only: the read and write futures shared by every byte-stream type on the
+// The read and write futures shared by every byte-stream type on the
 // IoDriver (TcpStream, Pipe). Each type supplies an `Io` policy naming its
 // non-blocking syscalls and its error-message prefixes:
 //

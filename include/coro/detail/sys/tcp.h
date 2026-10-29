@@ -8,7 +8,7 @@
 // "The sys/tcp.h seam".
 //
 // Current backends:
-//   POSIX: src/detail/sys/tcp_posix.cpp
+//   POSIX: src/detail/sys/posix/tcp_posix.cpp
 //
 // The try_ functions never block. They return a result or an errno; a would_block()
 // errno means "wait for readiness and retry" (see IoRegistration::poll_io). Setup

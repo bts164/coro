@@ -1,4 +1,4 @@
-// Desktop TcpStream on the IoDriver. Every syscall goes through the backend seam in
+// TcpStream on the IoDriver. Every syscall goes through the backend seam in
 // include/coro/detail/sys/tcp.h. See doc/design/tcp_stream.md.
 
 #include <coro/io/tcp_stream.h>

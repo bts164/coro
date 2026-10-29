@@ -456,8 +456,13 @@ int main() {
                           DNSSD_PROTO_TCP, TCP_PORT, nullptr, nullptr);
     std::printf("mDNS: reachable as %s.local\n", DEVICE_NAME);
 
-    coro::Runtime rt;
-    int r = rt.block_on(async_main(std::move(lcd)));
+    int r;
+    {
+        // Scoped: the runtime runs on the CYW43 driver's async_context, which
+        // cyw43_arch_deinit() destroys, so it must be gone first.
+        coro::Runtime rt;
+        r = rt.block_on(async_main(std::move(lcd)));
+    }
     cyw43_arch_deinit();
     return r;
 }

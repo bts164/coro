@@ -248,13 +248,12 @@ A concrete use case the exclusion rules out: RP2040/RP2350 are dual-core, so cor
 run a blocking compute loop while core 0 runs the `CurrentThreadExecutor` loop — core 1
 parking via `blocking_wait` until core 0 (or an ISR) has work for it is the same shape as
 the desktop `spawn_blocking`-thread case, just with cores instead of OS threads. Supporting
-it would mean a second `Waker` backend selected under `CORO_PICO` — not condvar-based, but
-built on the same **SIO inter-processor FIFO doorbell** (`sio_hw->fifo_wr` →
-`SIO_IRQ_PROC0`) already sketched out as the cross-core wake mechanism for the `__wfi()`
-idle-executor TODO in [pico_port.md](pico_port.md#busy-poll-loop-no-cpu-idle-wfi) (see
-"Dual-core implementation (requires doorbell)"). That backend has its own race to get right — the
-check-then-sleep atomicity the WFI TODO already calls out — which is why this is being
-deferred as its own design discussion rather than folded into this exclusion silently.
+it would mean a second `Waker` backend selected under `CORO_PICO`, not condvar-based but
+built on a `pico_sync` semaphore per blocked waiter: core 1 blocks in
+`sem_acquire_blocking()`, and `wake()` is `sem_release()`, which works across cores (see
+[Pico Port](pico_port.md#dual-core-wakes)). The rest of the executor would also need real
+locks for core 1, which is why this is a separate design question rather than folded
+into this exclusion.
 
 ## Contract: an active `Runtime` is required for reactor-touching futures
 

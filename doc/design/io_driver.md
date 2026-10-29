@@ -12,8 +12,10 @@ queue. Each I/O primitive built on it has its own document (see
 
 | Piece | Where | Tests |
 |---|---|---|
-| `sys::Poller`, `sys::PollWaker`, `Interest`, `Event` (epoll) | `include/coro/detail/sys/poller.h`, `src/detail/sys/poller_epoll.cpp` | `test/detail/test_poller.cpp` |
-| `IoDriver`, `ScheduledIo`, `IoRegistration`, `IoDriverParker` | `include/coro/runtime/io_driver.h`, `src/runtime/io_driver.cpp` | `test/runtime/test_io_driver.cpp` |
+| `sys::Poller`, `sys::PollWaker`, `Interest`, `Event` (epoll) | `include/coro/detail/sys/poller.h`, `src/detail/sys/posix/poller_epoll.cpp` | `test/detail/test_poller.cpp` |
+| `sys::Poller`, `sys::PollWaker` (lwIP) | `src/detail/sys/lwip/poller_lwip.cpp`; see [Pico Port](pico_port.md#poller) | `test/detail/test_notify.cpp`, and the TCP and UDP tests, on host lwIP and on the board |
+| `sys::notify_open`, `sys::notify_signal` | `include/coro/detail/sys/notify.h`, `src/detail/sys/posix/notify_posix.cpp`, `src/detail/sys/lwip/notify_lwip.cpp` | `test/detail/test_notify.cpp` |
+| `IoDriver`, `ScheduledIo`, `IoRegistration`, `IoDriverParker` | `include/coro/runtime/io_driver.h`, `src/runtime/io_driver.cpp` | `test/runtime/test_io_driver.cpp`; the waiter list in `test/detail/test_notify.cpp`, on every backend |
 | `Parker`, `PollingParker` | `include/coro/runtime/parker.h` | `test/runtime/test_current_thread_executor.cpp` |
 | `Clock`, `Instant` | `include/coro/runtime/clock.h` | |
 | `detail::TimerQueue`, `detail::TimerId` | `include/coro/detail/timer_queue.h`, `src/detail/timer_queue.cpp` | `test/detail/test_timer_queue.cpp` |
@@ -82,7 +84,7 @@ flowchart TD
 
 | Layer | Portable? | Responsibility |
 |---|---|---|
-| `sys::Poller` and `sys::PollWaker` | **No.** One implementation per OS. | Register, re-register and deregister an fd with an interest set; wait for events with a timeout; wake a blocked wait from another thread. |
+| `sys::Poller` and `sys::PollWaker` | **No.** One implementation per platform: epoll on Linux, lwIP on Pico. | Register, re-register and deregister an fd with an interest set; wait for events with a timeout; wake a blocked wait from another thread. |
 | `IoDriver` | Yes | Own the `Poller`, map each event to its `ScheduledIo`, update readiness, fire wakers; own the timer queue. |
 | `IoRegistration` | Yes | The readiness handshake a future uses: wait until ready, attempt the syscall, clear readiness on `EAGAIN`. |
 | Primitives | Mostly | Non-blocking syscalls behind a per-primitive backend seam (`detail/sys/udp.h`, `tcp.h`, ...), plus the `IoRegistration` handshake. |
@@ -95,7 +97,14 @@ driver needs.
 ```cpp
 namespace coro::detail::sys {
 
-using RawFd = int;  // SOCKET on Windows, if that platform is ever added
+// The handle of one I/O object: what the platform's "syscalls" take.
+using RawFd = int;                     // POSIX: a file descriptor
+// using RawFd = IoObject*;            // lwIP (CORO_SYS_LWIP): the object itself
+inline constexpr RawFd kInvalidFd = -1;   // nullptr on lwIP
+
+// Backend-specific construction options. Empty on POSIX; on lwIP, the Pico SDK
+// async_context poll() runs and sleeps on, and the PicoNetwork.
+struct PollerOptions;
 
 bool would_block(int err) noexcept;  // EAGAIN or EWOULDBLOCK
 
@@ -112,6 +121,7 @@ struct Event {
 
 class Poller {
 public:
+    explicit Poller(PollerOptions options = {});
     // thread-safe; trigger defaults to Trigger::Edge
     void register_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
     void reregister_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
@@ -120,7 +130,8 @@ public:
     void poll(std::vector<Event>& out, std::optional<std::chrono::nanoseconds> timeout);
 };
 
-/// Wakes a thread blocked in Poller::poll(). An eventfd on Linux, EVFILT_USER on kqueue.
+/// Wakes a thread blocked in Poller::poll(). An eventfd on Linux, EVFILT_USER on kqueue,
+/// a when-pending worker on the Pico SDK's async_context on lwIP.
 class PollWaker {
 public:
     PollWaker(Poller& poller, void* key);
@@ -133,7 +144,30 @@ public:
 
 Socket creation and the per-protocol non-blocking operations live in their own seam
 headers next to it (`socket.h`, `udp.h`, `tcp.h`, `pipe.h`, `signal.h`, `file.h`,
-`dns.h`), each documented with the primitive that uses it.
+`dns.h`), each documented with the primitive that uses it. A backend implements the
+seams for the primitives its platform has: the lwIP backend implements `poller.h`,
+`socket.h`, `tcp.h`, `udp.h`, `dns.h` and `notify.h`.
+
+`notify.h` is the eventfd seam: a handle that something outside the driver's thread
+signals to make it readable.
+
+```cpp
+RawFd notify_open();                     // a new notify object; throws on failure
+void  notify_signal(RawFd fd) noexcept;  // makes it readable; from any thread, and
+                                         // on lwIP from an ISR
+// close_socket(fd) closes it. A signal is an edge: each one is reported, and nothing
+// needs to be read back to re-arm it.
+```
+
+On POSIX it is an `eventfd` (`EFD_NONBLOCK | EFD_CLOEXEC`), and `notify_signal()`
+writes 1 to it. On lwIP it is an `IoObject` with its own `async_context` worker (see
+[Pico Port](pico_port.md#notify-objects)). The ISR primitives are built on it (see
+[ISR Safety](isr_safety.md#waiting-on-the-driver)).
+
+`RawFd` is an integer on POSIX because a file descriptor crosses the boundary between
+user space and the kernel. A backend with no such boundary uses a pointer to the object
+itself. The layers above treat `RawFd` as opaque: they store it, pass it to `sys`
+functions, and compare it with `kInvalidFd`.
 
 Semantics every backend must provide:
 
@@ -141,12 +175,13 @@ Semantics every backend must provide:
   consumer may only wait after it has seen `EAGAIN`. This is the strictest contract, and
   the handshake below follows it. A level-triggered backend still works under it; it just
   reports extra events.
-- **Level-triggered delivery on request** (`Trigger::Level`; planned, see
+- **Level-triggered delivery on request** (`Trigger::Level`; see
   [Level-triggered registrations](#level-triggered-registrations)). The fd is reported
   by every `poll()` while it is ready for something in its interest set. On epoll that
   is a registration without `EPOLLET`; on kqueue, one without `EV_CLEAR`. The interest
   set must be kept exact: an fd left registered for writing while nobody writes makes
-  every `poll()` return at once.
+  every `poll()` return at once. A backend whose platform runs no library that needs it
+  may refuse it with `ENOTSUP`; the lwIP backend does.
 - **Thread-safe registration.** Any thread may register or deregister while another
   thread is blocked in `poll()`. `epoll_ctl` and `kevent` both allow this.
 - **High-resolution timeout.** `poll()`'s timeout is in nanoseconds. On Linux this is
@@ -158,63 +193,60 @@ Semantics every backend must provide:
   profiling says otherwise. kqueue takes a `timespec` natively. Timer precision is
   the backend's job, not the timer queue's.
 
-!!! tip "TODO: prove the boundary with a second backend"
-    A kqueue backend is small (a few hundred lines), and writing it is the cheapest way to
-    catch Linux-isms leaking through `sys`.
+!!! tip "TODO: a kqueue backend"
+    A kqueue backend is small (a few hundred lines), and would catch BSD-isms and
+    Linux-isms leaking through `sys` that the lwIP backend, being so different, does not
+    exercise.
 
 ---
 
 ## Porting to a new platform
 
-A port supplies two things, and the rest of the stack is shared:
+A port implements the `sys` layer, and nothing else:
 
-1. **A readiness source.** Something has to mark a `ScheduledIo` readable or writable and
-   fire its waker.
-2. **The non-blocking operations** each primitive is built on: "try to receive now",
-   "try to send now", and so on. Each one either completes or reports *would block*.
+1. **A readiness source:** `sys::Poller` and `sys::PollWaker`. `poll()` waits up to a
+   timeout and returns an `Event` for each object whose readiness changed.
+2. **The non-blocking operations** each primitive is built on (`sys/tcp.h`,
+   `sys/udp.h`, ...): "try to receive now", "try to send now", and so on. Each one
+   either completes or reports *would block*.
 
-Everything above those two is the same on every platform: the `IoRegistration`
-handshake; each primitive's futures, buffer ownership, cancellation and error mapping;
-the executors and the `Parker` protocol; and the public API.
+Everything above `sys` is the same code on every platform: `IoDriver` and its timer
+queue, the `IoRegistration` handshake, `SocketState`, each primitive's futures, buffer
+ownership, cancellation and error mapping, the executors and the `Parker` protocol,
+`Runtime`, and the public API.
 
-How much a port has to write depends on what kind of platform it is:
-
-| Platform kind | Readiness source | Non-blocking ops | Shared unchanged |
-|---|---|---|---|
-| **fd-based OS** (Linux epoll, macOS/BSD kqueue) | A new `sys::Poller`/`PollWaker`. `IoDriver` itself is reused. | Reused: `recvfrom`, `sendto` and friends are POSIX. Only OS-specific options (GSO, GRO) differ, behind `#ifdef`. | `IoDriver`, `IoRegistration`, primitives, executors |
-| **Callback network stack** (lwIP raw API on Pico W) | The stack's own callbacks (`udp_recv`, `tcp_recv`, `tcp_sent`, `tcp_accept`, `tcp_err`) set readiness directly, playing `IoDriver::dispatch()`'s role, so neither a `Poller` nor `IoDriver::turn()` is involved. `PollingParker` around `cyw43_arch_poll()` runs those callbacks. | New: pop a queued pbuf (receive), `udp_sendto`/`tcp_write` with `ERR_MEM` mapped to *would block* (send). | The handshake, primitives' async logic, executors |
+| Platform | Readiness source | Non-blocking operations |
+|---|---|---|
+| **fd-based OS** (Linux epoll, macOS/BSD kqueue) | The OS readiness queue | POSIX syscalls (`recvfrom`, `sendto`, ...). Only OS-specific options (GSO, GRO) differ, behind `#ifdef` |
+| **Network stack without an OS** (lwIP raw API on Pico W) | lwIP's callbacks put objects on the `Poller`'s ready list; `poll()` runs the Pico SDK's `async_context` (radio, lwIP timers, ISR signals) and sleeps the CPU on it | "Syscalls" on per-socket objects that play the kernel's part: copy from per-socket receive buffers, `tcp_write`, `udp_sendto`. See [Pico Port](pico_port.md#the-lwip-sys-backend) |
 
 ```mermaid
 flowchart TD
-    P["Primitive async logic (shared)<br/>UdpSocket, TcpStream, TcpListener"]
-    R["Readiness handshake (shared)<br/>ScheduledIo: poll_ready / clear_ready"]
+    P["Primitives, IoRegistration, IoDriver<br/>(one implementation)"]
     subgraph desktop["fd-based OS"]
         DO["Non-blocking ops<br/>recvfrom / sendto (POSIX)"]
-        DD["IoDriver + sys::Poller<br/>(epoll, kqueue)"]
+        DD["sys::Poller<br/>(epoll, kqueue)"]
+        DK["kernel"]
     end
     subgraph pico["lwIP (Pico W)"]
-        LO["Non-blocking ops<br/>pbuf queue pop / tcp_write"]
-        LC["lwIP callbacks<br/>run by cyw43_arch_poll()"]
+        LO["Non-blocking ops<br/>receive-ring copy / tcp_write / udp_sendto"]
+        LD["sys::Poller<br/>ready list, async_context poll and sleep"]
+        LK["lwIP + per-socket IoObject"]
     end
-    P --> R
-    P --> DO
-    P --> LO
-    DD -- "dispatch(): set ready, wake" --> R
-    LC -- "set ready, wake" --> R
+    P --> DO --> DK
+    P --> DD --> DK
+    P --> LO --> LK
+    P --> LD --> LK
 ```
 
-This works because readiness is a property of the `ScheduledIo`, not of epoll. Only
-`dispatch()` knows where an event came from.
-
-!!! note "NOTE: the Pico lwIP primitives are not on the shared seam yet"
-    The lwIP `UdpSocket`, `TcpStream` and `TcpListener` are still separate
-    implementations with their own async logic. Moving them onto the shared readiness
-    core is described in [Raspberry Pi Pico Port](pico_port.md).
+On the lwIP backend there is no operating system for the `sys` layer to adapt: the
+backend itself does the kernel's job, with lwIP underneath. Each socket is an object
+holding the lwIP pcb and the data received for it, and `RawFd` points to it.
 
 !!! warning "WARNING: keep the shared layers free of fds and syscalls"
     A port stays this small only if:
 
-    - the readiness handshake doesn't assume an fd or an `IoDriver`;
+    - nothing above `sys` assumes `RawFd` is an integer, or calls the OS;
     - each primitive's async logic calls its non-blocking operations through one narrow
       backend seam, never `::recvfrom()` inline.
 
@@ -227,21 +259,37 @@ kernel holds its address as the event key:
 
 ```cpp
 class ScheduledIo {
-    std::mutex   m_mutex;
-    bool         m_readable = true;   // GUARDED BY m_mutex. Starts true, so the first
-    bool         m_writable = true;   //   attempt is a plain syscall.
-    uint64_t     m_tick     = 0;      // GUARDED BY m_mutex. Bumped on every driver event.
-    Weak<Waker>  m_reader;            // GUARDED BY m_mutex
-    Weak<Waker>  m_writer;            // GUARDED BY m_mutex
+    detail::Mutex m_mutex;              // std::mutex; a no-op on Pico
+    bool          m_level    = false;   // Written once by add(), before the poller can
+                                        //   name this object; read-only afterwards.
+    bool          m_readable = true;    // GUARDED BY m_mutex. Starts true, so the first
+    bool          m_writable = true;    //   attempt is a plain syscall.
+    bool          m_shutdown = false;   // GUARDED BY m_mutex. Set by IoDriver::shutdown().
+    uint64_t      m_tick     = 0;       // GUARDED BY m_mutex. Bumped on every driver event.
+    Weak<Waker>   m_reader;             // GUARDED BY m_mutex
+    Weak<Waker>   m_writer;             // GUARDED BY m_mutex
+    IntrusiveList<IoWaiter*> m_waiters; // GUARDED BY m_mutex. Any number of waiters;
+                                        //   see "More than one waiter".
+    ScheduledIo*  m_prev = nullptr;     // GUARDED BY IoDriver::m_registrations_mutex
+    ScheduledIo*  m_next = nullptr;     //   (the driver's registration list; see Shutdown)
 };
 ```
 
-- **One waker slot per direction.** A primitive allows one receive and one send in flight
-  at a time; a concurrent receive and send are fine.
+- **One waker slot per direction, for sockets.** A socket allows one receive and one send
+  in flight at a time; a concurrent receive and send are fine. Primitives that allow
+  several waiters at once use the waiter list instead (see
+  [More than one waiter](#more-than-one-waiter)).
 - **Weak wakers.** The task owns the future, which owns the registration, so a strong
   waker here would be a reference cycle. A waker whose task is gone is skipped.
-- **A plain mutex.** It is uncontended on the hot path. See
-  [Future improvements](#future-improvements) for tokio's lock-free alternative.
+- **A plain mutex.** It is uncontended on the hot path. Every lock in the driver is a
+  `detail::Mutex`, which is `std::mutex` on desktop and a no-op on single-threaded Pico
+  (see [Pico Port](pico_port.md#synchronisation-and-isr-safety)).
+- **The mutex is for the wakers, not just the flags.** `poll_ready()` checks readiness
+  and stores its waker as one step, and `dispatch()` sets readiness and takes the waker
+  as one step. That pairing is what makes a lost wake impossible. The flags and the tick
+  could be packed into one atomic word, but the waker slots could not, so the mutex
+  would remain on every path that waits. See
+  [Future improvements](#future-improvements) for why that split is not made.
 
 The handshake prevents lost wakeups by comparing ticks. Readiness is only cleared if no
 event has arrived since the attempt that failed. `IoRegistration::poll_io()` packages the
@@ -293,6 +341,77 @@ would store its waker, and nothing would ever wake it.
 
 An `Event` with `error` or `hup` set marks both directions ready, so each waiter retries
 its syscall and receives the actual error or end of stream from it.
+
+### More than one waiter
+
+The per-direction slots serve one waiter each, which is all a socket's contract allows.
+A primitive whose contract allows any number of concurrent waiters on one direction
+(the ISR primitives: see [ISR Safety](isr_safety.md#waiting-on-the-driver)) uses the
+registration's **waiter list** instead. This is tokio's design: its `ScheduledIo` keeps
+the same two slots for `poll_read_ready()` and a list for its `readiness()` futures,
+which any number of tasks may await at once.
+
+```cpp
+/// One waiter on a ScheduledIo. Lives inside the waiting future, so a wait allocates
+/// nothing. Linked into ScheduledIo::m_waiters while waiting.
+class IoWaiter {
+    IoWaiter*         prev = nullptr;  // detail::IntrusiveList links.
+    IoWaiter*         next = nullptr;  //   GUARDED BY the ScheduledIo's m_mutex
+    bool              m_linked = false;// GUARDED BY the ScheduledIo's m_mutex
+    Weak<Waker>       m_waker;         // GUARDED BY the ScheduledIo's m_mutex
+    IoDirection       m_direction;
+    bool              m_ready = false; // GUARDED BY the ScheduledIo's m_mutex. Set by
+                                       //   dispatch() or shutdown() when it wakes this
+                                       //   waiter, which unlinks it.
+};
+
+// IoRegistration: the waiter-list forms of poll_ready() and poll_io().
+std::optional<IoReadyEvent> poll_ready(IoDirection direction, detail::Context& ctx,
+                                       IoWaiter& waiter);
+template<typename Op>
+auto poll_io(IoDirection direction, detail::Context& ctx, IoWaiter& waiter, Op&& op);
+void cancel_wait(IoWaiter& waiter) noexcept;   // unlinks; the waiter's owner calls it on drop
+```
+
+`poll_ready(direction, ctx, waiter)`, under `m_mutex`:
+
+1. Shut down: return an event with `shutdown` set.
+2. The waiter was woken (`m_ready`): clear the flag and return an event with the current
+   tick.
+3. The waiter is linked: it is still waiting. Replace its waker and return `nullopt`.
+4. The direction is ready: return an event with the current tick.
+5. Otherwise link the waiter, store its waker, and return `nullopt`.
+
+`poll_io()` wraps it in the same loop as the slot form: run the operation, and on
+`EAGAIN` call `clear_ready(event)` and poll again, which links the waiter.
+
+`dispatch()` wakes the list after the slots. For each linked waiter whose direction the
+event made ready, it sets `m_ready`, takes its waker and unlinks it. It collects at
+most `kWakeBatch` (32) wakers at a time in a local array, then unlocks and wakes them,
+and re-locks to continue from the head of the list. Woken waiters are no longer linked, so restarting
+from the head never wakes one twice, and `dispatch()` allocates nothing however many
+waiters there are. `shutdown()` does the same for every waiter, whatever its direction.
+
+- **Why each waiter has its own `m_ready`.** The readiness bit is shared, and any waiter
+  whose operation fails calls `clear_ready()`. Suppose one event wakes waiters A and B,
+  and then a waiter C, which arrived after the event, runs first: it sees the direction
+  ready, its operation finds nothing for it, and it clears the bit. Without their own
+  flag, A and B would find readiness cleared and wait again for a signal they were
+  woken for. With it, each woken waiter returns ready exactly once, and its own
+  operation decides the outcome.
+- **The waiter must not move while linked.** The list holds its address. That follows
+  from the future contract: the waiter lives in a future, a future is pinned from its
+  first poll (see
+  [Future and Stream](future_and_stream.md#movable-until-the-first-poll-pinned-after)),
+  and only a poll links it. The owning future's move operations assert that its waiter
+  is not linked.
+- **Dropping a waiting future** calls `cancel_wait()`, which unlinks it under `m_mutex`.
+  A waiter that `dispatch()` already unlinked is not linked, so its drop does nothing,
+  and the waker `dispatch()` took finds a task that tolerates a spurious wake.
+- **A registration is deregistered with an empty list.** Every waiter's future holds a
+  share of whatever owns the registration, so the last waiter is gone before the
+  registration can be dropped. `deregister()` asserts it in debug builds.
+- **Level-triggered registrations do not use the list.**
 
 ### Registration lifetime and stale events
 
@@ -360,12 +479,14 @@ registration's lifetime and never per operation. This is tokio's `RegistrationSe
 
 1. Sets the driver's `is_shut_down()` flag.
 2. For every listed registration, sets `ScheduledIo::m_shutdown` and takes its reader
-   and writer wakers, under that registration's mutex.
+   and writer wakers, and every listed waiter's waker (unlinking it and setting its
+   `m_ready`), under that registration's mutex. It collects them into a vector, as
+   it may allocate where `dispatch()` may not.
 3. Wakes those wakers, outside both locks.
 4. Closes the timer queue, which removes every timer and wakes its waker
    (`TimerQueue::close_and_wake_all()`).
 
-Steps 3 and 4 are to run with the turn held (planned, see
+Steps 2 to 4 run with the turn held (see
 [Level-triggered registrations](#level-triggered-registrations)).
 
 Afterwards:
@@ -466,21 +587,21 @@ public:
 
 | Parker | `park(max_wait)` | `unpark()` | Used by |
 |---|---|---|---|
-| `IoDriverParker` | `driver.turn(max_wait)` | `driver.unpark()` | desktop `Runtime(1)` |
-| `PollingParker` | calls a function once (`cyw43_arch_poll()`), ignores `max_wait` | nothing | Pico `Runtime` |
+| `IoDriverParker` | `driver.turn(max_wait)` | `driver.unpark()` | desktop `Runtime(1)`, Pico `Runtime` |
+| `PollingParker` | calls a function once, ignores `max_wait` | nothing | a `CurrentThreadExecutor` built without a `Runtime` (tests) |
 
 The executor picks the wait: zero when a ready queue isn't empty, otherwise no limit
 (the driver bounds it by the earliest timer itself). It also decides how often it
 parks while busy: once per batch of `event_interval` task polls, so a task that keeps
 re-waking itself doesn't pay an `epoll_wait()` per poll (see
 [Executor Scheduling Design](executor_design.md#the-loop)). The parkers keep no count
-of their own. `PollingParker` never blocks, so Pico busy-polls.
+of their own.
 
 ### Per-executor integration
 
 | Executor | How it turns the driver | Details |
 |---|---|---|
-| `CurrentThreadExecutor` (`Runtime(1)`) | Parks through an `IoDriverParker`; a remote enqueue unparks it only while it is parked. | [Executor Scheduling Design](executor_design.md) |
+| `CurrentThreadExecutor` (`Runtime(1)`, Pico `Runtime`) | Parks through an `IoDriverParker`; a remote enqueue unparks it only while it is parked. | [Executor Scheduling Design](executor_design.md) |
 | `WorkStealingExecutor` (`Runtime(n)`) | The first idle worker takes the driver with `try_turn(nullopt, before_poll)`; other idle workers park on their own condition variable. Busy workers `try_turn(0)` every 61 polls. | [Work-Stealing Scheduler](work_stealing_executor.md) |
 | `WorkSharingExecutor` | One idle worker turns the driver; a remote enqueue unparks it. | [Executor Scheduling Design](executor_design.md) |
 
@@ -565,8 +686,8 @@ turning, without a hop. The user-facing API built on it (`sleep_for`, `sleep_unt
 
 ### `detail::TimerQueue`
 
-One timer queue type, used by the driver on desktop and by `CurrentThreadExecutor` on Pico
-(and when it runs without a `Runtime`):
+One timer queue type, used by the driver and by a `CurrentThreadExecutor` that runs
+without a `Runtime`:
 
 ```cpp
 namespace coro::detail {
@@ -663,7 +784,7 @@ flowchart LR
 !!! danger "WARNING: the queue must outlive every future that holds a `TimerId`"
     `SleepFuture`'s destructor calls `cancel()`. On the driver this follows from
     `Runtime`'s destruction order (see [Runtime integration](#runtime-integration)).
-    `CurrentThreadExecutor` owns its queue itself, so it must declare the queue before
+    `CurrentThreadExecutor` owns its own queue, so it must declare the queue before
     its task containers, so that the tasks are destroyed first.
 
 !!! tip "PERF: a sweep holds the queue mutex for O(n)"
@@ -707,18 +828,17 @@ timers, but `insert()` never unparks it. `IoDriver::add_timer(deadline, waker)` 
 
 Where a timer goes:
 
-- **Desktop `Runtime`**, any executor: `Runtime::add_timer()` adds it to the driver,
-  and `Runtime::cancel_timer()` cancels it there.
+- **A `Runtime`**, any executor, desktop or Pico: `Runtime::add_timer()` adds it to the
+  driver, and `Runtime::cancel_timer()` cancels it there.
   `CurrentThreadExecutor`'s `IoDriverParker` and the multi-threaded executors' driver
-  turns pick up the earliest deadline by themselves.
-- **`CurrentThreadExecutor`'s own `TimerQueue`** serves Pico and any executor built
-  without a `Runtime`, through `CurrentThreadExecutor::add_timer()` and
-  `cancel_timer()`. Its loop brackets
-  `park()` with `begin_wait()`/`end_wait()` and calls `fire_expired()` after each batch.
-  On Pico nothing blocks (`PollingParker`) and every insert comes from the executor's own
-  thread; `add_timer()` still unparks when `insert()` says so, which costs nothing there
-  and keeps a blocking `Parker` correct.
-- **Neither:** on a desktop `Runtime` whose executor never turns the driver (a
+  turns pick up the earliest deadline by themselves. On Pico the deadline bounds the
+  CPU's sleep in `Poller::poll()`.
+- **`CurrentThreadExecutor`'s own `TimerQueue`** serves an executor built without a
+  `Runtime`, through `CurrentThreadExecutor::add_timer()` and `cancel_timer()`. Its
+  loop brackets `park()` with `begin_wait()`/`end_wait()` and calls `fire_expired()`
+  after each batch. `add_timer()` unparks when `insert()` says so, which keeps a
+  blocking `Parker` correct.
+- **Neither:** on a `Runtime` whose executor never turns the driver (a
   `CurrentThreadExecutor` given its own `Parker`), `Runtime::add_timer()` throws
   `std::logic_error`, as registering an fd does.
 
@@ -770,8 +890,10 @@ never early: `SleepFuture` checks the clock itself.
       those deregister from a driver that is still alive.
     - The driver only dispatches inside `turn()`, and only executor threads call `turn()`.
       Once the executor is gone, nothing dispatches.
-- The Pico `Runtime` has no `IoDriver`. It builds a `CurrentThreadExecutor` with a
-  `PollingParker`, and its timers go to that executor's own queue.
+- The Pico `Runtime` has the same shape without the blocking pool: an `IoDriver` whose
+  `Poller` is the lwIP backend, configured by the `PicoNetwork` passed to the
+  constructor, and a `CurrentThreadExecutor` that parks through an `IoDriverParker`.
+  See [Pico Port](pico_port.md#runtime-on-pico).
 
 !!! warning "FIXME: wakes into a destroyed executor"
     A wake calls into the executor, and for a parked executor into its parker and the
@@ -792,7 +914,9 @@ never early: `SleepFuture` checks the clock itself.
 | `Pipe` | `IoRegistration` per FIFO end; `detail/sys/pipe.h` | [Pipe](pipe_streaming.md) |
 | `signal()`, `signal_stream()` | A self-pipe written by the signal handler; each watcher reads it through the driver | [Signal Handling](signal_handling.md) |
 | `sleep_for`, `sleep_until`, `timeout`, `IntervalTimer` | The driver's timer queue | [Timers](timers.md) |
-| `File`, `lookup_host()` | Not on the driver: regular files are always "ready", and `getaddrinfo()` blocks, so both run on the blocking pool | [File I/O](file_io.md) |
+| `File` | Not on the driver: a regular file is always "ready", so each operation runs on the blocking pool | [File I/O](file_io.md) |
+| `lookup_host()` | POSIX: `getaddrinfo()` blocks, so it runs on the blocking pool. lwIP: each query is an object registered with the driver, made readable by lwIP's DNS callback | [File I/O](file_io.md#lookup_host), [Pico Port](pico_port.md#name-resolution) |
+| `IsrEvent`, `IsrChannel<T>`, `IsrSemaphore` (Pico) | A notify fd per primitive, signalled by the ISR and registered while the primitive has waiters; its waiters use the [waiter list](#more-than-one-waiter) | [ISR Safety](isr_safety.md#waiting-on-the-driver) |
 | `WsStream`, `WsListener` | A [level-triggered registration](#level-triggered-registrations) per libwebsockets socket, whose waker calls lws inside the turn; lws's timers on the timer queue | [WebSocket Stream](websocket_stream.md) |
 
 ---
@@ -823,6 +947,9 @@ never early: `SleepFuture` checks the clock itself.
 | `Poller.LevelTriggeredReportsUntilDrained`, `LevelTriggeredFollowsInterestChange` | A level-triggered fd is reported by every poll while readable; dropping an interest stops its reports. |
 | `IoDriver.LevelWakerStaysStored`, `TakeReadyReportsAndClearsBothDirections`, `SetInterestStopsWritableWakes` | A level-triggered registration: its waker is woken on every turn while the fd is ready, `take_ready()` says which directions fired, and `set_interest()` reaches the poller. |
 | `IoDriver.WakerMayDeregisterItselfDuringWake`, `ShutdownWakesLevelWakerAndReportsIt`, `ShutdownWakesWithTheTurnHeld` | A waker that drops its own registration from `wake()`; shutdown wakes a level-triggered waker, which then reads `shutdown`; a shutdown wake can't overlap a turn on another thread. |
+| `IoWaiter.EveryListedWaiterIsWoken`, `LateWaiterClearingReadinessLosesNoWake`, `DroppedWaiterIsUnlinked`, `MoreThan32WaitersAreAllWoken`, `ShutdownWakesListedWaiters` | The waiter list: one event wakes every waiter of its direction; a waiter that arrives after the event and clears readiness doesn't strand those already woken; a dropped waiter is unlinked; wakes in batches lose no one; shutdown reaches the list. |
+| `Notify.SignalMakesReadable`, `SignalsAreEdges` | `sys/notify.h`: a signal from another thread wakes a waiting future; each signal is reported without reading the notify back. |
+| `Notify.SignalFromIsrEndsASleepingTurn`, `TurnTimesOutWhenIdle`, `SignalWhileDeregisteredLeavesAtMostOneEvent` | On every backend, the board's included: an interrupt's signal ends a sleeping turn; an idle turn sleeps out its timeout; a signal while the notify object is deregistered is reported at most once by its next registration, and the next signal still wakes it. |
 
 ---
 
@@ -855,9 +982,16 @@ how often:
 
     No wake is lost: dispatch locks after its atomic update, so either the reload under
     the lock sees the readiness, or dispatch's lock follows the stored waker and finds it.
-    This is the kind of atomic protocol CLAUDE.md warns against, so do it only with
-    profiling evidence, copy tokio's protocol rather than inventing one, and keep it
-    inside `poll_ready()`, `clear_ready()` and `dispatch()`.
+
+    The split removes the lock only from the "already ready" path. The waker slots
+    (`Weak<Waker>`, two words and a reference count) stay behind the mutex, so every
+    wait still locks. The gain is one uncontended lock per successful operation, and
+    the cost is a second synchronisation mechanism whose correctness rests on an
+    ordering argument rather than on one lock. This is the trade CLAUDE.md's "prefer
+    mutexes over atomics" guideline decides against, so the driver keeps the plain
+    mutex. Revisit it only if a profile shows `ScheduledIo::m_mutex` as a real cost,
+    and then copy tokio's protocol rather than inventing one, and keep it inside
+    `poll_ready()`, `clear_ready()` and `dispatch()`.
 
 !!! tip "PERF: skip the timer queue lock when it is empty"
     `begin_wait()` takes the queue mutex on every blocking turn, even with no timers. An
@@ -881,21 +1015,11 @@ how often:
     deregistering, the ordering would be impossible to get wrong, at no runtime cost. Every
     primitive would change, so it waits for a reason to touch them all.
 
-!!! note "NOTE: not planned: a driver-side registration set"
-    Tokio keeps every registration in a set under the driver's mutex, mainly so that
-    dropping the driver can mark them all shut down and fail pending I/O cleanly. We
-    instead require the driver to outlive its registrations, which `Runtime`'s teardown
-    order guarantees. A set would cost a lock and shared cache lines on every register and
-    deregister, for safety against misuse of an internal type.
-
 ## Open questions
 
 - **Windows / MSVC.** CLAUDE.md lists MSVC as a secondary target. If that means Windows
   must work, the option is an IOCP-backed `sys` layer using mio's AFD approach (readiness
   emulated on top of IOCP). If MSVC only matters as a compiler, it doesn't come up.
-- **More than one waiter per direction.** Tokio keeps a waiter list. The current API
-  contract (one receive and one send in flight) doesn't need one; revisit if a primitive
-  does.
 - **Waiting while no executor thread is running.** `CurrentThreadExecutor` only turns the
   driver inside `block_on()`. A `blocking_wait()` on a foreign thread for I/O, while the
   runtime thread sits outside `block_on()`, never makes progress. Decide whether that is

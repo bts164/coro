@@ -214,6 +214,6 @@ test process's pid. `static_assert`s check that the futures are `Future`s and no
 | File | Contents |
 |---|---|
 | `include/coro/io/pipe.h`, `pipe.hpp`, `src/io/pipe.cpp` | `PipeMode`, `PipeIo`, `Pipe`, `WriterSeenFuture` |
-| `include/coro/detail/sys/pipe.h`, `src/detail/sys/pipe_posix.cpp` | FIFO backend seam |
+| `include/coro/detail/sys/pipe.h`, `src/detail/sys/posix/pipe_posix.cpp` | FIFO backend seam |
 | `include/coro/detail/stream_io.h` | `FdReadFuture`, `FdWriteFuture` (shared with `TcpStream`) |
 | `test/io/test_pipe.cpp` | Tests |

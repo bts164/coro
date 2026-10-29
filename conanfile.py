@@ -170,6 +170,9 @@ class CoroRecipe(ConanFile):
             transitive_headers = True,
             transitive_libs = True)
 
+    def build_requirements(self):
+        self.tool_requires("cmake/3.31.12")
+
     def layout(self):
         cmake_layout(self)
         # cmake_layout() only patches the root self.cpp.build (libdirs=["."]),
@@ -266,9 +269,9 @@ class CoroRecipe(ConanFile):
         if self.settings.os == "baremetal":
             self.cpp_info.components["pico"].libs = ["coro_pico"]
             # Must match coro_pico's PUBLIC definitions in cmake/platforms/pico.cmake:
-            # they select the lwIP branches of tcp_stream.h and udp_socket.h.
-            self.cpp_info.components["pico"].defines = [
-                "CORO_PICO", "CORO_TCP_BACKEND_LWIP", "CORO_UDP_BACKEND_LWIP"]
+            # the single-threaded platform, and the lwIP backend of the sys layer
+            # (sys::RawFd is a pointer there).
+            self.cpp_info.components["pico"].defines = ["CORO_PICO", "CORO_SYS_LWIP"]
             self.cpp_info.components["pico"].set_property("cmake_target_name", "coro::pico")
             # lwipopts.h is installed to include/coro_pico_lwipopts/ by pico.cmake.
             # Must be listed explicitly because setting any includedirs replaces
