@@ -52,6 +52,10 @@ const std::error_category& dns_category() noexcept {
     return category;
 }
 
+std::error_code host_not_found_error() noexcept {
+    return std::error_code(kHostNotFound, dns_category());
+}
+
 RawFd dns_start(const std::string& host) {
     require_lwip("coro::lookup_host");
     auto query = std::make_unique<LwipDnsQuery>();
@@ -67,8 +71,7 @@ RawFd dns_start(const std::string& host) {
         // ERR_ARG: a malformed name. ERR_VAL: no DNS server, or a name lwIP cannot
         // look up. Both mean this name does not resolve here.
         if (err == ERR_ARG || err == ERR_VAL)
-            throw std::system_error(std::error_code(kHostNotFound, dns_category()),
-                                    "coro::lookup_host: " + host);
+            throw std::system_error(host_not_found_error(), "coro::lookup_host: " + host);
         throw_errno(lwip_errno(err), "coro::lookup_host");
     }
     return query.release();
@@ -78,7 +81,7 @@ std::error_code dns_try_result(RawFd fd, uint16_t port,
                                std::vector<SocketAddress>& out) noexcept {
     auto* query = static_cast<LwipDnsQuery*>(fd);
     if (!query->done) return std::make_error_code(std::errc::resource_unavailable_try_again);
-    if (!query->found) return std::error_code(kHostNotFound, dns_category());
+    if (!query->found) return host_not_found_error();
     out.assign(1, from_ip_addr(query->addr, port));
     return {};
 }

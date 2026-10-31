@@ -27,7 +27,7 @@ each rule has a short title, a rationale, and concrete examples.
 - [Silent Cancellation](#silent-cancellation)
 - [Error Handling](#error-handling)
 - [Signal Safety](#signal-safety)
-    - SG.1 — Never install a raw `sigaction`/`signal()` handler that touches coro primitives; use `coro::signal`/`coro::signal_stream` instead
+    - SG.1 — Never install a raw `sigaction`/`signal()` handler that touches coro primitives; use `coro::ctrl_c`/`coro::shutdown_requested`/`coro::signal` instead
 - [ISR Safety](#isr-safety-mcu-platforms--coro_pico-only)
     - IS.1 — Only call `signal_from_isr()` or `send_from_isr()` from an interrupt handler
     - IS.2 — Keep interrupt handlers minimal: write a flag or value and return immediately
@@ -1136,7 +1136,7 @@ try {
 
 ## Signal Safety
 
-### SG.1 — Never install a raw `sigaction`/`signal()` handler that touches coro primitives; use `coro::signal`/`coro::signal_stream` instead
+### SG.1 — Never install a raw `sigaction`/`signal()` handler that touches coro primitives; use `coro::ctrl_c`/`coro::shutdown_requested`/`coro::signal` instead
 
 **Reason:** A POSIX signal handler runs in a severely restricted async-signal-safe
 context — the same category of restriction as an ISR (see ISR Safety below), just
@@ -1146,6 +1146,7 @@ primitive is unsafe to call from inside one: `Event::set()`, channel `send()`,
 or a mutex — none of which are guaranteed reentrant or signal-safe, and a handler that
 interrupts the program mid-allocation or mid-lock can deadlock or corrupt state.
 
+`coro::ctrl_c()`, `coro::shutdown_requested()` and, for any other POSIX signal,
 `coro::signal(signum)` and `coro::signal_stream(signums)` (`include/coro/io/signal.h`)
 exist specifically so user code never needs to write a raw handler at all. They solve
 the signal-safety problem with a self-pipe: the actual OS-level handler coro installs
@@ -1166,15 +1167,16 @@ int main() {
     // ...
 }
 
-// GOOD — coro::signal does the equivalent safely, with no handler to write at all.
+// GOOD — coro::ctrl_c does the equivalent safely, with no handler to write at all,
+// and builds on Windows too.
 coro::Coro<void> run() {
-    co_await coro::signal(SIGINT);
+    co_await coro::ctrl_c();
     begin_shutdown();
 }
 ```
 
-This rule is specific to desktop builds (`coro::signal` is built on a self-pipe read
-through the epoll IoDriver, which is not available under `CORO_PICO`). The MCU analogue of
+This rule is specific to desktop builds (coro's signal futures are built on a self-pipe
+read through the IoDriver, which is not available under `CORO_PICO`). The MCU analogue of
 this rule — for hardware interrupts rather than OS signals — is **IS.1** below.
 
 ---

@@ -293,7 +293,7 @@ Coro<WsListener> WsListener::bind(std::string host, uint16_t port, Options optio
 #if !defined(LWS_WITH_IPV6)
         if (candidate && std::holds_alternative<Ipv6Address>(candidate->address)) {
             last_error = std::make_exception_ptr(std::system_error(
-                EAFNOSUPPORT, std::system_category(),
+                EAFNOSUPPORT, std::generic_category(),
                 "WsListener::bind: libwebsockets was built without IPv6"));
             continue;
         }
@@ -330,7 +330,7 @@ Coro<WsListener> WsListener::bind(std::string host, uint16_t port, Options optio
 
         const SocketAddress local = candidate ? *candidate : SocketAddress{Ipv4Address{}, port};
         last_error = std::make_exception_ptr(std::system_error(
-            bind_errno(local), std::system_category(), "WsListener::bind (" + lws_errors + ")"));
+            bind_errno(local), std::generic_category(), "WsListener::bind (" + lws_errors + ")"));
     }
     std::rethrow_exception(last_error);   // non-null: there is always a candidate
 }

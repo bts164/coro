@@ -1,8 +1,10 @@
 #pragma once
 
 // FiberContext / switch_context() -- see doc/design/fiber.md's "Design"
-// section. Two backends, selected by CORO_PICO:
+// section. Three backends:
 //  - POSIX/desktop: backed by ucontext.h (getcontext/makecontext/swapcontext).
+//  - Windows (_WIN32): Win32 fibers (CreateFiberEx/SwitchToFiber),
+//    src/detail/fiber_context_windows.cpp.
 //  - ARMv6-M/CORO_PICO: hand-written assembly, src/detail/fiber_context_pico.S
 //    (register swap) + src/detail/fiber_context_pico.cpp (stack allocation).
 
@@ -10,7 +12,7 @@
 
 #ifdef CORO_PICO
 #include <cstdint>
-#else
+#elif !defined(_WIN32)
 #include <ucontext.h>
 #endif
 
@@ -168,6 +170,84 @@ inline void coro_pico_enable_psp_stack() {
     coro_pico_enable_psp_stack_raw(
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(isr_stack + kIsrStackWords)));
 }
+
+#elif defined(_WIN32)
+
+/**
+ * @brief One stackful execution context on the Windows backend: a Win32 fiber.
+ *
+ * A context with a stack owns a fiber made by `init_fiber_entry()`
+ * (`CreateFiberEx`), with its own stack and an OS guard page below it. A
+ * caller-side context (no stack, see `FiberFuture`) owns nothing: `switch_context()`
+ * records in it whichever fiber the calling thread is running, which is the
+ * thread's own fiber made by `ConvertThreadToFiberEx()` on the thread's first
+ * switch. Win32 lets a fiber be resumed on a different thread than the one it
+ * last ran on, so a fiber may move between workers as on the other backends.
+ *
+ * The `asan_*` fields are used only under AddressSanitizer, to tell it which stack
+ * each switch goes to (see `switch_context()`). They are present in every build so
+ * that the struct's layout doesn't depend on the flags.
+ *
+ * Move-only, transferring the fiber; the destructor deletes a fiber it owns.
+ * See doc/design/fiber.md, "Windows backend".
+ */
+struct FiberContext {
+    void*  fiber      = nullptr; // the Win32 fiber: owned if `owned`, else the one last switched from
+    bool   owned      = false;   // made by init_fiber_entry(); deleted with this context
+    size_t stack_size = 0;       // the stack to reserve, from alloc_fiber_stack()
+    void*  asan_stack_bottom = nullptr; // the fiber's stack as last seen running on it;
+    size_t asan_stack_bytes  = 0;       //   null until then
+    void*  asan_fake_stack   = nullptr; // ASan's handle for the stack, kept while switched out
+
+    FiberContext() = default;
+    FiberContext(const FiberContext&)            = delete;
+    FiberContext& operator=(const FiberContext&) = delete;
+
+    FiberContext(FiberContext&& other) noexcept
+        : fiber(other.fiber), owned(other.owned), stack_size(other.stack_size),
+          asan_stack_bottom(other.asan_stack_bottom), asan_stack_bytes(other.asan_stack_bytes),
+          asan_fake_stack(other.asan_fake_stack) {
+        other.fiber = nullptr;
+        other.owned = false;
+    }
+
+    FiberContext& operator=(FiberContext&& other) noexcept {
+        if (this == &other) return *this;
+        fiber      = other.fiber;
+        owned      = other.owned;
+        stack_size = other.stack_size;
+        asan_stack_bottom = other.asan_stack_bottom;
+        asan_stack_bytes  = other.asan_stack_bytes;
+        asan_fake_stack   = other.asan_fake_stack;
+        other.fiber = nullptr;
+        other.owned = false;
+        return *this;
+    }
+
+    // Deletes the fiber this context owns, if any -- see free_fiber_stack().
+    ~FiberContext();
+};
+
+/// @brief Records the stack size for `fc`: `init_fiber_entry()` creates the fiber
+/// and its stack in one call (`CreateFiberEx`), so nothing is allocated here.
+void alloc_fiber_stack(FiberContext& fc, size_t stack_size);
+
+/// @brief Deletes the fiber owned by `fc`, if any. Never call it for the fiber that
+/// is running. Safe on a context that owns none.
+void free_fiber_stack(FiberContext& fc) noexcept;
+
+/// @brief Creates `fc`'s fiber, with a stack of the size `alloc_fiber_stack()`
+/// recorded, to start executing `entry` the first time it is switched into.
+/// @throws std::system_error if the fiber can't be created.
+void init_fiber_entry(FiberContext& fc, void (*entry)());
+
+/// @brief Records the calling thread's running fiber in `from` (converting the
+/// thread to a fiber on its first switch) and resumes `to`.
+void switch_context(FiberContext* from, FiberContext* to);
+
+/// @brief No-op on this backend: a new fiber's ASan handshake is done by its start
+/// routine in fiber_context_windows.cpp, before the entry point runs.
+inline void notify_fiber_switch_finished() {}
 
 #else
 

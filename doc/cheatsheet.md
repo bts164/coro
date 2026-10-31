@@ -26,7 +26,7 @@
 #include <coro/io/ws_stream.h>      // WsStream
 #include <coro/io/ws_listener.h>    // WsListener
 #include <coro/io/file.h>           // File
-#include <coro/io/signal.h>         // signal(), signal_stream()
+#include <coro/io/signal.h>         // ctrl_c(), shutdown_requested(), signal(), windows::console_event()
 ```
 
 ## Async functions
@@ -361,11 +361,24 @@ co_await out.write_at_exact(std::move(buf2), /*offset=*/512);
 ## OS signals
 
 ```cpp
-// One-shot: resolves once, on the next delivery of SIGINT.
-co_await coro::signal(SIGINT);
+// Every platform: resolves on the next Ctrl-C (SIGINT on POSIX, CTRL_C_EVENT on
+// Windows). ctrl_c_stream() yields each one.
+co_await coro::ctrl_c();
 
-// Shutdown on whichever of SIGINT/SIGTERM arrives first:
-co_await coro::select(coro::signal(SIGINT), coro::signal(SIGTERM));
+// Every platform: asked to go away (SIGTERM/SIGHUP; console closed on Windows). Hold
+// the guard while cleaning up: on Windows the process ends when it drops.
+auto guard = co_await coro::shutdown_requested();   // {.hangup = false}: not SIGHUP
+cleanup();
+
+// Either, without #ifdef:
+auto stop = co_await coro::select(coro::ctrl_c(), coro::shutdown_requested());
+
+// Windows: Ctrl-Break (and Ctrl-C) as console events.
+co_await coro::windows::console_event(coro::windows::ConsoleEvent::CtrlBreak);
+
+// POSIX from here on: any signal.
+// One-shot: resolves once, on the next delivery of SIGUSR1.
+co_await coro::signal(SIGUSR1);
 
 // Stream: coalesced {signum, count} event per distinct signal since the last poll.
 coro::SignalStream sigs = coro::signal_stream({SIGHUP, SIGUSR1});

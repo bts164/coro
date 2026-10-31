@@ -5,12 +5,14 @@
 # Usage: ci/run-tests.sh none|asan|tsan
 #
 #   none   a plain build
-#   asan   AddressSanitizer and UndefinedBehaviorSanitizer
-#   tsan   ThreadSanitizer
+#   asan   AddressSanitizer and UndefinedBehaviorSanitizer (on Windows, ASan alone)
+#   tsan   ThreadSanitizer (not on Windows)
 #
 # Written to run inside a CI image (docker/Dockerfile.<platform>): it uses the
 # image's Conan profiles and changes the global git configuration. To run it
-# that way on your own machine, use docker/run-tests.sh.
+# that way on your own machine, use docker/run-tests.sh. The Windows job runs it
+# under Git Bash on a GitHub-hosted runner instead, with the default profile set to
+# docker/profiles/windows2025 (.github/workflows/tests.yml).
 set -xeuo pipefail
 
 SANITIZER="${1:?usage: $0 none|asan|tsan}"
@@ -19,12 +21,25 @@ case "$SANITIZER" in
     *) echo "error: SANITIZER must be 'none', 'asan' or 'tsan', got '$SANITIZER'" >&2; exit 1 ;;
 esac
 
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) WINDOWS=1 ;;
+    *)                    WINDOWS=0 ;;
+esac
+
 # The image's default profile is the platform's own. A sanitizer is a second profile
 # named after it, which carries the flags for every package (docker/profiles/asan,
-# tsan). Only the host side gets it: the build machine's tools stay plain.
+# tsan). Only the host side gets it: the build machine's tools stay plain. MSVC takes
+# other flags and has ASan only: on Windows `asan` is docker/profiles/asan-msvc.
+SANITIZER_PROFILE="$SANITIZER"
+if [ "$WINDOWS" = 1 ]; then
+    case "$SANITIZER" in
+        asan) SANITIZER_PROFILE=asan-msvc ;;
+        tsan) echo "error: MSVC has no ThreadSanitizer" >&2; exit 1 ;;
+    esac
+fi
 PROFILES=(-pr:h default)
 if [ "$SANITIZER" != none ]; then
-    PROFILES+=(-pr:h "$SANITIZER")
+    PROFILES+=(-pr:h "$SANITIZER_PROFILE")
 fi
 PROFILES+=(-pr:b default)
 
@@ -61,7 +76,12 @@ conan build . "${PROFILES[@]}" --build=missing
 # halt_on_error=1 is essential here — without it the first
 # sanitizer hit repeats across the whole suite instead of stopping,
 # per BUILD.md.
-if [ "$SANITIZER" = asan ]; then
+if [ "$SANITIZER" = asan ] && [ "$WINDOWS" = 1 ]; then
+    # MSVC's ASan has no leak detection, and stack-use-after-return needs a compile
+    # flag of its own, so neither is asked for. The runtime DLL is found through the
+    # PATH each test gets (test/cmake/coro_test.cmake).
+    export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:check_initialization_order=1:strict_string_checks=1
+elif [ "$SANITIZER" = asan ]; then
     export ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=1:check_initialization_order=1:strict_string_checks=1:detect_stack_use_after_return=1
     export UBSAN_OPTIONS=halt_on_error=1:abort_on_error=1:print_stacktrace=1
 elif [ "$SANITIZER" = tsan ]; then

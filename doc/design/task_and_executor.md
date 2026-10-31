@@ -510,7 +510,7 @@ return StreamHandle<T>(std::move(sh_ptr));             // queue-access ref only
       `enable_shared_from_this` pointer (16), `owned_self` (16) and half of the waker
       slot (8). Intrusive reference counts remove all of it and bring the allocation to
       256 bytes (`JoinSetTask` too); see
-      [Planned: intrusive reference counting](task_ownership.md#planned-intrusive-reference-counting-not-yet-implemented).
+      [Planned: intrusive reference counting](task_ownership.md#planned-intrusive-reference-counting).
     - `alignas(64)` on `TaskBase`, which rounds the object up to a multiple of 64 and
       pads the control block in front of it. `scheduling_state` is the first data
       member, so there is no padding before it inside the object. Without the
@@ -622,13 +622,13 @@ the `Runtime` it points to is gone. This is cheaper than an extra allocation and
 indirection level — worthwhile as long as every consumer of the pointer is one the library
 itself controls the lifetime of.
 
-#### Proposed: `Handle` and `Runtime::enter()` (not yet implemented)
+#### Planned: `Handle` and `Runtime::enter()`
 
-!!! warning "PROPOSED: not yet implemented"
-    `Runtime::Handle`, `Runtime::enter()`, and the `Impl` split below do not exist yet.
-    `Runtime` today is the flat, directly-owning type described above. This section
-    describes the target design for giving an arbitrary foreign thread (one not managed
-    by `spawn_blocking` or `block_on`) valid access to a `Runtime`'s context.
+!!! tip "TODO: `Runtime::Handle` and `Runtime::enter()`"
+    `Runtime::Handle`, `Runtime::enter()`, and the `Impl` split below are planned;
+    `Runtime` is the flat, directly-owning type described above. This section describes
+    the design for giving an arbitrary foreign thread (one not managed by
+    `spawn_blocking` or `block_on`) valid access to a `Runtime`'s context.
 
 The raw-pointer guarantee above only holds for threads the library itself creates and
 retires (`block_on`'s caller, `BlockingPool` workers). It does not extend to a thread the
@@ -938,15 +938,15 @@ a bottleneck on the global mutex, sharding is the natural next step.
 !!! tip "TODO: Consider sharding the owned task list"
     If high task-spawn rates under the work-stealing executor show measurable contention on
     the owned task list mutex, shard it across N lists (one per worker thread is the natural
-    split). Not needed today — revisit if profiling shows it.
+    split). Revisit if profiling shows it.
 
-#### Planned exception: `CancelGuard` (not yet implemented)
+#### Planned exception: `CancelGuard`
 
-!!! warning "WARNING: CancelGuard does not exist yet"
-    The following describes a possible future addition. No `CancelGuard` type exists in the
-    library today. Do not design code around it.
+!!! tip "TODO: `CancelGuard`"
+    The following describes a possible addition. No `CancelGuard` type exists; don't
+    design code around it.
 
-A future `CancelGuard` type would allow a coroutine to temporarily opt out of the drain
+A `CancelGuard` type would allow a coroutine to temporarily opt out of the drain
 invariant — explicitly declaring that a particular section must not be interrupted by
 cancellation, even during a drain. This is an opt-in escape hatch for situations where an
 operation truly must complete before the task can safely exit (e.g. flushing a write buffer

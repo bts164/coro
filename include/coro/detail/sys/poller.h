@@ -11,12 +11,17 @@
 //   lwIP on the Pico SDK (CORO_SYS_LWIP): a ready list fed by lwIP's callbacks, run and
 //     slept on the SDK's async_context (src/detail/sys/lwip/poller_lwip.cpp). See
 //     doc/design/pico_port.md, "The lwIP sys backend".
+//   Windows (CORO_SYS_WINDOWS): IOCTL_AFD_POLL requests completing on an I/O
+//     completion port (src/detail/sys/windows/poller_iocp.cpp). See
+//     doc/design/windows_port.md.
 //
 // Contract every backend must provide:
 //   - Edge-triggered delivery (Trigger::Edge, the default). An event is only
 //     guaranteed after readiness *changes*, so a consumer may only wait after it has
 //     observed EAGAIN. (A level-triggered backend still satisfies this; it just
-//     reports extra events.)
+//     reports extra events.) A backend that emulates edges with one-shot polls
+//     (Windows) reports a direction again only after rearm(), which the consumer
+//     calls on EAGAIN (IoRegistration::clear_ready() does).
 //   - Level-triggered delivery (Trigger::Level). Every poll() reports the fd for as
 //     long as it is ready in a direction the registration is interested in. For a
 //     consumer that cannot promise to drain the fd, such as a foreign library's
@@ -36,6 +41,12 @@
 // The Pico SDK's async_context (pico/async_context.h). Declared here so that this
 // header, which public headers include, does not pull in the SDK.
 struct async_context;
+#elif defined(_WIN32)
+// The Windows backend. Derived here rather than set by the build, so that a program
+// including this header agrees with the library about it.
+#define CORO_SYS_WINDOWS 1
+#include <memory>
+#include <mutex>
 #endif
 
 namespace coro::detail::sys {
@@ -62,9 +73,24 @@ struct PollerOptions {
     /// creation fail with ENETDOWN otherwise, and the loopback queue is not drained.
     bool lwip = false;
 };
+#elif defined(CORO_SYS_WINDOWS)
+/// The Windows Poller's state: the completion port, AFD handles, per-socket state and
+/// the timeout timer. Defined in poller_iocp.cpp, which alone includes <windows.h>.
+struct IocpPoller;
+
+/// Native handle type for a pollable I/O object: a `SOCKET`. An integer the size of a
+/// pointer, so this header need not include <winsock2.h>. The file seam stores a
+/// handle object of its own in it (src/detail/sys/windows/file_windows.cpp).
+using RawFd = std::uintptr_t;
+
+/// The handle of no object: all ones, which is both INVALID_SOCKET and
+/// INVALID_HANDLE_VALUE.
+inline constexpr RawFd kInvalidFd = ~RawFd{0};
+
+/// Backend-specific construction options. Windows needs none.
+struct PollerOptions {};
 #else
-/// Native handle type for a pollable I/O object. `int` on POSIX; a Windows backend
-/// would make this `SOCKET`.
+/// Native handle type for a pollable I/O object: a file descriptor.
 using RawFd = int;
 
 /// The handle of no object.
@@ -149,6 +175,18 @@ public:
     ///         registered, or is no longer a valid fd (closed too early, or invalid).
     bool deregister_fd(RawFd fd) noexcept;
 
+    /// Re-enables reporting of `interest` on an edge-triggered `fd`, after its consumer
+    /// saw would-block. Thread-safe. On epoll and lwIP the OS (or the backend's ready
+    /// list) reports edges itself, and this does nothing. On Windows a direction that
+    /// has been reported is not polled for again until this is called. Never throws:
+    /// a failure to re-arm is reported as an error event on `fd`, so its waiter
+    /// retries its syscall and sees the error there.
+#ifdef CORO_SYS_WINDOWS
+    void rearm(RawFd fd, Interest interest) noexcept;
+#else
+    void rearm(RawFd, Interest) noexcept {}
+#endif
+
     /// Waits for readiness events and appends them to `out` (which is not cleared).
     ///
     /// @param timeout `std::nullopt` waits indefinitely; zero returns immediately.
@@ -168,6 +206,9 @@ public:
 #endif
 
 private:
+#ifdef CORO_SYS_WINDOWS
+    friend class PollWaker;
+#endif
 #ifdef CORO_SYS_LWIP
     // One pass of the SDK context and the loopback queue, then the teardown
     // deferred during it. See poll().
@@ -182,6 +223,8 @@ private:
     // FIFO of objects with readiness to report, through IoObject::next_ready.
     IoObject*      m_ready_head = nullptr;
     IoObject*      m_ready_tail = nullptr;
+#elif defined(CORO_SYS_WINDOWS)
+    std::unique_ptr<IocpPoller> m_impl;
 #else
     RawFd m_fd = -1;  // the epoll instance
 #endif
@@ -193,6 +236,7 @@ private:
  * Linux: an eventfd registered (readable) with the poller under a caller-chosen key.
  * lwIP: a notify object (sys/notify.h) registered the same way; wake() marks its
  * async_context worker pending, which ends a sleeping poll().
+ * Windows: a packet posted to the completion port, at most one at a time.
  * When poll() returns an Event carrying that key, the driver calls reset().
  */
 class PollWaker {
@@ -218,6 +262,10 @@ private:
     Poller& m_poller;
 #ifdef CORO_SYS_LWIP
     RawFd   m_fd = kInvalidFd;  // a notify object, registered under the waker's key
+#elif defined(CORO_SYS_WINDOWS)
+    void*      m_key;
+    std::mutex m_mutex;
+    bool       m_posted = false;  // GUARDED BY m_mutex: a wake packet is in the port
 #else
     RawFd   m_fd = -1;  // eventfd
 #endif

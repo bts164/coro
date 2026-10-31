@@ -15,6 +15,7 @@
 #include <memory>
 #else
 #include <coro/task/spawn_blocking.h>
+#include <atomic>
 #endif
 
 namespace coro {
@@ -76,12 +77,24 @@ Coro<std::vector<SocketAddress>> lookup_host(std::string host, uint16_t port) {
 
 #else
 
+namespace {
+
+// Set by tests through detail::sys::set_resolver_for_testing(); null otherwise.
+std::atomic<detail::sys::ResolveFn> g_resolver_for_testing{nullptr};
+
+} // namespace
+
+void detail::sys::set_resolver_for_testing(ResolveFn fn) noexcept {
+    g_resolver_for_testing.store(fn);
+}
+
 Coro<std::vector<SocketAddress>> lookup_host(std::string host, uint16_t port) {
     if (auto numeric = SocketAddress::parse(host, port))
         co_return std::vector<SocketAddress>{*numeric};
 
     co_return co_await spawn_blocking([host, port]() -> std::vector<SocketAddress> {
-        auto resolved = detail::sys::resolve_host(host, port);
+        const detail::sys::ResolveFn fake = g_resolver_for_testing.load();
+        auto resolved = fake ? fake(host, port) : detail::sys::resolve_host(host, port);
         if (!resolved)
             throw std::system_error(resolved.error(), "coro::lookup_host: " + host);
         return std::move(*resolved);

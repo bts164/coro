@@ -221,16 +221,14 @@ When a `JoinHandle` is destroyed and `t_current_coro` is non-null, the destructo
 The `JoinHandle` destructor fires during the coroutine body's LIFO unwind (guaranteed by
 the frame lifetime invariant above), so `t_current_coro` is always valid at that point.
 
-### `transfer_to` is not needed
+### No transfer between scopes
 
-The legacy `transfer_to` method existed to migrate pending children from a dying inner
-`Coro<T>` to the enclosing scope when the inner frame was destroyed eagerly (without first
-draining its awaited future). With the revised invariant, the awaited future is always
+Pending children never need to migrate from an inner `Coro<T>` to the enclosing scope.
+That would only be necessary if an inner frame were destroyed eagerly, without first
+draining its awaited future. Under the invariant above, the awaited future is always
 drained and pre-existing pending children are always cleared before `handle.destroy()` is
-called. When `handle.destroy()` runs the inner `Coro<T>`'s destructor it will find the
-scope empty, so there is nothing to migrate.
-
-`transfer_to` and its associated locking are therefore removed.
+called, so the inner `Coro<T>`'s destructor finds its scope empty. Scopes therefore need no
+transfer operation and no locking for one.
 
 ### Memory cycle note
 
@@ -245,13 +243,13 @@ The waker is passed to each pending child's `set_scope_waker` callback and lives
 `TaskState::scope_waker`, which is cleared when the child completes. No member storage of
 the waker in `CoroutineScope` is needed.
 
-### Proposed optimization: inline-capacity pending list
+### Possible optimization: inline-capacity pending list
 
-!!! note "TODO: not yet implemented — needs a prototype and on-device cycle measurement before committing"
-    This is a design sketch, not a decision. Validate with a SysTick-based cycle-count
-    measurement of a suspend/resume round trip on real Pico hardware before merging —
-    see [pico_port.md](pico_port.md)'s frame-pooling and refcounting sections for the
-    kind of allocator-driven costs this technique has caught before.
+!!! tip "PERF: inline-capacity pending list"
+    A design sketch, to validate with a SysTick-based cycle-count measurement of a
+    suspend/resume round trip on real Pico hardware before adopting it. See
+    [pico_port.md](pico_port.md)'s frame-pooling and refcounting sections for the kind of
+    allocator-driven costs this technique catches.
 
 `m_pending` is a `std::vector<Weak<TaskBase>>`. For a coroutine that never spawns children
 (the common case for leaf coroutines) it stays a default-constructed empty vector and never
@@ -291,10 +289,10 @@ only `poll()` and will never move again. A move therefore only ever needs to han
 and skip the inline slots entirely. No deferred-initialization trick or "pinned" flag is
 needed; the existing invariant already provides it.
 
-**Status**: not implemented. Worth prototyping (a small `detail::SmallVec`-style container,
-desktop-tested) but the actual payoff — heap allocation avoided per spawn, plus any cache
-locality benefit — needs to be measured with the same SysTick harness used for `FramePool`
-before deciding it's worth the added complexity over `std::vector`.
+A prototype would be a small `detail::SmallVec`-style container, tested on desktop. Its
+payoff — a heap allocation avoided per spawn, plus any cache locality benefit — needs to be
+measured with the same SysTick harness used for `FramePool` to show it's worth the added
+complexity over `std::vector`.
 
 ## `PollDropped` — a dedicated cancellation state
 

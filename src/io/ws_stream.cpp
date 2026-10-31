@@ -6,8 +6,13 @@
 #include <coro/io/socket_address.h>
 #include <coro/detail/socket_state.h>
 #include "ws_service.h"
+#ifdef _WIN32
+#include <winsock2.h>   // inet_ntop, after ws_service.h: <libwebsockets.h> includes it too
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#endif
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
@@ -349,7 +354,7 @@ public:
             return PollPending;
         }
         if (m_state->connect.error != 0)
-            throw std::system_error(m_state->connect.error, std::system_category(),
+            throw std::system_error(m_state->connect.error, std::generic_category(),
                                     "WsStream::connect: " + m_state->connect.reason);
         return WsStream(std::move(m_state), m_service);
     }
@@ -458,7 +463,7 @@ Coro<WsStream> WsStream::connect(std::string url, Options options) {
 #if !defined(LWS_WITH_IPV6)
         if (std::holds_alternative<Ipv6Address>(peer.address)) {
             last_error = std::make_exception_ptr(std::system_error(
-                EAFNOSUPPORT, std::system_category(),
+                EAFNOSUPPORT, std::generic_category(),
                 "WsStream::connect: libwebsockets was built without IPv6"));
             continue;
         }
@@ -504,7 +509,7 @@ PollResult<WsStream::Message> WsStream::ReceiveFuture::poll(detail::Context& ctx
         detail::ws::ReceivedMessage msg = std::move(ready.front());
         ready.pop_front();
         if (msg.error != 0)
-            throw std::system_error(std::error_code(msg.error, std::system_category()),
+            throw std::system_error(std::error_code(msg.error, std::generic_category()),
                                     "WsStream::receive");
         return Message{std::move(msg.data), msg.is_text, msg.is_final};
     }
@@ -558,7 +563,7 @@ PollResult<void> WsStream::SendFuture::poll(detail::Context& ctx) {
         std::lock_guard lk(m_state->send_queue_mutex);
         if (m_node.complete) {
             if (m_node.error != 0)
-                throw std::system_error(m_node.error, std::system_category(), "WsStream::send");
+                throw std::system_error(m_node.error, std::generic_category(), "WsStream::send");
             return PollReady;
         }
         m_node.waker = ctx.get_weak_waker();

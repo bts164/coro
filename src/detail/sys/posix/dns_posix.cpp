@@ -26,6 +26,10 @@ const std::error_category& dns_category() noexcept {
     return category;
 }
 
+std::error_code host_not_found_error() noexcept {
+    return std::error_code(EAI_NONAME, dns_category());
+}
+
 std::expected<std::vector<SocketAddress>, std::error_code>
 resolve_host(const std::string& host, uint16_t port) {
     addrinfo hints{};
@@ -49,7 +53,7 @@ resolve_host(const std::string& host, uint16_t port) {
         addr.port = port;
         out.push_back(addr);
     }
-    if (out.empty()) return std::unexpected(std::error_code(EAI_NONAME, dns_category()));
+    if (out.empty()) return std::unexpected(host_not_found_error());
     return out;
 }
 

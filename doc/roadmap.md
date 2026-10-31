@@ -12,7 +12,7 @@ weak count. `Rc` and `Weak` become single pointers, and a `Weak` may no longer o
 its task: if one does, the process aborts. A `TaskImpl` allocation goes
 from 320 to 256 bytes, and a `JoinSetTask` from 384 to 256. A forgotten reference becomes
 a loud abort instead of a silent leak. The design is in
-[Planned: intrusive reference counting](design/task_ownership.md#planned-intrusive-reference-counting-not-yet-implemented).
+[Planned: intrusive reference counting](design/task_ownership.md#planned-intrusive-reference-counting).
 
 !!! tip "TODO: Replace `shared_ptr` and `weak_ptr` for tasks and wakers"
     Three stages, each tested before the next (see
@@ -30,8 +30,7 @@ a loud abort instead of a silent leak. The design is in
 `WorkStealingExecutor` tracks parked workers in a single `std::atomic<uint64_t>`
 idle mask, so the pool is capped at `MAX_WORKERS` (64). A larger `num_threads`,
 including the `hardware_concurrency()` default on a >64-core machine, is clamped to
-64. (It used to throw `std::invalid_argument`, which made `Runtime()` fail outright on
-such machines.)
+64 rather than throwing, so `Runtime()` still works on such machines.
 
 !!! tip "TODO: Lift the 64-worker cap"
     Two options:
@@ -112,12 +111,12 @@ documented prominently. Key points to cover:
 
 ## Cancellation propagation tests
 
-The end-to-end cancellation tests deferred in `test/test_coro_scope.cpp` can now be written — `select` and `timeout` are both implemented. Specifically:
+`test/test_coro_scope.cpp` lacks end-to-end cancellation tests through `select` and `timeout`:
 
 - A cancelled coroutine that has spawned children via `spawn()` must drain those children (waiting for their `PollDropped`) before returning its own `PollDropped`.
 - Children receive cancellation via `select`/`timeout` combinators (e.g. a branch that loses a select is cancelled and must drain before the select result is delivered).
 
-These tests require no new infrastructure; they are Phase 3 validation for the interaction between `CoroutineScope`, `SelectFuture`, and `Coro<T>`.
+These tests require no new infrastructure. They would validate the interaction between `CoroutineScope`, `SelectFuture`, and `Coro<T>`.
 
 
 ## Channel — multi-sender watch variants (under consideration)

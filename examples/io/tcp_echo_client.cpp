@@ -97,7 +97,7 @@ static Coro<void> run_client(int id, std::string host, uint16_t port, std::strin
         auto& [n, reply] = std::get<0>(recv).value; // std::pair<size_t, std::string>
         reply.resize(n);
         LOG(id, "Echo: %s", reply.c_str());
-        co_await results.send(std::move(reply));
+        (void)co_await results.send(std::move(reply));
     }
 }
 

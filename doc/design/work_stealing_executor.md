@@ -2,51 +2,29 @@
 
 ## Overview
 
-The current `WorkSharingExecutor` gives each worker thread a local queue but has no
-stealing path: when a worker's local queue is empty it blocks on a shared
-condition variable waiting for the global injection queue. Under uneven load — one task
-spawning many children, or tasks with varied run times — some workers sleep while
-others are overloaded. Work-stealing fixes this by allowing idle workers to take tasks
-from busy workers' local queues before going to sleep.
+`WorkStealingExecutor` is the multi-threaded executor `Runtime` uses. Each worker thread
+has a local queue, and an idle worker takes tasks from busy workers' local queues before
+it goes to sleep. Under uneven load — one task spawning many children, or tasks with
+varied run times — no worker sleeps while others are overloaded.
 
-The design mirrors Tokio's multi-threaded scheduler at a high level, adapted to the
-existing `Executor` interface and task state machine.
+`WorkSharingExecutor` has the same local queues and shared injection queue but no steal
+path: a worker whose local queue is empty sleeps on a shared condition variable until the
+injection queue has work.
 
----
-
-## Goals
-
-- Replace (or upgrade) `WorkSharingExecutor` with a scheduler that steals work across
-  threads before parking.
-- Preserve the existing `Executor` interface (`schedule`, `enqueue`, `poll_ready_tasks`,
-  `wait_for_completion`) so `Runtime` needs no changes.
-- Preserve all invariants of the lock-free `SchedulingState` CAS machine.
-- Keep the lock-free deque interface (`push` / `pop` / `steal`) so that implementing the
-  Chase-Lev algorithm later is a drop-in change to `WorkStealingDeque`.
+The design mirrors Tokio's multi-threaded scheduler at a high level, adapted to coro's
+`Executor` interface (`schedule`, `enqueue`, `poll_ready_tasks`, `wait_for_completion`)
+and its lock-free `SchedulingState` CAS machine. The deque interface (`push` / `pop` /
+`steal`) is the one the Chase-Lev algorithm offers, so a lock-free deque would be a
+drop-in change to `WorkStealingDeque`.
 
 ---
 
-## Current State
-
-`WorkSharingExecutor` already has most of the structure in place:
-
-- Per-worker `WorkStealingDeque` with `push`, `pop`, `steal` — currently mutex-backed.
-- A shared injection queue protected by `m_mutex` + `m_cv`.
-- Thread-locals `t_owning_executor` and `t_worker_index` for local-path routing in
-  `enqueue()`.
-
-What is missing is the steal path in `worker_loop()`. Today, when a worker's local queue
-is empty it goes directly to sleep on `m_cv`. It should first attempt to steal from
-peer workers before sleeping.
-
----
-
-## Proposed Design
+## Design
 
 ### Worker Loop with Stealing
 
-The core change is the task-search strategy in `worker_loop()`. Each worker follows this
-priority order:
+The core of the design is the task-search strategy in `worker_loop()`. Each worker follows
+this priority order:
 
 ```
 1. Pop from own local queue                   (no lock, LIFO)
@@ -375,12 +353,12 @@ The tasks are held as `TaskBase*`, as in the run queues: the owned-task list kee
 alive. Up to 64 fit in the batch itself; more spill into a vector, so the usual batch
 allocates nothing.
 
-#### What it replaces and what it doesn't
+#### What it leaves to other mechanisms
 
-- **The driver-turn deferral stays as it is.** Wakes during a driver turn are local
+- **The driver-turn deferral is separate.** Wakes during a driver turn are local
   pushes that skip `notify_if_needed()` (see [Parking in the I/O driver](#parking-in-the-io-driver)).
   No batch is ever open during a turn: the driver calls wakers, it doesn't poll futures.
-- **The chain stays.** It still spreads bursts made without a batch: a task that spawns in
+- **The chain spreads bursts made without a batch**: a task that spawns in
   a loop, or a driver turn that dispatches many tasks.
 - **No LIFO slot.** A task diverted into a batch never goes to the
   [LIFO slot](#lifo-slot); a batch is for spreading work across workers.
@@ -529,8 +507,8 @@ per-worker approach was adopted because:
   idle worker — no shared-mutex round-trip.
 - Shutdown (`notify_all`) becomes: call `unpark_worker()` on each worker.
 
-The shared `m_mutex` is retained only for protecting the injection queue (remote
-enqueue path). It is no longer used for parking/wakeup.
+The shared `m_mutex` protects only the injection queue (the remote enqueue path). It
+plays no part in parking or wakeup.
 
 ### LIFO slot
 
@@ -842,12 +820,11 @@ sets `m_stop` and then calls `unpark_worker()` on every worker.
 !!! warning "FIXME: lost wakeup on the non-`CORO_USE_LOCAL_RUN_QUEUE` affinity path"
     Without `CORO_USE_LOCAL_RUN_QUEUE`, a remote `enqueue()` pushes to the task's last
     worker `k` (the affinity path). It then calls `notify_if_needed()`, which returns early
-    if any worker is searching. Before the last searcher re-checked its peers' queues, the
-    searcher looked only at its own queue and the injection queue before parking, never
-    `k`'s, and if `k` was parked the task stranded until some later wake. That re-check
-    should now find the task and steal it, but this has not been tested in that build,
-    which the default does not use. If it still strands, unpark `k` directly when its idle
-    bit is set, or drop the affinity path.
+    if any worker is searching. The last searcher's re-check of its peers' queues should
+    find the task and steal it, but this is untested in that build, which the default does
+    not use. Without the re-check, a searcher that parked after looking only at its own
+    queue and the injection queue would strand the task until some later wake. If it
+    strands, unpark `k` directly when its idle bit is set, or drop the affinity path.
 
 ### Tests
 
@@ -872,17 +849,16 @@ These are in `test/runtime/test_io_driver.cpp` and `test/runtime/test_work_steal
 
 ### WorkStealingDeque
 
-The current `WorkStealingDeque<T>` is mutex-backed and presents `push` / `pop` /
-`steal`. A `steal_half(WorkStealingDeque& dst)` method is added: under the victim's
+`WorkStealingDeque<T>` is mutex-backed and presents `push` / `pop` / `steal`, plus
+`steal_half(WorkStealingDeque& dst)`: under the victim's
 lock it computes `n = (size + 1) / 2`, moves the front `n` items into `dst`, and
 returns `n`. The caller pops one task immediately and leaves the rest in its own queue
 for future iterations. This amortizes steal overhead and avoids repeated lock
 acquisitions when a victim has many tasks.
 
-**The mutex-backed implementation will be kept for this phase.** The lock-free Chase-Lev
-upgrade is deferred — see the
-[Future Work: Chase-Lev Lock-Free Deque](#future-work-chase-lev-lock-free-deque) section
-below for a full description of how it works and what changes when the time comes.
+A lock-free Chase-Lev deque could replace it; see
+[Chase-Lev lock-free deque](#chase-lev-lock-free-deque) below for how it works and what
+it would change.
 
 ### Injection Queue
 
@@ -931,7 +907,7 @@ instead of the injection queue, provided the executor pointer still matches.
 The benefit: a woken task re-enters on the same core it last ran on, keeping its data
 warm in L1/L2 and avoiding an injection-queue lock acquisition on the hot wakeup path.
 
-### State Additions
+### Searching Count
 
 A single shared atomic `std::atomic<int> m_searching{0}` tracks the number of workers
 currently performing a steal sweep. No per-worker state is needed.
@@ -966,13 +942,13 @@ born cancelled and drained (see [runtime_shutdown.md](runtime_shutdown.md)). Tok
 live-task counter is left out because nothing in coro reads it.
 
 !!! note "NOTE: why the owned tasks are sharded"
-    The first version was one `std::unordered_set<shared_ptr<TaskBase>>` behind one
-    mutex. Every spawn and every completion on every worker took that lock. A
-    frame-pointer profile of `SkynetJoinTest.Stealing` attributed 79% of samples to
-    waiting on that mutex or waking its waiters, with about 7.5 s of system time against
-    2.5 s of user time for 1.25 s of wall time.
+    With one `std::unordered_set<shared_ptr<TaskBase>>` behind one mutex, every spawn and
+    every completion on every worker takes that lock. A frame-pointer profile of
+    `SkynetJoinTest.Stealing` with that set attributed 79% of samples to waiting on the
+    mutex or waking its waiters, with about 7.5 s of system time against 2.5 s of user
+    time for 1.25 s of wall time.
 
-!!! tip "TODO: `WorkSharingExecutor` and `CurrentThreadExecutor` still use a single set"
+!!! tip "TODO: `WorkSharingExecutor` and `CurrentThreadExecutor` use a single set"
     `CurrentThreadExecutor` has no contention to remove, but the intrusive list would
     still save it a hash-table insert and erase per task.
 
@@ -1036,8 +1012,8 @@ Workers exit their loop when `m_stop` is true and all queues are drained.
 
 ## Naming and Placement
 
-`WorkSharingExecutor` is kept as-is (useful for debugging scheduler issues due to its
-simpler concurrency). `WorkStealingExecutor` is added alongside it as a new class.
+`WorkSharingExecutor` sits alongside `WorkStealingExecutor` as a separate class; its
+simpler concurrency makes it useful for debugging scheduler issues.
 
 Files:
 
@@ -1051,7 +1027,8 @@ otherwise → `WorkStealingExecutor`.
 
 ## State Machine Invariants
 
-The `SchedulingState` CAS machine is unchanged. The steal path is just another way to
+The steal path uses the same `SchedulingState` CAS machine as every executor. It is just
+another way to
 dequeue a `Notified` task — the transition `Notified → Running` is always a CAS and
 will fail if two workers race to claim the same task (which should not happen since
 `steal()` is atomic, but the CAS is the ultimate guard).
@@ -1110,16 +1087,16 @@ sequenceDiagram
 
 ---
 
-## Future Work: Chase-Lev Lock-Free Deque
+## Chase-Lev lock-free deque
 
-> **Deferred.** The mutex-backed `WorkStealingDeque` is sufficient for correctness.
-> This section documents the Chase-Lev algorithm so the upgrade path is understood
-> before it is needed. When performance profiling shows deque contention is a
-> bottleneck, this section becomes the implementation spec.
+!!! tip "TODO: Chase-Lev lock-free deque"
+    The mutex-backed `WorkStealingDeque` is sufficient for correctness. This section
+    describes the Chase-Lev algorithm, and becomes the implementation spec once profiling
+    shows deque contention is a bottleneck.
 
 ### Why Bother?
 
-Every `steal()` call on the current mutex-backed deque acquires a lock, even when the
+Every `steal()` call on the mutex-backed deque acquires a lock, even when the
 victim's queue is empty. Under high thread counts with frequent stealing this creates
 contention on the victim's mutex. Chase-Lev eliminates all locks on the common paths:
 
@@ -1238,9 +1215,9 @@ sequenceDiagram
 | `top` CAS in thief | `acq_rel` | Synchronises all thieves with each other |
 | buffer element read in thief | `acquire` | Must happen before CAS commits the steal |
 
-### What Changes in the Codebase
+### What It Would Change in the Codebase
 
-Only `include/coro/detail/work_stealing_deque.h` changes. The three atomic fields
+Only `include/coro/detail/work_stealing_deque.h` would change. The three atomic fields
 replace `m_mutex` and `m_deque`. All call sites (`push`, `pop`, `steal_half`) keep the
 same signatures. The executor code, wakers, and task state machine are unaffected.
 
@@ -1251,12 +1228,3 @@ reclamation or hazard pointers. A simpler alternative that avoids this entirely 
 use a **fixed-capacity** deque (bounded at construction time) and abort/assert if the
 owner exceeds capacity. For task queues with a reasonable bound this is acceptable and
 eliminates the reclamation problem.
-
----
-
-## Open Questions
-
-**Chase-Lev lock-free deque:** the `WorkStealingDeque` is currently mutex-backed.
-Chase-Lev is documented in the [Future Work](#future-work-chase-lev-lock-free-deque)
-section as a follow-on once profiling shows deque contention is a real bottleneck.
-

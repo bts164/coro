@@ -23,7 +23,6 @@
 #include <coro/sync/timeout.h>
 #include <coro/sync/when.h>
 #include <chrono>
-#include <csignal>
 #include <cstdio>
 #include <ctime>
 #include <exception>
@@ -160,16 +159,18 @@ static Coro<int> run_server() {
 // ---------------------------------------------------------------------------
 // async_main
 //
-// Runs the server until it exits on its own or SIGINT/SIGTERM arrives.
+// Runs the server until it exits on its own, on Ctrl-C, or on a shutdown request.
 // ---------------------------------------------------------------------------
 static Coro<int> async_main() {
     auto server_handle = coro::spawn(run_server());
-    // coro::ref() keeps the server running when a signal wins, so that the shutdown
-    // can be announced before waiting for it.
+    // coro::ref() keeps the server running when Ctrl-C or a shutdown request wins, so
+    // that the shutdown can be announced before waiting for it. If the request won,
+    // `result` holds its ShutdownGuard until this coroutine returns: on Windows the
+    // process ends as soon as it is dropped.
     auto result = co_await coro::select(
         coro::ref(server_handle),
-        coro::signal(SIGINT),
-        coro::signal(SIGTERM)
+        coro::ctrl_c(),
+        coro::shutdown_requested()
     );
     if (result.index() == 0) {
         co_return std::get<0>(result).value;  // run_server() exited on its own
@@ -177,7 +178,7 @@ static Coro<int> async_main() {
     // Cancelling run_server() drops `sessions`, which cancels and drains every
     // connection still open before cancel_and_join() resolves. Each one sends its
     // goodbye on the way out, so shutdown takes at most the 1s send_goodbye() allows.
-    LOG(-1, "Signal received — shutting down");
+    LOG(-1, "Stop requested — shutting down");
     std::optional<int> code = co_await std::move(server_handle).cancel_and_join();
     co_return code.value_or(0);  // nullopt: the cancel stopped it, as it normally will
 }

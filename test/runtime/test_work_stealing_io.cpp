@@ -67,7 +67,7 @@ struct SignalFuture {
     }
 };
 
-Coro<Clock::time_point> read_while_busy(int fd, std::atomic<bool>* stop) {
+Coro<Clock::time_point> read_while_busy(RawFd fd, std::atomic<bool>* stop) {
     auto spin1 = coro::spawn(SpinFuture{stop});
     auto spin2 = coro::spawn(SpinFuture{stop});
     co_await ReadByteFuture{fd, {}};
@@ -78,7 +78,7 @@ Coro<Clock::time_point> read_while_busy(int fd, std::atomic<bool>* stop) {
     co_return read_at;
 }
 
-Coro<void> echo(int fd, int rounds) {
+Coro<void> echo(RawFd fd, int rounds) {
     AsyncByteReader reader(fd);
     for (int i = 0; i < rounds; ++i) {
         const char c = co_await reader.read();
@@ -86,7 +86,7 @@ Coro<void> echo(int fd, int rounds) {
     }
 }
 
-Coro<void> ping(int fd, int rounds) {
+Coro<void> ping(RawFd fd, int rounds) {
     AsyncByteReader reader(fd);
     for (int i = 0; i < rounds; ++i) {
         const char sent = static_cast<char>(i);
@@ -96,7 +96,7 @@ Coro<void> ping(int fd, int rounds) {
     }
 }
 
-Coro<int> ping_pong_all(std::vector<int> ping_fds, std::vector<int> echo_fds, int rounds) {
+Coro<int> ping_pong_all(std::vector<RawFd> ping_fds, std::vector<RawFd> echo_fds, int rounds) {
     std::vector<JoinHandle<void>> handles;
     for (std::size_t i = 0; i < ping_fds.size(); ++i) {
         handles.push_back(coro::spawn(echo(echo_fds[i], rounds)));
@@ -110,7 +110,7 @@ Coro<int> ping_pong_all(std::vector<int> ping_fds, std::vector<int> echo_fds, in
     co_return finished;
 }
 
-Coro<void> leave_pending_read(int fd) {
+Coro<void> leave_pending_read(RawFd fd) {
     coro::spawn(ReadByteFuture{fd, {}}).detach();
     co_return;
 }
@@ -165,8 +165,8 @@ TEST(WorkStealingIoTest, ManySocketsPingPong) {
     constexpr int kPairs  = 16;
     constexpr int kRounds = 200;
     std::vector<std::unique_ptr<SocketPair>> pairs;
-    std::vector<int> ping_fds;
-    std::vector<int> echo_fds;
+    std::vector<RawFd> ping_fds;
+    std::vector<RawFd> echo_fds;
     for (int i = 0; i < kPairs; ++i) {
         pairs.push_back(std::make_unique<SocketPair>());
         ping_fds.push_back(pairs.back()->a);

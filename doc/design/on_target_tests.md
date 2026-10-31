@@ -195,6 +195,8 @@ coro_test(io/test_tcp_stream.cpp         DESKTOP HOST_LINK coro_lwip_tcp ON_TARG
 | `PICO_STUB` | `test_pico_suite`: the Pico configuration of the core on the development machine, SDK calls stubbed |
 | `HOST_LINK <lib>...` | Its own executable on the development machine, linked with the named libraries: Pico code against stubs or a host build of lwIP. Named `<file>_pico` when the file is also `DESKTOP` |
 | `ON_TARGET <image>` | The firmware image `coro_target_<image>`, run on the board |
+| `NO_WINDOWS` | Not built on Windows: the file tests something the Windows port leaves out |
+| `LABELS <label>...` | Not a build: ctest labels for its executables on the development machine. `network` marks a test that asks the machine's DNS, which `ctest -LE network` skips |
 
 Adding a test file is one line. Running an existing file on the board is one more
 keyword on its line. The same recipe, `test/conanfile.py`, builds either side: a desktop
@@ -351,7 +353,7 @@ source, fetched by CMake (`test/cmake/on_target_pico.cmake`), with the settings 
 | Fibers | `test_fiber`, `test_switch_context_pico` | `test_fiber` is in the firmware: it runs the real context switch on real fiber stacks. The stack-overflow death test stays desktop-only until crash recovery exists. `test_switch_context_pico` drives the assembly through an ARM emulator and is not needed on the board |
 | Sockets | `test_tcp_stream`, `test_udp_socket`, `test_mqtt_client` | TCP and UDP are in the firmware: the same two files as the desktop, against lwIP's loopback interface, so no radio and no Pico W is needed. MQTT is not yet: it needs lwIP's MQTT client compiled in (`CORO_PICO_WITH_MQTT`) |
 | Over the radio | none written yet | Needs a Pico W, an access point and a peer on the network. On a microcontroller the network stack and the Wi-Fi driver are part of the firmware, so this tests code that loopback never reaches |
-| Desktop only | work-stealing and work-sharing executors, `test_io_driver`, `test_poller`, `test_file`, `test_pipe`, `test_signal`, `test_spawn_blocking`, `test_ws_stream`, `test_lookup_host`, `test_skynet` | Never |
+| Desktop only | work-stealing and work-sharing executors, `test_io_driver`, `test_poller`, `test_file`, `test_pipe`, `test_signal`, `test_spawn_blocking`, `test_ws_stream`, `test_lookup_host`, `test_system_resolver`, `test_skynet` | Never |
 
 The third and fourth rows are where running on hardware tests something the host cannot.
 

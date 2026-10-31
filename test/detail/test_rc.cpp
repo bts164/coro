@@ -163,8 +163,8 @@ TEST(Rc, SelfReferentialWeakBlockSurvivesUntilExternalWeakAlsoReleased) {
 }
 
 TEST(Rc, UsableAsUnorderedSetKey) {
+    int live = 0;  // before set: the set's destructor releases the last reference
     std::unordered_set<Rc<Counted>> set;
-    int live = 0;
     Rc<Counted> a = make_rc<Counted>(1, &live);
     Rc<Counted> b = a;
     set.insert(a);

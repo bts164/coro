@@ -4,15 +4,12 @@
 
 #include <gtest/gtest.h>
 #include <coro/runtime/io_driver.h>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "socket_test_util.h"
 
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -24,6 +21,8 @@
 
 using namespace coro;
 using namespace std::chrono_literals;
+using coro::test_sockets::SocketPair;
+using coro::test_sockets::UdpLoopback;
 
 namespace {
 
@@ -45,39 +44,9 @@ struct TestTask {
     int wakes() const { return waker->value(); }
 };
 
-struct SocketPair {
-    int a = -1;
-    int b = -1;
-    SocketPair() {
-        int fds[2];
-        EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
-        a = fds[0];
-        b = fds[1];
-    }
-    ~SocketPair() {
-        if (a >= 0) ::close(a);
-        if (b >= 0) ::close(b);
-    }
-};
-
-struct UdpLoopback {
-    int fd = -1;
-    sockaddr_in addr{};
-    UdpLoopback() {
-        fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        EXPECT_GE(fd, 0);
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        EXPECT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
-        socklen_t len = sizeof(addr);
-        EXPECT_EQ(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len), 0);
-    }
-    ~UdpLoopback() { if (fd >= 0) ::close(fd); }
-};
-
-void write_byte(int fd) {
-    char c = 'x';
-    ASSERT_EQ(::write(fd, &c, 1), 1);
+// The byte is at the peer when this returns, so a zero-timeout turn sees it.
+void write_byte(detail::sys::RawFd fd) {
+    coro::test_sockets::write_byte_and_settle(fd);
 }
 
 // Simulates "the syscall returned EAGAIN": clears readiness for the observed tick.
@@ -411,13 +380,13 @@ TEST(IoDriver, UdpReceiveHandshake) {
     char buf[64];
 
     // Equivalent of one future poll(): returns bytes received, or -1 for Pending.
-    auto try_recv = [&]() -> ssize_t {
+    auto try_recv = [&]() -> std::ptrdiff_t {
         for (;;) {
             auto ready = reg.poll_ready(IoDirection::Read, task.ctx);
             if (!ready) return -1;
-            ssize_t n = ::recv(rx.fd, buf, sizeof(buf), MSG_DONTWAIT);
-            if (n >= 0) return n;
-            EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+            auto n = rx.recv(buf, sizeof(buf));
+            if (n) return static_cast<std::ptrdiff_t>(*n);
+            EXPECT_TRUE(detail::sys::would_block(n.error())) << "errno " << n.error();
             reg.clear_ready(*ready);
         }
     };
@@ -425,18 +394,51 @@ TEST(IoDriver, UdpReceiveHandshake) {
     EXPECT_EQ(try_recv(), -1);  // nothing sent yet: EAGAIN, then Pending
 
     const char msg[] = "datagram";
-    ASSERT_EQ(::sendto(tx.fd, msg, sizeof(msg), 0,
-                       reinterpret_cast<const sockaddr*>(&rx.addr), sizeof(rx.addr)),
-              static_cast<ssize_t>(sizeof(msg)));
+    ASSERT_TRUE(tx.send_to(rx, msg, sizeof(msg)));
 
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (task.wakes() == 0 && std::chrono::steady_clock::now() < deadline)
         driver.turn(100ms);
     ASSERT_EQ(task.wakes(), 1);
 
-    EXPECT_EQ(try_recv(), static_cast<ssize_t>(sizeof(msg)));
+    EXPECT_EQ(try_recv(), static_cast<std::ptrdiff_t>(sizeof(msg)));
     EXPECT_STREQ(buf, msg);
     EXPECT_EQ(try_recv(), -1);  // drained: back to Pending
+}
+
+// The handshake across more than one wait: once a reader has drained the socket to
+// EAGAIN, the next datagram wakes it again. clear_ready() re-arms the direction on a
+// poller that stops reporting it once reported (Windows); see
+// doc/design/windows_port.md, "Edge emulation".
+TEST(IoDriver, WouldBlockRearmsTheDirection) {
+    IoDriver driver;
+    UdpLoopback rx;
+    UdpLoopback tx;
+    IoRegistration reg(driver, rx.fd);
+    TestTask task;
+    char buf[64];
+
+    auto try_recv = [&]() -> std::ptrdiff_t {
+        for (;;) {
+            auto ready = reg.poll_ready(IoDirection::Read, task.ctx);
+            if (!ready) return -1;
+            auto n = rx.recv(buf, sizeof(buf));
+            if (n) return static_cast<std::ptrdiff_t>(*n);
+            EXPECT_TRUE(detail::sys::would_block(n.error())) << "errno " << n.error();
+            reg.clear_ready(*ready);
+        }
+    };
+
+    for (int round = 1; round <= 3; ++round) {
+        ASSERT_EQ(try_recv(), -1) << "round " << round;
+        const char msg[] = "again";
+        ASSERT_TRUE(tx.send_to(rx, msg, sizeof(msg)));
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (task.wakes() < round && std::chrono::steady_clock::now() < deadline)
+            driver.turn(100ms);
+        ASSERT_EQ(task.wakes(), round);
+        EXPECT_EQ(try_recv(), static_cast<std::ptrdiff_t>(sizeof(msg))) << "round " << round;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,11 +487,9 @@ TEST(IoDriver, TryTurnDispatchesWhenFree) {
 namespace {
 
 // One non-blocking send of `size` bytes, in IoRegistration::poll_io()'s op shape.
-std::expected<std::size_t, int> try_send(int fd, std::size_t size) {
+std::expected<std::size_t, int> try_send(detail::sys::RawFd fd, std::size_t size) {
     static const char buf[4096] = {};
-    const ssize_t n = ::send(fd, buf, size, MSG_DONTWAIT);
-    if (n < 0) return std::unexpected(errno);
-    return static_cast<std::size_t>(n);
+    return coro::test_sockets::write_some(fd, buf, size);
 }
 
 } // namespace
@@ -513,8 +513,7 @@ TEST(IoDriver, PollIoWaitsForWritable) {
     EXPECT_EQ(task.wakes(), 0);
 
     // Drain the peer so the kernel reports the socket writable again.
-    char sink[65536];
-    while (::recv(sp.b, sink, sizeof(sink), MSG_DONTWAIT) > 0) {}
+    coro::test_sockets::drain(sp.b);
 
     EXPECT_GE(driver.turn(1s), 1u);
     EXPECT_EQ(task.wakes(), 1);
@@ -777,9 +776,8 @@ namespace {
 using detail::sys::Interest;
 using detail::sys::Trigger;
 
-void read_byte(int fd) {
-    char c = 0;
-    ASSERT_EQ(::read(fd, &c, 1), 1);
+void read_byte(detail::sys::RawFd fd) {
+    (void)coro::test_sockets::read_byte(fd);
 }
 
 // A waker that runs a function inline, as a level-triggered registration's does.

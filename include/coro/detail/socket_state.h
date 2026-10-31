@@ -47,7 +47,7 @@ IoDriver& socket_io_driver(const char* what);
 
 /// The exception a socket future fails with for errno `err`.
 inline std::exception_ptr socket_error(int err, const char* what) {
-    return std::make_exception_ptr(std::system_error(err, std::system_category(), what));
+    return std::make_exception_ptr(std::system_error(err, std::generic_category(), what));
 }
 
 } // namespace coro::detail

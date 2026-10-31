@@ -313,6 +313,17 @@ TEST(SleepTest, StreamHandedToAnotherTaskStillWakes) {
 // Many timeouts that never expire: each registers a far-off timer (the short sleep
 // makes select poll both branches) and cancels it. The cancelled entries are swept
 // rather than piling up, and timers keep working afterwards.
+//
+// The time bound catches entries piling up, not timer precision. Each 10 us sleep
+// lasts as long as the platform's shortest wait: tens of microseconds on Linux, about
+// 0.5 ms on Windows (doc/design/windows_port.md, "Sub-millisecond timeouts"), where
+// 10000 of them alone take over 5 s.
+#ifdef _WIN32
+constexpr auto kManyCancelledTimeoutsBound = 15s;
+#else
+constexpr auto kManyCancelledTimeoutsBound = 5s;
+#endif
+
 TEST(SleepTest, ManyCancelledTimeouts) {
     SingleThreadRuntime rt;
     auto start = Clock::now();
@@ -329,7 +340,7 @@ TEST(SleepTest, ManyCancelledTimeouts) {
         co_return n;
     }());
     EXPECT_EQ(done, 10000);
-    EXPECT_LT(Clock::now() - start, 5s);
+    EXPECT_LT(Clock::now() - start, kManyCancelledTimeoutsBound);
 }
 
 TEST(SleepTest, ManyConcurrentSleepers) {

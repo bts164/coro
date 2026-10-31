@@ -1,0 +1,32 @@
+# AddressSanitizer for MSVC: the Windows counterpart of the asan profile, whose
+# GCC/Clang flags MSVC does not take. Not a profile to use alone: it adds to the
+# platform's own (ci/run-tests.sh picks it for `asan` on Windows):
+#   conan build . -pr:h default -pr:h asan-msvc
+#
+# MSVC has no UBSan, no LeakSanitizer and no ThreadSanitizer, so this is ASan alone.
+#
+# The flags reach every package built with this profile, coro's dependencies
+# included. That is required, not just thorough: with ASan on, MSVC's standard
+# library annotates std::vector and std::string, and the linker refuses to mix C++
+# objects built with and without it (LNK2038, annotate_vector mismatch). MSVC links
+# the ASan runtime itself.
+#
+# /Z7 puts debug information in each object file, and /DEBUG has the linker gather it
+# into a PDB beside each executable, so ASan reports name functions and source lines.
+# /Z7 is a C++ flag only: OpenSSL's makefile compiles C with /Zi and its install step
+# copies the resulting ossl_static.pdb, which /Z7 (overriding /Zi) never lets exist.
+#
+# The setting adds no flags; it keeps these binaries apart from plain ones in the
+# Conan cache (docker/settings_user.yml).
+[settings]
+compiler.sanitizer=Address
+
+# No gperftools: tcmalloc and ASan would both replace malloc and free.
+[options]
+*:with_gperftools=False
+
+[conf]
+tools.build:cflags+=["/fsanitize=address"]
+tools.build:cxxflags+=["/fsanitize=address", "/Z7"]
+tools.build:exelinkflags+=["/DEBUG"]
+tools.build:sharedlinkflags+=["/DEBUG"]

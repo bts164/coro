@@ -52,7 +52,7 @@ graph TD
     Child -. "TaskState::waker: weak_ptr — weak" .-> Parent
 ```
 
-The executor is the root. Both edges in the former cycle are now weak. The parent's
+The executor is the root. Both edges between parent and child are weak. The parent's
 allocation is kept alive by the executor's owned list, not by any child-held reference.
 
 ---
@@ -86,8 +86,8 @@ executor's owned list always covers this window.
   `JoinHandle` is still alive it becomes the sole surviving reference to the allocation,
   keeping it live until the result is consumed.
 
-`JoinHandle` no longer holds an `OwnedTask` and is no longer the task's lifetime anchor
-while the task is running — the executor's owned list handles that.
+`JoinHandle` holds no `OwnedTask` and is not the task's lifetime anchor while the task is
+running — the executor's owned list handles that.
 
 ```mermaid
 flowchart TD
@@ -154,8 +154,8 @@ holds its tag. Unlike a regular spawned task, there is no `JoinHandle`: the cons
 results via the `JoinSetSharedState`. `spawn()` returns a [`CancelHandle`](#cancelhandle)
 instead, which can cancel the task but owns nothing.
 
-With executor-level ownership, `JoinSetSharedState::pending_handles` no longer needs
-to anchor each task's lifetime. It uses an intrusive list of raw `JoinSetTask*` pointers
+With executor-level ownership, `JoinSetSharedState::pending_handles` doesn't need to
+anchor each task's lifetime. It uses an intrusive list of raw `JoinSetTask*` pointers
 (safe because the executor's owned list guarantees the tasks remain live) with O(1)
 insertion, removal, and iteration:
 
@@ -335,7 +335,7 @@ into one of four categories.
 
 !!! note "NOTE: The categories outlive `shared_ptr`"
     These categories describe ownership, not a pointer type. The planned intrusive
-    reference counts (see [Planned: intrusive reference counting](#planned-intrusive-reference-counting-not-yet-implemented))
+    reference counts (see [Planned: intrusive reference counting](#planned-intrusive-reference-counting))
     change how each reference is stored, but not which category it belongs to.
 
 ---
@@ -432,15 +432,17 @@ See [shared_ptr_cycles.md](../notes/shared_ptr_cycles.md) for the full cycle ana
 
 ## Cycle analysis
 
-| Cycle | Status |
+Each row is a cycle that strong references at that point would form, and what breaks it.
+
+| Potential cycle | How it is broken |
 |---|---|
-| 1: `TaskImpl → Coro → CoroutineScope → shared_ptr<Waker> → TaskImpl` | **Eliminated** — `m_drain_waker` removed; waker storage is `weak_ptr` |
-| 2: `JoinSetSharedState → pending_handles → JoinSetTask → JoinSetSharedState` | **Eliminated** — `JoinSetTask::m_set_state` is `weak_ptr<JoinSetSharedState>`; `pending_handles` uses raw pointers, not strong refs |
-| 3: `CoroutineScope → TaskState_child → waker → TaskBase_parent` | **Eliminated** — `CoroutineScope::m_pending` uses `weak_ptr`; `TaskState::waker` is `weak_ptr`; no strong edge in either direction |
-| 4: `TaskImpl → TaskState::self_waker → shared_ptr<Waker> → TaskImpl` | **Eliminated** — `self_waker` removed; no future stores a strong waker pointing back to its own task |
-| Detached task self-ref: `TaskImpl → self_owned → TaskImpl` | **Eliminated** — `self_owned` removed; executor's owned list is the lifetime anchor for detached tasks |
-| 5: `StreamDriver → m_channel → producer_waker (strong) → StreamDriver` | **Eliminated** — `Channel::producer_waker` is `weak_ptr<Waker>` |
-| 6: `consumer_task → StreamHandle → m_channel → consumer_waker (strong) → consumer_task` | **Eliminated** — `Channel::consumer_waker` is `weak_ptr<Waker>` |
+| 1: `TaskImpl → Coro → CoroutineScope → waker → TaskImpl` | `CoroutineScope` stores no waker of its own; waker storage is `weak_ptr` |
+| 2: `JoinSetSharedState → pending_handles → JoinSetTask → JoinSetSharedState` | `JoinSetTask::m_set_state` is `weak_ptr<JoinSetSharedState>`; `pending_handles` uses raw pointers, not strong refs |
+| 3: `CoroutineScope → TaskState_child → waker → TaskBase_parent` | `CoroutineScope::m_pending` uses `weak_ptr`; `TaskState::waker` is `weak_ptr`; no strong edge in either direction |
+| 4: `TaskImpl → TaskState → waker of its own task → TaskImpl` | `TaskState` holds no waker for its own task; `JoinHandle::cancel()` wakes the task through its own weak task reference. No future stores a strong waker pointing back to its own task |
+| Detached task self-ref: `TaskImpl → self-reference → TaskImpl` | A detached task holds no reference to itself; the executor's owned list is its lifetime anchor |
+| 5: `StreamDriver → m_channel → producer_waker → StreamDriver` | `Channel::producer_waker` is `weak_ptr<Waker>` |
+| 6: `consumer_task → StreamHandle → m_channel → consumer_waker → consumer_task` | `Channel::consumer_waker` is `weak_ptr<Waker>` |
 
 ---
 
@@ -472,7 +474,7 @@ the shared mutex, this is always the case.
 
 **5. `cancel_pending()` does not need to transfer tasks to a `CoroutineScope`.**
 The executor-level drain on shutdown ensures all cancelled tasks reach a terminal state
-before `block_on` returns. `add_child()` is no longer required for JoinSet cancellation.
+before `block_on` returns. `add_child()` is not required for JoinSet cancellation.
 
 **6. Detached tasks are tracked by the executor.**
 `JoinHandle::detach()` removes the handle's Category 2 reference. The executor's owned
@@ -481,7 +483,7 @@ tasks including detached ones — no self-reference or external anchor is needed
 
 ---
 
-## Planned: intrusive reference counting (not yet implemented)
+## Planned: intrusive reference counting
 
 !!! tip "TODO: Intrusive reference counting for tasks"
     Replace `make_shared`'s control block with counts stored in the task, so each task
@@ -598,7 +600,7 @@ user and may be kept for as long as they like, long after the task ends, so no r
 make it release its reference in time. A strong reference keeps the task's memory alive
 until the handle is dropped or sees the task end, as the `weak_ptr` does today through
 `make_shared`'s shared allocation; the task's future is already destroyed by then. It
-then no longer satisfies "never keeps the task alive" in
+then doesn't satisfy "never keeps the task alive" in
 [`CancelHandle`](#behaviour); that text changes with the switch.
 
 Intrusive links are the only place raw task pointers remain. They adjust the weak count
@@ -657,7 +659,7 @@ Measured with a mock of the planned layout on x86-64 GCC, keeping `alignas(64)`:
 | `TaskImpl<Coro<size_t>>` | 208 | 320 | 256 |
 | `JoinSetTask<Coro<size_t>>` | 256 | 384 | 256 |
 
-The alignment no longer costs any padding, because nothing sits in front of the object
+With the switch, the alignment costs no padding, because nothing sits in front of the object
 in its allocation. `JoinSetTask` uses all 256 bytes, with no room to spare. Moving
 `cancelled` into the state word is what frees the last 8 bytes.
 

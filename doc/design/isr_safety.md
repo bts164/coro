@@ -75,7 +75,7 @@ The reasoning above assumes the only concurrency between an ISR and the executor
 completion, and returns. A plain `volatile bool` flag is sufficient for that case: the
 ISR's write and the executor's later read can never physically overlap, so there's no
 tear, and ordering between the flag and any payload is enforced with a `dmb` (see
-`IsrChannel<T>` below, prior revisions).
+`IsrChannel<T>` below).
 
 That assumption breaks on RP2040's second core. Nothing prevents an ISR from firing on
 core 1 while the `CurrentThreadExecutor` is running on core 0 — that is genuine
@@ -105,12 +105,12 @@ real, user-visible missed signal. See [Waiting on the driver](#waiting-on-the-dr
        briefly re-enables IRQs while spinning specifically to avoid this on the *local*
        core, but that doesn't help if the lock owner is the same core's ISR busy-spinning.)
 
-    The fix below uses the same underlying hardware primitive `pico_atomic` uses
+    The design below uses the same underlying hardware primitive `pico_atomic` uses
     (an SIO spin-lock register) but applies it explicitly and only to the one flag (and
     payload) that needs it — fully auditable as documented hardware-register
     read/write semantics, never routed through a generic atomics codegen path.
 
-### The fix: a dedicated hardware spin lock per flag
+### A dedicated hardware spin lock per flag
 
 `pico-sdk`'s own `queue_t` (`pico/util/queue.h`) solves exactly this problem — a value
 shared between an ISR and arbitrary other code, safe across both cores — using two
@@ -129,13 +129,13 @@ spin_unlock(lock, save);                    // releases the register, restores I
 behavior rather than toolchain-dependent codegen:
 
 - `save_and_disable_interrupts()` — `cpsid i`. Masks IRQs on *this* core only, so the
-  local ISR cannot preempt the critical section (same guarantee `volatile` relied on
-  before, now explicit).
+  local ISR cannot preempt the critical section, the guarantee a plain `volatile` flag
+  gets from same-core preemption, made explicit.
 - Spins on one of RP2040's 32 SIO spin-lock registers. A *read* of the register
   atomically claims the lock and returns nonzero if it was free; a *write of zero*
   releases it. This is real silicon, not LDREX/STREX and not a software CAS loop — the
   other core spinning on the same register physically cannot proceed until this core
-  writes zero. This is the cross-core exclusion `volatile` never had.
+  writes zero. This is the cross-core exclusion a `volatile` flag lacks.
 
 `IsrEvent` and `IsrChannel<T>` each own one dedicated spin-lock instance (drawn from the
 SDK's "striped" pool via `next_striped_spin_lock_num()`, the same allocation strategy

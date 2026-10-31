@@ -1,7 +1,8 @@
 # Conan has no setting for a sanitizer, so this adds one: compiler.sanitizer. Conan
-# merges this file into its own settings.yml; each CI image has it in its Conan home.
+# merges this file into its own settings.yml; each CI image has it in its Conan home,
+# and the Windows CI job copies it to the runner's.
 #
-# A profile then names the sanitizer (profiles/asan, tsan, ubsan), which makes it part
+# A profile then names the sanitizer (profiles/asan, tsan, ubsan, asan-msvc), which makes it part
 # of the package ID of everything built with that profile: a sanitizer build and a
 # plain one never share a binary. The setting is only a name: Conan derives no flags
 # from it, and no recipe of coro's reads it. The flags are in the same profiles.
@@ -16,3 +17,6 @@ compiler:
     sanitizer: [null, Address, Leak, Thread, UndefinedBehavior, KernelAddress, AddressUndefinedBehavior, ThreadUndefinedBehavior]
   clang:
     sanitizer: [null, Address, Leak, Thread, Memory, UndefinedBehavior, HardwareAssistanceAddress, KernelAddress, AddressUndefinedBehavior, ThreadUndefinedBehavior]
+  # MSVC has AddressSanitizer only (profiles/asan-msvc).
+  msvc:
+    sanitizer: [null, Address, KernelAddress]

@@ -11,8 +11,15 @@
 #include <algorithm>
 #include <deque>
 #include <mutex>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <csignal>   // SIGINT, SIGTERM, SIGHUP
+#endif
 
 namespace coro {
 
@@ -35,7 +42,7 @@ Registry& registry();
  * driver isn't turning right now still gets its events, through its waker.
  */
 struct SignalState {
-    SignalState(IoDriver& driver, std::initializer_list<int> signums, const char* what);
+    SignalState(IoDriver& driver, std::span<const int> signums, const char* what);
     ~SignalState();
 
     SignalState(const SignalState&)            = delete;
@@ -105,7 +112,7 @@ void broadcast() {
 
 } // namespace
 
-SignalState::SignalState(IoDriver& driver, std::initializer_list<int> signums,
+SignalState::SignalState(IoDriver& driver, std::span<const int> signums,
                          const char* what_)
     : what(what_), pipe(driver, sys::signal_pipe_dup()) {
     Registry& reg = registry();
@@ -124,6 +131,7 @@ SignalState::SignalState(IoDriver& driver, std::initializer_list<int> signums,
         }
     } catch (...) {
         for (const Watch& w : watches) sys::signal_unwatch(w.signum);
+        sys::signal_pipe_release(pipe.fd);
         throw;   // `pipe` is a constructed member, so it deregisters and closes itself
     }
     reg.states.push_back(this);
@@ -134,6 +142,7 @@ SignalState::~SignalState() {
     std::lock_guard lock(reg.mutex);
     std::erase(reg.states, this);
     for (const Watch& w : watches) sys::signal_unwatch(w.signum);
+    sys::signal_pipe_release(pipe.fd);
     // `pipe` deregisters and closes after this body, outside the registry mutex.
 }
 
@@ -196,19 +205,156 @@ PollResult<void> SignalFuture::poll(detail::Context& ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// signal / signal_stream
+// Constructors: signal / signal_stream, ctrl_c, shutdown_requested,
+// windows::console_event
 // ---------------------------------------------------------------------------
 
+namespace {
+
+std::unique_ptr<detail::SignalState> make_state(std::span<const int> signums,
+                                                const char* what) {
+    IoDriver& driver = detail::socket_io_driver(what);
+    return std::make_unique<detail::SignalState>(driver, signums, what);
+}
+
+std::unique_ptr<detail::SignalState> make_state(std::initializer_list<int> signums,
+                                                const char* what) {
+    return make_state(std::span<const int>(signums.begin(), signums.size()), what);
+}
+
+#ifdef _WIN32
+constexpr int kCtrlC = static_cast<int>(windows::ConsoleEvent::CtrlC);
+#else
+constexpr int kCtrlC = SIGINT;
+#endif
+
+} // namespace
+
+#ifndef _WIN32
 SignalFuture signal(int signum) {
-    IoDriver& driver = detail::socket_io_driver("coro::signal");
-    return SignalFuture(std::make_unique<detail::SignalState>(driver, std::initializer_list<int>{signum},
-                                                              "coro::signal"));
+    return SignalFuture(make_state({signum}, "coro::signal"));
 }
 
 SignalStream signal_stream(std::initializer_list<int> signums) {
-    IoDriver& driver = detail::socket_io_driver("coro::signal_stream");
-    return SignalStream(std::make_unique<detail::SignalState>(driver, signums,
-                                                              "coro::signal_stream"));
+    return SignalStream(make_state(signums, "coro::signal_stream"));
 }
+#endif
+
+SignalFuture ctrl_c() {
+    return SignalFuture(make_state({kCtrlC}, "coro::ctrl_c"));
+}
+
+SignalStream ctrl_c_stream() {
+    return SignalStream(make_state({kCtrlC}, "coro::ctrl_c_stream"));
+}
+
+ShutdownFuture shutdown_requested(ShutdownOptions options) {
+#ifdef _WIN32
+    (void)options;   // Close is always watched: nothing else holds the process open
+    using windows::ConsoleEvent;
+    const int signums[] = {static_cast<int>(ConsoleEvent::Close),
+                           static_cast<int>(ConsoleEvent::Logoff),
+                           static_cast<int>(ConsoleEvent::Shutdown)};
+    const std::span<const int> watched(signums);
+#else
+    int         signums[2]{};
+    std::size_t n = 0;
+    // A signal ignored now (SIGHUP under nohup) stays ignored: watching it would undo
+    // what the user asked for.
+    if (!detail::sys::signal_ignored(SIGTERM)) signums[n++] = SIGTERM;
+    if (options.hangup && !detail::sys::signal_ignored(SIGHUP)) signums[n++] = SIGHUP;
+    const std::span<const int> watched(signums, n);
+#endif
+    return ShutdownFuture(make_state(watched, "coro::shutdown_requested"));
+}
+
+// ---------------------------------------------------------------------------
+// ShutdownGuard / ShutdownFuture
+// ---------------------------------------------------------------------------
+
+// The guard is one more watch of each signal its future watched, with no fd. On
+// Windows the handler waits for an event's watch count to reach 0
+// (signal_windows.cpp), so it counts the guard like a watcher; on POSIX the watch
+// keeps coro's handler in place, which absorbs a repeated request.
+ShutdownGuard::ShutdownGuard(const detail::SignalState& state) {
+    std::lock_guard lock(detail::registry().mutex);   // guards `state.watches`
+    for (const detail::SignalState::Watch& w : state.watches) {
+        // Doesn't throw: `state` already watches it, so this only bumps a count.
+        detail::sys::signal_watch(w.signum);
+        m_signums[m_count++] = w.signum;
+    }
+}
+
+ShutdownGuard::ShutdownGuard(ShutdownGuard&& other) noexcept
+    : m_signums(other.m_signums), m_count(std::exchange(other.m_count, 0)) {}
+
+ShutdownGuard& ShutdownGuard::operator=(ShutdownGuard&& other) noexcept {
+    if (this == &other) return *this;
+    release();
+    m_signums = other.m_signums;
+    m_count   = std::exchange(other.m_count, 0);
+    return *this;
+}
+
+ShutdownGuard::~ShutdownGuard() { release(); }
+
+void ShutdownGuard::release() noexcept {
+    for (std::size_t i = 0; i < m_count; ++i) detail::sys::signal_unwatch(m_signums[i]);
+    m_count = 0;
+}
+
+ShutdownFuture::ShutdownFuture(std::unique_ptr<detail::SignalState> state) noexcept
+    : m_state(std::move(state)) {}
+
+ShutdownFuture::ShutdownFuture(ShutdownFuture&&) noexcept = default;
+ShutdownFuture& ShutdownFuture::operator=(ShutdownFuture&&) noexcept = default;
+ShutdownFuture::~ShutdownFuture() = default;
+
+PollResult<ShutdownGuard> ShutdownFuture::poll(detail::Context& ctx) {
+    auto ready = m_state->poll_pending(ctx);
+    if (ready.isPending()) return PollPending;
+    if (ready.isError()) return PollError(ready.error());
+    // Made while this future still watches, so on Windows the handler's count never
+    // reaches 0 between the future letting go and the guard taking over.
+    return ShutdownGuard(*m_state);
+}
+
+#ifdef _WIN32
+namespace windows {
+
+namespace {
+
+// The events that end the process once the handler returns. Watched only through
+// shutdown_requested(), whose guard keeps the handler waiting.
+bool ends_process(ConsoleEvent event) noexcept {
+    return event == ConsoleEvent::Close || event == ConsoleEvent::Logoff ||
+           event == ConsoleEvent::Shutdown;
+}
+
+void reject_ending_events(std::initializer_list<ConsoleEvent> events, const char* what) {
+    for (ConsoleEvent e : events)
+        if (ends_process(e))
+            throw std::invalid_argument(std::string(what) +
+                ": Close, Logoff and Shutdown end the process; watch them with "
+                "coro::shutdown_requested()");
+}
+
+} // namespace
+
+SignalFuture console_event(ConsoleEvent event) {
+    reject_ending_events({event}, "coro::windows::console_event");
+    return SignalFuture(make_state({static_cast<int>(event)}, "coro::windows::console_event"));
+}
+
+SignalStream console_event_stream(std::initializer_list<ConsoleEvent> events) {
+    reject_ending_events(events, "coro::windows::console_event_stream");
+    std::vector<int> signums;
+    signums.reserve(events.size());
+    for (ConsoleEvent e : events) signums.push_back(static_cast<int>(e));
+    return SignalStream(make_state(signums, "coro::windows::console_event_stream"));
+}
+
+} // namespace windows
+#endif
 
 } // namespace coro

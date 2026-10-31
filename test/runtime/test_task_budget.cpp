@@ -26,8 +26,8 @@
 
 #ifndef CORO_PICO
 #include "io_test_util.h"
-#include <coro/io/signal.h>
-#include <csignal>
+#include "signal_test_util.h"
+#define CORO_TEST_HAS_SIGNALS 1
 #endif
 
 // Desktop and board, not the stub suite.
@@ -138,16 +138,18 @@ Coro<void> sleep_then_set(std::chrono::milliseconds delay, std::atomic<bool>& fl
 }
 
 #ifndef CORO_PICO
-Coro<void> read_then_set(int fd, std::atomic<bool>& flag) {
+Coro<void> read_then_set(io_test::RawFd fd, std::atomic<bool>& flag) {
     co_await io_test::ReadByteFuture{fd, {}};
     flag.store(true);
 }
+#endif  // CORO_PICO
 
+#ifdef CORO_TEST_HAS_SIGNALS
 Coro<void> signal_then_set(SignalFuture sig, std::atomic<bool>& flag) {
     co_await std::move(sig);
     flag.store(true);
 }
-#endif  // CORO_PICO
+#endif  // CORO_TEST_HAS_SIGNALS
 
 // Counts wakes in *m_wakes, which its clones share.
 class CountingWaker final : public detail::Waker {
@@ -603,7 +605,7 @@ TYPED_TEST(TaskBudgetTest, AlwaysReadyLoopLetsIoEventThrough) {
     io_test::SocketPair sp;
     std::atomic<bool>   stop{false};
     const bool seen = this->traits.rt.block_on(
-        [](int read_fd, int write_fd, std::atomic<bool>& stop) -> Coro<bool> {
+        [](io_test::RawFd read_fd, io_test::RawFd write_fd, std::atomic<bool>& stop) -> Coro<bool> {
             auto peer = coro::spawn(read_then_set(read_fd, stop));
             // Long enough for the peer to be polled and find nothing to read yet.
             for (int i = 0; i < 64; ++i) co_await ReadyFuture{};
@@ -615,20 +617,23 @@ TYPED_TEST(TaskBudgetTest, AlwaysReadyLoopLetsIoEventThrough) {
     EXPECT_TRUE(seen);
 }
 
+#ifdef CORO_TEST_HAS_SIGNALS
 TYPED_TEST(TaskBudgetTest, AlwaysReadyLoopLetsSignalThrough) {
     std::atomic<bool> stop{false};
     const bool seen = this->traits.rt.block_on(
         [](std::atomic<bool>& stop) -> Coro<bool> {
             // Watching starts here, so the raise below cannot be missed.
-            auto peer = coro::spawn(signal_then_set(coro::signal(SIGUSR1), stop));
+            auto peer = coro::spawn(
+                signal_then_set(signal_test::watch(signal_test::kSignalA), stop));
             for (int i = 0; i < 64; ++i) co_await ReadyFuture{};
-            ::raise(SIGUSR1);
+            signal_test::raise(signal_test::kSignalA);
             const bool seen = co_await spin_until(stop);
             if (seen) co_await std::move(peer);
             co_return seen;
         }(stop));
     EXPECT_TRUE(seen);
 }
+#endif  // CORO_TEST_HAS_SIGNALS
 
 #endif  // CORO_PICO
 
@@ -640,7 +645,7 @@ TYPED_TEST(TaskBudgetTest, ValueDeliveredOnceAcrossYield) {
         [](std::vector<int>& received) -> Coro<void> {
             auto [tx, rx] = mpsc_channel<int>(64);
             auto producer = coro::spawn([](MpscSender<int> tx) -> Coro<void> {
-                for (int i = 0; i < kCount; ++i) co_await tx.send(i);
+                for (int i = 0; i < kCount; ++i) (void)co_await tx.send(i);
             }(std::move(tx)));
             while (auto v = co_await next(rx)) received.push_back(*v);
             co_await std::move(producer);

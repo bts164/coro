@@ -19,12 +19,12 @@
 #include "test_netif.h"
 #else
 #include <coro/io/lookup_host.h>
+#include "fake_resolver.h"
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/parker.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <coro/detail/sys/socket.h>
+#include <coro/detail/sys/udp.h>
 #include <memory>
 #include <variant>
 #include <vector>
@@ -383,14 +383,14 @@ TEST(UdpSocketTest, SendRefusedByLinkFailsWithEnobufs) {
 namespace {
 
 bool ipv6_loopback_available() {
-    const int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_addr   = in6addr_loopback;
-    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-    ::close(fd);
-    return ok;
+    Ipv6Address loopback;
+    loopback.octets[15] = 1;   // ::1
+    try {
+        detail::sys::close_socket(detail::sys::udp_open(SocketAddress{loopback, 0}));
+        return true;
+    } catch (const std::system_error&) {
+        return false;
+    }
 }
 
 constexpr int kConcurrentDatagrams = 100;   // well under the default SO_RCVBUF
@@ -461,9 +461,11 @@ TEST(UdpSocketTest, SendToStillWorksAfterConnectToSamePeer) {
     }());
 }
 
+// Bounded: a platform that sends to the connected peer instead (unverified on
+// Windows; see doc/design/windows_port.md, "UDP") fails here rather than hanging.
 TEST(UdpSocketTest, SendToStillWorksAfterConnectToDifferentPeer) {
     Runtime rt;
-    rt.block_on([]() -> Coro<void> {
+    EXPECT_TRUE(finishes_within(rt, 10s, []() -> Coro<void> {
         auto server = co_await UdpSocket::bind("127.0.0.1", 30031);
         auto client = co_await UdpSocket::bind("127.0.0.1", 30032);
         auto other  = co_await UdpSocket::bind("127.0.0.1", 30033);
@@ -477,7 +479,7 @@ TEST(UdpSocketTest, SendToStillWorksAfterConnectToDifferentPeer) {
         buf.resize(n);
         EXPECT_EQ(buf, "explicit");
         (void)server;
-    }());
+    }()));
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +649,26 @@ TEST(UdpSocketTest, BindIpv6Loopback) {
     }());
 }
 
+// A send to a port nobody listens on draws an ICMP "port unreachable". POSIX reports it
+// only on a connected socket; Windows would report it as a reset on the next receive
+// of any socket, which udp_open() turns off (SIO_UDP_CONNRESET). The receive must get
+// the next datagram, not an error.
+TEST(UdpSocketTest, IcmpUnreachableIsNotAReceiveError) {
+    Runtime rt;
+    EXPECT_TRUE(finishes_within(rt, 10s, []() -> Coro<void> {
+        auto sock = co_await UdpSocket::bind("127.0.0.1", 30111);
+        auto peer = co_await UdpSocket::bind("127.0.0.1", 30112);
+        // 30113: nothing bound there.
+        co_await sock.send_to(std::string("nobody"), SocketAddress::parse("127.0.0.1", 30113).value());
+        co_await coro::sleep_for(50ms);   // let the ICMP reply arrive
+        co_await peer.send_to(std::string("somebody"), SocketAddress::parse("127.0.0.1", 30111).value());
+        auto [n, buf, sender] = co_await sock.recv_from(std::string(64, '\0'));
+        buf.resize(n);
+        EXPECT_EQ(buf, "somebody");
+        EXPECT_EQ(sender.to_string(), "127.0.0.1:30112");
+    }()));
+}
+
 TEST(UdpSocketTest, BindAddressInUseThrowsOnAwait) {
     Runtime rt;
     rt.block_on([]() -> Coro<void> {
@@ -661,6 +683,7 @@ TEST(UdpSocketTest, BindAddressInUseThrowsOnAwait) {
         EXPECT_TRUE(in_use);
 
         // Hostnames are resolved now; an unresolvable one fails with the DNS error.
+        FakeResolver fake(resolve_nothing);
         bool unresolved = false;
         try {
             auto bad = co_await UdpSocket::bind("nonexistent.invalid", 0);

@@ -58,11 +58,14 @@ profile, which it adds to:
 | `tsan` | ThreadSanitizer |
 | `ubsan` | UBSan in trap mode, for a Pico (below) |
 
-A sanitizer profile has two parts. This is `tsan`:
+A sanitizer profile has three parts. This is `tsan`:
 
 ```ini
 [settings]
 compiler.sanitizer=Thread
+
+[options]
+*:with_gperftools=False
 
 [conf]
 tools.build:cflags+=["-fsanitize=thread", "-g"]
@@ -73,8 +76,12 @@ tools.build:sharedlinkflags+=["-fsanitize=thread"]
 
 The `[conf]` lines are the sanitizer. The setting adds no flags: it makes the sanitizer
 part of every package ID, so a sanitizer build and a plain one never share a binary in
-the Conan cache. Conan has no such setting of its own, so define it once per Conan
-home, and copy the profiles there too:
+the Conan cache. The option turns gperftools off: tcmalloc would replace `malloc` and
+`free`, which ASan and TSan must own to see heap accesses, so with it a sanitizer build
+misses heap bugs or reports false races.
+
+Conan has no `compiler.sanitizer` setting of its own, so define it once per Conan home,
+and copy the profiles there too:
 
 ```bash
 conan config install docker/settings_user.yml

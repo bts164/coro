@@ -435,16 +435,31 @@ std::optional<IoReadyEvent> IoRegistration::poll_ready(IoDirection direction,
 
 void IoRegistration::clear_ready(IoReadyEvent event) {
     assert(m_io && "clear_ready() on an empty IoRegistration");
-    std::lock_guard lock(m_io->m_mutex);
-    // A changed tick means the driver reported new readiness after the caller's
-    // poll_ready(); that readiness may postdate the caller's EAGAIN, so keep it.
-    // (The tick is shared by both directions, so an event for the other direction
-    // also keeps it; that costs the caller one extra EAGAIN, never a lost wake.)
-    if (m_io->m_tick != event.tick) return;
-    if (event.direction == IoDirection::Read)
-        m_io->m_readable = false;
-    else
-        m_io->m_writable = false;
+    {
+        std::lock_guard lock(m_io->m_mutex);
+        // A changed tick means the driver reported new readiness after the caller's
+        // poll_ready(); that readiness may postdate the caller's EAGAIN, so keep it.
+        // (The tick is shared by both directions, so an event for the other direction
+        // also keeps it; that costs the caller one extra EAGAIN, never a lost wake.)
+        if (m_io->m_tick != event.tick) return;
+        if (event.direction == IoDirection::Read)
+            m_io->m_readable = false;
+        else
+            m_io->m_writable = false;
+    }
+    // The edge contract lets the caller wait from here on, so a poller that stops
+    // reporting a direction once it has reported it (Windows) must poll for it again.
+    // A no-op on epoll and lwIP. After the clear and outside the mutex: an event from
+    // the re-armed poll then sets the flag again, and the AFD poll reports the
+    // socket's state when it is submitted, so data that arrived between the EAGAIN
+    // and here is not lost. See doc/design/windows_port.md, "Edge emulation".
+    //
+    // Race (benign): a turn on another thread may dispatch an event for this
+    // direction between the unlock and this call; the re-arm then only makes the
+    // poller report it once more.
+    m_driver->m_poller.rearm(m_fd, event.direction == IoDirection::Read
+                                       ? detail::sys::Interest::read()
+                                       : detail::sys::Interest::write());
 }
 
 void IoRegistration::deregister() noexcept {

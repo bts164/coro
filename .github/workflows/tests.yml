@@ -8,7 +8,8 @@ name: Tests
 #
 # Each job is ci/run-tests.sh, run in the platform's CI image
 # (docker/Dockerfile.<platform>). docker/run-tests.sh runs the same script in the
-# same image on your own machine.
+# same image on your own machine. Windows is the exception: the windows job runs the
+# script directly on a GitHub-hosted runner, with docker/profiles/windows2025.
 #
 # To add a platform: add docker/Dockerfile.<platform> and docker/profiles/<platform>,
 # then name it in both lists below. To change the primary platform, move the
@@ -129,6 +130,103 @@ jobs:
           conan remove "*/*#*" --lru=6h --confirm
           conan cache clean "*" --source --build --download
           conan cache save "*/*:*" --file "$RUNNER_TEMP/conan-packages.tgz"
+
+      - name: Cache the Conan packages
+        if: ${{ !cancelled() && steps.conan-save.outcome == 'success' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/conan-packages.tgz
+          key: ${{ steps.conan-cache.outputs.cache-primary-key }}
+
+  # Windows, with MSVC: no container and no CI image. GitHub's runner image brings
+  # Visual Studio 2026, Ninja, Python and Git Bash, so the job installs Conan,
+  # makes docker/profiles/windows2025 the default profile (which takes CMake from
+  # Conan, at a version that knows Visual Studio 2026), and runs the same
+  # ci/run-tests.sh. Plain, and once under AddressSanitizer
+  # (docker/profiles/asan-msvc), which covers the Windows-only code the Linux
+  # sanitizer runs never build. MSVC has no ThreadSanitizer. See
+  # doc/design/windows_port.md.
+  windows:
+    name: windows2025 (${{ matrix.sanitizer }})
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, asan]
+    runs-on: windows-2025-vs2026
+    # The first run builds OpenSSL and libwebsockets from source; later runs take
+    # them from the cache below.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CORO_VERSION_OVERRIDE: ${{ inputs.version }}
+      # Short, with forward slashes: OpenSSL's build tree nests deep enough to reach
+      # MAX_PATH under the default %USERPROFILE%\.conan2, and bash and Conan both
+      # take this form.
+      CONAN_HOME: C:/conan2
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # Before the checkout: Git for Windows checks text files out with CRLF, and
+      # bash cannot run ci/run-tests.sh with CRLF line endings.
+      - name: Check out with LF line endings
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v5
+        with:
+          # conan_version.py runs `git describe --tags`; see the test job.
+          fetch-depth: 0
+
+      - name: Install Conan
+        run: python -m pip install --disable-pip-version-check conan
+
+      # What a CI image has in its Conan home (docker/Dockerfile.*): the platform's
+      # profile as the default, its sanitizer profile, and settings_user.yml, which
+      # defines compiler.sanitizer.
+      - name: Install the Windows profiles and settings
+        run: |
+          New-Item -ItemType Directory -Force "$env:CONAN_HOME/profiles" | Out-Null
+          Copy-Item docker/profiles/windows2025 "$env:CONAN_HOME/profiles/default"
+          Copy-Item docker/profiles/asan-msvc "$env:CONAN_HOME/profiles/asan-msvc"
+          Copy-Item docker/settings_user.yml "$env:CONAN_HOME/settings_user.yml"
+
+      # As in the test job: third-party packages only, keyed on the sanitizer, the
+      # profiles and the recipes, with the previous cache restored when only the
+      # recipes change.
+      - name: Look for cached Conan packages
+        id: conan-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/conan-packages.tgz
+          key: conan-windows2025-${{ matrix.sanitizer }}-${{ hashFiles('docker/profiles/windows2025', 'docker/profiles/asan-msvc', 'docker/settings_user.yml') }}-${{ hashFiles('conanfile.py', 'conandata.yml', 'test/conanfile.py') }}
+          restore-keys: |
+            conan-windows2025-${{ matrix.sanitizer }}-${{ hashFiles('docker/profiles/windows2025', 'docker/profiles/asan-msvc', 'docker/settings_user.yml') }}-
+
+      - name: Restore the cached Conan packages
+        run: |
+          $archive = "$env:RUNNER_TEMP/conan-packages.tgz"
+          if (Test-Path $archive) {
+            conan cache restore $archive
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Remove-Item $archive
+          }
+
+      - name: Build and run the tests
+        shell: bash
+        run: ci/run-tests.sh ${{ matrix.sanitizer }}
+
+      - name: Collect the Conan packages to cache
+        id: conan-save
+        if: ${{ !cancelled() && steps.conan-cache.outputs.cache-hit != 'true' }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = 'Stop'
+          conan remove "coro/*" --confirm
+          conan remove "*/*#*:*#*" --lru=6h --confirm
+          conan remove "*/*#*" --lru=6h --confirm
+          conan cache clean "*" --source --build --download
+          conan cache save "*/*:*" --file "$env:RUNNER_TEMP/conan-packages.tgz"
 
       - name: Cache the Conan packages
         if: ${{ !cancelled() && steps.conan-save.outcome == 'success' }}

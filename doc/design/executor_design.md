@@ -60,8 +60,8 @@ the poll thread wakes up if it is blocked. The poll thread drains the injection 
 at the start of each cycle.
 
 The thread identity check is performed inside `Executor::enqueue()` — the method called
-by `TaskBase::wake()` after winning the `Idle → Notified` CAS. This replaces the old
-`wake_task(key)` pattern that required a `m_suspended` lookup:
+by `TaskBase::wake()` after winning the `Idle → Notified` CAS. The task arrives as a
+`shared_ptr`, so no lookup is needed:
 
 ```
 enqueue(task):
@@ -80,8 +80,8 @@ External threads never touch the local ready queue directly — only the injecti
 
 ## Task Scheduling State
 
-Rather than tracking suspended tasks in a central `m_suspended` map, the planned design
-follows Tokio's approach: ownership of the `shared_ptr<TaskBase>` moves with the task's
+Rather than tracking suspended tasks in a central map, the executors follow Tokio's
+approach: ownership of the `shared_ptr<TaskBase>` moves with the task's
 lifecycle, and an atomic state field in `TaskBase` tracks the current phase.
 
 ### States
@@ -111,8 +111,8 @@ This mirrors Tokio, which initializes new task state with the `SCHEDULED` flag s
 
 Unlike the conceptual states shown in the executor state diagrams (which are implicit in
 which data structure holds the task's `shared_ptr`), `SchedulingState` is an explicit
-field that must be stored. The CAS operations that replace `m_suspended` have nothing to
-operate on without it.
+field that must be stored: the scheduling CAS operations have nothing to operate on
+without it.
 
 **Implementation note:** `scheduling_state` lives in `TaskBase`. Fire-and-forget tasks
 (created by `spawn().detach()`) have no external `JoinHandle` holding a
@@ -128,10 +128,9 @@ public:
 };
 ```
 
-**C++ note:** `std::atomic<T>` is not movable. `Task` previously had
-`Task(Task&&) noexcept = default`, which would produce a deleted move constructor once
-`scheduling_state` was added. Explicit move operations were required that load/store the
-atomic value rather than trying to move it.
+**C++ note:** `std::atomic<T>` is not movable, so a defaulted move constructor on a
+type holding `scheduling_state` is deleted. A movable type holding one needs explicit
+move operations that load/store the atomic value rather than trying to move it.
 
 ### TaskBase as Waker
 
@@ -202,8 +201,7 @@ Context ctx(*task, task_budget());
 
 `executor->enqueue(task)` routes the task to the appropriate queue based on thread
 identity — local queue (no lock) for the owning worker, injection queue (with lock) for
-any other thread. This replaces `wake_task(key)`, which had to look up the task in
-`m_suspended`. With the waker owning the `shared_ptr<Task>`, no lookup is needed.
+any other thread. With the waker owning the `shared_ptr<Task>`, no lookup is needed.
 
 **Initial schedule always uses the injection queue.** `schedule()` is called by
 `Runtime::block_on()` before `wait_for_completion()` sets `m_poll_thread_id`
@@ -248,8 +246,7 @@ after poll() returns Pending:
         enqueue(task)
 ```
 
-This eliminates `m_suspended` from both executors entirely — there is no longer a map of
-parked tasks. A task in the `Idle` state is kept alive solely by the `shared_ptr` inside
+Neither executor keeps a map of parked tasks. A task in the `Idle` state is kept alive solely by the `shared_ptr` inside
 the `Waker` that the suspended future is holding.
 
 Every scheduling state transition uses CAS — including `Notified → Running` before
@@ -618,9 +615,9 @@ WorkSharingExecutor
 └── m_workers         : vector<thread>           ← N worker threads
 ```
 
-There is no `m_suspended` map — a task in `Idle` is kept alive solely by the waker
-clone(s) held by leaf futures. There is no `m_self_woken` map — self-wake is handled by
-the `Running → RunningAndNotified` CAS in `TaskBase::wake()`.
+No map of parked tasks is kept — a task in `Idle` is kept alive solely by the waker
+clone(s) held by leaf futures. Self-wake is handled by the `Running → RunningAndNotified`
+CAS in `TaskBase::wake()`, with no separate record of self-woken tasks.
 
 ### Task state machine
 
@@ -816,31 +813,17 @@ enqueue(task):
 
 ---
 
-## Former direction: unified current-thread poll loop
-
-!!! note "NOTE: superseded by the I/O driver"
-    This section used to propose absorbing the libuv loop into a single-threaded executor,
-    so the calling thread would drive both tasks and I/O, as the Pico executor does. The
-    I/O driver did this more generally: an idle executor parks by turning the epoll `IoDriver`
-    (one worker at a time on the multi-threaded executors), the uv thread and the
-    `t_current_uv_executor` thread-local are gone, and libuv was removed. See
-    [I/O Driver](io_driver.md), "Who turns the driver". The `poll_ready_tasks()` /
-    unconditional `Runtime::poll()` part of the proposal was not adopted;
-    `Runtime::poll()` remains Pico-only.
-
----
-
 ## Files
 
-| File | Status | Contents |
-|---|---|---|
-| `include/coro/detail/task_state.h` | Complete | `TaskStateBase`, `TaskState<T>` — completion signal, result, wakers |
-| `include/coro/detail/task.h` | Complete | `TaskBase` (non-template executor base); `TaskImpl<F>` (concrete template combining `TaskBase` + `TaskState<T>` + future in one allocation) |
-| `include/coro/detail/work_stealing_deque.h` | Complete | `WorkStealingDeque<T>` — mutex-backed, Chase-Lev interface |
-| `include/coro/runtime/executor.h` | Complete | `schedule`/`enqueue(shared_ptr<TaskBase>)` pure virtual |
-| `src/task.cpp` | Complete | `TaskBase::wake()` / `TaskBase::clone()` — out-of-line to break circular include with `executor.h` |
-| `include/coro/runtime/current_thread_executor.h` | Complete | Unlocked local queue and inject queue under `m_inject_mutex`; `Parker`; own `TimerQueue` |
-| `src/runtime/current_thread_executor.cpp` | Complete | CAS-based poll loop in batches of `event_interval`; `park_once()`; unpark-only-when-parked `enqueue` |
-| `include/coro/runtime/parker.h` | Complete | `Parker`, `IoDriverParker`, `PollingParker` |
-| `include/coro/runtime/work_sharing_executor.h` | Complete | Per-worker local queues; `m_suspended`, `m_self_woken` removed |
-| `src/runtime/work_sharing_executor.cpp` | Complete | Dual thread-locals; `enqueue` routing; CAS-based worker loop; driver handoff |
+| File | Contents |
+|---|---|
+| `include/coro/detail/task_state.h` | `TaskStateBase`, `TaskState<T>` — completion signal, result, wakers |
+| `include/coro/detail/task.h` | `TaskBase` (non-template executor base); `TaskImpl<F>` (concrete template combining `TaskBase` + `TaskState<T>` + future in one allocation) |
+| `include/coro/detail/work_stealing_deque.h` | `WorkStealingDeque<T>` — mutex-backed, Chase-Lev interface |
+| `include/coro/runtime/executor.h` | `schedule`/`enqueue(shared_ptr<TaskBase>)` pure virtual |
+| `src/task/task.cpp` | `TaskBase::wake()` / `TaskBase::clone()` — out-of-line to break circular include with `executor.h` |
+| `include/coro/runtime/current_thread_executor.h` | Unlocked local queue and inject queue under `m_inject_mutex`; `Parker`; own `TimerQueue` |
+| `src/runtime/current_thread_executor.cpp` | CAS-based poll loop in batches of `event_interval`; `park_once()`; unpark-only-when-parked `enqueue` |
+| `include/coro/runtime/parker.h` | `Parker`, `IoDriverParker`, `PollingParker` |
+| `include/coro/runtime/work_sharing_executor.h` | Per-worker local queues; no map of parked or self-woken tasks |
+| `src/runtime/work_sharing_executor.cpp` | Dual thread-locals; `enqueue` routing; CAS-based worker loop; driver handoff |

@@ -49,15 +49,16 @@ other:
   that a blocking callable is waiting on.
 
 Whichever of the two is torn down first, the other can still reach into it. The
-scenarios below show what that looked like when the runtime did exactly that.
+scenarios below show what each case does under destructor ordering, and at shutdown.
 
 ## Scenarios
 
 Each row is a blocking task that is still live when the runtime shuts down, and what it
-is doing at that moment. "Before" is the behaviour of the executor-first destruction
-order this design replaced.
+is doing at that moment. "Executor destroyed first" is the behaviour of a teardown that
+destroys the executor, then the blocking pool, then the I/O driver, without draining
+unfinished executor tasks.
 
-| | The blocking callable is… | Before | Now |
+| | The blocking callable is… | Executor destroyed first | At shutdown |
 |---|---|---|---|
 | A | parked in `blocking_wait` on a leaf future (a channel, an event) | Works: the pool cancels it and it unwinds | Same |
 | B | waiting on, or already draining, something an executor task must finish: a `JoinHandle`, a `co_invoke` scope with children, a `CoroStream` with children, a `StreamHandle` | **Hangs** in `~BlockingPool`: the executor is gone, so the drain never completes | The executor is still running; the task drains and the callable unwinds |
@@ -162,11 +163,11 @@ sequenceDiagram
     R-->>O: return
 ```
 
-Stopping the pool and the executor is the teardown there has always been. It now runs
-only once nothing is left that could reach into what it destroys. The last step is for
-waiters the runtime does not own; see
+Stopping the pool and the executor runs only once nothing is left that could reach into
+what it destroys. The last step is for waiters the runtime does not own; see
 [below](#waiters-on-the-io-driver-from-outside-the-runtime). The driver itself is
-destroyed by `~Runtime`.
+destroyed by `~Runtime`. The member order of `Runtime` (driver, pool, executor) doesn't
+matter for correctness: by the time members are destroyed there is no task left.
 
 ### Knowing when both are empty
 
@@ -257,7 +258,8 @@ behind by the last `block_on()` get to run at all. They run only to be shut down
 ### Wakers held outside the runtime
 
 A channel whose other end lives outside the runtime (in a global, in `main()`, on a
-user thread) holds wakers for the tasks parked on it. That used to crash at exit:
+user thread) holds wakers for the tasks parked on it. Without draining, this crashes at
+exit:
 
 ```cpp
 std::optional<coro::BroadcastSender<std::string>> g_tx;   // destroyed after main()
@@ -278,20 +280,20 @@ flowchart LR
 ```
 
 A parked task is kept alive by its own waker: the task owns the future, the future
-contains the waiter node, and the node holds a strong reference back to the task. When
-the executor is destroyed it releases its reference, but the task is not destroyed, so
-its future never unlinks the node. The task is left idle, still on the channel's waiter
-list, pointing at an executor that no longer exists. When the sender is finally
-destroyed it wakes its waiters, and `wake()` enqueues the task on that executor.
+contains the waiter node, and the node holds a strong reference back to the task. An
+executor destroyed with the task still parked releases its reference, but the task is
+not destroyed, so its future never unlinks the node. The task is left idle, still on
+the channel's waiter list, pointing at an executor that no longer exists. When the
+sender is finally destroyed it wakes its waiters, and `wake()` enqueues the task on
+that executor.
 
 Draining removes the cause. A task that is cancelled at shutdown has its future
 destroyed, which unlinks the node and releases the waker, and the task is marked done.
 Nothing is left on the waiter list, and a waker that some other code still holds
 refers to a done task, for which `wake()` returns without touching the executor.
 
-No change to how futures hold wakers is needed, and none is made: the rule that keeps
-this safe is that **no task is left non-terminal when the executor goes away**, which
-is rule 1.
+How futures hold wakers doesn't need to change: the rule that keeps this safe is that
+**no task is left non-terminal when the executor goes away**, which is rule 1.
 
 ### Waiters on the I/O driver from outside the runtime
 
@@ -370,9 +372,9 @@ Cancellation is a request. Shutdown waits for the answer, however long it takes:
     - A `Cancellable` future whose drain does not complete, in breach of the
       [drain invariant](task_and_executor.md#the-drain-invariant).
 
-    None of this is new. The same cases used to hang in `~BlockingPool` or in the join
-    of the executor's threads. Cancelling the pool first, the executor first, or both
-    together makes no difference to them.
+    These hang under any teardown, in `~BlockingPool` or in the join of the executor's
+    threads. Cancelling the pool first, the executor first, or both together makes no
+    difference to them.
 
 There is no shutdown timeout. A thread cannot be killed, and a pool thread that is
 still running holds a pointer to the `Runtime`, so giving up on it would mean leaking
@@ -390,64 +392,52 @@ A `block_on()` whose task is cancelled by shutdown throws `std::runtime_error`, 
 it has no value to return. That can only happen to a `block_on()` that breaks the first
 precondition, or to one made on the same runtime by a blocking callable.
 
-## Removing the channel blocking calls
+## Channels from blocking code
 
-`MpscSender::blocking_send()`, `MpscReceiver::blocking_recv()` and
-`OneshotReceiver::blocking_recv()` have been removed. They predate `blocking_wait`, which
-does the same job for every future and does it correctly at cancellation and shutdown.
+Channels have no blocking calls of their own. Blocking code waits on a channel future
+with `blocking_wait`, which does the job for every future and does it correctly at
+cancellation and shutdown.
 
-| Removed | Replacement | Result type |
+| Operation | From blocking code | Result type |
 |---|---|---|
-| `tx.blocking_send(v)` | `blocking_wait(tx.send(std::move(v)))` | `std::expected<void, T>`, unchanged: the value comes back if the receiver is gone |
-| `rx.blocking_recv()` (mpsc) | `blocking_next(rx)`, or `blocking_wait(rx.recv())` | `std::optional<T>`, unchanged |
-| `rx.blocking_recv()` (oneshot) | `blocking_wait(rx.recv())` | `std::expected<T, ChannelError>`, unchanged |
+| mpsc send | `blocking_wait(tx.send(std::move(v)))` | `std::expected<void, T>`: the value comes back if the receiver is gone |
+| mpsc receive | `blocking_next(rx)`, or `blocking_wait(rx.recv())` | `std::optional<T>` |
+| oneshot receive | `blocking_wait(rx.recv())` | `std::expected<T, ChannelError>` |
 
-Why they have to go, rather than stay as shorthand:
+Why there is no per-channel shorthand:
 
-- **They are not cancellation points.** They wait on a condition variable inside the
-  channel, which a cancel request cannot reach. A callable parked in one ignores
-  `BlockingHandle` drop and runtime shutdown alike, and ends only if the other end of
-  the channel happens to be dropped (scenario I).
-- **Making them cancellation points would duplicate `blocking_wait`.** They would need
-  the blocking task as their waker, the entry check, the shield, and the same
-  exception.
-- **They cost every channel operation.** The channel carries a condition variable that
-  is notified on every push, pop and close, for the benefit of callers that are almost
-  never there.
+- **It would not be a cancellation point.** A blocking call built into the channel
+  would wait on a condition variable inside it, which a cancel request cannot reach. A
+  callable parked in one would ignore `BlockingHandle` drop and runtime shutdown alike,
+  and end only if the other end of the channel happened to be dropped (scenario I).
+- **Making it a cancellation point would duplicate `blocking_wait`.** It would need
+  the blocking task as its waker, the entry check, the shield, and the same exception.
+- **It would cost every channel operation.** The channel would carry a condition
+  variable notified on every push, pop and close, for the benefit of callers that are
+  almost never there.
 
-What changes for the caller:
+How it behaves for the caller:
 
-- **Inside `spawn_blocking`, the replacement can throw `TaskCancelled`.** That is
-  the point of the change. A callable that must finish a send or a receive regardless
-  holds a `BlockingCancelShield` around it.
-- **On a plain `std::thread`, nothing changes.** Channel futures do not touch the
+- **Inside `spawn_blocking`, a channel wait can throw `TaskCancelled`.** A callable
+  that must finish a send or a receive regardless holds a `BlockingCancelShield` around
+  it.
+- **On a plain `std::thread`, no runtime is needed.** Channel futures do not touch the
   runtime, so `blocking_wait` needs no runtime context there; it parks the thread on a
   private waker.
-- **On Pico, nothing is lost.** `blocking_wait` is not available there, and neither, in
-  practice, were the blocking calls: on that target their condition variable wait
-  is a loop that never returns.
+- **On Pico, `blocking_wait` is not available.** A condition variable wait on that
+  target is a loop that never returns, so there is no blocking form of a channel
+  operation there at all.
 
-Guideline BL.5 went with them: BL.2 already covers `blocking_wait` and `blocking_next`
-in a coroutine.
+Guideline BL.2 covers `blocking_wait` and `blocking_next` in a coroutine.
 
-## What this replaced
+## Cancellation paths at shutdown
 
-`~Runtime` used to destroy its executor, then its blocking pool, then its I/O driver,
-and unfinished executor tasks were destroyed without being drained. The "Before" column
-of [Scenarios](#scenarios) is that behaviour. The member order of `Runtime` (driver,
-pool, executor) is unchanged, but nothing depends on it for correctness any more: by
-the time members are destroyed there is no task left.
+Shutdown cancels every task in the program at once, so cancellation paths that are
+rarely taken elsewhere are taken on every exit.
 
-## Related gaps
-
-Shutdown cancels every task in the program at once, so cancellation paths that were
-rarely taken are now taken on every exit. Three gaps were found on those paths. One was
-closed with this work; two are open and independent of it.
-
-The closed one: a cancelled stream task used to destroy its stream without draining it.
-`StreamTaskImpl::poll()` now cancels a stream that has a `cancel()` and polls it until
-it is exhausted, as `TaskImpl` does for a `Cancellable` future, and closes the queue
-only after that.
+A cancelled stream task cancels a stream that has a `cancel()` and polls it until it is
+exhausted, as `TaskImpl` does for a `Cancellable` future, and closes the queue only after
+that.
 
 !!! warning "FIXME: a coroutine cancelled in `co_await next(stream)` does not drain the stream"
     `NextFuture` is deliberately not `Cancellable` (it borrows the stream, and a losing
@@ -467,9 +457,8 @@ only after that.
     (or `false` for `void`). `join()` and `select()` fail with `TaskCancelled` when one
     of their branches reports dropped without having been cancelled by them. A task
     that lets `TaskCancelled` escape is reported as cancelled, not as failed, as a
-    blocking task is: its handle reports dropped too. Shutdown does not make this newly
-    reachable from a coroutine: every task that could await such a handle is itself
-    cancelled.
+    blocking task is: its handle reports dropped too. Shutdown doesn't lead a coroutine
+    here: every task that could await such a handle is itself cancelled.
 
 ## Testing
 
@@ -513,5 +502,5 @@ that the task shares with the test, that the task's cleanup really ran.
 | `TimerAndSocketAfterShutdownThrow` | API | `sleep_for()` and `UdpSocket::bind()` on a shut-down runtime throw `std::runtime_error` |
 | `ChannelEndOutlivesRuntime` | wakers | For each channel type: a task parked on a channel whose other end is destroyed after the runtime. The task's future is destroyed at shutdown and the late close wakes nothing |
 
-The existing channel tests that call `blocking_send()` and `blocking_recv()` are
-rewritten against the replacements, and gain a case each for cancellation while parked.
+The channel tests use `blocking_wait` and `blocking_next` from blocking code, with a case
+each for cancellation while parked.

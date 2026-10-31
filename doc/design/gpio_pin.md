@@ -213,10 +213,10 @@ temporary is just as `co_await`-able as the `Coro<void>` it replaces.
     an object the caller controls the lifetime of.
 
     !!! tip "TODO: debug-only lifetime assertion"
-        Not yet implemented. A cheap, release-mode-free safety net worth
-        adding: an outstanding-future counter on `GpioPin`, incremented in
-        `GpioEdgeFuture`'s constructor and decremented in its destructor,
-        with `~GpioPin()` asserting the count is zero. Catches a violation
+        A cheap, release-mode-free safety net: an outstanding-future counter
+        on `GpioPin`, incremented in `GpioEdgeFuture`'s constructor and
+        decremented in its destructor, with `~GpioPin()` asserting the count
+        is zero. Catches a violation
         of the above contract in debug/test builds without requiring shared
         ownership.
 

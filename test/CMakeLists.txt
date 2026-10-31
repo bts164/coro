@@ -46,9 +46,18 @@ if(CORO_PLATFORM STREQUAL "pico")
 endif()
 
 find_package(GTest CONFIG REQUIRED)
-find_package(libunicorn CONFIG REQUIRED)
 
 enable_testing()
+
+if(WIN32)
+    # Windows builds only the DESKTOP tests: the Pico configuration on the host
+    # (stubbed SDK, host lwIP, the ARM emulator) is POSIX-only. coro_test() skips
+    # PICO_STUB, HOST_LINK and NO_WINDOWS there. See doc/design/windows_port.md.
+    include(tests.cmake)
+    return()
+endif()
+
+find_package(libunicorn CONFIG REQUIRED)
 
 include(cmake/host_pico_support.cmake)
 include(tests.cmake)

@@ -309,14 +309,21 @@ caller can see come from lwIP:
 | `NoneModeSocketsThrowEnetdown` (lwIP) | On a `PicoNetwork::None` runtime, `TcpStream::connect`, `UdpSocket::bind` and a name's `lookup_host` throw `ENETDOWN`; a numeric `lookup_host` still answers. |
 | `LookupWithoutDnsServerFailsPromptly` (lwIP) | With no DNS server, a name fails at once in `dns_error_category()`; a numeric address still resolves. |
 
-Name resolution is covered in `test/io/test_lookup_host.cpp`:
+Name resolution is covered in `test/io/test_lookup_host.cpp`. A failed lookup, or a
+chosen list of addresses, comes from a fake resolver (`test/fake_resolver.h`, through
+`sys::set_resolver_for_testing()`), so these don't depend on the machine's DNS:
 
 | Test | Checks |
 |---|---|
 | `LookupHostTest.ConnectByNameTriesEachAddress` | `connect("localhost")` falls through to `127.0.0.1` when `::1` refuses. |
+| `LookupHostTest.ConnectTriesEachResolvedAddress` | A fake resolver's first address is refused; `connect()` goes on to the second. |
 | `LookupHostTest.BindByName` | `TcpListener::bind` and `UdpSocket::bind` accept `"localhost"`. |
 | `LookupHostTest.ConnectByNameRethrowsLastError` | With every address refused, the error is `ECONNREFUSED`. |
-| `LookupHostTest.ConnectToUnresolvableNameThrowsDnsError` | `nonexistent.invalid` fails in `dns_error_category()`. |
+| `LookupHostTest.ConnectToUnresolvableNameThrowsDnsError` | The resolver's "not found" comes out of `connect()` unchanged. |
+
+What the system resolver itself reports for `nonexistent.invalid` is tested on its own
+in `test/io/test_system_resolver.cpp`, labelled `network` (see
+[File I/O](file_io.md#lookup_host)).
 
 The lwIP backend is tested by the same file. `test/io/test_tcp_stream.cpp` is also built
 against lwIP on the host (`test_tcp_stream_pico`) and into the on-target firmware. Its

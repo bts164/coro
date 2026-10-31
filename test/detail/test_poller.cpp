@@ -1,66 +1,29 @@
 // Tests for coro::detail::sys::Poller / PollWaker — the platform readiness layer.
-// See doc/design/io_driver.md, "The sys layer".
+// See doc/design/io_driver.md, "The sys layer", and for the Windows backend's own
+// tests at the end, doc/design/windows_port.md.
 
 #include <gtest/gtest.h>
 #include <coro/detail/sys/poller.h>
+#include "socket_test_util.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
+#include <algorithm>
 #include <chrono>
+#include <memory>
 #include <system_error>
 #include <thread>
 #include <vector>
 
 using namespace coro::detail::sys;
 using namespace std::chrono_literals;
+using coro::test_sockets::drain;
+using coro::test_sockets::SocketPair;
+using coro::test_sockets::UdpLoopback;
 
 namespace {
 
-// Owns a non-blocking AF_UNIX stream socketpair.
-struct SocketPair {
-    int a = -1;
-    int b = -1;
-    SocketPair() {
-        int fds[2];
-        EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
-        a = fds[0];
-        b = fds[1];
-    }
-    ~SocketPair() {
-        if (a >= 0) ::close(a);
-        if (b >= 0) ::close(b);
-    }
-    void close_b() { ::close(b); b = -1; }
-};
-
-// Non-blocking UDP socket bound to 127.0.0.1 on an ephemeral port.
-struct UdpLoopback {
-    int fd = -1;
-    sockaddr_in addr{};
-    UdpLoopback() {
-        fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        EXPECT_GE(fd, 0);
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port        = 0;
-        EXPECT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
-        socklen_t len = sizeof(addr);
-        EXPECT_EQ(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len), 0);
-    }
-    ~UdpLoopback() { if (fd >= 0) ::close(fd); }
-};
-
-void write_byte(int fd) {
-    char c = 'x';
-    ASSERT_EQ(::write(fd, &c, 1), 1);
-}
-
-void drain(int fd) {
-    char buf[256];
-    while (::read(fd, buf, sizeof(buf)) > 0) {}
+// The byte is at the peer when this returns, so a zero-timeout poll sees it.
+void write_byte(RawFd fd) {
+    coro::test_sockets::write_byte_and_settle(fd);
 }
 
 const Event* find_key(const std::vector<Event>& events, void* key) {
@@ -147,7 +110,11 @@ TEST(Poller, IsEdgeTriggered) {
     poller.poll(events, 0ns);
     EXPECT_EQ(find_key(events, &g_key_a), nullptr);
 
-    // New data is a new edge.
+    // A consumer waits again only after it has seen EAGAIN, and tells the poller so
+    // (a no-op on epoll; on Windows the direction is re-enabled). New data is then a
+    // new edge.
+    drain(sp.a);
+    poller.rearm(sp.a, Interest::read());
     write_byte(sp.b);
     poller.poll(events, 1s);
     EXPECT_NE(find_key(events, &g_key_a), nullptr);
@@ -226,7 +193,7 @@ TEST(Poller, DeregisterUnknownFdIsHarmless) {
     Poller poller;
     SocketPair sp;
     EXPECT_FALSE(poller.deregister_fd(sp.a));  // never registered
-    EXPECT_FALSE(poller.deregister_fd(-1));    // invalid
+    EXPECT_FALSE(poller.deregister_fd(kInvalidFd));
 }
 
 TEST(Poller, ReregisterChangesKeyAndInterest) {
@@ -290,9 +257,7 @@ TEST(Poller, UdpDatagramMakesSocketReadable) {
     events.clear();
 
     const char msg[] = "hello";
-    ASSERT_EQ(::sendto(tx.fd, msg, sizeof(msg), 0,
-                       reinterpret_cast<const sockaddr*>(&rx.addr), sizeof(rx.addr)),
-              static_cast<ssize_t>(sizeof(msg)));
+    ASSERT_TRUE(tx.send_to(rx, msg, sizeof(msg)));
     poller.poll(events, 1s);
     const Event* e = find_key(events, &g_key_a);
     ASSERT_NE(e, nullptr);
@@ -380,3 +345,212 @@ TEST(PollWaker, CoexistsWithIoRegistrations) {
     EXPECT_NE(find_key(events, &g_key_b), nullptr);
     drain(sp.a);
 }
+
+#ifdef CORO_SYS_WINDOWS
+// ---------------------------------------------------------------------------
+// The IOCP/AFD backend: edge emulation, AFD handle groups, poll lifetime, the
+// timeout timer. See doc/design/windows_port.md.
+// ---------------------------------------------------------------------------
+
+// A direction that has been reported is not polled for again until rearm(): more
+// data alone produces no event.
+TEST(Poller, ReportedDirectionStaysQuietUntilRearm) {
+    Poller poller;
+    SocketPair sp;
+    poller.register_fd(sp.a, &g_key_a, Interest::read());
+    write_byte(sp.b);
+
+    std::vector<Event> events;
+    poller.poll(events, 1s);
+    ASSERT_NE(find_key(events, &g_key_a), nullptr);
+
+    events.clear();
+    write_byte(sp.b);
+    poller.poll(events, 50ms);
+    EXPECT_EQ(find_key(events, &g_key_a), nullptr);
+
+    poller.rearm(sp.a, Interest::read());
+    poller.poll(events, 1s);
+    const Event* e = find_key(events, &g_key_a);
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->readable);
+}
+
+// Data that arrived while the direction was disarmed is reported once it is re-armed:
+// an AFD poll reports the socket's state when it is submitted. No edge is lost.
+TEST(Poller, RearmWithDataAlreadyPresentReportsAtOnce) {
+    Poller poller;
+    SocketPair sp;
+    poller.register_fd(sp.a, &g_key_a, Interest::read());
+    write_byte(sp.b);
+
+    std::vector<Event> events;
+    poller.poll(events, 1s);
+    ASSERT_NE(find_key(events, &g_key_a), nullptr);
+    drain(sp.a);                 // ... EAGAIN, but before the consumer re-arms:
+    write_byte(sp.b);            // new data
+    poller.rearm(sp.a, Interest::read());
+
+    events.clear();
+    poller.poll(events, 1s);
+    EXPECT_NE(find_key(events, &g_key_a), nullptr);
+}
+
+// Re-arming one direction re-enables only that one. Each re-arm cancels the poll in
+// flight and resubmits it wider, without losing what was armed already.
+TEST(Poller, RearmReEnablesOnlyThatDirection) {
+    Poller poller;
+    SocketPair sp;
+    poller.register_fd(sp.a, &g_key_a, Interest::read_write());
+    write_byte(sp.b);
+
+    // The first poll may report writable alone (the registration's poll can complete
+    // before the byte arrives); collect until both directions have been seen.
+    std::vector<Event> events;
+    bool readable = false;
+    bool writable = false;
+    for (int i = 0; i < 3 && !(readable && writable); ++i) {
+        events.clear();
+        poller.poll(events, 1s);
+        if (const Event* e = find_key(events, &g_key_a)) {
+            readable = readable || e->readable;
+            writable = writable || e->writable;
+        }
+    }
+    ASSERT_TRUE(readable);
+    ASSERT_TRUE(writable);
+
+    events.clear();
+    poller.rearm(sp.a, Interest::write());
+    poller.poll(events, 1s);
+    const Event* e = find_key(events, &g_key_a);
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->writable);
+    EXPECT_FALSE(e->readable);   // still unread, but read isn't re-armed
+
+    events.clear();
+    poller.rearm(sp.a, Interest::read());
+    poller.poll(events, 1s);
+    e = find_key(events, &g_key_a);
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->readable);
+    EXPECT_FALSE(e->writable);
+}
+
+// A deregistration cancels the poll in flight; its completion arrives later and must
+// report nothing.
+TEST(Poller, DeregisterWithPollInFlightReportsNothing) {
+    Poller poller;
+    SocketPair sp;
+    poller.register_fd(sp.a, &g_key_a, Interest::read());
+    std::vector<Event> events;
+    poller.poll(events, 0ns);
+    ASSERT_TRUE(poller.deregister_fd(sp.a));
+    write_byte(sp.b);
+
+    for (int i = 0; i < 3; ++i) poller.poll(events, 20ms);
+    EXPECT_EQ(find_key(events, &g_key_a), nullptr);
+}
+
+// The destructor collects every outstanding poll before it frees the state the
+// kernel writes into. Meaningful under Application Verifier or ASan.
+TEST(Poller, DestroyWithPollsInFlight) {
+    SocketPair sp1, sp2, sp3;
+    {
+        Poller poller;
+        poller.register_fd(sp1.a, &g_key_a, Interest::read());
+        poller.register_fd(sp2.a, &g_key_a, Interest::read_write());
+        poller.register_fd(sp3.a, &g_key_b, Interest::read());
+        ASSERT_TRUE(poller.deregister_fd(sp3.a));   // one cancelled, two left registered
+    }
+    SUCCEED();
+}
+
+// I/O sent through a handle bound to a completion port is not cancelled when the
+// thread that sent it exits.
+TEST(Poller, RegisterFromExitedThread) {
+    Poller poller;
+    SocketPair sp;
+    std::thread([&] { poller.register_fd(sp.a, &g_key_a, Interest::read()); }).join();
+    write_byte(sp.b);
+
+    std::vector<Event> events;
+    poller.poll(events, 1s);
+    EXPECT_NE(find_key(events, &g_key_a), nullptr);
+}
+
+// More sockets than one \Device\Afd handle serves (32) each get their own events.
+TEST(Poller, ManySocketsSpanAfdGroups) {
+    constexpr int kSockets = 40;
+    Poller poller;
+    std::vector<std::unique_ptr<SocketPair>> pairs;
+    for (int i = 0; i < kSockets; ++i) {
+        pairs.push_back(std::make_unique<SocketPair>());
+        poller.register_fd(pairs.back()->a, pairs.back().get(), Interest::read());
+    }
+    for (auto& p : pairs) write_byte(p->b);
+
+    std::vector<Event> events;
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    auto all_seen = [&] {
+        return std::all_of(pairs.begin(), pairs.end(),
+                           [&](const auto& p) { return find_key(events, p.get()) != nullptr; });
+    };
+    while (!all_seen() && std::chrono::steady_clock::now() < deadline) poller.poll(events, 100ms);
+    EXPECT_TRUE(all_seen());
+    for (auto& p : pairs) EXPECT_TRUE(poller.deregister_fd(p->a));
+}
+
+// A reset by the peer (AFD_POLL_ABORT) is an error and a hang-up.
+TEST(Poller, ResetConnectionReportsErrorAndHup) {
+    Poller poller;
+    SocketPair sp;
+    poller.register_fd(sp.a, &g_key_a, Interest::read());
+    // Linger on, zero timeout: closesocket() resets the connection.
+    const LINGER linger{1, 0};
+    ASSERT_EQ(::setsockopt(static_cast<SOCKET>(sp.b), SOL_SOCKET, SO_LINGER,
+                           reinterpret_cast<const char*>(&linger), sizeof(linger)), 0);
+    sp.close_b();
+
+    std::vector<Event> events;
+    poller.poll(events, 1s);
+    const Event* e = find_key(events, &g_key_a);
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->error);
+    EXPECT_TRUE(e->hup);
+}
+
+// The high-resolution timer ends a timed wait well under the 15.6 ms system tick a
+// millisecond wait would round to, and never early.
+TEST(Poller, SubMillisecondTimeoutIsPrecise) {
+    Poller poller;
+    std::vector<Event> events;
+    std::vector<std::chrono::steady_clock::duration> took;
+    for (int i = 0; i < 21; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        poller.poll(events, 300us);
+        took.push_back(std::chrono::steady_clock::now() - start);
+        EXPECT_GE(took.back(), 300us);
+    }
+    std::sort(took.begin(), took.end());
+    EXPECT_LT(took[took.size() / 2], 3ms) << "median of 21 waits of 300 us";
+    EXPECT_TRUE(events.empty());
+}
+
+// Wakes before a poll() post one packet between them, not one each.
+TEST(PollWaker, RepeatedWakesPostOnePacket) {
+    Poller poller;
+    PollWaker waker(poller, &g_key_a);
+    for (int i = 0; i < 100; ++i) waker.wake();
+
+    std::vector<Event> events;
+    poller.poll(events, 1s);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(),
+                            [](const Event& e) { return e.key == &g_key_a; }), 1);
+    waker.reset();
+
+    events.clear();
+    poller.poll(events, 0ns);
+    EXPECT_TRUE(events.empty());
+}
+#endif  // CORO_SYS_WINDOWS

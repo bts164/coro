@@ -144,7 +144,7 @@ directly:
 #include <coro/io/socket_address.h>       // SocketAddress, Ipv4Address, Ipv6Address
 #include <coro/io/ws_stream.h>            // WsStream — async WebSocket client
 #include <coro/io/ws_listener.h>          // WsListener — WebSocket server
-#include <coro/io/signal.h>               // signal(), signal_stream() — OS signal delivery
+#include <coro/io/signal.h>               // ctrl_c(), shutdown_requested(), signal(), windows::console_event() — OS signal delivery
 #include <coro/io/byte_buffer.h>          // ByteBuffer — concept for buffers passed to read/write
 
 // Framing — decoding a byte stream into messages
@@ -2100,15 +2100,28 @@ quick reference.
 
 ## 12. Graceful shutdown on OS signals
 
-A long-running server needs to stop cleanly when the operator sends `SIGINT` or
-`SIGTERM` — finish in-flight work, close listeners, exit — rather than dying
-mid-request. `coro::signal()` and `coro::signal_stream()` (`#include <coro/io/signal.h>`)
-turn a signal into something a coroutine can simply `co_await`, so you never write a
-signal handler yourself. That is the one rule of this section: **do not install your own
-handler and call into coro from it** — not even a channel's `try_send()`. The deep dive
-below explains why; the rest of the section shows what to do instead.
+A long-running server needs to stop cleanly when the operator presses Ctrl-C or asks it
+to stop — finish in-flight work, close listeners, exit — rather than dying mid-request.
+`#include <coro/io/signal.h>` turns those requests into futures a coroutine can simply
+`co_await`, so you never write a signal handler yourself. That is the one rule of this
+section: **do not install your own handler and call into coro from it** — not even a
+channel's `try_send()`. The deep dive below explains why; the rest of the section shows
+what to do instead.
 
-??? note "Deep dive: why a raw signal handler is unsafe, and how `coro::signal()` avoids it"
+Two calls cover a graceful shutdown, the same way on every platform, with no `#ifdef`:
+
+- **`coro::ctrl_c()`** resolves on the next Ctrl-C: `SIGINT` on POSIX, `CTRL_C_EVENT` on
+  Windows.
+- **`coro::shutdown_requested()`** resolves when the process is asked to go away:
+  `SIGTERM` (`kill`, `systemctl stop`, `docker stop`) or `SIGHUP` (the terminal closed)
+  on POSIX, the console window closing on Windows. It resolves to a **guard**: hold it
+  until the cleanup is done, because Windows ends the process as soon as it is dropped.
+
+For anything else there are platform-specific calls: `coro::signal()` and
+`coro::signal_stream()` for any POSIX signal, and `coro::windows::console_event()` for
+Windows' Ctrl-Break. See [Signal Handling](design/signal_handling.md) for the details.
+
+??? note "Deep dive: why a raw signal handler is unsafe, and how coro avoids it"
     The channels from section 11 make an obvious approach tempting: install a raw
     `sigaction()` handler and push a message onto a channel for the server to receive.
     **Don't do this:**
@@ -2146,16 +2159,15 @@ below explains why; the rest of the section shows what to do instead.
         interrupt-safe primitive is the only option for signaling out of an ISR in that
         environment.
 
-    `coro::signal()` and `coro::signal_stream()` solve the signal-safety problem with a
-    self-pipe: the real OS-level handler coro installs only bumps an atomic counter
-    and writes one byte to a pipe — both async-signal-safe — and all actual dispatch
+    coro's signal futures solve the signal-safety problem with a self-pipe: the real
+    OS-level handler coro installs only bumps an atomic counter and writes one byte to a
+    pipe — both async-signal-safe — and all actual dispatch
     (coalescing repeat deliveries, waking the waiting coroutine) happens afterward, when the
     pipe wakes the Runtime's I/O driver, in ordinary non-handler context. See
     `doc/design/signal_handling.md` for the full design.
 
-`coro::signal(signum)` returns a one-shot `Future<void>` that resolves on the next
-delivery of that signal — `select` it (section 10) alongside the running server task so
-either a normal exit or a signal triggers the same cleanup path:
+Both are one-shot futures — `select` them (section 10) alongside the running server
+task so a normal exit, a Ctrl-C and a shutdown request all take the same cleanup path:
 
 ```cpp
 #include <coro/io/signal.h>
@@ -2163,14 +2175,15 @@ either a normal exit or a signal triggers the same cleanup path:
 coro::Coro<int> async_main() {
     auto result = co_await coro::select(
         coro::spawn(run_server()),
-        coro::signal(SIGINT),
-        coro::signal(SIGTERM)
+        coro::ctrl_c(),
+        coro::shutdown_requested()
     );
     if (result.index() == 0) {
         co_return std::get<0>(result).value;  // run_server() exited normally
     }
-    // SIGINT or SIGTERM received: select() has already cancelled run_server()
-    // and waited for it to drain.
+    // Ctrl-C or a shutdown request: select() has already cancelled run_server()
+    // and waited for it to drain. If it was a shutdown request, `result` holds the
+    // guard until here.
     co_return 0;
 }
 
@@ -2180,12 +2193,19 @@ int main() {
 }
 ```
 
-The `JoinHandle` is moved into `select`, which owns it from then on. When a signal wins,
+The `JoinHandle` is moved into `select`, which owns it from then on. When a stop request wins,
 `select` cancels the losing server branch and waits for it to drain before it returns,
 just as it does for any other losing branch (section 10), so by the time `async_main()`
 resumes the server is gone.
 
-To do something between the signal and the shutdown, such as logging that it has
+Where the guard lives matters. `shutdown_requested()` resolves to a `ShutdownGuard`,
+and the branch that holds it lives in `result`, so it is held until `async_main()`
+returns. On Windows the process ends as soon as the guard is dropped, so writing
+`co_await coro::shutdown_requested();` on its own, discarding the guard, would let it end
+before the cleanup ran. On POSIX the guard only keeps a repeated `SIGTERM` from killing
+the process mid-cleanup. Keep it to the end and the same code is right on both.
+
+To do something between the request and the shutdown, such as logging that it has
 started, keep the handle in a local instead, pass `coro::ref(server_handle)` to `select`
 so that losing leaves it running, and stop it yourself afterwards with
 `co_await std::move(server_handle).cancel_and_join()`. That cancels the task, waits for
@@ -2205,15 +2225,24 @@ on the way out, only destructors.) The bottom-up bookkeeping that a manual
 cancellation-token scheme requires — and the risk of forgetting one branch — is handled
 by the same destructor ordering the language already guarantees, instead of by hand.
 
-For a server that needs to react to several distinct signals differently — reload
-config on `SIGHUP`, shut down on `SIGTERM` — `coro::signal_stream()` yields a coalesced
-`SignalEvent{signum, count}` for every watched signal instead of resolving once:
+A POSIX server that reacts to a signal repeatedly — the classic one is reloading its
+config on `SIGHUP` — uses `coro::signal_stream()`, which yields a coalesced
+`SignalEvent{signum, count}` each time instead of resolving once. Such a server wants
+`SIGHUP` to mean "reload", not "stop", so it tells `shutdown_requested()` to leave it
+alone:
 
 ```cpp
-coro::SignalStream sigs = coro::signal_stream({SIGHUP, SIGTERM});
-while (std::optional<coro::SignalEvent> event = co_await coro::next(sigs)) {
-    if (event->signum == SIGHUP) reload_config();
-    else break;  // SIGTERM
+coro::SignalStream reload = coro::signal_stream({SIGHUP});     // POSIX only
+auto stop = coro::shutdown_requested({.hangup = false});       // SIGTERM only
+for (;;) {
+    auto sel = co_await coro::select(coro::next(reload), coro::ref(stop));
+    if (sel.index() == 0) {
+        reload_config();
+        continue;
+    }
+    auto guard = std::move(std::get<1>(sel).value);   // held while draining
+    co_await drain();
+    break;
 }
 ```
 
@@ -2302,7 +2331,8 @@ nothing new introduced.
 The server brings together the runtime entry point, async I/O, a task per connection,
 `JoinSet` for dynamic fan-out, `select` to interleave accepting and draining, `timeout`
 to evict stalled clients, the async-cleanup pattern of section 9 to send each client a
-goodbye line however its session ends, and `signal` for a clean shutdown on Ctrl-C. Not
+goodbye line however its session ends, and `ctrl_c()` / `shutdown_requested()` for a
+clean shutdown when asked. Not
 every section ends up in it: the mutex and logger of section 11 were there to show how a
 feature works rather than because an echo server needs them.
 Channels (section 11) appear in the client below, and `spawn_blocking` (section 13) is
@@ -2324,7 +2354,6 @@ the centrepiece of section 15.
 #include <coro/sync/timeout.h>
 #include <coro/sync/when.h>
 #include <chrono>
-#include <csignal>
 #include <cstdio>
 #include <exception>
 #include <optional>
@@ -2402,15 +2431,18 @@ static Coro<int> run_server() {
     }
 }
 
-// Runs the server until it exits on its own or SIGINT/SIGTERM arrives (section 12).
+// Runs the server until it exits on its own, on Ctrl-C, or on a shutdown request
+// (section 12).
 static Coro<int> async_main() {
     auto server_handle = coro::spawn(run_server());
-    // coro::ref() keeps the server running when a signal wins, so that the shutdown
-    // can be announced before waiting for it.
+    // coro::ref() keeps the server running when Ctrl-C or a shutdown request wins, so
+    // that the shutdown can be announced before waiting for it. If the request won,
+    // `result` holds its ShutdownGuard until this coroutine returns: on Windows the
+    // process ends as soon as it is dropped.
     auto result = co_await coro::select(
         coro::ref(server_handle),
-        coro::signal(SIGINT),
-        coro::signal(SIGTERM)
+        coro::ctrl_c(),
+        coro::shutdown_requested()
     );
     if (result.index() == 0) {
         co_return std::get<0>(result).value;  // run_server() exited on its own
@@ -2418,7 +2450,7 @@ static Coro<int> async_main() {
     // Cancelling run_server() drops `sessions`, which cancels and drains every
     // connection still open before cancel_and_join() resolves. Each one sends its
     // goodbye on the way out, so shutdown takes at most the 1s send_goodbye() allows.
-    std::printf("signal received — shutting down\n");
+    std::printf("stop requested — shutting down\n");
     std::optional<int> code = co_await std::move(server_handle).cancel_and_join();
     co_return code.value_or(0);  // nullopt: the cancel stopped it, as it normally will
 }
@@ -2859,7 +2891,7 @@ adding more peers is a scheduler entry, not a system call. A `JoinSet<void>` tra
 handlers as connections arrive and depart, removing the need to manage their lifetimes
 manually; the accept loop reaps finished handlers with the same `when()`-gated
 `next(peers)` branch as the section 10 server. `listener.accept()` never fails while the
-listener is alive, so the loop also races it against `SIGINT` (section 12) to give the
+listener is alive, so the loop also races it against `coro::ctrl_c()` (section 12) to give the
 server a way to stop. On Ctrl-C the server exits as soon as it can rather than waiting
 for clients to leave: `peers.shutdown()` cancels every peer handler still connected and
 waits for them all. Shutdown then flows through the channel: each `handle_peer` drops its
@@ -2881,7 +2913,7 @@ static Coro<void> run_dsp(uint16_t port) {
 
     // Created once and lent to each select() with coro::ref(), so Ctrl-C is watched
     // continuously rather than only while a select() is in progress.
-    auto interrupted = coro::signal(SIGINT);
+    auto interrupted = coro::ctrl_c();
     JoinSet<void> peers;
     for (;;) {
         // std::variant<SelectBranch<0, WsStream>,
@@ -3099,7 +3131,8 @@ That completes the tour. These are the points from the guide to carry into your 
   that loses is abandoned along with whatever was moved into it; use `coro::ref()` to keep
   a future alive across rounds.
 - **Pass data between tasks through channels** instead of sharing it behind a mutex.
-- **Let `coro::signal()` handle OS signals;** do not install a handler of your own.
+- **Let `coro::ctrl_c()` and `coro::shutdown_requested()` handle stopping** (and
+  `coro::signal()` any other OS signal); do not install a handler of your own.
 
 ## Next steps
 

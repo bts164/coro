@@ -55,7 +55,7 @@ include/coro/
 │   ├── lookup_host.h       lookup_host() — DNS resolution on the blocking pool
 │   ├── ws_stream.h         WsStream — async WebSocket client connection
 │   ├── ws_listener.h       WsListener — async WebSocket server acceptor
-│   └── signal.h            signal() / signal_stream() — async OS signal delivery (self-pipe)
+│   └── signal.h            ctrl_c() / shutdown_requested() / signal() — async OS signal delivery
 │
 └── detail/             Internal plumbing — not intended for direct user inclusion
     ├── poll_result.h       stable API for custom Future/Stream implementors
@@ -153,8 +153,8 @@ the `IoDriver` (the epoll reactor in `runtime/`) or the blocking pool, and satis
 - `TcpStream` — async TCP connection
 - `WsStream` — async WebSocket client connection
 - `WsListener` — async WebSocket server acceptor
-- `signal()` / `signal_stream()` — async OS signal delivery via a self-pipe on the
-  IoDriver; see `doc/design/signal_handling.md`
+- `ctrl_c()` / `shutdown_requested()` / `signal()` / `signal_stream()` — async OS
+  signal delivery via a self-pipe on the IoDriver; see `doc/design/signal_handling.md`
 
 ### `detail/` — internal plumbing and low-level extension points
 

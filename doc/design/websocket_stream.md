@@ -174,7 +174,7 @@ flowchart TB
 
     For a handful of connections this doesn't matter. For heavy traffic, `wss://`
     above all, it is a ceiling that more worker threads don't raise. Measure before
-    relying on it; [What was considered and left](#what-was-considered-and-left) and
+    relying on it; [Alternatives not taken](#alternatives-not-taken) and
     [Without lws](#without-lws) are the ways out.
 
 Every other primitive's waker is its task: the driver wakes it and the task does the I/O
@@ -682,19 +682,15 @@ remaining connections abruptly.
 
 ## Possible changes
 
-A review of the design after it was implemented and its tests passed, under
-ThreadSanitizer too. The core holds up: level-triggered registrations, wakers that call
-lws inline, and the turn as lws's lock. Three things came out of it and are done: the
-service reports its own context's destruction ([Destroy](#destroy)), client contexts
-belong to their runtime instead of a process-wide pool
-([Client contexts](#client-contexts)), and `post()` wakes once per batch
-([Commands](#commands)).
+The core of the design is level-triggered registrations, wakers that call lws inline, and
+the turn as lws's lock. This section covers the alternatives around it and what each
+would cost.
 
 !!! note "NOTE: what a `send()` still costs"
     Inherent to driving lws from a poller: at most one wake, two interest changes
     (`epoll_ctl`) around the writable callback, and the write.
 
-### What was considered and left
+### Alternatives not taken
 
 - **One context per runtime, a vhost per listener.** One wake pipe, one timer and one fd
   table instead of one each per listener. But a listener would then be closed with
@@ -709,7 +705,7 @@ belong to their runtime instead of a process-wide pool
 
 ### Without lws
 
-Decided against for now, and worth reconsidering if what follows changes.
+coro keeps lws. The reasons follow, and what would reopen the question.
 
 Nearly all the difficulty in this design is adapting a library that wants its own loop
 and its own thread. WebSocket framing over `TcpStream` is on the order of a thousand
@@ -719,28 +715,28 @@ parallel across the workers, nothing runs with the turn held, and a slow receive
 applies backpressure through the socket, which fixes the unbounded receive queue. It
 would also run on Pico, where lws does not.
 
-The work to match what `WsStream` does today is small. What decided it is what lws
+The work to match what `WsStream` does is small. What decided it is what lws
 leaves room for later:
 
 | lws provides | To do it natively |
 |---|---|
-| TLS (`wss://`), used by the client today | A `TlsStream` over `TcpStream`, with WebSockets on top of either. Substantial and security-sensitive, though plain TCP would gain it too. No `wss://` until it exists. |
+| TLS (`wss://`), used by the client | A `TlsStream` over `TcpStream`, with WebSockets on top of either. Substantial and security-sensitive, though plain TCP would gain it too. No `wss://` until it exists. |
 | WebSockets over HTTP/2 (RFC 8441), compiled into the Conan build | A whole HTTP/2 stack: HPACK, stream multiplexing, flow control. Rarely required, since the upgrade falls back to HTTP/1.1, but there is no cheap answer behind something that only speaks h2. |
 | A parser hardened by years of hostile input | Fuzzing, the Autobahn conformance suite, and limits on lengths and fragmentation, kept up for as long as a listener faces the internet. |
 | An HTTP server on the same port (health checks, a REST endpoint, static files) | Growing the upgrade parser into a small HTTP server. Open-ended if the requirements grow. |
-| Compression (`permessage-deflate`) and client proxies (HTTP `CONNECT`, SOCKS5), as build options | A few hundred lines each. All three are switched off in the Conan build today, so nothing would be lost now. |
+| Compression (`permessage-deflate`) and client proxies (HTTP `CONNECT`, SOCKS5), as build options | A few hundred lines each. All three are switched off in the Conan build, so nothing would be lost. |
 
 Everything else is easy either way: custom headers, subprotocol negotiation, basic auth,
 keepalive, UTF-8 validation, Unix-domain sockets.
 
 The reasons, then:
 
-- **The integration is paid for.** It is implemented and passes its tests, under
+- **The integration is paid for.** It exists and passes its tests, under
   ThreadSanitizer too. Keeping lws costs maintenance; replacing it costs a parser to
   write and harden, and a TLS layer.
 - **lws keeps the upgrade routes short.** Each feature in the table is a build option
   or a call away, not a project.
-- **A better desktop implementation is valued above microcontroller support** for now,
+- **A better desktop implementation is valued above microcontroller support,**
   and Pico is the one thing only a native implementation offers.
 - **Two implementations is never ideal.** A native client for Pico alone, beside lws on
   the desktop, would be possible without touching this design, but it means carrying
@@ -765,9 +761,8 @@ What would reopen the question:
 
 ## Open points
 
-- **Other lws versions.** `conanfile.py` accepts `>=4.5.8 <4.6`. It used to accept
-  `>=4.3.5 <5`, which resolved to 4.3.5 on one machine and 4.5.8 on another. What this
-  design relies on was read in both and is the same: no thread affinity, the event-loop
+- **Other lws versions.** `conanfile.py` accepts `>=4.5.8 <4.6`. What this design
+  relies on is the same in 4.3.5 and 4.5.8: no thread affinity, the event-loop
   ops and where lws calls them, the wake pipe and `LWS_CALLBACK_EVENT_WAIT_CANCELLED`,
   `lws_service_adjust_timeout()` and `_lws_plat_service_forced_tsi()`. Read it again
   before moving to another minor version; the SSL teardown changed in a patch release.

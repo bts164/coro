@@ -180,9 +180,12 @@ runner, so the job builds straight into it, and nothing is kept between runs.
 
 - **ThreadSanitizer aborts every test with "unexpected memory mapping".** The host
   kernel randomises more address bits than ThreadSanitizer accepts. It is a setting
-  of the host, not the container. `run-tests.sh tsan` warns when it sees
-  it; the fix, until the next reboot, is `sudo sysctl vm.mmap_rnd_bits=28` on the
-  host.
+  of the kernel the containers run on, not of the container. `run-tests.sh tsan`
+  warns when it sees it. On a Linux host the fix, until the next reboot, is
+  `sudo sysctl vm.mmap_rnd_bits=28`. Under Docker Desktop (Windows, macOS) the kernel
+  is that of Docker's VM; set it there, until Docker Desktop restarts, from a
+  privileged container:
+  `docker run --rm --privileged <image> sh -c 'echo 28 > /proc/sys/vm/mmap_rnd_bits'`.
 - **A build fails in a way that a profile or Dockerfile change should have fixed.**
   A failed configure can be left in a volume. Remove the job's build volume, and the
   Conan cache volume if a dependency is involved.

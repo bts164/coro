@@ -118,7 +118,7 @@ private:
     // One per lws socket (wsi), from the first time lws mentions it until lws frees
     // the wsi. `socket` is set while the fd is registered with the driver.
     struct Entry {
-        sys::RawFd              fd    = -1;
+        sys::RawFd              fd    = sys::kInvalidFd;
         bool                    read  = false;
         bool                    write = false;
         std::shared_ptr<Socket> socket;

@@ -59,10 +59,26 @@ inline constexpr bool kResolverBlocks = true;
 std::expected<std::vector<SocketAddress>, std::error_code>
 resolve_host(const std::string& host, uint16_t port);
 
+/// A stand-in for resolve_host(), for set_resolver_for_testing().
+using ResolveFn = std::expected<std::vector<SocketAddress>, std::error_code> (*)(
+    const std::string& host, uint16_t port);
+
+/// For tests: makes lookup_host call `fn` instead of resolve_host(), for every name
+/// (numeric addresses never reach the resolver), until called again with nullptr.
+/// Process-wide. Lets a test fail a lookup, or return addresses of its choosing,
+/// without depending on the machine's DNS. Defined in lookup_host.cpp, not by the
+/// backends.
+void set_resolver_for_testing(ResolveFn fn) noexcept;
+
 #endif
 
 /// The error category of the resolver's own failure codes (e.g. "Name or service not
 /// known"). Named "coro.dns".
 const std::error_category& dns_category() noexcept;
+
+/// The error this backend's resolver reports for a name that doesn't exist, in
+/// dns_category(): EAI_NONAME on POSIX, WSAHOST_NOT_FOUND on Windows, lwIP's only
+/// failure code on lwIP.
+std::error_code host_not_found_error() noexcept;
 
 } // namespace coro::detail::sys

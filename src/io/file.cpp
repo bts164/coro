@@ -33,7 +33,7 @@ File::OpenFuture File::open(std::string path, FileMode mode) {
     return spawn_blocking([path = std::move(path), flags = translate_flags(mode)]() -> File {
         auto fd = detail::sys::file_open(path, flags);
         if (!fd)
-            throw std::system_error(fd.error(), std::system_category(),
+            throw std::system_error(fd.error(), std::generic_category(),
                                     "coro::File::open: " + path);
         // If the OpenFuture was dropped, this File dies with the job's result and
         // closes the fd.
@@ -44,7 +44,7 @@ File::OpenFuture File::open(std::string path, FileMode mode) {
 BlockingHandle<void> File::sync_all() {
     return spawn_blocking([state = state("coro::File::sync_all")] {
         if (auto r = detail::sys::file_sync(state->fd); !r)
-            throw std::system_error(r.error(), std::system_category(), "coro::File::sync_all");
+            throw std::system_error(r.error(), std::generic_category(), "coro::File::sync_all");
     }).detach();
 }
 

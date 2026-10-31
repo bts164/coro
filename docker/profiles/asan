@@ -8,19 +8,16 @@
 [settings]
 compiler.sanitizer=AddressUndefinedBehavior
 
+# No gperftools: tcmalloc and the sanitizer would both replace malloc and free.
+[options]
+*:with_gperftools=False
+
 [conf]
 tools.build:cflags+=["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
 tools.build:cxxflags+=["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
 tools.build:exelinkflags+=["-fsanitize=address,undefined"]
 tools.build:sharedlinkflags+=["-fsanitize=address,undefined"]
 
-# libunicorn is QEMU, which relies on behaviour UBSan reports (left shifts of
-# negative values; upstream builds with -fwrapv). It is a test tool, not code
-# under test, so it is built plain.
-libunicorn/*:tools.build:cflags=!
-libunicorn/*:tools.build:cxxflags=!
-libunicorn/*:tools.build:exelinkflags=!
-libunicorn/*:tools.build:sharedlinkflags=!
 # libunicorn is QEMU, which relies on behaviour UBSan reports (left shifts of
 # negative values; upstream builds with -fwrapv). It is a test tool, not code under
 # test, so it is built plain under every sanitizer.

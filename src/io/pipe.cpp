@@ -66,7 +66,7 @@ Coro<Pipe> Pipe::open(std::string path, PipeMode mode) {
             auto fd = detail::sys::fifo_try_open_write(path);
             if (fd) co_return Pipe(std::make_shared<State>(driver, *fd));
             if (fd.error() != ENXIO)
-                throw std::system_error(fd.error(), std::system_category(),
+                throw std::system_error(fd.error(), std::generic_category(),
                                         "Pipe::open: " + path);
             // Race (benign): a reader may open just after the failed attempt; it is
             // seen on the next retry, at most kMaxOpenRetry later.

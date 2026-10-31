@@ -1,19 +1,16 @@
 # Fiber — cooperative stackful execution contexts
 
-## Status: Phase 3 (implemented — POSIX/desktop backend)
+A fiber is a cooperative, stackful execution context that can suspend from
+*anywhere in its call stack* — not just at a `co_await` expression — and be
+resumed later exactly where it left off.
 
-This document sketches a new coro primitive: a cooperative, stackful execution
-context ("fiber") that can suspend from *anywhere in its call stack* — not just
-at a `co_await` expression — and be resumed later exactly where it left off.
-
-The POSIX/desktop backend (`FiberFuture<T>`, `FiberHandle<T>`, `spawn_fiber()`,
-`fiber_await()`, `ucontext`-backed `switch_context()`, `mprotect`-guarded
-stack allocation) is implemented and unit-tested — see
-`include/coro/task/fiber.h`, `include/coro/detail/fiber_context.h`,
-`src/detail/fiber_context_posix.cpp`, `src/task/fiber.cpp`, and
-`test/task/test_fiber.cpp`. Per the "Testing strategy" section's sequencing
-note, the Pico/ARMv6-M backend (`fiber_context_pico.S`, the Unicorn-based test
-setup) has not been started yet.
+`spawn_fiber()`, `FiberHandle<T>`, `FiberFuture<T>` and `fiber_await()` live in
+`include/coro/task/fiber.h` and `src/task/fiber.cpp`. They run on three
+`switch_context()` backends (`include/coro/detail/fiber_context.h`): `ucontext`
+with `mprotect`-guarded stacks on POSIX (`src/detail/fiber_context_posix.cpp`),
+Win32 fibers on Windows (`src/detail/fiber_context_windows.cpp`), and
+hand-written ARMv6-M assembly on Pico (`src/detail/fiber_context_pico.S`). See
+[Header layout](#header-layout).
 
 ---
 
@@ -26,15 +23,15 @@ the moment a third-party C library sits in between — its blocking wait loop
 is buried several ordinary (non-coroutine) stack frames deep, and there is no
 `co_await` anywhere inside it to hook into.
 
-This came up concretely on a Pico (RP2040) project driving a DMA-based
-peripheral through a third-party C GUI/display library. Getting a truly
-async, DMA-driven transfer out of that library requires suspending *inside*
-its own event-pump entry point — specifically inside an internal spin loop
-that blocks until the DMA completes, several frames below any code we
-control — and resuming exactly there once the DMA finishes, while letting
-every other coro task keep making progress in the meantime. `Coro<T>`
-fundamentally cannot do this: there is no `co_await` point inside the
-library's C code for the compiler to have generated a suspension for.
+A typical case is a Pico (RP2040) application driving a DMA-based peripheral
+through a third-party C GUI/display library. Getting a truly async,
+DMA-driven transfer out of that library requires suspending *inside* its own
+event-pump entry point — inside an internal spin loop that blocks until the
+DMA completes, several frames below any application code — and resuming
+exactly there once the DMA finishes, while every other coro task keeps making
+progress in the meantime. `Coro<T>` cannot do this: there is no `co_await`
+point inside the library's C code for the compiler to have generated a
+suspension for.
 
 `spawn_blocking` (see [spawn_blocking.md](spawn_blocking.md)) solves the
 adjacent problem — "call a blocking function without stalling the
@@ -43,18 +40,17 @@ That doesn't help here for two reasons:
 
 - **No OS thread pool exists on bare metal.** The Pico target has no threads
   to spawn at all.
-- **Some libraries assume single-thread affinity.** This particular
-  library's global state is not internally synchronized and is documented
-  as single-threaded-only — `spawn_blocking`'s pool hands work to whichever
-  thread happens to be idle, with no guaranteed affinity across calls, which
-  is exactly the kind of use a library like this doesn't support even if
-  threads were available.
+- **Some libraries assume single-thread affinity.** A library whose global
+  state is not internally synchronized and is documented as
+  single-threaded-only can't be driven from `spawn_blocking`'s pool, which
+  hands work to whichever thread happens to be idle, with no guaranteed
+  affinity across calls.
 
-The same shape of problem can often be encountered on desktop projects too,
-independent of any MCU constraint — wanting to run a blocking, callback-driven
-library cooperatively on the executor's own thread rather than paying for a
-full OS thread or fighting its single-thread-affinity assumptions. So this is
-worth designing as a portable coro primitive, not a bare-metal-only hack.
+The same shape of problem comes up on desktop too, independent of any MCU
+constraint: running a blocking, callback-driven library cooperatively on the
+executor's own thread rather than paying for a full OS thread or fighting its
+single-thread-affinity assumptions. That's why fibers are a portable coro
+primitive rather than a bare-metal-only mechanism.
 
 ---
 
@@ -66,23 +62,20 @@ worth designing as a portable coro primitive, not a bare-metal-only hack.
 | Boost.Context, `libaco`, Ruby `Fiber`, Win32 Fiber API | Hand-written per-ISA assembly register/stack swap | Yes, with per-arch backends |
 | FreeRTOS / ChibiOS Cortex-M0 ports | Hand-written ARMv6-M assembly context switch (for preemptive scheduling, but the register save/restore mechanics are identical for a purely cooperative switch) | Reference implementation for the exact target this project cares about |
 
-Nothing here needs to be invented from scratch — this is a well-trodden
-technique with directly adaptable reference implementations, particularly for
-Cortex-M0+ specifically (RP2040), whose AAPCS calling convention only
-requires saving `r4`–`r11` and `sp` across a switch (`r0`–`r3`/`r12` are
-caller-saved scratch; `lr`/`pc` fall out of the return sequence).
+This is a well-trodden technique with directly adaptable reference
+implementations, particularly for Cortex-M0+ (RP2040), whose AAPCS calling
+convention only requires saving `r4`–`r11` and `sp` across a switch
+(`r0`–`r3`/`r12` are caller-saved scratch; `lr`/`pc` fall out of the return
+sequence).
 
-!!! note "Default to following FreeRTOS's lead on Cortex-M mechanics"
-    For any low-level ARMv6-M question this design runs into (stack-pointer
-    banking, register save/restore conventions, interrupt-masking needs, and
-    similar) — FreeRTOS's Cortex-M0 port has already had this exact class of
-    problem worked through and hardened across years of production use on
-    real hardware. Defer to what it actually does rather than re-deriving an
-    answer from first principles or intuition, and only deviate where there's
-    a concrete, stated reason this project's constraints differ from an
-    RTOS's. Any deviation from FreeRTOS's approach should be called out
-    explicitly in this document, next to the design point it affects, rather
-    than left implicit.
+!!! note "FreeRTOS's lead on Cortex-M mechanics"
+    For low-level ARMv6-M questions (stack-pointer banking, register
+    save/restore conventions, interrupt-masking needs, and similar) the Pico
+    backend follows FreeRTOS's Cortex-M0 port, which has had this class of
+    problem hardened across years of production use on real hardware. It
+    deviates only where coro's constraints differ from an RTOS's, and each
+    deviation is called out in this document next to the design point it
+    affects.
 
 ---
 
@@ -124,15 +117,20 @@ if it's outside that range — see "Stack overflow detection" below.
     there's no shared, concurrently-mutated scheduler state for an ISR to
     race in the first place.
 
-This is implemented per-architecture, mirroring how `runtime/` already
-selects an `Executor` implementation per platform:
+Each architecture has its own backend, as `runtime/` selects an `Executor`
+implementation per platform:
 
 - **ARMv6-M (RP2040 / Cortex-M0+, `CORO_PICO`)** — hand-written assembly,
   saving/restoring `r4`–`r11` and `sp` only.
-- **POSIX desktop (x86-64 / ARM64)** — backed by `ucontext.h` initially
-  (`makecontext`/`swapcontext`); no new assembly needed here to start. A
-  hand-rolled backend can replace it later if `ucontext`'s overhead (it saves
-  the full signal mask, not just registers) ever actually matters.
+- **POSIX desktop (x86-64 / ARM64)** — `ucontext.h`
+  (`makecontext`/`swapcontext`).
+- **Windows** — Win32 fibers (`CreateFiberEx`/`SwitchToFiber`); see
+  [Windows backend](#windows-backend).
+
+!!! tip "PERF: hand-rolled POSIX switch"
+    `swapcontext()` saves and restores the full signal mask, a syscall per
+    switch. A hand-rolled per-ISA backend could replace it if that overhead
+    ever matters.
 
 ### `FiberFuture<T>` — a fiber is just another `Future`, internally
 
@@ -280,24 +278,26 @@ to opaque functions. A fiber function that reads a thread-local, suspends, is
 resumed on another worker and reads the same thread-local again may therefore
 read the *previous* worker's copy.
 
-The access sites in the fiber bridge, checked against that hazard:
+So no thread-local of the fiber bridge is visible in a header. The current
+fiber's state (`FiberFrame`: the polling task's `Context`, the fiber's own
+`FiberContext` and its caller's) and the trampoline's start argument are
+thread-locals in `src/task/fiber.cpp` (plain globals under `CORO_PICO`),
+reachable only through out-of-line, `noinline` functions: `enter_fiber()`,
+`leave_fiber()`, `current_fiber_context()` and `fiber_start_arg()`. Code on a
+fiber's stack has no thread-local address to cache: each call computes it on
+the thread that is running.
 
-| Site | Runs on | Thread-local read after a switch? | Exposed? |
+| Site | Runs on | Reads the current fiber after a switch? | Exposed? |
 |---|---|---|---|
-| `FiberFuture<T>::poll()` | the worker's own stack | Yes, to restore the saved values, but `switch_context()` returns to `poll()` on the same thread that called it | No |
-| `fiber_yield()` | the fiber's stack | No, it reads all three before switching and nothing after | No |
-| `trampoline()` | the fiber's stack | No, it reads `t_fiber_start_arg` once on first entry | No |
-| `fiber_await()` | the fiber's stack | Yes, it reads `t_current_fiber_ctx` on every loop iteration, with `fiber_yield()` in between | **Yes** |
+| `FiberFuture<T>::poll()` | the worker's own stack | Yes, `leave_fiber()` restores the saved frame, but `switch_context()` returns to `poll()` on the same thread that called it | No |
+| `fiber_yield()` | the fiber's stack | No, it reads the frame before switching and nothing after | No |
+| `trampoline()` | the fiber's stack | No, it calls `fiber_start_arg()` once on first entry | No |
+| `fiber_await()` | the fiber's stack | Yes, `current_fiber_context()` after every `fiber_yield()`: a fresh call, on the thread now running | No |
 
-!!! danger "WARNING: `fiber_await()` may poll with a stale `Context` after migration"
-    `fiber_await()` is a header template, and `t_current_fiber_ctx` is declared
-    in the same header, so the compiler is free to compute the thread-local's
-    address once and reuse it after `fiber_yield()` returns. If the fiber was
-    resumed on a different worker, the next `future.poll()` then receives
-    whatever `Context*` the previous worker's `t_current_fiber_ctx` holds at
-    that moment: null, or the `Context` of an unrelated fiber. Not yet
-    confirmed against generated code, and it cannot occur on
-    `CurrentThreadExecutor` or the Pico backend, where there is one thread.
+A header-visible `extern thread_local`, read directly by `fiber_await()`,
+could be cached across `fiber_yield()` and so poll with the previous worker's
+`Context`. MSVC caches thread-local addresses within a function unless built
+with `/GT`, a flag every program that includes `fiber.h` would need.
 
 Boost.Fiber has the same exposure (its `work_stealing` and `shared_work`
 algorithms migrate fibers between threads) and avoids it by construction:
@@ -314,14 +314,7 @@ algorithms migrate fibers between threads) and avoids it by construction:
 - Fiber bodies are told not to rely on thread-local storage across a
   suspension; `fiber_specific_ptr` is the replacement.
 
-!!! tip "TODO: move the fiber thread-locals behind an out-of-line accessor"
-    Make the four `t_current_fiber_*` / `t_fiber_start_arg` variables `static`
-    in `src/task/fiber.cpp` and expose a non-inline accessor for the current
-    `Context*`, marked `noinline` so LTO cannot fold it back into the caller.
-    `fiber_await()` calls it on each loop iteration; `FiberFuture<T>::poll()`
-    saves and restores through out-of-line helpers. This also removes the
-    per-access initialisation wrapper that an `extern thread_local` with a
-    hidden initialiser can incur.
+coro does the same for its one piece of fiber state.
 
 The same rule applies to fiber bodies: user code running in a fiber must not
 hold a reference or pointer to a thread-local across `fiber_await()`, and
@@ -433,7 +426,7 @@ immediately, or held and dropped later.
     runtime keeps a pointer to its `WaitFuture`, and `~Event()` writes through it.
     Until this is fixed, let every fiber finish before the runtime shuts down.
 
-### Usage sketch — bridging a third-party library's blocking wait callback
+### Usage — bridging a third-party library's blocking wait callback
 
 ```cpp
 [[maybe_unused]] auto lib_fiber = coro::spawn_fiber<void>([]() {
@@ -495,8 +488,7 @@ sequenceDiagram
 
 ### Stack model (Pico backend): MSP as the dedicated ISR stack, PSP for everything else
 
-Adopted directly from FreeRTOS's own Cortex-M0 port rather than designed from
-scratch — confirmed against the real, current source
+The stack model is FreeRTOS's own Cortex-M0 port
 ([`portable/GCC/ARM_CM0/portasm.c`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/main/portable/GCC/ARM_CM0/portasm.c),
 non-MPU `vRestoreContextOfFirstTask`):
 
@@ -517,8 +509,8 @@ single, dedicated interrupt stack that every ISR lands on no matter what
 thread-mode code was running (or which fiber's stack was active) when the
 interrupt fired.
 
-This design follows the identical shape, with one timing difference from
-FreeRTOS worth being explicit about: the switch does *not* need to happen at
+coro follows the identical shape, with one timing difference from
+FreeRTOS: the switch does *not* need to happen at
 reset. FreeRTOS does it at scheduler start only because that's the earliest
 point its own model has a "first task" to move onto PSP; the actual
 requirement being satisfied is narrower than "at boot" — it's that
@@ -527,10 +519,13 @@ and must never be reverted for the remaining lifetime of the program.**
 Nothing before that point is ever a `switch_context()` target, so it has no
 need for the no-ISR-margin guarantee and can run on MSP without
 consequence. Concretely: SDK/hardware init and any code in `main()` prior to
-entering the executor's run loop are free to stay on MSP; the switch belongs
-at the top of the executor's own run-loop entry point
-(`CurrentThreadExecutor::wait_for_completion()`), executed once, from the
-executor's own thread, immediately before it starts polling anything.
+entering the executor's run loop stay on MSP; the switch is
+`coro_pico_enable_psp_stack()` (`fiber_context_pico.S`), which performs the
+`MRS`/`MSR PSP`/`MSR CONTROL`/`ISB` sequence. Its one call site is the top of
+the executor's own run-loop entry point
+(`CurrentThreadExecutor::wait_for_completion()`), guarded by a `static bool`
+so it runs once, from the executor's own thread, immediately before it starts
+polling anything.
 
 That switch moves the executor's own primary execution (its main loop, and
 any stackless `Coro<T>` resumption running inline on top of it) onto a
@@ -547,35 +542,26 @@ context" and "whichever fiber is currently active" live on PSP —
 `switch_context()` is just a PSP-value + callee-saved-register swap between
 two PSP-side contexts, with no `CONTROL`/`SPSEL` toggling per switch at all
 (that only ever happens once, at executor entry). MSP is left exactly where
-the vector table initialized it at reset, now permanently repurposed as the
-one shared, dedicated ISR stack, sized once for worst-case interrupt nesting
-across the whole program rather than per-fiber.
+the vector table initialized it at reset and serves as the one shared,
+dedicated ISR stack, sized once for worst-case interrupt nesting across the
+whole program rather than per-fiber.
 
-!!! note "Implemented"
-    `coro_pico_enable_psp_stack()` (`fiber_context_pico.S`) performs the
-    `MRS`/`MSR PSP`/`MSR CONTROL`/`ISB` sequence described above; its one call
-    site, guarded by a `static bool` so it only ever runs once, is at the top
-    of `CurrentThreadExecutor::wait_for_completion()`.
+Nested context switches need nothing extra: both parties in any
+`switch_context()` call are PSP-side contexts distinguished only by their
+saved stack-pointer *value* (never by a `CONTROL` mode bit), so swapping
+which one is "active" is symmetric and requires no bookkeeping about how many
+levels deep the switch is.
 
-This also fully answers the "nested context switch" question for free: since
-both parties in any `switch_context()` call are already PSP-side contexts
-distinguished only by their saved stack-pointer *value* (never by a
-`CONTROL` mode bit), swapping which one is "active" is symmetric and requires
-no bookkeeping about how many levels deep the switch is — the same reasoning
-that already ruled out fiber-into-fiber recursion arising in this design in
-the first place.
-
-!!! note "POSIX/desktop backend is unaffected"
+!!! note "Cortex-M only"
     MSP/PSP banking is Cortex-M-specific hardware; it doesn't exist on
-    x86-64/ARM64. The desktop backend's `ucontext.h`-based `switch_context()`
-    and its `mprotect`-guarded stack sizing (below) are unrelated to this and
-    unchanged by it.
+    x86-64/ARM64. The POSIX and Windows backends' `switch_context()` and their
+    guard-page stacks (below) are unrelated to it.
 
 ### Stack allocation and sizing
 
-Boost.Context/Boost.Fiber's own `stack_traits` (checked directly against its
-docs/source) doesn't have one universal default either — it's split by
-platform, and the reasoning behind each half doesn't transfer to the other:
+Boost.Context/Boost.Fiber's own `stack_traits` doesn't have one universal
+default either — it's split by platform, and the reasoning behind each half
+doesn't transfer to the other:
 
 - `minimum_size()`: an OS-defined floor (4KB on Win32, 8KB on Win64,
   similarly small on POSIX).
@@ -589,23 +575,25 @@ platform, and the reasoning behind each half doesn't transfer to the other:
 
 That whole philosophy — "match what a normal thread gets, and lean on the
 MMU for a free safety net" — assumes an MMU and abundant virtual memory,
-neither of which Cortex-M0+ has. A single hardcoded default shared by both
-backends would be wrong for at least one of them, so this is split per
-backend, same as `switch_context()` itself:
+neither of which Cortex-M0+ has. A single hardcoded default shared by all
+backends would be wrong for at least one of them, so `stack_size` is always
+passed explicitly, and the stack itself is allocated per backend, same as
+`switch_context()`:
 
-**POSIX/desktop backend**: borrow Boost's reasoning directly. Default to
-something in the 64–256KB range, and back it with a real `mprotect`-based
-guard page the same way `protected_fixedsize_stack` does — overflow then
-reliably faults instead of corrupting whatever static/heap data happens to
-sit past the stack, at negligible cost (unmapped virtual pages, not RAM).
+**POSIX/desktop backend**: Boost's reasoning applies directly. Something in
+the 64–256KB range is a reasonable size, and `alloc_fiber_stack()` backs it
+with an `mprotect(PROT_NONE)` guard page the same way
+`protected_fixedsize_stack` does — overflow reliably faults instead of
+corrupting whatever static/heap data happens to sit past the stack, at
+negligible cost (unmapped virtual pages, not RAM). The Windows backend gets
+the same from the OS (see [Windows backend](#windows-backend)).
 
 **Pico/MCU backend**: no safe universal default exists — physical RAM is the
 scarce, fully-budgeted resource (264KB total, shared with the framebuffer
 and everything else), and there's no guard page to fall back on if a guess
-is wrong. `stack_size` is a required constructor argument on this backend
-rather than a number pulled out of the air. Sizing it correctly is a
-one-time, offline profiling step, not something done at runtime in the
-shipped build: during development, deliberately over-provision (e.g. 16KB),
+is wrong. Sizing it correctly is a one-time, offline profiling step, not
+something done at runtime in the shipped build: during development,
+deliberately over-provision (e.g. 16KB),
 paint it with a fill pattern, exercise the worst-case call path (the
 third-party library's deepest internal call chain, under whatever real
 content/workload stresses it hardest), and read the high-water mark
@@ -621,7 +609,7 @@ runtime — not "what should the size be" but "did this run exceed whatever
 size we already picked."
 
 !!! note "Fiber stacks don't need ISR-nesting margin — MSP already absorbs it"
-    With the MSP/PSP split adopted above (MSP as the sole, dedicated ISR
+    With the MSP/PSP split above (MSP as the sole, dedicated ISR
     stack; every fiber's stack lives on PSP), an interrupt firing while a
     fiber is active does *not* push its exception frame onto that fiber's
     stack — hardware forces handler mode onto MSP unconditionally, regardless
@@ -634,7 +622,7 @@ size we already picked."
 ### Stack overflow detection (borrowed from FreeRTOS/ChibiOS)
 
 Neither mainstream RTOS trusts static analysis of stack depth, and both
-converge on the same two-pronged approach worth borrowing directly:
+converge on the same two-pronged approach, which the Pico backend borrows:
 
 - **FreeRTOS** paints each stack with a `0xa5a5a5a5` fill pattern at
   creation. `uxTaskGetStackHighWaterMark()` reports how much of that pattern
@@ -652,8 +640,8 @@ converge on the same two-pronged approach worth borrowing directly:
   pointer against a precomputed valid range before resuming a thread and
   halts immediately if it's out of range. On Cortex-M4/M7 parts with an MPU
   it can back this with a real guard region that traps synchronously on the
-  offending write; **RP2040's Cortex-M0+ has no MPU**, so that particular
-  option isn't available to us any more than it is for our own backend.
+  offending write; **RP2040's Cortex-M0+ has no MPU**, so that option isn't
+  available on Pico.
 
 !!! note "The SP-range check is containment, not prevention"
     Neither RTOS's software check actually stops the corruption — both only
@@ -676,14 +664,57 @@ The SP-range check folded into `switch_context()` above is ChibiOS's
 placement (check before resuming, not after), since coro has no separate
 context-switch ISR to hook a trap into the way FreeRTOS does. The
 poison-fill/high-water-mark measurement (FreeRTOS's technique) is the tool
-for *choosing* `stack_size` during development. Given neither technique
-actually prevents corruption on a Cortex-M0+ with no MPU, the stack buffer
-itself should include a small sacrificial cushion of extra bytes below the
-real working range, with the canary word placed at the *bottom* of that
-cushion rather than the top of the working stack — sized so a typical modest
-overrun lands in dead space instead of whatever static/heap data follows it,
-same reasoning as `protected_fixedsize_stack`'s guard page, done with plain
-static allocation since no MMU is available to do it properly.
+for *choosing* `stack_size` during development; `alloc_fiber_stack()` paints
+every Pico stack with `0xa5a5a5a5` so the measurement is always available.
+Since neither technique prevents corruption on a Cortex-M0+ with no MPU, the
+stack buffer also has a 32-byte sacrificial cushion below the real working
+range, with the canary word at the *bottom* of that cushion rather than the
+top of the working stack. A modest overrun lands in dead space instead of
+whatever heap data follows it, and still trips the canary check — the same
+reasoning as `protected_fixedsize_stack`'s guard page, done with plain
+allocation since no MMU is available to do it properly.
+
+### Windows backend
+
+`src/detail/fiber_context_windows.cpp`, on Win32 fibers, which provide the
+whole primitive:
+
+| `FiberContext` operation | Windows |
+|---|---|
+| `alloc_fiber_stack()` | records the size only: the fiber and its stack are made in one call |
+| `init_fiber_entry()` | `CreateFiberEx(0, stack_size, FIBER_FLAG_FLOAT_SWITCH, start, entry)`; the start routine calls `entry` (the trampoline), which never returns |
+| `switch_context(from, to)` | converts the thread to a fiber on its first switch (`ConvertThreadToFiberEx`), records `GetCurrentFiber()` in a caller-side `from`, `SwitchToFiber(to)` |
+| `free_fiber_stack()` | `DeleteFiber()` of a fiber the context owns |
+
+- **Caller-side contexts own nothing.** A caller-side `FiberContext` (the
+  executor's side of a `FiberFuture`) records whichever fiber the calling
+  thread was running when it switched away: its own converted fiber. A
+  thread converted by coro is converted back when it exits; one some other
+  code had already made a fiber is left alone.
+- **Migration.** Win32 lets a fiber be resumed on a different thread from the
+  one it last ran on, so a fiber may move between workers as on POSIX. The
+  thread-locals are handled as above.
+- **Stack and overflow.** The stack is reserved at `stack_size`, rounded up by
+  the OS to its allocation granularity, and committed as it grows, with a
+  guard page below. An overrun raises a stack-overflow exception, which ends
+  the process, as the POSIX guard page's `SIGSEGV` does
+  (`FiberDeathTest.StackOverflowFaultsOnGuardPage` runs on both).
+- **Floating point.** `FIBER_FLAG_FLOAT_SWITCH` saves and restores the
+  floating-point state with each switch, as `swapcontext()` does.
+- **ASan handshake.** Under MSVC's AddressSanitizer, `switch_context()` names
+  the destination stack with `__sanitizer_start_switch_fiber()` and finishes
+  with `__sanitizer_finish_switch_fiber()`, as on POSIX. Otherwise a throw on a
+  fiber leaves stale redzones poisoned on its stack, and the exception
+  machinery's writes there are reported as errors. `CreateFiberEx()` chooses the
+  stack, so its bounds are only known on it (`GetCurrentThreadStackLimits()`):
+  each context records its own when it switches away, and a fiber's start
+  routine finishes its first switch with no stack named, then names its own
+  with a second handshake in place. The ASan state lives in the `FiberContext`,
+  not a thread-local, since the fiber may resume on another thread. The handshake
+  is all in the start routine, so `notify_fiber_switch_finished()` is a no-op.
+  `free_fiber_stack()` unpoisons the stack before `DeleteFiber()`: a finished
+  fiber's last frames never return, and Windows frees the stack where ASan can't
+  see it, so a later fiber given the same memory would inherit their redzones.
 
 ---
 
@@ -698,23 +729,22 @@ include/coro/task/fiber.h            spawn_fiber(), FiberHandle<T>, fiber_await(
                                       is internal -- fiber_await() is the only
                                       sanctioned way for a fiber body to suspend)
 include/coro/detail/fiber_context.h  FiberContext struct + switch_context()/alloc_fiber_stack()
-                                      declarations -- both backends implemented (POSIX and
-                                      ARMv6-M/CORO_PICO, selected by #ifdef CORO_PICO)
-src/detail/fiber_context_pico.S      ARMv6-M switch_context()/init_fiber_entry() (CORO_PICO) --
-                                      implemented and Unicorn-tested, including the SP-range/
-                                      canary overflow checks (see "Testing strategy" and "Stack
+                                      declarations -- all three backends (POSIX, Windows (_WIN32) and
+                                      ARMv6-M/CORO_PICO), selected by the preprocessor
+src/detail/fiber_context_pico.S      ARMv6-M switch_context()/init_fiber_entry() (CORO_PICO),
+                                      including the SP-range/canary overflow checks (see "Stack
                                       overflow detection"); also coro_pico_enable_psp_stack(),
                                       the one-time CONTROL/PSP switch (see "Stack model")
 src/detail/fiber_context_pico.cpp    alloc_fiber_stack()/free_fiber_stack() (CORO_PICO) -- plain
-                                      heap allocation + fill pattern + canary word, implemented
-                                      and host-tested (test_fiber_context_pico_alloc.cpp; no ARM
-                                      instructions here, so no Unicorn needed)
+                                      heap allocation + fill pattern + canary word
 src/detail/fiber_context_posix.cpp   ucontext-backed switch_context() + mmap/mprotect-based
-                                      stack allocation (POSIX) -- implemented
-src/task/fiber.cpp                   the fiber-bridge thread-locals + detail::fiber_yield() --
-                                      backend-agnostic (just switch_context() calls); wired into
-                                      the real coro_pico build (cmake/platforms/pico.cmake), not
-                                      just the host-side coro_pico_core test double
+                                      stack allocation (POSIX)
+src/detail/fiber_context_windows.cpp Win32-fiber switch_context() and stack (Windows)
+src/task/fiber.cpp                   the fiber-bridge thread-locals, behind out-of-line
+                                      accessors, + detail::fiber_yield() --
+                                      backend-agnostic (just switch_context() calls); part of
+                                      the coro_pico build (cmake/platforms/pico.cmake) as well
+                                      as the host-side coro_pico_core test double
 ```
 
 `FiberContext`/`switch_context()` itself is `detail/` — a low-level extension
@@ -730,16 +760,22 @@ worker-thread handoff.
 
 ## Testing strategy
 
-`test/pico/stub/` already lets existing Pico-specific code be unit-tested on
-the host by stubbing out *pico-sdk API calls* (`hardware/dma.h` and similar)
-so the surrounding logic compiles and runs as ordinary x86 code. That
-approach doesn't reach the ARMv6-M `switch_context()` backend here: it isn't
-a pico-sdk call being stubbed out, it's hand-written assembly that manipulates
+The shared parts (`FiberFuture<T>`, `FiberHandle<T>`, `fiber_await()`, the
+thread-locals) are tested on the host in `test/task/test_fiber.cpp`, which
+runs on the POSIX and Windows backends.
+
+`test/pico/stub/` lets Pico-specific code be unit-tested on the host by
+stubbing out *pico-sdk API calls* (`hardware/dma.h` and similar) so the
+surrounding logic compiles and runs as ordinary x86 code.
+`fiber_context_pico.cpp`'s stack allocation has no ARM instructions, so it is
+tested on the host directly (`test/task/test_fiber_context_pico_alloc.cpp`).
+Neither approach reaches the ARMv6-M `switch_context()` backend: it isn't a
+pico-sdk call being stubbed out, it's hand-written assembly that manipulates
 real `CONTROL`/PSP/MSP and callee-saved registers — there's no header to stub,
 and the thing under test *is* the architecture-specific mechanics.
 
 **Unicorn Engine** (a host-native library wrapping QEMU's CPU-only emulation
-core, with no board/peripheral model) resolves this without needing to boot a
+core, with no board/peripheral model) tests it instead, without needing to boot a
 whole emulated Pico or flash real hardware. The test itself stays a completely
 ordinary gtest, running as an x86 binary linked against `libunicorn` like any
 other host test dependency — nothing about the test binary itself is
@@ -763,30 +799,5 @@ firmware image linked against pico-sdk and drivers. It also generalizes:
 Unicorn supports many ISAs
 (ARM, ARM64, RISC-V, MIPS, ...), so the same pattern — cross-assemble just the
 one context-switch file, load it standalone, assert on registers — applies
-unchanged if coro ever gains a `switch_context()` backend for a different
-architecture, rather than needing a new one-off testing approach per port.
-
-The POSIX `ucontext`-backed path needs none of this — it's ordinary host code,
-unit-tested the normal way already.
-
-**Sequencing**: get the POSIX/desktop backend (design, stub, implementation,
-and normal host-native tests) working end to end first, before taking on the
-ARM cross-compilation/`libunicorn`/conanfile work above. That surfaces any
-unexpected issues in the shared parts of the design (`FiberFuture<T>`,
-`fiber_await()`, the thread-locals, stack sizing/overflow-detection
-philosophy) on the simpler backend, before adding the Pico backend's extra
-moving parts on top.
-
----
-
-## Open Questions
-
-Cancellation, exception propagation, stack allocation strategy, the MSP/PSP
-stack model, and the testing strategy for the Pico backend's
-`switch_context()` have all been resolved above.
-
-One is open: whether GCC actually caches the address of `t_current_fiber_ctx`
-across `fiber_yield()` inside `fiber_await()` on the desktop backend. See
-[Thread-locals and worker migration](#thread-locals-and-worker-migration).
-Inspecting the generated code for a `fiber_await()` instantiation settles it;
-the accessor change described there removes the question either way.
+unchanged to a `switch_context()` backend for any other architecture, rather
+than needing a new one-off testing approach per port.

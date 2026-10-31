@@ -125,7 +125,7 @@ TYPED_TEST(FutureRefTest, LosingBranchDoesNotCancelTask) {
         };
         auto sel = co_await select(coro::ref(task), ImmediateVoid{});
         EXPECT_TRUE((std::holds_alternative<SelectBranch<1, void>>(sel)));
-        tx.send(77);
+        (void)tx.send(77);
         result = co_await task;
     }(result));
     EXPECT_EQ(result, 77);

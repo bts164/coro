@@ -20,9 +20,6 @@
 #include <coro/runtime/io_driver.h>
 #include "io_test_util.h"
 
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <cerrno>
 #include <condition_variable>
 #include <future>
@@ -850,21 +847,16 @@ TEST(CurrentThreadExecutorTest, SecondThreadInLoopIsRefused) {
 using io_test::ReadByteFuture;
 
 TEST(CurrentThreadRuntimeTest, IoEventWakesTaskParkedInDriver) {
-    int fds[2];
-    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
+    io_test::SocketPair sp;
 
     Runtime rt(std::size_t{1});
-    std::thread writer([fd = fds[1]] {
+    std::thread writer([fd = sp.b] {
         std::this_thread::sleep_for(50ms);
-        const char c = 'q';
-        EXPECT_EQ(::write(fd, &c, 1), 1);
+        io_test::write_byte(fd, 'q');
     });
-    const char got = rt.block_on(ReadByteFuture{fds[0], {}});
+    const char got = rt.block_on(ReadByteFuture{sp.a, {}});
     writer.join();
     EXPECT_EQ(got, 'q');
-
-    ::close(fds[0]);
-    ::close(fds[1]);
 }
 
 TEST(CurrentThreadRuntimeTest, DriverTimerWakesBlockedTurn) {

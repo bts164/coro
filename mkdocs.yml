@@ -120,6 +120,7 @@ nav:
       - Timers: design/timers.md
     - Platform & Integration:
       - Raspberry Pi Pico Port: design/pico_port.md
+      - Windows Port: design/windows_port.md
       - ISR Safety: design/isr_safety.md
       - GpioPin: design/gpio_pin.md
       - On-Target Tests: design/on_target_tests.md

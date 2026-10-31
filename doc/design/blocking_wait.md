@@ -1,18 +1,16 @@
 # `blocking_wait` / `blocking_next` — driving a `Future`/`Stream` from a blocking thread
 
-!!! note "Implemented"
-    `blocking_wait` lives in `coro/future.h`, `blocking_next` in `coro/stream.h`, both
-    guarded `#ifndef CORO_PICO`. Tests: `test/test_future.cpp` (`BlockingWaitTest`),
-    `test/test_stream.cpp` (`BlockingNextTest`), and, for parking on the blocking task
-    and cancellation, `test/task/test_spawn_blocking.cpp` (`SpawnBlockingCancel`).
+`blocking_wait` lives in `coro/future.h`, `blocking_next` in `coro/stream.h`, both guarded
+`#ifndef CORO_PICO`. Tests: `test/test_future.cpp` (`BlockingWaitTest`),
+`test/test_stream.cpp` (`BlockingNextTest`), and, for parking on the blocking task and
+cancellation, `test/task/test_spawn_blocking.cpp` (`SpawnBlockingCancel`).
 
 ## Motivation
 
-Any OS thread that already has `current_runtime()` set — today, that means a
-[`spawn_blocking`](spawn_blocking.md) pool thread, and in the future any thread that has
-called the proposed `Runtime::enter()` (see [task_and_executor.md](task_and_executor.md)'s
-"Runtime" section) — is a valid place to synchronously drive a `Future` or `Stream` to
-completion. There is currently no generic way to do this. The nested-`Runtime` pattern (see
+Any OS thread that already has `current_runtime()` set — a
+[`spawn_blocking`](spawn_blocking.md) pool thread, or any other thread given runtime context
+with `set_current_runtime()` — is a valid place to synchronously drive a `Future` or
+`Stream` to completion. The nested-`Runtime` pattern (see
 [spawn_blocking.md](spawn_blocking.md)'s "Running a Future on a blocking thread") gives a
 blocking-pool callable a fully independent async environment — its own executor, its own
 `IoDriver`, complete isolation. That isolation is the *point* when it's needed, but it is
@@ -27,7 +25,7 @@ no executor and no ready queue — it polls exactly one `Future` (or, via
 context is already ambient there. This is the same role Tokio's `Handle::block_on` plays
 relative to spinning up a second `tokio::Runtime`.
 
-Although the concrete use in mind today is a `spawn_blocking` compute loop generalized over
+Although the main use is a `spawn_blocking` compute loop generalized over
 `Stream<T>` (see the example below), `blocking_wait`/`blocking_next` are not
 `spawn_blocking`-specific: the goal is a primitive usable from any thread with an active
 runtime context, which is why this design lives in its own document rather than folded into
@@ -94,7 +92,7 @@ so it is already a `Waker`, and it gives access to a mutex and a condition varia
 `blocking_wait` uses it for both jobs and allocates nothing:
 
 ```cpp
-// Sketch. `task` is the current BlockingTaskBase; its scheduling_state is Running.
+// Simplified. `task` is the current BlockingTaskBase; its scheduling_state is Running.
 // The real code reaches it through the free functions in detail/blocking_cancel.h.
 template<Future F>
 typename F::OutputType blocking_wait(F future) {
@@ -233,7 +231,7 @@ itself in a `BlockingCancelShield`.
     `TaskCancelled`, which terminates the program if it happens during unwinding.
     Put a `BlockingCancelShield` in the destructor.
 
-## Excluded on `CORO_PICO` — for now
+## Not available on `CORO_PICO`
 
 `blocking_wait`/`blocking_next` are compiled out entirely under `CORO_PICO` (`#ifndef
 CORO_PICO` around both, in `future.h`/`stream.h`; `detail/blocking_waker.h` is guarded the
@@ -241,19 +239,19 @@ same way, and so is the blocking pool whose tasks the cancellable path parks on)
 **not** a judgment that parking-until-woken has no use case on Pico —
 it's that the current backend, `detail::BlockingWaker`, is built on `std::mutex`/
 `std::condition_variable`, which require an OS thread scheduler that bare-metal RP2040
-builds don't have. The exclusion tracks what the implementation can support today, not a
-claim about the primitive itself.
+builds don't have. The exclusion follows from the implementation, not from the primitive
+itself.
 
-A concrete use case the exclusion rules out: RP2040/RP2350 are dual-core, so core 1 could
-run a blocking compute loop while core 0 runs the `CurrentThreadExecutor` loop — core 1
-parking via `blocking_wait` until core 0 (or an ISR) has work for it is the same shape as
-the desktop `spawn_blocking`-thread case, just with cores instead of OS threads. Supporting
-it would mean a second `Waker` backend selected under `CORO_PICO`, not condvar-based but
-built on a `pico_sync` semaphore per blocked waiter: core 1 blocks in
-`sem_acquire_blocking()`, and `wake()` is `sem_release()`, which works across cores (see
-[Pico Port](pico_port.md#dual-core-wakes)). The rest of the executor would also need real
-locks for core 1, which is why this is a separate design question rather than folded
-into this exclusion.
+!!! tip "TODO: `blocking_wait` on Pico's second core"
+    RP2040/RP2350 are dual-core, so core 1 could run a blocking compute loop while core 0
+    runs the `CurrentThreadExecutor` loop — core 1 parking via `blocking_wait` until core 0
+    (or an ISR) has work for it is the same shape as the desktop `spawn_blocking`-thread
+    case, just with cores instead of OS threads. Supporting it means a second `Waker`
+    backend selected under `CORO_PICO`, not condvar-based but built on a `pico_sync`
+    semaphore per blocked waiter: core 1 blocks in `sem_acquire_blocking()`, and `wake()`
+    is `sem_release()`, which works across cores (see
+    [Pico Port](pico_port.md#dual-core-wakes)). The rest of the executor would also need
+    real locks for core 1, which makes this a separate design question.
 
 ## Contract: an active `Runtime` is required for reactor-touching futures
 
@@ -269,9 +267,9 @@ whatever the calling thread already has. Concretely:
   future that never touches it (pure in-memory work — draining an `MpscReceiver`, awaiting
   a `oneshot`, a hand-written `CoroStream` that only ever `co_await`s channel `recv()`s)
   still works, but one that does throws through `blocking_wait` exactly as it would through
-  `co_await` anywhere else without a `Runtime`. Use the proposed `Runtime::enter()` (see
-  [task_and_executor.md](task_and_executor.md)'s "Runtime" section) to give such a thread
-  valid context first.
+  `co_await` anywhere else without a `Runtime`. Give such a thread valid context first with
+  `set_current_runtime()`; a scoped `Runtime::enter()` guard is planned (see
+  [task_and_executor.md](task_and_executor.md)'s "Runtime" section).
 
 !!! note "NOTE: what runtime shutdown does to a thread that is not one of its blocking callables"
     A thread that gave itself runtime context (`set_current_runtime()`) can wait on a
@@ -293,9 +291,9 @@ site.
 
 | Approach | Pros | Cons |
 |---|---|---|
-| `blocking_wait`/`blocking_next` (this doc) | No second reactor/executor allocation; works with any `Future`/`Stream`; usable from any thread with an active runtime context | Requires an already-active `Runtime` context (ambient on `spawn_blocking` threads, or via the proposed `Runtime::enter()`) for futures that touch the reactor |
+| `blocking_wait`/`blocking_next` (this doc) | No second reactor/executor allocation; works with any `Future`/`Stream`; usable from any thread with an active runtime context | Requires an already-active `Runtime` context (ambient on `spawn_blocking` threads, or via `set_current_runtime()`) for futures that touch the reactor |
 | Nested `Runtime` + `block_on` (see [spawn_blocking.md](spawn_blocking.md)) | Fully isolated reactor; no ambient-context requirement | Full second executor + `IoDriver` (epoll fd, eventfd) allocated per call |
-| Per-channel blocking calls (`MpscReceiver::blocking_recv()` and the like) | Purpose-built | Bespoke to one channel type, and not cancellation points. Removed in favour of this; see [runtime_shutdown.md](runtime_shutdown.md#removing-the-channel-blocking-calls) |
+| Per-channel blocking calls (`MpscReceiver::blocking_recv()` and the like) | Purpose-built | Bespoke to one channel type, and not cancellation points; coro doesn't provide them. See [runtime_shutdown.md](runtime_shutdown.md#channels-from-blocking-code) |
 
 ## Placement
 

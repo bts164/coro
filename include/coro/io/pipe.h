@@ -2,6 +2,10 @@
 
 // Desktop only: named pipes (FIFOs) on the IoDriver. See doc/design/pipe_streaming.md.
 
+#ifdef _WIN32
+#error "Pipe is not ported to Windows yet; see doc/design/windows_port.md, \"Scope\""
+#endif
+
 #include <coro/coro.h>
 #include <coro/detail/socket_state.h>
 #include <coro/detail/stream_io.h>

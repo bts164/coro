@@ -2,6 +2,7 @@
 // (doc/design/websocket_stream.md). Each test uses its own port in 30201-30299.
 
 #include <gtest/gtest.h>
+#include "fake_resolver.h"
 #include <coro/io/lookup_host.h>
 #include <coro/io/tcp_listener.h>
 #include <coro/io/tcp_stream.h>
@@ -85,9 +86,11 @@ std::string url(uint16_t port, const std::string& host = "127.0.0.1") {
 }
 
 // Awaits connect(url) and returns the error it threw (a default error_code if none).
+// The bound only catches a hang: a refused connect takes about 2 s on Windows, which
+// retries a SYN answered with a reset (doc/design/windows_port.md, "TCP").
 Coro<std::error_code> connect_error(std::string to, WsStream::Options options = {}) {
     try {
-        auto result = co_await timeout(2s, WsStream::connect(std::move(to), std::move(options)));
+        auto result = co_await timeout(10s, WsStream::connect(std::move(to), std::move(options)));
         if (result.index() != 0) throw std::runtime_error("connect timed out");
     } catch (const std::system_error& e) {
         co_return e.code();
@@ -1060,6 +1063,7 @@ TEST(WsStreamTest, ConnectRefusedThrowsSystemError) {
 }
 
 TEST(WsStreamTest, ConnectToUnresolvableNameThrowsDnsError) {
+    FakeResolver fake(resolve_nothing);
     Runtime rt;
     auto code = rt.block_on(connect_error(url(80, "nonexistent.invalid")));
     EXPECT_EQ(&code.category(), &dns_error_category()) << code.message();
@@ -1199,6 +1203,7 @@ TEST(WsListenerTest, BindAddressInUseThrowsEaddrinuse) {
 }
 
 TEST(WsListenerTest, BindUnresolvableNameThrowsDnsError) {
+    FakeResolver fake(resolve_nothing);
     Runtime rt;
     auto code = rt.block_on(bind_error("nonexistent.invalid", 30217));
     EXPECT_EQ(&code.category(), &dns_error_category()) << code.message();

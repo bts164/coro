@@ -1,25 +1,19 @@
 # Tracing
 
-!!! note "Status"
-    Proof of concept. Implemented so far: the build option, the awake zone and its gaps
-    on every runtime thread, the poll zone in all three executors, the I/O wait message
-    and the I/O poll and dispatch zones, the blocking-job zone and thread names. Not yet:
-    the search zone, the plots, and the recording backend for tests.
-
 ## Summary
 
 A sampling profiler shows where CPU time goes. It does not show what the runtime did
 in what order: which task a worker polled and for how long, when the worker turned the
 I/O driver, how long it was parked, and how long a woken task waited before it ran.
 
-This design adds fixed trace points inside the runtime that record exactly that, with
-nanosecond timestamps, as one timeline row per worker thread. The trace points are
-compiled in only when the library is built with a tracing backend. The default build
-has none, and its code is the same as today.
+Fixed trace points inside the runtime record exactly that, with nanosecond timestamps,
+as one timeline row per worker thread. The trace points are compiled in only when the
+library is built with a tracing backend. The default build has none, and the trace
+points compile to nothing.
 
-The first backend is [Tracy](https://github.com/wolfpld/tracy). The trace points go
-through a small internal interface, so a second backend can be added without touching
-the executors again.
+The backend is [Tracy](https://github.com/wolfpld/tracy). The trace points go through a
+small internal interface, so another backend can be added without touching the
+executors.
 
 What a capture shows:
 
@@ -29,15 +23,13 @@ What a capture shows:
   or events;
 - every I/O driver turn, split into the wait and the dispatch of what the wait
   returned;
-- every job on the blocking pool;
-- run-queue depth and the number of live tasks as plots over time.
+- every job on the blocking pool.
 
-## What exists today
+## Relation to the lifecycle hooks
 
 `coro::set_task_lifecycle_hooks()` installs two `std::function`s that every
-`TaskImpl::poll()` calls, one on entry and one on exit. A program can already draw task
-polls on a timeline by calling a tracer's begin and end from those two hooks, with no
-change to the library.
+`TaskImpl::poll()` calls, one on entry and one on exit. A program can draw task polls on
+a timeline by calling a tracer's begin and end from those two hooks.
 
 That is not enough on its own:
 
@@ -112,8 +104,6 @@ flowchart TD
 | `BlockingJobZone` | around one job on the blocking pool | `blocking job`; nothing beyond the duration |
 | `IoWaitZone` | around the poller call in `IoDriver::turn_locked()` | an `io poll` zone when the call cannot block; an `io wait` message and a gap when it can |
 | `IoDispatchZone` | the dispatch loop and timer firing that follow | number of events and timers dispatched |
-| `SearchZone` | the steal step of `WorkStealingExecutor::worker_loop()` | whether a task was found (not yet; the time is inside `awake`) |
-| `plot` | at each driver turn | injection-queue depth, live task count, parked worker count |
 
 A driver turn is made for two different reasons, recorded differently:
 
@@ -163,9 +153,16 @@ installed. Each zone is a scope object:
 With no backend selected, every type in the header is empty and every function is an
 empty inline, so the trace points compile to nothing. Nothing is checked at run time.
 
-A backend supplies the bodies. Besides Tracy there is a recording backend used only by
-the tests, which appends each begin and end to a per-thread list so that a test can
-check that the zones pair up, nest, and carry the right task name.
+A backend supplies the bodies.
+
+!!! tip "TODO: search zone, plots and a recording backend"
+    - A `SearchZone` around the steal step of `WorkStealingExecutor::worker_loop()`,
+      recording whether a task was found. Until then the time is inside `awake`.
+    - A `plot` at each driver turn: injection-queue depth, live task count and parked
+      worker count, as Tracy plots.
+    - A recording backend used only by the tests, which appends each begin and end to a
+      per-thread list so that a test can check that the zones pair up, nest, and carry
+      the right task name.
 
 ### Tracy backend
 
@@ -174,7 +171,7 @@ check that the zones pair up, nest, and carry the right task name.
   location's own name, `task poll`. Naming the tasks is what makes the capture readable.
 - `AwakeZone` is a Tracy zone held in a `std::optional`, so a `SleepScope` can end and
   begin it again. The `io wait` tick is a `TracyMessageL`.
-- Plots are Tracy plots. `thread_name` sets the Tracy thread name.
+- `thread_name` sets the Tracy thread name.
 - Tracy is built with `TRACY_ON_DEMAND`: nothing is recorded or buffered until a
   viewer or `tracy-capture` connects. A traced binary left running with nobody
   connected does not grow.
@@ -358,8 +355,7 @@ Captures of a few seconds to a minute are practical; captures of hours are not.
   workers it runs on. Each switch costs more than a zone, and thousands of short-lived
   tasks make thousands of rows. It may be added later as an opt-in per task.
 - **Wake events.** Recording each `wake()` would show the delay from wake to poll, but
-  a wake can come from any thread and there can be several per poll. The run-queue
-  plots give a coarser view of the same thing.
+  a wake can come from any thread and there can be several per poll.
 - **Arrows from a wake to the poll it caused.** Tracy has no such link. See Perfetto
   below.
 - **A public tracing API.** Programs that want their own zones use the backend
@@ -375,7 +371,8 @@ Captures of a few seconds to a minute are practical; captures of hours are not.
   only, and the viewers have no notion of zones named at run time.
 - **USDT probes with bpftrace.** No dependency and no cost when unattached. Each
   attached probe traps into the kernel, which is too slow for a per-poll event.
-- **Only the lifecycle hooks.** Covered under [What exists today](#what-exists-today).
+- **Only the lifecycle hooks.** Covered under
+  [Relation to the lifecycle hooks](#relation-to-the-lifecycle-hooks).
 
 ## Open questions
 

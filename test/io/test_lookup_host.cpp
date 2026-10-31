@@ -1,8 +1,12 @@
 // lookup_host() (doc/design/file_io.md, "lookup_host") and hostnames in connect() and
-// bind(). Names that need resolving use "localhost", which /etc/hosts answers without
-// the network, or the RFC 6761 ".invalid" TLD, which never resolves.
+// bind(). Names that need resolving use "localhost", which the hosts file answers
+// without asking DNS. A failed lookup, or a chosen list of addresses, comes from a fake
+// resolver (fake_resolver.h); what the real one reports for a name that doesn't exist
+// is test_system_resolver.cpp's.
 
 #include <gtest/gtest.h>
+#include "fake_resolver.h"
+#include <coro/detail/sys/dns.h>
 #include <coro/io/lookup_host.h>
 #include <coro/io/tcp_listener.h>
 #include <coro/io/tcp_stream.h>
@@ -13,6 +17,7 @@
 #include <coro/coro.h>
 #include <array>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -75,11 +80,22 @@ TEST(LookupHostTest, LocalhostResolvesToLoopbackWithPort) {
     }
 }
 
+// The resolver's failure comes out of lookup_host() as it is.
 TEST(LookupHostTest, UnresolvableNameThrowsDnsError) {
+    FakeResolver fake(resolve_nothing);
     Runtime rt;
     auto code = rt.block_on(lookup_error("nonexistent.invalid"));
+    EXPECT_EQ(code, detail::sys::host_not_found_error()) << code.message();
+}
+
+// The backend's "not found" code is in the public DNS category and has a message of
+// its own, without asking any resolver.
+TEST(LookupHostTest, NotFoundErrorIsInDnsCategory) {
+    const std::error_code code = detail::sys::host_not_found_error();
     EXPECT_TRUE(code);
-    EXPECT_EQ(&code.category(), &dns_error_category()) << code.message();
+    EXPECT_EQ(&code.category(), &dns_error_category());
+    EXPECT_STREQ(code.category().name(), "coro.dns");
+    EXPECT_FALSE(code.message().empty());
 }
 
 // The resolver runs on the blocking pool, which doesn't need the IoDriver.
@@ -137,7 +153,33 @@ TEST(LookupHostTest, ConnectByNameRethrowsLastError) {
     EXPECT_EQ(code, std::errc::connection_refused);
 }
 
+// Two addresses for every name: first one nothing listens on (refused), then
+// 127.0.0.1 with the port asked for.
+static std::expected<std::vector<SocketAddress>, std::error_code>
+resolve_refused_then_loopback(const std::string&, uint16_t port) {
+    return std::vector{SocketAddress::parse("127.0.0.1", 31102).value(),
+                       SocketAddress::parse("127.0.0.1", port).value()};
+}
+
+// connect() tries each address in the resolver's order. "localhost" exercises this
+// only where it resolves to ::1 first; the fake makes the first address fail always.
+TEST(LookupHostTest, ConnectTriesEachResolvedAddress) {
+    FakeResolver fake(resolve_refused_then_loopback);
+    Runtime rt;
+    auto echoed = rt.block_on([]() -> Coro<std::string> {
+        auto listener = co_await TcpListener::bind("127.0.0.1", 31103);
+        auto client   = co_await TcpStream::connect("two.addresses.test", 31103);
+        auto server   = co_await listener.accept();
+        co_await client.write(std::string("hi"));
+        auto [n, buf] = co_await server.read_exact(std::string(2, '\0'));
+        buf.resize(n);
+        co_return buf;
+    }());
+    EXPECT_EQ(echoed, "hi");
+}
+
 TEST(LookupHostTest, ConnectToUnresolvableNameThrowsDnsError) {
+    FakeResolver fake(resolve_nothing);
     Runtime rt;
     auto code = rt.block_on([]() -> Coro<std::error_code> {
         try {

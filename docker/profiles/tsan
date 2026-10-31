@@ -8,6 +8,10 @@
 [settings]
 compiler.sanitizer=Thread
 
+# No gperftools: tcmalloc and the sanitizer would both replace malloc and free.
+[options]
+*:with_gperftools=False
+
 [conf]
 tools.build:cflags+=["-fsanitize=thread", "-g"]
 tools.build:cxxflags+=["-fsanitize=thread", "-g"]

@@ -105,6 +105,16 @@ uint64_t signal_count(int signum) noexcept {
     return g_counts[static_cast<std::size_t>(signum)].load();
 }
 
+bool signal_ignored(int signum) noexcept {
+    if (signum <= 0 || signum >= kMaxSignal) return false;
+    std::lock_guard lock(g_install_mutex);
+    // Watched: coro's handler is installed, whatever the action was before.
+    if (g_installed[static_cast<std::size_t>(signum)].refs > 0) return false;
+    struct sigaction current {};
+    if (::sigaction(signum, nullptr, &current) != 0) return false;
+    return !(current.sa_flags & SA_SIGINFO) && current.sa_handler == SIG_IGN;
+}
+
 RawFd signal_pipe_dup() {
     ensure_pipe();
     // Each dup() shares the pipe's one open file description, so it is non-blocking
@@ -114,6 +124,8 @@ RawFd signal_pipe_dup() {
     if (fd < 0) throw_errno(errno, "coro::signal: dup");
     return fd;
 }
+
+void signal_pipe_release(RawFd) noexcept {}
 
 IoResult signal_pipe_drain(RawFd fd) noexcept {
     std::size_t total = 0;

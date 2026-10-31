@@ -338,7 +338,11 @@ TEST(FiberDeathTest, StackOverflowFaultsOnGuardPage) {
                 // after the recursive call) so the compiler can't turn this into
                 // a constant-stack loop -- it needs a real, growing stack frame
                 // per call for the guard page to ever be reached.
+                // The n < 0 return is never taken (n only grows); it is there so
+                // MSVC does not reject the function as recursive on every path
+                // (C4717).
                 struct Recur { static int go(int n) {
+                    if (n < 0) return 0;
                     volatile char pad[512];
                     std::memset(const_cast<char*>(pad), 0, sizeof(pad));
                     int r = go(n + 1);

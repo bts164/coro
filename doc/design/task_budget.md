@@ -160,14 +160,14 @@ yield cannot multiply and is left as it is.
     extra await per task poll and nothing more. The charge is there for a future that
     polls several others and does not make that check.
 
-    What it guards against was seen before `join()` made the check. An earlier version
-    polled a deferred future for free on the next turn. Under nested `join()` each
-    coroutine resumed for free started its children, every one of them was deferred at
-    its own first `co_await`, and all of those were resumed for free on the turn after.
-    The number of suspended coroutines grew by the width of the `join()` on every
-    turn. A task that walked a tree of ready coroutines depth-first, with a few dozen
-    frames alive, instead had the whole tree alive at once; one benchmark of that
-    shape took about six times as long.
+    What it guards against: if a deferred future were polled for free on the next turn,
+    and a `join()` didn't make the check, then under nested `join()` each coroutine
+    resumed for free would start its children, every one of them would be deferred at
+    its own first `co_await`, and all of those would be resumed for free on the turn
+    after. The number of suspended coroutines would grow by the width of the `join()`
+    on every turn. A task that walks a tree of ready coroutines depth-first, with a few
+    dozen frames alive, would instead have the whole tree alive at once; one benchmark
+    of that shape takes about six times as long.
 
     Removing it would loosen the bound from `budget` awaits started per task poll to
     `budget` plus one for each deferred await resumed in that poll, and would leave
@@ -365,7 +365,9 @@ Not covered:
   See [Select](select.md), "Fairness". It is a separate question from this one.
 - **Starvation of the injection queue by a busy local queue.** A yield puts the task
   behind the tasks in its worker's own queue, not behind tasks waiting in the shared
-  queue. That is what the two executor proposals linked at the top are for.
+  queue. That is what the
+  [periodic injection-queue check](work_stealing_executor.md#periodic-injection-queue-check)
+  is for.
 
 ## Edge cases
 

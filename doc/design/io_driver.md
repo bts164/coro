@@ -14,6 +14,7 @@ queue. Each I/O primitive built on it has its own document (see
 |---|---|---|
 | `sys::Poller`, `sys::PollWaker`, `Interest`, `Event` (epoll) | `include/coro/detail/sys/poller.h`, `src/detail/sys/posix/poller_epoll.cpp` | `test/detail/test_poller.cpp` |
 | `sys::Poller`, `sys::PollWaker` (lwIP) | `src/detail/sys/lwip/poller_lwip.cpp`; see [Pico Port](pico_port.md#poller) | `test/detail/test_notify.cpp`, and the TCP and UDP tests, on host lwIP and on the board |
+| `sys::Poller`, `sys::PollWaker` (IOCP + AFD) | `src/detail/sys/windows/poller_iocp.cpp`; see [Windows Port](windows_port.md#the-iocpafd-poller) | `test/detail/test_poller.cpp` |
 | `sys::notify_open`, `sys::notify_signal` | `include/coro/detail/sys/notify.h`, `src/detail/sys/posix/notify_posix.cpp`, `src/detail/sys/lwip/notify_lwip.cpp` | `test/detail/test_notify.cpp` |
 | `IoDriver`, `ScheduledIo`, `IoRegistration`, `IoDriverParker` | `include/coro/runtime/io_driver.h`, `src/runtime/io_driver.cpp` | `test/runtime/test_io_driver.cpp`; the waiter list in `test/detail/test_notify.cpp`, on every backend |
 | `Parker`, `PollingParker` | `include/coro/runtime/parker.h` | `test/runtime/test_current_thread_executor.cpp` |
@@ -78,13 +79,13 @@ flowchart TD
     R["IoRegistration<br/>per I/O object: poll_ready / clear_ready / poll_io"]
     D["IoDriver<br/>ScheduledIo registry, event dispatch, timer queue"]
     S["sys:: platform layer (the mio equivalent)<br/>Poller, Event, Interest, PollWaker"]
-    OS["epoll (Linux) / kqueue (macOS, BSD) / ? (Windows)"]
+    OS["epoll (Linux) / IOCP + AFD (Windows) / lwIP (Pico)"]
     P --> R --> D --> S --> OS
 ```
 
 | Layer | Portable? | Responsibility |
 |---|---|---|
-| `sys::Poller` and `sys::PollWaker` | **No.** One implementation per platform: epoll on Linux, lwIP on Pico. | Register, re-register and deregister an fd with an interest set; wait for events with a timeout; wake a blocked wait from another thread. |
+| `sys::Poller` and `sys::PollWaker` | **No.** One implementation per platform: epoll on Linux, IOCP + AFD on Windows, lwIP on Pico. | Register, re-register and deregister an fd with an interest set; wait for events with a timeout; wake a blocked wait from another thread. |
 | `IoDriver` | Yes | Own the `Poller`, map each event to its `ScheduledIo`, update readiness, fire wakers; own the timer queue. |
 | `IoRegistration` | Yes | The readiness handshake a future uses: wait until ready, attempt the syscall, clear readiness on `EAGAIN`. |
 | Primitives | Mostly | Non-blocking syscalls behind a per-primitive backend seam (`detail/sys/udp.h`, `tcp.h`, ...), plus the `IoRegistration` handshake. |
@@ -100,7 +101,8 @@ namespace coro::detail::sys {
 // The handle of one I/O object: what the platform's "syscalls" take.
 using RawFd = int;                     // POSIX: a file descriptor
 // using RawFd = IoObject*;            // lwIP (CORO_SYS_LWIP): the object itself
-inline constexpr RawFd kInvalidFd = -1;   // nullptr on lwIP
+// using RawFd = std::uintptr_t;       // Windows: a SOCKET
+inline constexpr RawFd kInvalidFd = -1;   // nullptr on lwIP; all ones on Windows
 
 // Backend-specific construction options. Empty on POSIX; on lwIP, the Pico SDK
 // async_context poll() runs and sleeps on, and the PicoNetwork.
@@ -126,6 +128,9 @@ public:
     void register_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
     void reregister_fd(RawFd fd, void* key, Interest interest, Trigger trigger = Trigger::Edge);
     bool deregister_fd(RawFd fd) noexcept;                       // thread-safe
+    /// Re-enables a direction after its consumer saw would-block. Thread-safe. A no-op
+    /// where the OS delivers edges itself; see "Emulated edges" below.
+    void rearm(RawFd fd, Interest interest) noexcept;
     /// Waits up to timeout (nullopt = forever) and appends events to out.
     void poll(std::vector<Event>& out, std::optional<std::chrono::nanoseconds> timeout);
 };
@@ -175,6 +180,11 @@ Semantics every backend must provide:
   consumer may only wait after it has seen `EAGAIN`. This is the strictest contract, and
   the handshake below follows it. A level-triggered backend still works under it; it just
   reports extra events.
+- **Emulated edges.** A backend whose OS only offers one-shot polls (AFD on Windows)
+  stops reporting a direction once it has reported it, and reports it again only after
+  `rearm()`. `IoRegistration::clear_ready()` calls `rearm()` when it clears a direction,
+  which is exactly when the edge contract lets a consumer wait. On epoll and lwIP it is
+  an empty inline function. See [Windows Port](windows_port.md#edge-emulation).
 - **Level-triggered delivery on request** (`Trigger::Level`; see
   [Level-triggered registrations](#level-triggered-registrations)). The fd is reported
   by every `poll()` while it is ready for something in its interest set. On epoll that
@@ -218,6 +228,7 @@ ownership, cancellation and error mapping, the executors and the `Parker` protoc
 | Platform | Readiness source | Non-blocking operations |
 |---|---|---|
 | **fd-based OS** (Linux epoll, macOS/BSD kqueue) | The OS readiness queue | POSIX syscalls (`recvfrom`, `sendto`, ...). Only OS-specific options (GSO, GRO) differ, behind `#ifdef` |
+| **Windows** | `IOCTL_AFD_POLL` requests completing on an I/O completion port, one-shot, with edges emulated through `rearm()`. See [Windows Port](windows_port.md) | Winsock calls, with WSA errors translated to errno |
 | **Network stack without an OS** (lwIP raw API on Pico W) | lwIP's callbacks put objects on the `Poller`'s ready list; `poll()` runs the Pico SDK's `async_context` (radio, lwIP timers, ISR signals) and sleeps the CPU on it | "Syscalls" on per-socket objects that play the kernel's part: copy from per-socket receive buffers, `tcp_write`, `udp_sendto`. See [Pico Port](pico_port.md#the-lwip-sys-backend) |
 
 ```mermaid
@@ -314,8 +325,8 @@ for (;;) {
     if (!ready) return PollPending;
     auto r = op();
     if (r || !would_block(r.error())) return r;
-    reg.clear_ready(*ready);                              // clears only if tick is unchanged
-}
+    reg.clear_ready(*ready);                              // clears only if tick is unchanged,
+}                                                         //   then Poller::rearm()s the direction
 ```
 
 ```mermaid
@@ -912,7 +923,7 @@ never early: `SleepFuture` checks the clock itself.
 | `UdpSocket` | `IoRegistration` per socket; non-blocking ops in `detail/sys/udp.h` | [UDP Socket](udp_socket.md) |
 | `TcpStream`, `TcpListener` | `IoRegistration` per socket; non-blocking ops in `detail/sys/tcp.h` | [TCP Stream](tcp_stream.md) |
 | `Pipe` | `IoRegistration` per FIFO end; `detail/sys/pipe.h` | [Pipe](pipe_streaming.md) |
-| `signal()`, `signal_stream()` | A self-pipe written by the signal handler; each watcher reads it through the driver | [Signal Handling](signal_handling.md) |
+| `ctrl_c()`, `shutdown_requested()`, `signal()`, `signal_stream()` | A self-pipe written by the signal handler; each watcher reads it through the driver | [Signal Handling](signal_handling.md) |
 | `sleep_for`, `sleep_until`, `timeout`, `IntervalTimer` | The driver's timer queue | [Timers](timers.md) |
 | `File` | Not on the driver: a regular file is always "ready", so each operation runs on the blocking pool | [File I/O](file_io.md) |
 | `lookup_host()` | POSIX: `getaddrinfo()` blocks, so it runs on the blocking pool. lwIP: each query is an object registered with the driver, made readable by lwIP's DNS callback | [File I/O](file_io.md#lookup_host), [Pico Port](pico_port.md#name-resolution) |
@@ -1017,9 +1028,6 @@ how often:
 
 ## Open questions
 
-- **Windows / MSVC.** CLAUDE.md lists MSVC as a secondary target. If that means Windows
-  must work, the option is an IOCP-backed `sys` layer using mio's AFD approach (readiness
-  emulated on top of IOCP). If MSVC only matters as a compiler, it doesn't come up.
 - **Waiting while no executor thread is running.** `CurrentThreadExecutor` only turns the
   driver inside `block_on()`. A `blocking_wait()` on a foreign thread for I/O, while the
   runtime thread sits outside `block_on()`, never makes progress. Decide whether that is

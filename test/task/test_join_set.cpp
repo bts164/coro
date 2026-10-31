@@ -1031,6 +1031,7 @@ namespace {
 Coro<int> throw_after_a_poll() {
     co_await OneShotFuture<int>{0};
     throw std::runtime_error("second");
+    co_return 0;
 }
 
 Coro<int> throw_at_once() {

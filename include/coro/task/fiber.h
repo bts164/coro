@@ -27,38 +27,39 @@ namespace detail {
 
 // Bridges fiber code (running on its own stack, possibly many ordinary
 // non-coroutine frames deep inside a third-party library) back to the
-// executor's Context/Waker machinery. Saved/restored around every
-// switch_context() call in FiberFuture<T>::poll(), the same pattern
-// coro_scope.h's t_current_coro already uses to expose "the currently
-// running task" to code that isn't lexically inside it.
+// executor's Context/Waker machinery: the fiber the calling thread is running,
+// set and restored around every switch_context() call in
+// FiberFuture<T>::poll(), the same pattern coro_scope.h's t_current_coro uses
+// to expose "the currently running task" to code that isn't lexically inside it.
 //
-// Plain globals under CORO_PICO, not thread_local: Cortex-M0+ has no
-// hardware TLS, and thread_local compiles down to a call to
-// __aeabi_read_tp, which bare-metal newlib doesn't implement -- undefined
-// reference at link time. A plain global is equivalent on the
-// single-threaded CurrentThreadExecutor -- see coro_scope.h's
-// t_current_coro for the same fix applied earlier.
-#ifdef CORO_PICO
-extern Context*      t_current_fiber_ctx;
-extern FiberContext* t_current_fiber_running_ctx; // the fiber's own context
-extern FiberContext* t_current_fiber_caller_ctx;  // who to switch back to
-#else
-extern thread_local Context*      t_current_fiber_ctx;
-extern thread_local FiberContext* t_current_fiber_running_ctx; // the fiber's own context
-extern thread_local FiberContext* t_current_fiber_caller_ctx;  // who to switch back to
-#endif
+// The state is thread-local (a plain global under CORO_PICO, which has one
+// thread and no hardware TLS) and lives in src/task/fiber.cpp, reachable only
+// through the out-of-line functions below. A fiber can be resumed on another
+// worker, and a compiler may compute a thread-local's address once per function
+// and reuse it across calls: code on a fiber's stack that read a header-visible
+// thread-local before and after a suspension could read the previous worker's
+// copy. Each call here computes it again on the thread that is running. See
+// doc/design/fiber.md, "Thread-locals and worker migration".
+struct FiberFrame {
+    Context*      ctx     = nullptr;  // the polling task's Context
+    FiberContext* running = nullptr;  // the fiber's own context
+    FiberContext* caller  = nullptr;  // who to switch back to
+};
 
-// Set immediately before a fiber's very first switch_context() (poll()'s
-// first call), read exactly once by FiberFuture<T>::trampoline() as it
-// starts running on the fresh stack. makecontext() only supports passing
-// plain int arguments portably, so the FiberFuture<T>* is threaded through
-// here instead, the same way the three thread-locals above thread state
-// through switch_context()'s otherwise argument-less transfer.
-#ifdef CORO_PICO
-extern void* t_fiber_start_arg;
-#else
-extern thread_local void* t_fiber_start_arg;
-#endif
+/// @brief Makes `frame` the calling thread's current fiber, and `start_arg` what
+/// fiber_start_arg() returns, until leave_fiber(). Returns the previous frame.
+/// `start_arg` is how FiberFuture<T>::trampoline() finds its FiberFuture on its
+/// first entry: makecontext() only passes ints portably.
+FiberFrame enter_fiber(FiberFrame frame, void* start_arg) noexcept;
+
+/// @brief Restores the frame enter_fiber() returned.
+void leave_fiber(FiberFrame previous) noexcept;
+
+/// @brief The current fiber's Context, or null outside a fiber.
+Context* current_fiber_context() noexcept;
+
+/// @brief The `start_arg` of the innermost enter_fiber() on this thread.
+void* fiber_start_arg() noexcept;
 
 } // namespace detail
 
@@ -104,19 +105,12 @@ public:
             m_started = true;
         }
 
-        auto* prev_ctx     = detail::t_current_fiber_ctx;
-        auto* prev_running = detail::t_current_fiber_running_ctx;
-        auto* prev_caller  = detail::t_current_fiber_caller_ctx;
-        detail::t_current_fiber_ctx         = &ctx;
-        detail::t_current_fiber_running_ctx = &m_fiber_ctx;
-        detail::t_current_fiber_caller_ctx  = &m_caller_ctx;
-        detail::t_fiber_start_arg           = this;
+        const detail::FiberFrame prev =
+            detail::enter_fiber({&ctx, &m_fiber_ctx, &m_caller_ctx}, this);
 
         detail::switch_context(&m_caller_ctx, &m_fiber_ctx); // resume (or start) the fiber
 
-        detail::t_current_fiber_ctx         = prev_ctx;
-        detail::t_current_fiber_running_ctx = prev_running;
-        detail::t_current_fiber_caller_ctx  = prev_caller;
+        detail::leave_fiber(prev);
 
         if (!m_finished) return PollPending;
         if (m_exception) return PollError(m_exception);
@@ -125,7 +119,7 @@ public:
     }
 
 private:
-    // Runs on the fiber's own stack. Reads `this` back out of t_fiber_start_arg
+    // Runs on the fiber's own stack. Reads `this` back from fiber_start_arg()
     // (stashed by poll() immediately before the switch that starts us), invokes
     // the entry callable, stores its result/exception, and switches back to the
     // caller. Never returns: the caller's poll() only ever resumes this stack
@@ -135,7 +129,7 @@ private:
         // entry -- see notify_fiber_switch_finished()'s comment. Must come
         // before anything else touches this stack.
         detail::notify_fiber_switch_finished();
-        auto* self = static_cast<FiberFuture*>(detail::t_fiber_start_arg);
+        auto* self = static_cast<FiberFuture*>(detail::fiber_start_arg());
         try {
             if constexpr (std::is_void_v<T>) self->m_entry();
             else self->m_result = self->m_entry();
@@ -190,14 +184,17 @@ void fiber_yield();
  */
 template<Future F>
 typename F::OutputType fiber_await(F future) {
-    if (!detail::t_current_fiber_ctx)
+    // current_fiber_context() is called again after every fiber_yield(): the fiber may
+    // have been resumed on another worker, with another Context.
+    detail::Context* ctx = detail::current_fiber_context();
+    if (!ctx)
         throw std::logic_error("fiber_await() called outside a fiber");
-    if (!detail::t_current_fiber_ctx->try_consume_budget()) {
-        detail::t_current_fiber_ctx->yield_to_executor();
+    if (!ctx->try_consume_budget()) {
+        ctx->yield_to_executor();
         detail::fiber_yield(); // resumes on the task's next poll, with a fresh Context
     }
     for (;;) {
-        auto r = future.poll(*detail::t_current_fiber_ctx);
+        auto r = future.poll(*detail::current_fiber_context());
         if (r.isDropped()) throw TaskCancelled{};  // no value to return, as for co_await
         if (!r.isPending()) {
             r.rethrowIfError();

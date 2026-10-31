@@ -4,10 +4,9 @@
 
 lwIP's headers resolve `lwipopts.h` via an unqualified `#include "lwipopts.h"`
 — whichever include directory is searched first that contains a matching
-file wins. Historically every Pico application in this repo provided its
-own copy (`examples/pico/lwipopts.h`, `examples/pico/epaper/lwipopts.h` —
-byte-identical) and had to remember to add it to `coro_pico`'s include path.
-Forgetting it is a build error; subtly diverging it is worse, since
+file wins. If every Pico application provided its own copy, each would have
+to remember to add it to `coro_pico`'s include path. Forgetting it is a
+build error; subtly diverging it is worse, since
 `lwipopts.h` affects the ABI of every translation unit that includes lwIP
 headers, including the ones inside `coro_pico` itself.
 
@@ -24,8 +23,8 @@ get it transitively through `coro` — by linking `coro::pico` (or
 `coro::pico_mqtt`, etc.) — never by declaring its own copy or its own
 include path for one. `coro_pico_mqtt` is the existing proof this works:
 it needs `LWIP_MQTT 1`, but gets there through its `coro_pico` dependency,
-not by bringing its own `lwipopts.h`. A future `coro_pico_https` (or any
-other lwIP-touching module) must follow the same rule. This is a documented
+not by bringing its own `lwipopts.h`. Any other lwIP-touching module
+must follow the same rule. This is a documented
 constraint, not something enforced generically across an arbitrary
 dependency graph — a second, independent lwIP-using Conan package that
 insists on its own config is an accepted incompatibility, not a problem
@@ -146,7 +145,7 @@ A custom `lwipopts.h` must keep these.
 
 ## Future: packages split out of `coro` itself
 
-If `coro_pico_mqtt` (or a future `coro_pico_https`) is ever split into its
+If `coro_pico_mqtt` (or another lwIP module) is ever split into its
 *own* Conan package rather than living inside `coro`'s own CMakeLists.txt,
 the options-as-package-ID mechanism alone isn't enough — Conan doesn't
 stop two independently-versioned recipes from disagreeing about a shared
@@ -160,7 +159,9 @@ def validate(self):
 ```
 
 This raises a hard, early error rather than a silent link-against-the-wrong-
-config failure. Not implemented yet because there is no split-out package
-yet — `coro_pico_mqtt` still lives in `coro`'s own `cmake/platforms/`. Add
-this `validate()` the day a `coro_pico_mqtt` *package* (separate
-`conanfile.py`) is introduced.
+config failure.
+
+!!! tip "TODO: add `validate()` to a split-out package"
+    `coro_pico_mqtt` lives in `coro`'s own `cmake/platforms/`, so there is no
+    separate recipe to put this in. Add this `validate()` when a
+    `coro_pico_mqtt` *package* (separate `conanfile.py`) is introduced.

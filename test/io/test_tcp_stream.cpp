@@ -24,12 +24,12 @@
 #include "test_netif.h"
 #else
 #include <coro/io/lookup_host.h>
+#include "fake_resolver.h"
 #include <coro/runtime/work_sharing_executor.h>
 #include <coro/runtime/current_thread_executor.h>
 #include <coro/runtime/parker.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <coro/detail/sys/socket.h>
+#include <coro/detail/sys/tcp.h>
 #endif
 #include <algorithm>
 #include <cerrno>
@@ -321,21 +321,29 @@ TEST(TcpStreamTest, SlowReaderClosesAndReopensWindow) {
 
 // With nobody reading, a write too large for the window and the send buffer waits.
 // Once the peer reads, it completes, and every byte arrives.
+//
+// Windows accepts a whole non-blocking send() whenever the send buffer has any room
+// left, however large the send, so there the first write completes at once and only
+// the next one finds the buffer full. So: write until one waits, a few times at most.
 TEST(TcpStreamTest, WriteWaitsUntilPeerReads) {
     NetRuntime rt;
     EXPECT_TRUE(finishes_within(rt, 10s, []() -> Coro<void> {
+        constexpr int kMaxWrites = 3;
         auto c = co_await connect_pair("127.0.0.1", 31024);
         JoinHandle<std::size_t> reader;
-        {
+        std::size_t sent = 0;
+        for (int i = 0; i < kMaxWrites && !reader; ++i) {
             auto write = c.client.write(std::vector<std::byte>(kBlockedWrite));
             auto early = co_await coro::timeout(100ms, coro::ref(write));
-            EXPECT_EQ(early.index(), 1u) << "the write did not wait for room";
-            if (early.index() == 0) co_return;   // spent: it cannot be polled again
+            sent += kBlockedWrite;
+            if (early.index() == 0) continue;   // accepted whole; spent, so write again
             reader = coro::spawn(read_until_eof(std::move(c.server)));
             co_await coro::ref(write);
         }
+        EXPECT_TRUE(reader) << "no write waited for room";
+        if (!reader) co_return;
         { TcpStream gone = std::move(c.client); }   // EOF ends the reader
-        EXPECT_EQ(co_await reader, kBlockedWrite);
+        EXPECT_EQ(co_await reader, sent);
     }()));
 }
 
@@ -804,14 +812,14 @@ TEST(TcpStreamTest, LookupWithoutDnsServerFailsPromptly) {
 namespace {
 
 bool ipv6_loopback_available() {
-    const int fd = ::socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6;
-    addr.sin6_addr   = in6addr_loopback;
-    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
-    ::close(fd);
-    return ok;
+    Ipv6Address loopback;
+    loopback.octets[15] = 1;   // ::1
+    try {
+        detail::sys::close_socket(detail::sys::tcp_listen(SocketAddress{loopback, 0}, 1));
+        return true;
+    } catch (const std::system_error&) {
+        return false;
+    }
 }
 
 } // namespace
@@ -870,6 +878,7 @@ TEST(TcpStreamTest, BadAddressesThrowOnAwait) {
 
         // Hostnames are resolved now; an unresolvable one fails with the DNS error.
         // Name-based connect/bind are covered in test_lookup_host.cpp.
+        FakeResolver fake(resolve_nothing);
         bool bad_bind = false;
         try {
             auto l = co_await TcpListener::bind("nonexistent.invalid", 0);

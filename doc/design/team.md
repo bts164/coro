@@ -705,7 +705,7 @@ is reported by a poll, and a coro future's constructor has no side effects.
 - A moved-from handle used for anything but destruction or assignment. `rank()`,
   `size()`, `range()` and `is_broken()` throw `TeamUsageError`, and a collective
   returns a future that fails with it at its first poll. Answering with the rank the
-  handle used to have would let a part go on with another part's share. Neither breaks
+  handle had before the move would let a part go on with another part's share. Neither breaks
   anything, since there's no team, and the error's `rank()` is `SIZE_MAX`. The move
   resets the handle's rank, size and round count, so nothing of the old rank is left
   in it.
@@ -1101,23 +1101,16 @@ it takes no code of its own.
 ## `parallel()`
 
 `parallel()` calls `make_team(k)` at its first poll and moves one member into each part,
-so `fn` takes a `TeamMember`. `ParallelPart` goes: an alias would keep the old
-signatures compiling, but the changes below break every caller anyway, and two names
-for one type would only make readers look for a difference.
+so `fn` takes a `TeamMember`, by value since it's move-only. A part has no type of its
+own: two names for one type would only make readers look for a difference.
 
-The changes for existing code:
+- A part's position is `rank()` and `size()`, the names every reference library uses.
+- `sync()` returns a `TeamSyncFuture`, with no leader flag.
+- `parallel()` holds no `Barrier`: the team state is reference-counted and can be
+  created at any time, so nothing has to be emplaced late.
+- `test_team.cpp` covers `range()` for every `make_team(k)`.
 
-- `ParallelPart` becomes `TeamMember`, taken by value: it's move-only.
-- `index()` and `count()` become `rank()` and `size()`, the names every reference library
-  uses.
-- `sync()` returns a `TeamSyncFuture` with no leader flag, instead of a
-  `BarrierWaitFuture`.
-- The range test moves to `test_team.cpp`, which covers `range()` for every `make_team(k)`.
-- `parallel()` no longer holds a `Barrier`. The `std::optional<Barrier>` and its late
-  emplacement go, since the team state is reference-counted and can be created at any
-  time.
-
-`parallel()` still cancels the other parts on the first error. With a team, the parts
+`parallel()` cancels the other parts on the first error. With a team, the parts
 waiting in a collective would have failed with `TeamBroken` regardless; cancelling them
 stops the ones still computing between collectives.
 

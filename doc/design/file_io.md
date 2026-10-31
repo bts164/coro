@@ -162,6 +162,20 @@ std::vector<coro::SocketAddress> addrs = co_await coro::lookup_host("example.com
 resolve it with `lookup_host`. They try each address in order and rethrow the last
 failure if all of them fail, as tokio does.
 
+**Testing without the machine's DNS.** A lookup the system resolver has to fail can
+take 10 s or more where no nameserver answers (a VPN's slow backup servers, a container
+with none). So the tests don't ask it, except for one:
+
+- `sys::set_resolver_for_testing(fn)` makes `lookup_host` call `fn` instead of
+  `resolve_host()` until it is reset (blocking backends only; it is defined in
+  `lookup_host.cpp`, not by the backends). `test/fake_resolver.h` wraps it in an RAII
+  `FakeResolver`, with `resolve_nothing`, which fails every name with
+  `sys::host_not_found_error()`: the backend's own "not found" code. Every test of a
+  failed lookup, and of `connect()` trying each address, uses it.
+- `test/io/test_system_resolver.cpp` is the one test that asks the real resolver, for
+  `nonexistent.invalid`. It is its own executable with the ctest label `network`, so
+  `ctest -LE network` skips it on a machine whose DNS is slow.
+
 !!! tip "TODO: asynchronous resolver"
     `getaddrinfo` holds a pool thread for the whole lookup, up to the resolver's timeout.
     That is fine at connect-time rates. If a workload resolves many names concurrently,
@@ -222,7 +236,7 @@ failure if all of them fail, as tokio does.
 | `include/coro/io/file.h`, `file.hpp`, `src/io/file.cpp` | `FileMode`, `detail::FileState`, `File` |
 | `include/coro/io/lookup_host.h`, `src/io/lookup_host.cpp` | `lookup_host()`, `dns_error_category()` |
 | `include/coro/detail/sys/file.h`, `src/detail/sys/posix/file_posix.cpp` | File backend seam |
-| `include/coro/detail/sys/dns.h`, `src/detail/sys/posix/dns_posix.cpp`, `src/detail/sys/lwip/dns_lwip.cpp` | Resolver backend seam |
-| `test/io/test_file.cpp`, `test/io/test_lookup_host.cpp` | Tests |
+| `include/coro/detail/sys/dns.h`, `src/detail/sys/posix/dns_posix.cpp`, `src/detail/sys/windows/dns_windows.cpp`, `src/detail/sys/lwip/dns_lwip.cpp` | Resolver backend seam |
+| `test/io/test_file.cpp`, `test/io/test_lookup_host.cpp`, `test/io/test_system_resolver.cpp`, `test/fake_resolver.h` | Tests, and the fake resolver |
 
 `file.h` and `file.hpp` are excluded from the Pico install.

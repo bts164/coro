@@ -1,5 +1,12 @@
-# Applies to `git archive`, and so to the source archives GitHub generates for
-# a tag or a release. See doc/versioning.md.
+# Checked out with LF endings on every platform, whatever core.autocrlf says, as
+# the tools that read them fail on CRLF: bash, on Windows (Git Bash) and in the
+# Linux containers docker/run-tests.sh mounts a Windows checkout into, and the
+# sanitizers, which read their suppression files in those containers.
+*.sh   text eol=lf
+*.supp text eol=lf
+
+# The rest applies to `git archive`, and so to the source archives GitHub
+# generates for a tag or a release. See doc/versioning.md.
 
 # git fills in this file's $Format:...$ placeholders in an archive, recording
 # the `git describe` result and the commit. conan_version.py reads the version

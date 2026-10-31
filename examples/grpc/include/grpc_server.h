@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 
 #include <absl/log/log.h>
 #include <grpcpp/grpcpp.h>
@@ -149,7 +150,7 @@ private:
 
         auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         responder.Finish(reply, grpc::Status::OK, &finish_tx);
-        co_await finish_rx.recv();
+        (void)co_await finish_rx.recv();
     }
 
     // -------------------------------------------------------------------------
@@ -211,7 +212,7 @@ private:
         // Send the single reply and wait for delivery.
         auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         reader.Finish(reply, grpc::Status::OK, &finish_tx);
-        co_await finish_rx.recv();
+        (void)co_await finish_rx.recv();
     }
 
     // -------------------------------------------------------------------------
@@ -270,7 +271,7 @@ private:
         // All replies sent; close the stream.
         auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         writer.Finish(grpc::Status::OK, &finish_tx);
-        co_await finish_rx.recv();
+        (void)co_await finish_rx.recv();
     }
 
     // -------------------------------------------------------------------------
@@ -352,7 +353,7 @@ private:
         // All replies sent; close the stream.
         auto [finish_tx, finish_rx] = coro::oneshot_channel<bool>();
         stream.Finish(grpc::Status::OK, &finish_tx);
-        co_await finish_rx.recv();
+        (void)co_await finish_rx.recv();
     }
 
 protected:
@@ -384,7 +385,7 @@ public:
     /*!
      * \brief Starts the gRPC server and drives its completion queue.
      *
-     * Serves until SIGINT or SIGTERM, then shuts down: in-flight RPCs get a
+     * Serves until Ctrl-C or a shutdown request, then shuts down: in-flight RPCs get a
      * second to finish before gRPC cancels them, and Serve() returns once every
      * handler has ended and the completion queue is drained.
      *
@@ -423,17 +424,24 @@ public:
         });
 
         // Reap each handler as it finishes, so the set doesn't grow without bound
-        // and a handler that threw is logged. The signals are created once and lent
-        // to each select() with coro::ref(), so they are watched continuously.
-        auto interrupted = coro::signal(SIGINT);
-        auto terminated  = coro::signal(SIGTERM);
+        // and a handler that threw is logged. The stop futures are created once and
+        // lent to each select() with coro::ref(), so they are watched continuously.
+        auto interrupted = coro::ctrl_c();
+        auto terminated  = coro::shutdown_requested();
+        // Held through the shutdown below if a shutdown request stopped us: on Windows
+        // the process ends as soon as it is dropped.
+        std::optional<coro::ShutdownGuard> guard;
         for (;;) {
             auto sel = co_await coro::select(
                 coro::ref(interrupted),
                 coro::ref(terminated),
                 coro::when(!self->m_join_set.empty(),
                            [&] { return coro::next(self->m_join_set); }));
-            if (sel.index() != 2) break;
+            if (sel.index() == 0) break;
+            if (sel.index() == 1) {
+                guard.emplace(std::move(std::get<1>(sel).value));
+                break;
+            }
             if (auto& done = std::get<2>(sel).value) LogHandlerFailure(*done);
         }
 

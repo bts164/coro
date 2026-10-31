@@ -126,6 +126,38 @@ else()
 
     file(GLOB_RECURSE CORO_PUBLIC_HEADERS "include/coro/*.h" "include/coro/*.hpp")
     message(STATUS ${CORO_PUBLIC_HEADERS})
+    if(WIN32)
+        # The IOCP/AFD sys backend, console control events and Win32 fibers. Pipe is
+        # not ported yet; see doc/design/windows_port.md, "Scope".
+        set(CORO_PLATFORM_SOURCES
+            src/detail/fiber_context_windows.cpp
+            src/detail/sys/windows/win.cpp
+            src/detail/sys/windows/poller_iocp.cpp
+            src/detail/sys/windows/socket_windows.cpp
+            src/detail/sys/windows/tcp_windows.cpp
+            src/detail/sys/windows/udp_windows.cpp
+            src/detail/sys/windows/dns_windows.cpp
+            src/detail/sys/windows/file_windows.cpp
+            src/detail/sys/windows/signal_windows.cpp
+            src/io/signal.cpp
+        )
+    else()
+        set(CORO_PLATFORM_SOURCES
+            src/detail/fiber_context_posix.cpp
+            src/detail/sys/posix/dns_posix.cpp
+            src/detail/sys/posix/file_posix.cpp
+            src/detail/sys/posix/notify_posix.cpp
+            src/detail/sys/posix/pipe_posix.cpp
+            src/detail/sys/posix/signal_posix.cpp
+            src/detail/sys/posix/poller_epoll.cpp
+            src/detail/sys/posix/socket_posix.cpp
+            src/detail/sys/posix/tcp_posix.cpp
+            src/detail/sys/posix/udp_posix.cpp
+            src/io/pipe.cpp
+            src/io/signal.cpp
+        )
+    endif()
+
     add_library(coro
         # runtime/
         src/runtime/runtime.cpp
@@ -141,16 +173,6 @@ else()
         src/task/context.cpp
         src/task/fiber.cpp
         # detail/
-        src/detail/fiber_context_posix.cpp
-        src/detail/sys/posix/dns_posix.cpp
-        src/detail/sys/posix/file_posix.cpp
-        src/detail/sys/posix/notify_posix.cpp
-        src/detail/sys/posix/pipe_posix.cpp
-        src/detail/sys/posix/signal_posix.cpp
-        src/detail/sys/posix/poller_epoll.cpp
-        src/detail/sys/posix/socket_posix.cpp
-        src/detail/sys/posix/tcp_posix.cpp
-        src/detail/sys/posix/udp_posix.cpp
         src/detail/socket_state.cpp
         src/detail/timer_queue.cpp
         # sync/
@@ -163,12 +185,27 @@ else()
         src/io/ws_service.cpp
         src/io/file.cpp
         src/io/lookup_host.cpp
-        src/io/pipe.cpp
         src/io/circular_byte_buffer.cpp
-        src/io/signal.cpp
         src/io/socket_address.cpp
         src/io/udp_socket.cpp
+        # platform: sys backend and the parts not yet ported everywhere
+        ${CORO_PLATFORM_SOURCES}
     )
+    if(WIN32)
+        # Windows 10 or later. Winsock is the only library linked: the NT calls the
+        # poller needs are looked up in ntdll at run time (src/detail/sys/windows/nt.h).
+        target_compile_definitions(coro PRIVATE
+            WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+        target_link_libraries(coro PUBLIC ws2_32)
+    endif()
+    if(MSVC)
+        # Standard conformance, a __cplusplus that tells the truth, UTF-8 sources.
+        # C4324 ("structure was padded due to alignment specifier") is off: the padding
+        # is the point of every alignas in coro, which keeps hot fields on their own
+        # cache line (TaskBase, OwnedTasks::Shard, the work-stealing queues).
+        target_compile_options(coro PRIVATE /permissive- /Zc:__cplusplus /utf-8 /EHsc /W4
+                                            /wd4324)
+    endif()
     if(CORO_USE_LOCAL_RUN_QUEUE)
         target_compile_definitions(coro PUBLIC CORO_USE_LOCAL_RUN_QUEUE)
     endif()
@@ -177,6 +214,13 @@ else()
         $<$<BOOL:${WITH_GPERFTOOLS}>:${CORO_GPERFTOOLS_TARGET}>
         ${CORO_LIBWEBSOCKETS_TARGET}
         $<$<BOOL:${CORO_LIBWEBSOCKETS_USES_LIBCAP}>:cap>)
+    if(WITH_GPERFTOOLS AND MSVC)
+        # A static tcmalloc on Windows works by patching the CRT's malloc at startup,
+        # which nothing references, so the linker drops it unless each executable
+        # forces it in, as gperftools' own CMakeLists.txt does. conanfile.py's
+        # package_info() passes the same flag to consumers of the package.
+        target_link_options(coro INTERFACE "/INCLUDE:__tcmalloc")
+    endif()
     if(CORO_TRACING STREQUAL "tracy")
         # PRIVATE definition: only src/detail/trace.h reads it, and no public header
         # includes that. The link is PUBLIC so that a program adding its own zones

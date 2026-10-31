@@ -13,10 +13,15 @@
 #include <cstdlib>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace coro::detail::ws {
+
+// lws's sockets go straight to the driver: an int on POSIX, a SOCKET on Windows.
+static_assert(std::is_same_v<lws_sockfd_type, sys::RawFd>,
+              "lws's socket type must be the sys layer's RawFd");
 
 int protocol_cb(lws* wsi, lws_callback_reasons reason, void* user, void* in, std::size_t len);
 
@@ -150,7 +155,7 @@ void ensure_ssl_anchor() {
             t_lws_errors = nullptr;
         }
         if (!ctx)
-            throw std::system_error(EIO, std::system_category(),
+            throw std::system_error(EIO, std::generic_category(),
                                     "WsStream::connect: lws_create_context failed (" +
                                         errors + ")");
         return ctx;
@@ -395,7 +400,7 @@ std::shared_ptr<LwsService> LwsService::client(IoDriver& driver) {
     std::string lws_errors;
     auto service = create(info, nullptr, nullptr, driver, &lws_errors);
     if (!service)
-        throw std::system_error(EIO, std::system_category(),
+        throw std::system_error(EIO, std::generic_category(),
                                 "WsStream::connect: lws_create_context failed (" +
                                     lws_errors + ")");
     clients.services.push_back(service);
@@ -572,7 +577,8 @@ void LwsService::sync_registration(lws* wsi, Entry& entry) {
     const sys::RawFd fd = lws_get_socket_fd(wsi);
     if (entry.socket && entry.fd != fd) drop_registration(entry);
     entry.fd = fd;
-    if (fd < 0) return;
+    // Not `fd < 0`: RawFd is unsigned on Windows, where lws's invalid SOCKET is all ones.
+    if (fd == sys::kInvalidFd) return;
 
     const sys::Interest interest{entry.read, entry.write};
     if (!entry.socket) {

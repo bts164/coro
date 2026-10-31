@@ -1,9 +1,8 @@
 # spawn_blocking
 
-!!! note "Implemented"
-    Code: `include/coro/task/spawn_blocking.h`, `include/coro/detail/blocking_task.h`,
-    `include/coro/detail/blocking_cancel.h`, `src/task/blocking_pool.cpp`. Tests:
-    `test/task/test_spawn_blocking.cpp`.
+Code: `include/coro/task/spawn_blocking.h`, `include/coro/detail/blocking_task.h`,
+`include/coro/detail/blocking_cancel.h`, `src/task/blocking_pool.cpp`. Tests:
+`test/task/test_spawn_blocking.cpp`.
 
 ## Overview
 
@@ -95,7 +94,7 @@ public:
     // std::nullopt if it unwound (for BlockingHandle<void>, a bool: true if it returned).
     [[nodiscard]] CancelAndJoin<BlockingHandle> cancel_and_join() &&;
 
-    // Dropping the handle no longer requests cancellation: the callable runs to
+    // After detach(), dropping the handle doesn't request cancellation: the callable runs to
     // completion and its result is discarded. The handle can still be awaited.
     BlockingHandle& detach() &;
     BlockingHandle&& detach() &&;
@@ -119,9 +118,8 @@ class BlockingCancelShield;
 ```
 
 A blocking pool thread waits for another blocking task with
-`blocking_wait(std::move(handle))` (see [blocking_wait.md](blocking_wait.md)). The
-`blocking_get()` method an earlier version of `BlockingHandle` had is gone: it was the
-same wait, except that it was not a cancellation point.
+`blocking_wait(std::move(handle))` (see [blocking_wait.md](blocking_wait.md)), which is a
+cancellation point.
 
 ```cpp
 int result = co_await coro::spawn_blocking([]() -> int {
@@ -242,7 +240,7 @@ classDiagram
     BlockingHandle~T~ ..> TaskBase : weak
 ```
 
-One object does four jobs that used to be separate allocations or separate types:
+One object does four jobs, with no separate allocations or types:
 
 | Job | How |
 |---|---|
@@ -659,8 +657,8 @@ throws. Shields nest, and the shield's destructor never throws.
 Dropping a `BlockingHandle` does not wait for the thread, and cancellation may never take
 effect. So it is still **unsafe to capture references to data owned by the spawning
 coroutine**: if the coroutine exits while the blocking thread is running, the thread
-accesses dangling memory. That the handle now asks the thread to stop narrows the window;
-it does not close it.
+accesses dangling memory. That the handle asks the thread to stop narrows the window; it
+does not close it.
 
 !!! danger "WARNING: the callable must own all of its data"
     Do not capture references or pointers into the spawning coroutine's frame in a
@@ -770,10 +768,10 @@ call site rather than hidden behind a convenience wrapper.
 | `oneshot` channel + `std::thread` | No library support needed | Boilerplate; caller manages thread lifetime |
 | libuv thread pool (`uv_queue_work`) | Reuses existing pool | Pool is shared with libuv internals; size capped at `UV_THREADPOOL_SIZE` (default 4) |
 | `co_await` blocking future inline | None | Blocks an executor worker — should never be done |
-| `blocking_wait`/`blocking_next` (see [blocking_wait.md](blocking_wait.md)) | No second reactor/executor allocation; works with any `Future`/`Stream` | Requires an already-active `Runtime` context (ambient on `spawn_blocking` threads, or via the proposed `Runtime::enter()`) for futures that touch the reactor |
+| `blocking_wait`/`blocking_next` (see [blocking_wait.md](blocking_wait.md)) | No second reactor/executor allocation; works with any `Future`/`Stream` | Requires an already-active `Runtime` context (ambient on `spawn_blocking` threads, or via `set_current_runtime()`) for futures that touch the reactor |
 | Nested `Runtime` + `block_on` (above) | Fully isolated reactor; no ambient-context requirement | Full second executor + `IoDriver` (epoll fd, eventfd) allocated per call |
 
-The libuv thread pool (`uv_queue_work`) was considered but rejected (coro no longer
-uses libuv at all): its default size cap of 4 threads (max 128 via `UV_THREADPOOL_SIZE`)
-is too restrictive for general-purpose blocking work, and sharing it with libuv internals
-creates unpredictable contention.
+An event-loop library's shared pool, such as libuv's `uv_queue_work`, doesn't fit: its
+default size cap of 4 threads (max 128 via `UV_THREADPOOL_SIZE`) is too restrictive for
+general-purpose blocking work, and sharing it with the library's internals creates
+unpredictable contention.

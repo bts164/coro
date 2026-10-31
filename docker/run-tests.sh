@@ -29,6 +29,10 @@ case "$SANITIZER" in
     *) echo "error: SANITIZER must be 'none', 'asan' or 'tsan', got '$SANITIZER'" >&2; exit 1 ;;
 esac
 
+# Sets REPO_ROOT, IMAGE and VOLUME_PREFIX; builds the image if this machine does not have it.
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+use_image
+
 if [ "$SANITIZER" = tsan ]; then
     # vm.mmap_rnd_bits is a global, non-namespaced kernel setting -- it can't
     # be fixed with a docker run flag or anything inside the container, and
@@ -38,18 +42,20 @@ if [ "$SANITIZER" = tsan ]; then
     # runs. This only weakens ASLR entropy, and only until next reboot, but
     # it's a host-wide security-relevant setting -- deliberately just warned
     # about here rather than silently sudo'd.
-    rnd_bits="$(cat /proc/sys/vm/mmap_rnd_bits 2>/dev/null || echo unknown)"
+    #
+    # Read from a container, since the setting that matters is the kernel's the
+    # containers run on: the host's on Linux, but on Windows or macOS that of
+    # Docker Desktop's VM, which the host's own /proc (if it has one) doesn't show.
+    rnd_bits="$(docker run --rm "$IMAGE" cat /proc/sys/vm/mmap_rnd_bits 2>/dev/null || echo unknown)"
     if [ "$rnd_bits" != unknown ] && [ "$rnd_bits" -gt 28 ] 2>/dev/null; then
-        echo "warning: /proc/sys/vm/mmap_rnd_bits is $rnd_bits (>28) -- ThreadSanitizer" >&2
-        echo "will abort every test with 'unexpected memory mapping'. Fix (until next" >&2
-        echo "reboot) by running on the HOST, not in the container:" >&2
+        echo "warning: vm.mmap_rnd_bits is $rnd_bits (>28) -- ThreadSanitizer" >&2
+        echo "will abort every test with 'unexpected memory mapping'. Fix (until the" >&2
+        echo "next reboot) on a Linux host, not in the container:" >&2
         echo "    sudo sysctl vm.mmap_rnd_bits=28" >&2
+        echo "or under Docker Desktop (until it restarts), from a privileged container:" >&2
+        echo "    docker run --rm --privileged $IMAGE sh -c 'echo 28 > /proc/sys/vm/mmap_rnd_bits'" >&2
     fi
 fi
-
-# Sets REPO_ROOT, IMAGE and VOLUME_PREFIX; builds the image if this machine does not have it.
-source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
-use_image
 
 # A volume mounted inside the read-only tree needs its mount point to exist already:
 # docker cannot create it there. An empty, git-ignored directory on the host.

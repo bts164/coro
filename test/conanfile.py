@@ -64,6 +64,9 @@ class CoroRecipe(ConanFile):
     def config_options(self):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
+            # Mirrors the root conanfile.py: coro is always static on Windows.
+            self.package_type = "static-library"
+            self.options.rm_safe("shared")
 
         # baremetal (Pico): builds the on-target firmware images instead of the
         # desktop executables. Mirrors the root conanfile.py -- always static,
@@ -75,9 +78,11 @@ class CoroRecipe(ConanFile):
             self.options.rm_safe("with_gperftools")
         else:
             self.options.rm_safe("gtest_from_conan")
-            self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
-            self.options.with_gperftools = self._env_bool(
-                "CORO_WITH_GPERFTOOLS", self.options.with_gperftools)
+            if self.options.get_safe("shared") is not None:
+                self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
+            if self.options.get_safe("with_gperftools") is not None:
+                self.options.with_gperftools = self._env_bool(
+                    "CORO_WITH_GPERFTOOLS", self.options.with_gperftools)
             self.options.with_local_run_queue = self._env_bool(
                 "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
 
@@ -110,12 +115,15 @@ class CoroRecipe(ConanFile):
                 self.requires("gtest/[>=1.14.0 <2]",
                               options={"disable_pthreads": True})
             return
-        self.requires(f"coro/{self._coro_dependency_version()}", options={
-            "with_gperftools": self.options.with_gperftools,
-            "with_local_run_queue": self.options.with_local_run_queue
-        })
+        coro_options = {"with_local_run_queue": self.options.with_local_run_queue}
+        if self.options.get_safe("with_gperftools") is not None:
+            coro_options["with_gperftools"] = self.options.with_gperftools
+        self.requires(f"coro/{self._coro_dependency_version()}", options=coro_options)
         self.requires("gtest/[>=1.14.0 <2]")
-        self.requires("libunicorn/2.1.4")
+        # The ARM emulator runs the Pico host tests, which the Windows build leaves
+        # out (test/CMakeLists.txt).
+        if self.settings.os != "Windows":
+            self.requires("libunicorn/2.1.4")
 
     def build_requirements(self):
         self.tool_requires("cmake/3.31.12")

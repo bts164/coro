@@ -7,6 +7,8 @@
 #                      <file>_pico if the file is DESKTOP as well)
 #   ON_TARGET <image>  in the firmware image coro_target_<image>, run on the board
 #
+# NO_WINDOWS leaves a file out of the Windows build, which builds only DESKTOP files.
+#
 # To add a test file, add one line. To run a file on another platform, add the
 # keyword to its line. To leave single tests out on a platform, guard them in the
 # source with the preprocessor (#ifndef CORO_PICO today).
@@ -23,7 +25,7 @@ coro_test(detail/test_frame_pool.cpp             DESKTOP PICO_STUB ON_TARGET cor
 coro_test(detail/test_poller.cpp                 DESKTOP)
 # sys/notify.h on both backends: the eventfd on the desktop, the async_context worker
 # in the Pico configuration on the host and on the board.
-coro_test(detail/test_notify.cpp                 DESKTOP PICO_STUB ON_TARGET core)
+coro_test(detail/test_notify.cpp                 DESKTOP PICO_STUB ON_TARGET core NO_WINDOWS)
 coro_test(detail/test_timer_queue.cpp            DESKTOP PICO_STUB ON_TARGET core)
 
 # Foundational types: coro.h, future.h, stream.h, co_invoke.h, defer.h
@@ -88,7 +90,11 @@ coro_test(sync/test_isr_event.cpp                PICO_STUB ON_TARGET sync)
 # no radio.
 coro_test(io/test_file.cpp                       DESKTOP)
 coro_test(io/test_lookup_host.cpp                DESKTOP)
-coro_test(io/test_pipe.cpp                       DESKTOP)
+# Asks the machine's DNS, which may be slow to fail a lookup (a VPN's backup servers,
+# a container with no nameserver): `ctest -LE network` skips it. Every other test that
+# needs a failed lookup fakes the resolver (fake_resolver.h).
+coro_test(io/test_system_resolver.cpp            DESKTOP LABELS network)
+coro_test(io/test_pipe.cpp                       DESKTOP NO_WINDOWS)
 coro_test(io/test_circular_byte_buffer.cpp       DESKTOP PICO_STUB ON_TARGET core)
 coro_test(io/test_signal.cpp                     DESKTOP)
 coro_test(io/test_tcp_stream.cpp                 DESKTOP HOST_LINK coro_pico_core ON_TARGET net)

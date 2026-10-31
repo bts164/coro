@@ -122,6 +122,10 @@ class CoroRecipe(ConanFile):
     def config_options(self):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
+            # Always static: coro has no export macros, so a DLL would export
+            # nothing. See doc/design/windows_port.md, "Build".
+            self.package_type = "static-library"
+            self.options.rm_safe("shared")
 
         # baremetal (Pico) targets: always static (no "shared" option to
         # decide otherwise), no PIC, and the desktop I/O stack
@@ -134,20 +138,22 @@ class CoroRecipe(ConanFile):
             self.options.rm_safe("tracing")
         else:
             self.options.rm_safe("with_mqtt")
-            self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
-            self.options.with_gperftools = self._env_bool(
-                "CORO_WITH_GPERFTOOLS", self.options.with_gperftools)
+            if self.options.get_safe("shared") is not None:
+                self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
+            if self.options.get_safe("with_gperftools") is not None:
+                self.options.with_gperftools = self._env_bool(
+                    "CORO_WITH_GPERFTOOLS", self.options.with_gperftools)
             self.options.with_local_run_queue = self._env_bool(
                 "CORO_WITH_LOCAL_RUN_QUEUE", self.options.with_local_run_queue)
 
     def configure(self):
-        if self.settings.os != "baremetal" and self.options.shared:
+        if self.settings.os != "baremetal" and self.options.get_safe("shared"):
             self.options.rm_safe("fPIC")
 
     def requirements(self):
         if self.settings.os == "baremetal":
             return
-        if self.options.with_gperftools:
+        if self.options.get_safe("with_gperftools"):
             self.requires("gperftools/2.17.2",
                 transitive_headers = True,
                 transitive_libs = True)
@@ -157,7 +163,7 @@ class CoroRecipe(ConanFile):
             # coro gets the same Tracy client and not a second one. The version is
             # exact because the viewer has to match it.
             self.requires("tracy/0.13.1",
-                options={"on_demand": True, "shared": bool(self.options.shared)},
+                options={"on_demand": True, "shared": bool(self.options.get_safe("shared"))},
                 transitive_headers = True,
                 transitive_libs = True)
         # lws is serviced by coro's IoDriver through a custom event loop
@@ -238,7 +244,7 @@ class CoroRecipe(ConanFile):
             tc.cache_variables["CORO_PLATFORM"] = "pico"
             tc.cache_variables["CORO_PICO_WITH_MQTT"] = bool(self.options.with_mqtt)
         else:
-            tc.cache_variables["WITH_GPERFTOOLS"] = self.options.with_gperftools
+            tc.cache_variables["WITH_GPERFTOOLS"] = bool(self.options.get_safe("with_gperftools"))
             tc.cache_variables["CORO_USE_LOCAL_RUN_QUEUE"] = self.options.with_local_run_queue
             tc.cache_variables["CORO_TRACING"] = str(self.options.tracing)
         tc.generate()
@@ -304,8 +310,19 @@ class CoroRecipe(ConanFile):
             return
 
         self.cpp_info.libs = ["coro"]
-        if self.options.with_gperftools:
+        if self.options.get_safe("with_gperftools"):
             self.cpp_info.requires.append("gperftools::gperftools")
+            if self.settings.os == "Windows":
+                # A static tcmalloc on Windows works by patching the CRT's malloc at
+                # startup, which nothing references, so the linker drops it unless the
+                # executable forces it in (gperftools' own CMakeLists.txt does the same).
+                # Its recipe doesn't pass this on. Also set in CMakeLists.txt.
+                self.cpp_info.exelinkflags.append("/INCLUDE:__tcmalloc")
+                self.cpp_info.sharedlinkflags.append("/INCLUDE:__tcmalloc")
+        if self.settings.os == "Windows":
+            # Winsock. The AFD poller's NT calls are looked up in ntdll at run time
+            # (src/detail/sys/windows/nt.h), so nothing else is linked.
+            self.cpp_info.system_libs.append("ws2_32")
         if self.options.with_local_run_queue:
             self.cpp_info.defines.append("CORO_USE_LOCAL_RUN_QUEUE")
         if self.options.tracing == "tracy":

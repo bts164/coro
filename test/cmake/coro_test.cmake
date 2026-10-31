@@ -2,7 +2,8 @@
 # tests.cmake calls it once per file; that list is the only place a test file is
 # named. See doc/design/on_target_tests.md.
 #
-#   coro_test(<source> [DESKTOP] [PICO_STUB] [HOST_LINK <lib>...] [ON_TARGET <image>])
+#   coro_test(<source> [DESKTOP] [PICO_STUB] [HOST_LINK <lib>...] [ON_TARGET <image>]
+#             [NO_WINDOWS] [LABELS <label>...])
 #
 #   DESKTOP            Its own executable on the development machine, linked with
 #                      the desktop coro library. Named after the file.
@@ -17,6 +18,14 @@
 #                      <file>_pico when the file is also DESKTOP.
 #   ON_TARGET <image>  Part of the firmware image coro_target_<image>, run on the
 #                      board. Files naming the same image share it.
+#   NO_WINDOWS         Not built on Windows: the file tests something the Windows
+#                      port leaves out (doc/design/windows_port.md, "Scope").
+#   LABELS <label>...  ctest labels for its executables on the development machine,
+#                      e.g. "network" for a test that asks the machine's DNS, which
+#                      `ctest -LE network` then skips.
+#
+# On Windows only DESKTOP applies: PICO_STUB and HOST_LINK need the POSIX host
+# support in cmake/host_pico_support.cmake, which Windows doesn't build.
 #
 # A file may combine any of these. Which tests inside a file apply to a platform is
 # decided in the source, with the preprocessor.
@@ -25,16 +34,27 @@
 # HOST_LINK targets, "pico" the ON_TARGET images.
 
 function(_coro_host_test name)
-    cmake_parse_arguments(PARSE_ARGV 1 A "" "" "SOURCES;LIBS")
+    cmake_parse_arguments(PARSE_ARGV 1 A "" "" "SOURCES;LIBS;LABELS")
     add_executable(${name} ${A_SOURCES})
     target_include_directories(${name} PRIVATE ${CORO_TEST_ROOT})
     target_link_libraries(${name} PRIVATE
         ${A_LIBS} GTest::gtest GTest::gtest_main GTest::gmock)
     add_test(NAME ${name} COMMAND ${name})
+    if(A_LABELS)
+        set_tests_properties(${name} PROPERTIES LABELS "${A_LABELS}")
+    endif()
+    # MSVC's ASan (docker/profiles/asan-msvc) links its runtime as a DLL that lives
+    # beside the compiler, which is on PATH only inside the Visual Studio
+    # environment. ctest runs outside it, so each test gets the compiler's directory.
+    if(MSVC AND CMAKE_CXX_FLAGS MATCHES "/fsanitize=address")
+        get_filename_component(compiler_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        set_tests_properties(${name} PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${compiler_dir}")
+    endif()
 endfunction()
 
 function(coro_test source)
-    cmake_parse_arguments(PARSE_ARGV 1 T "DESKTOP;PICO_STUB" "ON_TARGET" "HOST_LINK")
+    cmake_parse_arguments(PARSE_ARGV 1 T "DESKTOP;PICO_STUB;NO_WINDOWS" "ON_TARGET" "HOST_LINK;LABELS")
     if(T_UNPARSED_ARGUMENTS OR T_KEYWORDS_MISSING_VALUES)
         message(FATAL_ERROR "coro_test(${source}): bad arguments: "
             "${T_UNPARSED_ARGUMENTS} ${T_KEYWORDS_MISSING_VALUES}")
@@ -58,14 +78,21 @@ function(coro_test source)
         return()
     endif()
 
+    if(WIN32)
+        if(T_DESKTOP AND NOT T_NO_WINDOWS)
+            _coro_host_test(${name} SOURCES ${path} LIBS coro::coro LABELS ${T_LABELS})
+        endif()
+        return()
+    endif()
+
     if(T_DESKTOP)
-        _coro_host_test(${name} SOURCES ${path} LIBS coro::coro)
+        _coro_host_test(${name} SOURCES ${path} LIBS coro::coro LABELS ${T_LABELS})
     endif()
     if(T_HOST_LINK)
         if(T_DESKTOP)
             set(name ${name}_pico)
         endif()
-        _coro_host_test(${name} SOURCES ${path} LIBS ${T_HOST_LINK})
+        _coro_host_test(${name} SOURCES ${path} LIBS ${T_HOST_LINK} LABELS ${T_LABELS})
     endif()
     if(T_PICO_STUB)
         set_property(GLOBAL APPEND PROPERTY CORO_PICO_STUB_SOURCES ${path})

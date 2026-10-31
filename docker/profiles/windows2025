@@ -1,0 +1,24 @@
+# The Windows CI job's Conan profile (.github/workflows/tests.yml, job "windows"),
+# installed as the runner's default profile. The runner image (windows-2025-vs2026)
+# has Visual Studio 2026, whose MSVC is compiler.version 195, and Ninja.
+#
+# CMake comes from Conan, for every package and for coro: CMake 4.2 is the first to
+# know Visual Studio 2026, and neither the copy Visual Studio installs nor every
+# machine's PATH is guaranteed to be that new. `!cmake/*` keeps the cmake package
+# from requiring itself. A tool requirement doesn't enter package IDs, so this
+# rebuilds nothing.
+[tool_requires]
+!cmake/*: cmake/[>=4.2 <5]
+
+[settings]
+arch=x86_64
+build_type=Release
+compiler=msvc
+compiler.cppstd=23
+compiler.runtime=dynamic
+compiler.version=195
+os=Windows
+
+[conf]
+tools.cmake.cmaketoolchain:generator=Ninja
+tools.compilation:verbosity=verbose

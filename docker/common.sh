@@ -1,7 +1,7 @@
 # Sourced by the scripts in this directory; not run on its own.
 #
 # Picks the platform, names its CI image and makes sure there is one to run. Sets:
-#   REPO_ROOT       the repository root
+#   REPO_ROOT       the repository root (in C:/... form under Git Bash, for docker)
 #   PLATFORM        the platform the script runs on, e.g. ubuntu2404
 #   IMAGE           the image a script should `docker run` (set by use_image)
 #   VOLUME_PREFIX   what a script's named volumes start with, so that no two
@@ -17,8 +17,19 @@
 # running in the image CI published, say. Left unset, the name has no registry in it,
 # so docker never pulls it: it is only ever the image built on this machine.
 
-DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$DOCKER_DIR/.." && pwd)"
+# Git Bash on Windows rewrites every argument that looks like a Unix path into a
+# Windows one before it starts a Windows program such as docker.exe, container paths
+# (/workspace/...) included. MSYS_NO_PATHCONV turns that off, so the host paths must
+# then be given in Windows form (C:/...), which `pwd -W` prints and bash also accepts.
+case "$(uname -s)" in
+    MINGW* | MSYS*)
+        export MSYS_NO_PATHCONV=1
+        PWD_FLAGS=-W
+        ;;
+    *) PWD_FLAGS= ;;
+esac
+DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd $PWD_FLAGS)"
+REPO_ROOT="$(cd "$DOCKER_DIR/.." && pwd $PWD_FLAGS)"
 
 # The platform a script runs on when CORO_PLATFORM is not set. It is also the one CI
 # runs the sanitizer and emulator jobs on; the other platforms get one plain run of
@@ -40,11 +51,16 @@ fi
 
 VOLUME_PREFIX="coro-$PLATFORM"
 
+# Profiles no image copies: those of the platforms CI tests on a GitHub-hosted
+# runner, with no image and so no Dockerfile, and the sanitizer profiles only those
+# platforms use. They are in profiles/ with the rest.
+HOSTED_PROFILES=(windows2025 asan-msvc)
+
 # Hashes the names and contents of the files the image is built from: the platform's
 # Dockerfile, settings_user.yml, the platform's own profile (profiles/<platform>, the
 # image's default profile) and the profiles that are not any platform's, which every
-# image may copy. Another platform's profile is left out, so editing it does not
-# rename this platform's image.
+# image may copy. Another platform's profile is left out, an image platform's or a
+# hosted one, so editing it does not rename this platform's image.
 image_hash() {
     (cd "$DOCKER_DIR" &&
         {
@@ -52,7 +68,9 @@ image_hash() {
             echo settings_user.yml
             for profile in profiles/*; do
                 name="${profile#profiles/}"
-                if [ "$name" = "$PLATFORM" ] || [ ! -f "Dockerfile.$name" ]; then
+                if [ "$name" = "$PLATFORM" ] ||
+                   { [ ! -f "Dockerfile.$name" ] &&
+                     [[ " ${HOSTED_PROFILES[*]} " != *" $name "* ]]; }; then
                     echo "$profile"
                 fi
             done

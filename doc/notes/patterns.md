@@ -357,26 +357,29 @@ cancel based on multiple independent signals.
 
 ### Shutdown on OS signal
 
-**Problem:** A long-running server needs to shut down cleanly on `SIGINT`/`SIGTERM`
-(operator interrupt).
+**Problem:** A long-running server needs to shut down cleanly on Ctrl-C or when it is
+asked to stop (`SIGTERM`, `docker stop`, the console window closing on Windows).
 
-`coro::signal()` (see `doc/design/signal_handling.md`) is a one-shot `Future<void>` that
-resolves on the next delivery of a given signal. `select` it against the running server
-task so either source triggers the same exit path:
+`coro::ctrl_c()` and `coro::shutdown_requested()` (see `doc/design/signal_handling.md`)
+are one-shot futures that work the same on every platform. `select` them against the
+running server task so every source triggers the same exit path.
+`shutdown_requested()` resolves to a `ShutdownGuard`: keep it (here, inside `result`)
+until the cleanup is done, because Windows ends the process as soon as it is dropped.
 
 ```cpp
 coro::Coro<int> async_main(int argc, char *argv[]) {
     auto run_server_handle = coro::spawn(run_server(argc, argv));
     auto result = co_await coro::select(
         coro::ref(run_server_handle),
-        coro::signal(SIGINT),
-        coro::signal(SIGTERM)
+        coro::ctrl_c(),
+        coro::shutdown_requested()
     );
     if (result.index() == 0) {
         // run_server exited normally
         co_return std::get<0>(result).value;
     }
-    // SIGINT or SIGTERM received. Cancel run_server & wait for it to drain.
+    // Ctrl-C or a shutdown request. Cancel run_server & wait for it to drain; a
+    // shutdown request's guard stays in `result` until we return.
     // Cancel itself does not throw an exception, but rather stops polling
     // and runs RAII cleanup of all coroutine frames in drain order. We
     // should still co_await the result here to receive any exceptions that
@@ -397,9 +400,10 @@ int main(int argc, char *argv[]) {
 }
 ```
 
-Never install a raw `sigaction` handler to do this — see guidelines.md SG.1. `coro::signal`
-already handles the async-signal-safety concerns internally (a self-pipe read through the
-I/O driver) and delivers the result as an ordinary pollable `Future`.
+Never install a raw `sigaction` handler to do this — see guidelines.md SG.1. coro's
+signal futures already handle the async-signal-safety concerns internally (a self-pipe
+read through the I/O driver) and deliver the result as an ordinary pollable `Future`.
+For other POSIX signals, use `coro::signal()` / `coro::signal_stream()`.
 
 ---
 

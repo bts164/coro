@@ -20,7 +20,7 @@ Dependencies are managed with Conan.
 
 ---
 
-## What Is Implemented
+## Components
 
 ### Runtime & Scheduling
 - **`CurrentThreadExecutor`** — runs its loop on the calling thread, with no threads of
@@ -51,9 +51,10 @@ Dependencies are managed with Conan.
 - **`File` / `lookup_host()`** — blocking syscalls run as jobs on the blocking pool
 - **`WsStream` / `WsListener`** — async WebSocket client and server via libwebsockets,
   driven by the I/O driver; full and partial frame modes, TLS, subprotocol negotiation
-- **`coro::signal()` / `coro::signal_stream()`** — async OS signal delivery via a self-pipe
-  on the IoDriver; one-shot `Future<void>` and a coalesced `Stream<SignalEvent>` variant;
-  see [Signal Handling](signal_handling.md)
+- **`coro::ctrl_c()` / `coro::shutdown_requested()` / `coro::signal()` /
+  `coro::signal_stream()`** — async OS signal delivery via a self-pipe on the IoDriver;
+  portable Ctrl-C and shutdown-request futures, one-shot `Future<void>` and coalesced
+  `Stream<SignalEvent>` for any POSIX signal; see [Signal Handling](signal_handling.md)
 
 ### Task Primitives
 - **`spawn()` / `SpawnBuilder`** — schedule a `Coro<T>` on the runtime; returns a
@@ -595,7 +596,7 @@ int result = co_await coro::spawn_blocking([]() -> int {
 
 ## Channels
 
-All three implemented channel variants live in `include/coro/sync/`. They share common
+All three channel variants live in `include/coro/sync/`. They share common
 design principles: `std::expected` for fallible operations, intrusive waiters (no
 allocations beyond the channel itself), and RAII handles with reference counting.
 
@@ -864,7 +865,7 @@ include/coro/
     lookup_host.h           lookup_host(), dns_error_category()
     ws_stream.h             WsStream
     ws_listener.h           WsListener
-    signal.h                signal(), signal_stream(), SignalEvent
+    signal.h                ctrl_c(), shutdown_requested(), signal(), signal_stream()
 
   detail/
     poll_result.h           PollResult<T>
