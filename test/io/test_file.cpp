@@ -319,7 +319,7 @@ TEST(FileTest, MetadataReportsSizeTimeAndType) {
     EXPECT_EQ(meta.size, 1234u);
     EXPECT_TRUE(meta.is_regular);
     const auto expected = std::chrono::time_point_cast<std::chrono::nanoseconds>(
-        std::chrono::file_clock::to_sys(fs::last_write_time(temp.path())));
+        std::chrono::clock_cast<std::chrono::system_clock>(fs::last_write_time(temp.path())));
     EXPECT_EQ(meta.modified, expected);
 }
 

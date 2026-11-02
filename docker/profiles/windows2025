@@ -22,3 +22,7 @@ os=Windows
 [conf]
 tools.cmake.cmaketoolchain:generator=Ninja
 tools.compilation:verbosity=verbose
+# Verbose builds lose CMake's /nologo, and cl then prints its banner, and the
+# /std:c++latest preview notice, for every file it compiles.
+tools.build:cflags+=["/nologo"]
+tools.build:cxxflags+=["/nologo"]
