@@ -28,9 +28,14 @@ asynchronous and a query waits on the driver like a socket; see
 
 ## Non-goals
 
-- **Directory operations, metadata, `rename`, `remove`.** Use `spawn_blocking` around
-  `std::filesystem` for now.
+- **Directory operations, metadata by path, `rename`, `remove`.** Use `spawn_blocking`
+  around `std::filesystem` for now; see [Path operations](#path-operations).
 - **Cancelling a running syscall.** A dropped job runs to completion.
+- **Memory-mapped files.** Touching a page of a mapping whose file has since been
+  truncated raises `SIGBUS`, which kills the process unless a process-wide signal handler
+  intervenes, and a library can't install one on its users' behalf. A positional read of
+  a truncated file just comes up short. A reader of a file another process may change
+  should read it with `read_at`.
 
 ---
 
@@ -47,7 +52,7 @@ seams, in the style of the driver's [`sys` layer](io_driver.md#the-sys-layer):
 
 | Seam | Functions | POSIX backend |
 |---|---|---|
-| `detail/sys/file.h` | `file_open`, `file_read`, `file_write`, `file_sync`, `file_close` | `src/detail/sys/posix/file_posix.cpp` |
+| `detail/sys/file.h` | `file_open`, `file_read`, `file_write`, `file_sync`, `file_stat`, `file_close` | `src/detail/sys/posix/file_posix.cpp` |
 | `detail/sys/dns.h` | `resolve_host(host, port)`, `dns_category()` | `src/detail/sys/posix/dns_posix.cpp` |
 
 Unlike the socket seams, these are ordinary blocking calls. `EINTR` is retried inside
@@ -79,9 +84,17 @@ buf.resize(n);
 | `read_at(buf, off)` / `write_at(buf, off)` | `IoFuture<Buf>` | one `pread` / `pwrite` |
 | `read_at_exact` / `write_at_exact` | `IoFuture<Buf>` | positional loops |
 | `sync_all()` | `BlockingHandle<void>` | `fsync` |
+| `metadata()` | `BlockingHandle<FileMetadata>` | `fstat` |
 
-`FileMode` flags (`Read`, `Write`, `ReadWrite`, `Create`, `Truncate`, `Append`) combine
-with `|` and are translated to `sys::FileOpenFlags`, then to `O_*` flags by the backend.
+`FileMode` flags (`Read`, `Write`, `ReadWrite`, `Create`, `Truncate`, `Append`,
+`CreateNew`) combine with `|` and are translated to `sys::FileOpenFlags`, then to `O_*`
+flags by the backend. `CreateNew` is `O_CREAT | O_EXCL`: it creates the file and fails
+with `EEXIST` if the path exists, so of two openers racing to make a file, only one
+succeeds.
+
+`FileMetadata` holds the `size`, the `modified` time (`sys_time<nanoseconds>`, the last
+change to the data) and `is_regular`. It describes the open file, not whatever is at its
+path now, so a reader can check that a file it opened is the one it expected.
 
 Errors are `std::system_error` in `std::system_category()`, thrown at `co_await`. A
 short read returns fewer bytes than `buf.size()`, and 0 means EOF. Any call on a
@@ -208,6 +221,66 @@ with none). So the tests don't ask it, except for one:
 
 ---
 
+## Not yet: designs to come
+
+Gaps that a workload reading parts of large files, and writing derived files beside
+them, runs into. Each needs its API thought through before it's added; until then, the
+workaround given works.
+
+### Path operations
+
+`rename`, `remove`, metadata by path, `create_dir_all` and `read_dir`. Now:
+`spawn_blocking` around `std::filesystem`.
+
+Proposed: free functions in a `coro::fs` namespace, each one job on the blocking pool, as
+`tokio::fs` has them. To decide:
+
+- **Errors.** `std::filesystem` throws `filesystem_error`, which carries the paths;
+  `File` throws `system_error`. One of them for both, or each its own.
+- **Paths.** `std::filesystem::path`, or `std::string` as `File::open` takes.
+- **Renaming over an existing file.** POSIX `rename` replaces it atomically; Windows
+  needs `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which isn't atomic on every
+  filesystem. Whether `coro::fs::rename` promises atomicity, and where.
+- **Metadata by path**, returning the same `FileMetadata` as `File::metadata()`.
+
+### Atomic replace
+
+Writing a file under a temporary name, syncing it, renaming it over the real name and
+syncing the directory, so a crash leaves either the old file or the new one, never half
+of one. It's a common pattern and easy to get wrong: the directory sync is POSIX only,
+the temporary needs a name nothing else uses and an exclusive create, and one left by a
+crash needs cleaning up. Now: the caller does each step, creating the temporary with
+`FileMode::CreateNew`.
+
+Proposed: a helper on top of the path operations and `CreateNew`, which writes
+through a `File` it hands to the caller and commits on success. It depends on the path
+operations above.
+
+### Several positional reads in one job
+
+Each `read_at` is one hop to the blocking pool and one back. A reader that needs several
+runs of one file, at different offsets, pays a hop per run where one job could read
+them all. Now: lay the file out so a reader needs one run, or accept the hops.
+
+Proposed: `read_at_many`, taking owned buffers each with an offset, reading them all in
+one job and handing back each buffer with its byte count. `preadv` doesn't do it: it
+reads one contiguous range into several buffers. To decide: whether it stops at the
+first short read or failure, and how it reports which range failed.
+
+### Access hints
+
+Telling the kernel how a file will be read: sequentially once, so read-ahead can grow
+and the pages needn't stay cached, or at random. Now: none; the default read-ahead
+copes with a sequential reader.
+
+Proposed: hint flags in `FileMode`, applied at open. Windows takes them only there
+(`FILE_FLAG_SEQUENTIAL_SCAN`, `FILE_FLAG_RANDOM_ACCESS`); POSIX takes them any time
+(`posix_fadvise`), so the backend applies them right after opening. To decide: whether
+to offer dropping a range from the cache after reading it (`POSIX_FADV_DONTNEED`), which
+Windows has no equivalent of.
+
+---
+
 ## Tests
 
 | Test | Checks |
@@ -220,7 +293,10 @@ with none). So the tests don't ask it, except for one:
 | `FileTest.OpenMissingFileThrowsEnoent` | The error code is `no_such_file_or_directory`. |
 | `FileTest.PendingWriteOutlivesFile` | Dropping the `File` with a write in flight: the write still lands. |
 | `FileTest.ReopenAfterDropSeesWrites` | Close is synchronous. |
-| `FileTest.MovedFromFileThrowsLogicError` | `write` and `sync_all` on a moved-from `File`. |
+| `FileTest.MovedFromFileThrowsLogicError` | `write`, `sync_all` and `metadata` on a moved-from `File`. |
+| `FileTest.MetadataReportsSizeTimeAndType` | Size, type, and the same mtime as `std::filesystem`. |
+| `FileTest.CreateNewMakesMissingFile` | `CreateNew` on a missing path creates it. |
+| `FileTest.CreateNewFailsIfPathExists` | `file_exists`; even `Truncate` leaves the file alone. |
 | `FileTest.WorksWithoutDriver` | `CurrentThreadExecutor` with a `PollingParker`. |
 | `LookupHostTest.NumericLiteralsReturnThemselves` | IPv4 and IPv6 literals, port applied. |
 | `LookupHostTest.LocalhostResolvesToLoopbackWithPort` | Every result is loopback with the port. |

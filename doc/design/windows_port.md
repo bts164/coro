@@ -558,9 +558,12 @@ struct WinFile {          // file_windows.cpp; RawFd is its address
 - `file_open()` converts the path to UTF-16 and calls `CreateFileW()` with
   `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`, which is closest to POSIX
   sharing. `create`, `truncate` and `create` + `truncate` map to `OPEN_ALWAYS`,
-  `TRUNCATE_EXISTING` and `CREATE_ALWAYS`.
+  `TRUNCATE_EXISTING` and `CREATE_ALWAYS`, and `create_new` to `CREATE_NEW`.
 - `file_sync()` is `FlushFileBuffers()`. `file_close()` closes the handle and frees the
   object.
+- `file_stat()` is `GetFileInformationByHandle()`. The last write time, in 100 ns ticks
+  since 1601, is shifted to the Unix epoch. A file is regular if `GetFileType()` says
+  `FILE_TYPE_DISK` and it isn't a directory.
 - Win32 errors become errno through `win32_to_errno()`: `ERROR_FILE_NOT_FOUND` and
   `ERROR_PATH_NOT_FOUND` → `ENOENT`, `ERROR_ACCESS_DENIED` → `EACCES`,
   `ERROR_FILE_EXISTS` → `EEXIST`, `ERROR_DISK_FULL` → `ENOSPC`, and so on. A read

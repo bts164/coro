@@ -5,6 +5,7 @@
 #include <coro/runtime/parker.h>
 #include <coro/coro.h>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -301,7 +302,52 @@ TEST(FileTest, MovedFromFileThrowsLogicError) {
         File other = std::move(file);
         EXPECT_THROW((void)file.write(std::string("x")), std::logic_error);
         EXPECT_THROW((void)file.sync_all(), std::logic_error);
+        EXPECT_THROW((void)file.metadata(), std::logic_error);
     }(temp.path_string()));
+}
+
+// The modification time is compared exactly with std::filesystem's, which catches a
+// wrong epoch or unit in the backend's conversion.
+TEST(FileTest, MetadataReportsSizeTimeAndType) {
+    TempFile temp("coro_test_metadata.bin");
+    Runtime rt;
+    auto meta = rt.block_on([](std::string path) -> Coro<FileMetadata> {
+        auto file = co_await File::open(path, FileMode::Write | FileMode::Create | FileMode::Truncate);
+        co_await file.write_exact(std::string(1234, 'm'));
+        co_return co_await file.metadata();
+    }(temp.path_string()));
+    EXPECT_EQ(meta.size, 1234u);
+    EXPECT_TRUE(meta.is_regular);
+    const auto expected = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+        std::chrono::file_clock::to_sys(fs::last_write_time(temp.path())));
+    EXPECT_EQ(meta.modified, expected);
+}
+
+TEST(FileTest, CreateNewMakesMissingFile) {
+    TempFile temp("coro_test_create_new.txt");
+    Runtime rt;
+    rt.block_on([](std::string path) -> Coro<void> {
+        auto file = co_await File::open(path, FileMode::Write | FileMode::CreateNew);
+        co_await file.write_exact(std::string("new"));
+    }(temp.path_string()));
+    EXPECT_EQ(read_whole(temp.path_string()), "new");
+}
+
+TEST(FileTest, CreateNewFailsIfPathExists) {
+    TempFile temp("coro_test_create_new_exists.txt");
+    { std::ofstream(temp.path_string()) << "kept"; }
+    Runtime rt;
+    std::error_code code;
+    try {
+        rt.block_on([](std::string path) -> Coro<void> {
+            auto file = co_await File::open(path, FileMode::Write | FileMode::CreateNew |
+                                                      FileMode::Truncate);
+        }(temp.path_string()));
+    } catch (const std::system_error& e) {
+        code = e.code();
+    }
+    EXPECT_EQ(code, std::errc::file_exists);
+    EXPECT_EQ(read_whole(temp.path_string()), "kept");
 }
 
 // Files need the blocking pool, not the IoDriver: they work on a CurrentThreadExecutor

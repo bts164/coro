@@ -13,12 +13,13 @@ bool has(FileMode mode, FileMode flag) { return (mode & flag) != FileMode{}; }
 
 detail::sys::FileOpenFlags translate_flags(FileMode mode) {
     detail::sys::FileOpenFlags flags;
-    flags.write    = has(mode, FileMode::Write);
+    flags.write      = has(mode, FileMode::Write);
     // Neither Read nor Write still opens read-only, as open(2) with O_RDONLY would.
-    flags.read     = has(mode, FileMode::Read) || !flags.write;
-    flags.create   = has(mode, FileMode::Create);
-    flags.truncate = has(mode, FileMode::Truncate);
-    flags.append   = has(mode, FileMode::Append);
+    flags.read       = has(mode, FileMode::Read) || !flags.write;
+    flags.create     = has(mode, FileMode::Create);
+    flags.truncate   = has(mode, FileMode::Truncate);
+    flags.append     = has(mode, FileMode::Append);
+    flags.create_new = has(mode, FileMode::CreateNew);
     return flags;
 }
 
@@ -45,6 +46,20 @@ BlockingHandle<void> File::sync_all() {
     return spawn_blocking([state = state("coro::File::sync_all")] {
         if (auto r = detail::sys::file_sync(state->fd); !r)
             throw std::system_error(r.error(), std::generic_category(), "coro::File::sync_all");
+    }).detach();
+}
+
+BlockingHandle<FileMetadata> File::metadata() {
+    return spawn_blocking([state = state("coro::File::metadata")] {
+        auto st = detail::sys::file_stat(state->fd);
+        if (!st)
+            throw std::system_error(st.error(), std::generic_category(), "coro::File::metadata");
+        return FileMetadata{
+            .size       = st->size,
+            .modified   = std::chrono::sys_time<std::chrono::nanoseconds>(
+                std::chrono::nanoseconds(st->modified_ns)),
+            .is_regular = st->regular,
+        };
     }).detach();
 }
 

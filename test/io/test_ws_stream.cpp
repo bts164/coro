@@ -12,6 +12,8 @@
 #include <coro/runtime/parker.h>
 #include <coro/runtime/runtime.h>
 #include <coro/sync/join.h>
+#include <coro/sync/oneshot.h>
+#include <coro/sync/select.h>
 #include <coro/sync/sleep.h>
 #include <coro/sync/timeout.h>
 #include <coro/coro.h>
@@ -31,6 +33,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using namespace coro;
@@ -287,14 +290,17 @@ std::string raw_frame(unsigned char opcode, char first, char second) {
                        first, second};
 }
 
-// A TCP server that is not a WebSocket server. Takes one connection; with a reply,
-// reads the request and answers with it; then holds the connection for `hold` and
-// drops it.
+// A TCP server that is not a WebSocket server. Takes one connection and signals
+// `on_accept`, if given; with a reply, reads the request and answers with it; then
+// holds the connection for `hold` and drops it. The bound on the accept only catches
+// a hang.
 Coro<void> tcp_peer(TcpListener listener, std::optional<std::string> reply,
-                    std::chrono::milliseconds hold) {
-    auto accepted = co_await timeout(2s, listener.accept());
+                    std::chrono::milliseconds hold,
+                    std::optional<OneshotSender<void>> on_accept = std::nullopt) {
+    auto accepted = co_await timeout(10s, listener.accept());
     if (accepted.index() != 0) throw std::runtime_error("tcp_peer: no connection");
     TcpStream tcp = std::move(std::get<0>(accepted).value);
+    if (on_accept) (void)on_accept->send();
     if (reply) {
         (void)co_await read_headers(tcp);
         co_await tcp.write(std::move(*reply));
@@ -1074,9 +1080,6 @@ TEST(WsStreamTest, MalformedUrlThrowsInvalidArgument) {
     EXPECT_THROW(rt.block_on(WsStream::connect("http://127.0.0.1/")), std::invalid_argument);
 }
 
-// A connect dropped part way (here by a 1 ms timeout) may or may not have finished
-// its handshake. Either way it must not leave anything broken: a connection it did
-// make is closed, and the next connect works.
 // A server that takes the TCP connection and closes it without a word.
 TEST(WsStreamTest, ConnectToPeerThatClosesThrows) {
     Runtime rt;
@@ -1101,14 +1104,19 @@ TEST(WsStreamTest, ConnectToPlainHttpServerThrows) {
 }
 
 // A server that takes the TCP connection and never answers: the connect is dropped
-// in the middle of the handshake, by a timeout. The client context must be left fit
-// for the next connect.
+// in the middle of the handshake, as soon as the server has the connection. The
+// client context must be left fit for the next connect.
 TEST(WsStreamTest, ConnectDroppedMidHandshakeIsHarmless) {
     Runtime rt;
     rt.block_on([]() -> Coro<void> {
-        auto peer = spawn(tcp_peer(co_await TcpListener::bind("127.0.0.1", 30259), std::nullopt, 300ms));
-        auto timed_out = co_await timeout(100ms, WsStream::connect(url(30259)));
-        EXPECT_EQ(timed_out.index(), 1u);
+        auto [accepted_tx, accepted_rx] = oneshot_channel<void>();
+        auto peer = spawn(tcp_peer(co_await TcpListener::bind("127.0.0.1", 30259), std::nullopt, 300ms,
+                                   std::move(accepted_tx)));
+        // The connect cannot win against a server that never answers; the bound only
+        // catches a hang.
+        auto raced = co_await timeout(10s, select(WsStream::connect(url(30259)), accepted_rx.recv()));
+        EXPECT_EQ(raced.index(), 0u) << "the server never took the connection";
+        if (raced.index() == 0) EXPECT_EQ(std::get<0>(raced).value.index(), 1u);
 
         Connection c = co_await connect_pair(30260);
         co_await round_trip(c.client, c.server, "after a dropped handshake");
@@ -1116,6 +1124,9 @@ TEST(WsStreamTest, ConnectDroppedMidHandshakeIsHarmless) {
     }());
 }
 
+// A connect dropped part way (here by a 1 ms timeout) may or may not have finished
+// its handshake. Either way it must not leave anything broken: a connection it did
+// make is closed, and the next connect works.
 TEST(WsStreamTest, DroppedConnectIsHarmless) {
     Runtime rt;
     rt.block_on([]() -> Coro<void> {

@@ -3,6 +3,7 @@
 #include <coro/detail/sys/file.h>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -14,9 +15,10 @@ std::expected<RawFd, int> file_open(const std::string& path, FileOpenFlags flags
     if (flags.read && flags.write) oflags |= O_RDWR;
     else if (flags.write)          oflags |= O_WRONLY;
     else                           oflags |= O_RDONLY;
-    if (flags.create)   oflags |= O_CREAT;
-    if (flags.truncate) oflags |= O_TRUNC;
-    if (flags.append)   oflags |= O_APPEND;
+    if (flags.create)     oflags |= O_CREAT;
+    if (flags.truncate)   oflags |= O_TRUNC;
+    if (flags.append)     oflags |= O_APPEND;
+    if (flags.create_new) oflags |= O_CREAT | O_EXCL;
     for (;;) {
         const int fd = ::open(path.c_str(), oflags, 0644);
         if (fd >= 0) return fd;
@@ -48,6 +50,17 @@ std::expected<void, int> file_sync(RawFd fd) noexcept {
         if (::fsync(fd) == 0) return {};
         if (errno != EINTR) return std::unexpected(errno);
     }
+}
+
+std::expected<FileStat, int> file_stat(RawFd fd) noexcept {
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) return std::unexpected(errno);
+    FileStat out;
+    out.size        = static_cast<uint64_t>(st.st_size);
+    out.modified_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1'000'000'000
+                    + st.st_mtim.tv_nsec;
+    out.regular     = S_ISREG(st.st_mode);
+    return out;
 }
 
 void file_close(RawFd fd) noexcept {

@@ -6,6 +6,7 @@
 #include <coro/detail/sys/file.h>
 #include <coro/io/byte_buffer.h>
 #include <coro/task/spawn_blocking.h>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,7 @@ enum class FileMode : unsigned {
     Create    = 0x10,  // O_CREAT  — create if not exists
     Truncate  = 0x20,  // O_TRUNC  — truncate to zero length on open
     Append    = 0x40,  // O_APPEND — writes always go to end
+    CreateNew = 0x80,  // O_CREAT | O_EXCL — create, failing if the path exists
 };
 
 /// Allow combining FileMode flags with |
@@ -35,6 +37,15 @@ constexpr FileMode operator|(FileMode a, FileMode b) {
 constexpr FileMode operator&(FileMode a, FileMode b) {
     return static_cast<FileMode>(static_cast<unsigned>(a) & static_cast<unsigned>(b));
 }
+
+/// What File::metadata() reports.
+struct FileMetadata {
+    uint64_t size = 0;
+    /// The last change to the file's data.
+    std::chrono::sys_time<std::chrono::nanoseconds> modified{};
+    /// Not a directory, device, pipe or socket.
+    bool is_regular = false;
+};
 
 namespace detail {
 
@@ -99,9 +110,11 @@ public:
 
     /**
      * @brief Opens a file at `path` with the given mode, close-on-exec. `Create`
-     * makes it with mode 0644 (subject to umask).
+     * makes it with mode 0644 (subject to umask). `CreateNew` does too, but fails if
+     * the path already exists, so two openers can't both think they made it.
      * @return An `OpenFuture` that resolves to a `File` handle.
-     * @throws std::system_error (at co_await) on open failure (ENOENT, EACCES, …).
+     * @throws std::system_error (at co_await) on open failure (ENOENT, EACCES, EEXIST
+     *         with `CreateNew`, …).
      */
     [[nodiscard]] static OpenFuture open(std::string path, FileMode mode);
 
@@ -177,6 +190,13 @@ public:
      *         kernel deferred (e.g. EIO, ENOSPC on some filesystems).
      */
     [[nodiscard]] BlockingHandle<void> sync_all();
+
+    /**
+     * @brief The file's size, modification time and type, of the open file (fstat), so
+     * they can't belong to another file renamed into its path since it was opened.
+     * @throws std::system_error (at co_await) on failure.
+     */
+    [[nodiscard]] BlockingHandle<FileMetadata> metadata();
 
 private:
     explicit File(std::shared_ptr<detail::FileState> state) noexcept

@@ -145,6 +145,23 @@ sender/receiver capability and own writes automatically advance `last_seen`.
 The peer channel and cloneable sender interact — cloneable sender may be sufficient
 for the peer use case, or the two may need to be addressed together. Resolve together.
 
+**Weak endpoints for global placeholders.** A common pattern keeps a global
+`WatchReceiver<T>` whose only job is to be `clone()`d into a private receiver for each
+task that watches the value. Each clone tracks its own `last_seen`, but the global is
+itself a usable receiver: nothing stops code from calling `changed()` or
+`borrow_and_update()` on it directly, and then every caller shares one `last_seen` and
+they steal updates from each other. That is documented, but a weak endpoint would make
+the mistake impossible. It can't read, wait or send; its only operation is producing a
+strong clone.
+
+!!! tip "TODO: Weak watch endpoints"
+    1. Add `WatchReceiver<T>::downgrade()` returning a `WeakWatchReceiver<T>` whose only
+       operation is `upgrade()`: a fresh strong receiver, or a closed one if the
+       channel is gone.
+    2. Decide whether a weak handle counts toward `receiver_count` (i.e. keeps the
+       channel open for the sender), and whether a weak sender is worth having too.
+    3. Document it as the recommended way to hold a global placeholder.
+
 ## Async `Mutex<T>`
 
 `std::mutex` blocks the OS thread, starving the executor. `Mutex<T>` suspends the *task*
@@ -336,3 +353,44 @@ The plan is to build every tutorial from code that compiles:
        shutdown that never cancels a handler with a gRPC operation outstanding.
     4. Add a "Where next" list at the end of `getting_started.md` linking each example
        tutorial and naming what it teaches.
+
+
+## Shutdown safety — test gaps and unguarded lifetimes
+
+[runtime_shutdown.md](design/runtime_shutdown.md) covers what happens to tasks,
+channels and outside waiters when a runtime shuts down. Two parts of it are weaker
+than the rest.
+
+**Timers and sockets after `~Runtime` are a use-after-free.** `SleepFuture` holds a
+raw `Runtime*`, and `~SleepFuture` calls `cancel_timer()` through it. Every socket,
+pipe and signal future holds an `IoRegistration`, which holds a raw `IoDriver*` and
+deregisters through it on destruction. So a timer or socket destroyed after its
+`Runtime` is destroyed touches freed memory. The shutdown WARNING ("the runtime must
+still outlive the waiter") documents this, but nothing enforces it and no test
+exercises it. The existing tests cover a waiter *outside* the runtime getting an error
+when the runtime shuts down, not a timer or socket outliving the runtime.
+
+**Channel coverage is partial.** `ChannelEndOutlivesRuntime` checks that a channel end
+outliving the runtime is safe for `mpsc`, `oneshot`, `broadcast` and `watch`, in each
+case with a parked *receiver*. These aren't covered:
+
+- `Event` and the ISR types (`IsrEvent`, `IsrChannel`), whose wakers are set from
+  interrupt context.
+- `Barrier`, `TeamMember` and the async `Mutex`, which park tasks the same way.
+- Parked *senders*, e.g. a bounded `mpsc` send waiting for capacity.
+
+**The Pico shutdown path is untested.** Every shutdown test is `CORO_DESKTOP`-only.
+`Runtime::shutdown` on Pico is a separate implementation, and on Pico
+`detail::Mutex`/`SharedMutex` are no-ops, so it can't lean on the desktop results.
+
+!!! tip "TODO: Close the shutdown-safety gaps"
+    1. Add tests (run under ASan) that destroy a `SleepFuture`, a socket and a signal
+       future after their `Runtime`, and decide on a fix: either make the
+       future/registration hold something that outlives the runtime (a shared or weak
+       handle to the timer wheel / I/O driver, checked on destruction) or make the
+       violation a guaranteed, diagnosable failure instead of silent memory
+       corruption.
+    2. Extend `ChannelEndOutlivesRuntime` to `Event`, `IsrEvent`, `IsrChannel`,
+       `Barrier`, `TeamMember` and `Mutex`, and to parked senders.
+    3. Run the shutdown tests on Pico (`on_target_pico`), or a host build of the Pico
+       runtime, so its `Runtime::shutdown` path is covered.

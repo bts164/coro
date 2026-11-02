@@ -54,8 +54,9 @@ else()
                 ${googletest_SOURCE_DIR}/googlemock
     )
     target_compile_definitions(gtest_target PRIVATE ${_CORO_GTEST_DEFINITIONS})
+    # -Wno-psabi: see the firmware images below.
     target_compile_options(gtest_target PRIVATE
-        -fno-rtti -ffunction-sections -fdata-sections)
+        -fno-rtti -ffunction-sections -fdata-sections -Wno-psabi)
     # GNU extensions must stay on: gtest calls fileno(), fdopen(), strdup() and
     # isatty(), which newlib hides under a strict -std=c++NN.
     set_target_properties(gtest_target PROPERTIES CXX_EXTENSIONS ON)
@@ -86,6 +87,10 @@ function(coro_add_on_target_images)
                 PROPERTIES COMPILE_OPTIONS "${CORO_SANITIZE_OPTIONS}")
         endif()
         target_include_directories(${target} PRIVATE ${CORO_TEST_ROOT})
+        # GCC's ARM note that a type's argument passing "changed in GCC 7.1" (bug
+        # 77728) matters only when linking code built with GCC before 7.1; the image
+        # is built with one compiler throughout.
+        target_compile_options(${target} PRIVATE -Wno-psabi)
         target_compile_definitions(${target} PRIVATE
             # The main stack is all of the 4 KB region the linker script gives
             # it (the SDK's default is half of that), with a guard below it: the

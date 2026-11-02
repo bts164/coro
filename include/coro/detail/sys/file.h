@@ -6,7 +6,8 @@
 // with EPERM; a disk read is always "ready" and then blocks). EINTR is retried here.
 //
 // Current backends:
-//   POSIX: src/detail/sys/posix/file_posix.cpp
+//   POSIX:   src/detail/sys/posix/file_posix.cpp
+//   Windows: src/detail/sys/windows/file_windows.cpp
 //
 // See doc/design/file_io.md.
 
@@ -21,15 +22,23 @@ namespace coro::detail::sys {
 
 /// open() flags in backend-neutral form, translated by the backend.
 struct FileOpenFlags {
-    bool read     = false;
-    bool write    = false;
-    bool create   = false;
-    bool truncate = false;
-    bool append   = false;
+    bool read       = false;
+    bool write      = false;
+    bool create     = false;
+    bool truncate   = false;
+    bool append     = false;
+    bool create_new = false;  // create, failing with EEXIST if the path exists
+};
+
+/// What file_stat() reports, in backend-neutral form.
+struct FileStat {
+    uint64_t size        = 0;
+    int64_t  modified_ns = 0;      // last data modification, since the Unix epoch
+    bool     regular     = false;  // not a directory, device, pipe or socket
 };
 
 /// Opens `path`, close-on-exec, creating it with mode 0644 (subject to umask) if
-/// `flags.create` is set. Returns the fd, or errno.
+/// `flags.create` or `flags.create_new` is set. Returns the fd, or errno.
 std::expected<RawFd, int> file_open(const std::string& path, FileOpenFlags flags) noexcept;
 
 /// One read() (`offset < 0`: at the file position, advancing it) or pread() (at
@@ -43,6 +52,9 @@ IoResult file_write(RawFd fd, const std::byte* data, std::size_t size,
 
 /// fsync(): flushes the file's data and metadata to the device. Returns errno on failure.
 std::expected<void, int> file_sync(RawFd fd) noexcept;
+
+/// fstat(): the file's size, modification time and type. Returns errno on failure.
+std::expected<FileStat, int> file_stat(RawFd fd) noexcept;
 
 /// Closes `fd`. Errors are ignored: the fd is released either way, and a deferred write
 /// error is what file_sync() is for.

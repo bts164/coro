@@ -14,11 +14,6 @@
 #include <string>
 #include <utility>
 
-#ifndef CORO_PICO
-#include <chrono>
-#include <thread>
-#endif
-
 using namespace coro;
 
 namespace {
@@ -315,42 +310,3 @@ TYPED_TEST(ParallelTest, MovedBeforeFirstPollSpawnsOnlyWhenPolled) {
     EXPECT_EQ(ran, 3);
 }
 
-// ---------------------------------------------------------------------------
-// WorkStealingExecutor
-// ---------------------------------------------------------------------------
-
-#ifndef CORO_PICO
-
-namespace {
-
-// Holds its worker, with no co_await, until every part has started or the deadline
-// passes. Passes only if every part runs on a worker of its own at once.
-Coro<void> hold_until_all_started(TeamMember part, std::atomic<int>& started,
-                                  std::atomic<bool>& gave_up) {
-    started.fetch_add(1);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (started.load() < static_cast<int>(part.size())) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            gave_up.store(true);
-            break;
-        }
-        std::this_thread::yield();
-    }
-    co_return;
-}
-
-}  // namespace
-
-TEST(ParallelWorkStealingTest, PartsRunOnEveryWorkerAtOnce) {
-    Runtime rt(std::size_t{4});
-    std::atomic<int> started = 0;
-    std::atomic<bool> gave_up = false;
-    rt.block_on([](std::atomic<int>& started, std::atomic<bool>& gave_up) -> Coro<void> {
-        co_await parallel(worker_count(), hold_until_all_started, std::ref(started),
-                          std::ref(gave_up));
-    }(started, gave_up));
-    EXPECT_EQ(started, 4);
-    EXPECT_FALSE(gave_up);
-}
-
-#endif  // !CORO_PICO

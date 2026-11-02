@@ -59,6 +59,15 @@ if(CORO_PLATFORM STREQUAL "pico")
         include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/platforms/pico_mqtt.cmake)
     endif()
 
+    # GCC's ARM note that a type's argument passing "changed in GCC 7.1" (bug 77728)
+    # matters only when linking code built with GCC before 7.1; coro is built with one
+    # compiler throughout. PRIVATE: an application decides for its own sources.
+    target_compile_options(coro_pico     PRIVATE -Wno-psabi)
+    target_compile_options(coro_pico_hal PRIVATE -Wno-psabi)
+    if(CORO_PICO_WITH_MQTT)
+        target_compile_options(coro_pico_mqtt PRIVATE -Wno-psabi)
+    endif()
+
     # Empty unless this is a UBSan build; see cmake/Sanitize.cmake.
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Sanitize.cmake)
     if(CORO_SANITIZE_OPTIONS)

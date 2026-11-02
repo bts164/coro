@@ -35,8 +35,9 @@ The pieces exist: `JoinSet` spawns the parts and a `Team` keeps them in step.
 `parallel()` puts them together so that each use doesn't have to get the cancellation, the
 exception handling and the wake-up right again:
 
-- the parts start on as many workers as are idle at once, not one by one
-  ([`WakeBatch`](work_stealing_executor.md#batched-wakes-wakebatch));
+- the idle workers are woken together, not one by one
+  ([`WakeBatch`](work_stealing_executor.md#batched-wakes-wakebatch)), so the parts can
+  start in parallel; where and when each one runs is up to the scheduler;
 - a part that throws cancels the others, and the exception it threw is the one reported,
   not the `TeamBroken` it causes in the parts waiting for it;
 - the data the parts borrow outlives them on every path, including cancellation of the

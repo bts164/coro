@@ -75,10 +75,11 @@ std::expected<RawFd, int> file_open(const std::string& path, FileOpenFlags flags
     if (flags.write || flags.append) access |= GENERIC_WRITE;
 
     DWORD disposition;
-    if (flags.create && flags.truncate) disposition = CREATE_ALWAYS;
-    else if (flags.create)              disposition = OPEN_ALWAYS;
-    else if (flags.truncate)            disposition = TRUNCATE_EXISTING;
-    else                                disposition = OPEN_EXISTING;
+    if (flags.create_new)                    disposition = CREATE_NEW;
+    else if (flags.create && flags.truncate) disposition = CREATE_ALWAYS;
+    else if (flags.create)                   disposition = OPEN_ALWAYS;
+    else if (flags.truncate)                 disposition = TRUNCATE_EXISTING;
+    else                                     disposition = OPEN_EXISTING;
 
     // Sharing as close to POSIX as Windows allows: others may read, write, rename and
     // delete the file while it is open. Not inheritable (no SECURITY_ATTRIBUTES).
@@ -137,6 +138,24 @@ std::expected<void, int> file_sync(RawFd fd) noexcept {
     if (!::FlushFileBuffers(file_of(fd)->handle))
         return std::unexpected(win32_to_errno(::GetLastError()));
     return {};
+}
+
+std::expected<FileStat, int> file_stat(RawFd fd) noexcept {
+    const HANDLE h = file_of(fd)->handle;
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!::GetFileInformationByHandle(h, &info))
+        return std::unexpected(win32_to_errno(::GetLastError()));
+    // FILETIME counts 100 ns ticks from 1601-01-01; the Unix epoch is this many later.
+    constexpr int64_t kTicksTo1970 = 116'444'736'000'000'000;
+    const int64_t ticks = static_cast<int64_t>(
+        (static_cast<uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32)
+        | info.ftLastWriteTime.dwLowDateTime);
+    FileStat out;
+    out.size        = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    out.modified_ns = (ticks - kTicksTo1970) * 100;
+    out.regular     = ::GetFileType(h) == FILE_TYPE_DISK
+                   && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    return out;
 }
 
 void file_close(RawFd fd) noexcept {
