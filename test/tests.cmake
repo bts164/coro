@@ -80,6 +80,7 @@ coro_test(sync/test_oneshot.cpp                  DESKTOP PICO_STUB ON_TARGET syn
 coro_test(sync/test_mpsc.cpp                     DESKTOP PICO_STUB ON_TARGET sync)
 coro_test(sync/test_watch.cpp                    DESKTOP PICO_STUB ON_TARGET sync)
 coro_test(sync/test_broadcast.cpp                DESKTOP PICO_STUB ON_TARGET sync)
+coro_test(sync/test_channel_pair.cpp             DESKTOP PICO_STUB ON_TARGET sync)
 # Pico only. IsrTrigger (isr_trigger.h) makes the interrupt: a hardware timer alarm
 # on the board, a thread on the host.
 coro_test(sync/test_isr_event.cpp                PICO_STUB ON_TARGET sync)

@@ -91,8 +91,7 @@ template<ByteBuffer Buf, bool WithSender>
 class UdpRecvFuture {
     using State = detail::SocketState;
 public:
-    using OutputType = std::conditional_t<WithSender,
-        std::tuple<std::size_t, Buf, SocketAddress>, std::pair<std::size_t, Buf>>;
+    using OutputType = std::conditional_t<WithSender, UdpDatagram<Buf>, BufResult<Buf>>;
 
     UdpRecvFuture(std::shared_ptr<State> state, Buf buf)
         : m_state(std::move(state)), m_buf(std::move(buf)) {}

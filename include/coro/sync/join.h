@@ -31,8 +31,8 @@ enum class JoinBranchState {
 /**
  * @brief Placeholder result type used for `void`-returning branches in `JoinFuture`.
  *
- * Because `std::tuple` cannot hold `void` elements, void branches contribute a
- * `VoidJoinBranch` in the output tuple instead.
+ * A member can't have type `void`, so void branches contribute a `VoidJoinBranch` to the
+ * output instead.
  */
 struct VoidJoinBranch {};
 
@@ -71,17 +71,185 @@ using JoinBranchOptionalType = typename detail::JoinBranchTraits<T>::OptionalTyp
 
 
 /**
+ * @brief What `join()` resolves with: each branch's result, in the order given, as members
+ *        `first`, `second`, ... `tenth`.
+ *
+ * `auto [a, b] = co_await join(f, g);` binds it, and `coro::get<I>(out)` reads branch `I`,
+ * for code that joins a pack. Deliberately a plain aggregate per branch count rather than a
+ * `std::tuple`: GCC 15 never destroys a structured binding through the tuple protocol whose
+ * hidden object lives in a coroutine frame across a suspension, so a `std::tuple` bound that
+ * way leaked every branch's result (doc/known_issues.md, KI.2). A plain aggregate is bound
+ * member by member, which GCC gets right. Don't give it a tuple protocol: `coro::get` is a
+ * plain function, and `std::tuple_size` stays unspecialized.
+ *
+ * A plain aggregate needs its members spelled out, so coro defines it for 1 to 10 branches.
+ * For more, nest a `join()`, or define a specialization for the count you need, in the same
+ * form: see doc/known_issues.md, KI.2, "More than ten branches in a join()".
+ */
+template<typename... Ts>
+struct JoinOutput {
+    static_assert(sizeof...(Ts) >= 1 && sizeof...(Ts) <= 10,
+                  "coro::JoinOutput is defined for 1 to 10 branches: a plain aggregate needs one "
+                  "member per branch, spelled out. For more, nest a join(), or define a "
+                  "specialization of coro::JoinOutput for your count, with one member per "
+                  "branch in order. See doc/known_issues.md, KI.2, \"More than ten branches in "
+                  "a join()\".");
+};
+
+template<typename T0>
+struct JoinOutput<T0> {
+    T0 first;
+};
+
+template<typename T0, typename T1>
+struct JoinOutput<T0, T1> {
+    T0 first;
+    T1 second;
+};
+
+template<typename T0, typename T1, typename T2>
+struct JoinOutput<T0, T1, T2> {
+    T0 first;
+    T1 second;
+    T2 third;
+};
+
+template<typename T0, typename T1, typename T2, typename T3>
+struct JoinOutput<T0, T1, T2, T3> {
+    T0 first;
+    T1 second;
+    T2 third;
+    T3 fourth;
+};
+
+template<typename T0, typename T1, typename T2, typename T3, typename T4>
+struct JoinOutput<T0, T1, T2, T3, T4> {
+    T0 first;
+    T1 second;
+    T2 third;
+    T3 fourth;
+    T4 fifth;
+};
+
+template<typename T0, typename T1, typename T2, typename T3, typename T4, typename T5>
+struct JoinOutput<T0, T1, T2, T3, T4, T5> {
+    T0 first;
+    T1 second;
+    T2 third;
+    T3 fourth;
+    T4 fifth;
+    T5 sixth;
+};
+
+template<typename T0, typename T1, typename T2, typename T3, typename T4, typename T5, typename T6>
+struct JoinOutput<T0, T1, T2, T3, T4, T5, T6> {
+    T0 first;
+    T1 second;
+    T2 third;
+    T3 fourth;
+    T4 fifth;
+    T5 sixth;
+    T6 seventh;
+};
+
+template<typename T0, typename T1, typename T2, typename T3, typename T4, typename T5, typename T6, typename T7>
+struct JoinOutput<T0, T1, T2, T3, T4, T5, T6, T7> {
+    T0 first;
+    T1 second;
+    T2 third;
+    T3 fourth;
+    T4 fifth;
+    T5 sixth;
+    T6 seventh;
+    T7 eighth;
+};
+
+template<typename T0, typename T1, typename T2, typename T3, typename T4, typename T5, typename T6, typename T7, typename T8>
+struct JoinOutput<T0, T1, T2, T3, T4, T5, T6, T7, T8> {
+    T0 first;
+    T1 second;
+    T2 third;
+    T3 fourth;
+    T4 fifth;
+    T5 sixth;
+    T6 seventh;
+    T7 eighth;
+    T8 ninth;
+};
+
+template<typename T0, typename T1, typename T2, typename T3, typename T4, typename T5, typename T6, typename T7, typename T8, typename T9>
+struct JoinOutput<T0, T1, T2, T3, T4, T5, T6, T7, T8, T9> {
+    T0 first;
+    T1 second;
+    T2 third;
+    T3 fourth;
+    T4 fifth;
+    T5 sixth;
+    T6 seventh;
+    T7 eighth;
+    T8 ninth;
+    T9 tenth;
+};
+
+/// @brief Branch `I`'s result in a `join()`'s output, as `std::get` reads a `std::tuple`. For
+/// the specializations coro defines; one of your own can add an overload of its own.
+template<std::size_t I, typename... Ts>
+    requires(I < sizeof...(Ts) && sizeof...(Ts) <= 10)
+auto& get(JoinOutput<Ts...>& out) noexcept {
+    if constexpr (I == 0) return (out.first);
+    else if constexpr (I == 1) return (out.second);
+    else if constexpr (I == 2) return (out.third);
+    else if constexpr (I == 3) return (out.fourth);
+    else if constexpr (I == 4) return (out.fifth);
+    else if constexpr (I == 5) return (out.sixth);
+    else if constexpr (I == 6) return (out.seventh);
+    else if constexpr (I == 7) return (out.eighth);
+    else if constexpr (I == 8) return (out.ninth);
+    else if constexpr (I == 9) return (out.tenth);
+}
+
+template<std::size_t I, typename... Ts>
+    requires(I < sizeof...(Ts) && sizeof...(Ts) <= 10)
+const auto& get(const JoinOutput<Ts...>& out) noexcept {
+    if constexpr (I == 0) return (out.first);
+    else if constexpr (I == 1) return (out.second);
+    else if constexpr (I == 2) return (out.third);
+    else if constexpr (I == 3) return (out.fourth);
+    else if constexpr (I == 4) return (out.fifth);
+    else if constexpr (I == 5) return (out.sixth);
+    else if constexpr (I == 6) return (out.seventh);
+    else if constexpr (I == 7) return (out.eighth);
+    else if constexpr (I == 8) return (out.ninth);
+    else if constexpr (I == 9) return (out.tenth);
+}
+
+template<std::size_t I, typename... Ts>
+    requires(I < sizeof...(Ts) && sizeof...(Ts) <= 10)
+auto&& get(JoinOutput<Ts...>&& out) noexcept {
+    if constexpr (I == 0) return std::move(out.first);
+    else if constexpr (I == 1) return std::move(out.second);
+    else if constexpr (I == 2) return std::move(out.third);
+    else if constexpr (I == 3) return std::move(out.fourth);
+    else if constexpr (I == 4) return std::move(out.fifth);
+    else if constexpr (I == 5) return std::move(out.sixth);
+    else if constexpr (I == 6) return std::move(out.seventh);
+    else if constexpr (I == 7) return std::move(out.eighth);
+    else if constexpr (I == 8) return std::move(out.ninth);
+    else if constexpr (I == 9) return std::move(out.tenth);
+}
+
+/**
  * @brief Future that drives multiple branches concurrently and resolves once
  *        **all** branches have completed successfully.
  *
  * All branches are polled in round-robin order on every `poll()` call. If any
  * branch faults, all remaining active branches are cancelled and drained before
  * the first exception is propagated. If all branches succeed, their results are
- * returned as a `std::tuple`. A branch that reports `PollDropped` without being
+ * returned as a `JoinOutput`, one member per branch. A branch that reports `PollDropped` without being
  * cancelled (a handle to a task cancelled elsewhere) faults with @ref TaskCancelled.
  *
- * - `OutputType` is `std::tuple<JoinBranchType<T0>, JoinBranchType<T1>, ...>`.
- *   `void` branches contribute `VoidJoinBranch{}` as their tuple element.
+ * - `OutputType` is `JoinOutput<JoinBranchType<T0>, JoinBranchType<T1>, ...>`.
+ *   `void` branches contribute `VoidJoinBranch{}` as their member.
  * - Prefer the @ref join factory function over constructing this directly.
  *
  * @tparam Fs The `Future` types for each branch.
@@ -91,7 +259,7 @@ class JoinFuture
 {
 public:
     static constexpr std::size_t N = sizeof...(Fs);
-    using OutputType = std::tuple<JoinBranchType<typename Fs::OutputType>...>;
+    using OutputType = JoinOutput<JoinBranchType<typename Fs::OutputType>...>;
 
     /**
      * @brief Constructs a `JoinFuture` from a pack of futures.
@@ -120,10 +288,10 @@ public:
      * 3. If polling reveals an error, cancel remaining active branches and
      *    begin draining them.
      * 4. If all branches are now done, either propagate the exception or return
-     *    the result tuple.
+     *    the results.
      *
      * @return `PollPending` while branches are still running or draining;
-     *         the complete result tuple on success; `PollError` on the first
+     *         every branch's result on success; `PollError` on the first
      *         exception raised by any branch.
      */
     PollResult<OutputType> poll(detail::Context& ctx) {
@@ -170,10 +338,10 @@ private:
     // Result extraction
     // -----------------------------------------------------------------------
 
-    /// Assembles and returns the output tuple by moving results out of storage.
+    /// Assembles and returns the output by moving results out of storage.
     template<std::size_t... Is>
     OutputType get_results(std::index_sequence<Is...>) {
-        return OutputType(get_result_one<Is>()...);
+        return OutputType{get_result_one<Is>()...};
     }
 
     /// Extracts the result for branch `I`. For void branches returns `VoidJoinBranch{}`.
@@ -321,11 +489,11 @@ private:
  * once **every** branch has completed. If any branch faults, remaining branches
  * are cancelled and drained before the first exception is re-raised.
  *
- * `void`-returning branches contribute `VoidJoinBranch{}` in the output tuple.
+ * `void`-returning branches contribute `VoidJoinBranch{}` as their member of the output.
  *
  * @param futures Two or more futures to run concurrently. Each must satisfy @ref Future.
  * @return A `JoinFuture` whose `OutputType` is
- *         `std::tuple<JoinBranchType<T0>, JoinBranchType<T1>, ...>`.
+ *         `JoinOutput<JoinBranchType<T0>, JoinBranchType<T1>, ...>`.
  *
  * Example:
  * @code

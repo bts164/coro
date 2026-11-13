@@ -6,6 +6,7 @@
 #include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
 #include <coro/sync/channel_error.h>
+#include <coro/sync/channel_pair.h>
 
 #include <cassert>
 #include <expected>
@@ -573,10 +574,11 @@ WatchChangedFuture<T>::poll(coro::detail::Context& ctx) {
  *
  * @tparam T     The watched value type.
  * @param initial The initial value published to all receivers.
- * @return A pair `{WatchSender<T>, WatchReceiver<T>}`.
+ * @return A `ChannelPair` `{WatchSender<T>, WatchReceiver<T>}`: `first` sends, `second` receives. Not a
+ *         `std::pair`, as GCC 15 leaks a `std::pair` bound in a coroutine (see `ChannelPair`).
  */
 template<typename T>
-[[nodiscard]] std::pair<WatchSender<T>, WatchReceiver<T>> watch_channel(T initial) {
+[[nodiscard]] ChannelPair<WatchSender<T>, WatchReceiver<T>> watch_channel(T initial) {
     auto shared = detail::make_rc<detail::WatchShared<T>>(std::move(initial));
     return { WatchSender<T>(shared), WatchReceiver<T>(shared) };
 }

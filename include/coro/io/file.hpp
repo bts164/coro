@@ -17,7 +17,7 @@ File::IoFuture<Buf> File::transfer(Buf buf, int64_t offset, const char* what) {
     // discard its result instead of asking it to cancel.
     return spawn_blocking(
         [state = state(what), buf = std::move(buf), offset, what]() mutable
-            -> std::pair<std::size_t, Buf> {
+            -> BufResult<Buf> {
             auto* data = reinterpret_cast<std::byte*>(std::ranges::data(buf));
             const std::size_t size = std::ranges::size(buf);
             std::size_t done = 0;

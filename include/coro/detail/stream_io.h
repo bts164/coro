@@ -47,7 +47,7 @@ namespace coro::detail {
 template<class Io, ByteBuffer Buf, bool Exact>
 class FdReadFuture {
 public:
-    using OutputType = std::pair<std::size_t, Buf>;
+    using OutputType = BufResult<Buf>;
 
     FdReadFuture(std::shared_ptr<SocketState> state, Buf buf)
         : m_state(std::move(state)), m_buf(std::move(buf)) {}

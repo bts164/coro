@@ -7,6 +7,7 @@
 #include <coro/detail/rc.h>
 #include <coro/detail/waker.h>
 #include <coro/sync/channel_error.h>
+#include <coro/sync/channel_pair.h>
 
 #include <algorithm>
 #include <cassert>
@@ -628,10 +629,11 @@ private:
  * @param capacity Maximum number of not-yet-evicted values held in the ring buffer.
  * @throws std::invalid_argument if @p capacity is zero — a zero-capacity channel could
  *         never hold a value for any receiver to read.
- * @return A pair `{BroadcastSender<T>, BroadcastReceiver<T>}`.
+ * @return A `ChannelPair` `{BroadcastSender<T>, BroadcastReceiver<T>}`: `first` sends, `second` receives. Not a
+ *         `std::pair`, as GCC 15 leaks a `std::pair` bound in a coroutine (see `ChannelPair`).
  */
 template<typename T>
-[[nodiscard]] std::pair<BroadcastSender<T>, BroadcastReceiver<T>> broadcast_channel(size_t capacity) {
+[[nodiscard]] ChannelPair<BroadcastSender<T>, BroadcastReceiver<T>> broadcast_channel(size_t capacity) {
     if (capacity == 0)
         throw std::invalid_argument("broadcast_channel: capacity must be non-zero");
     auto shared = detail::make_rc<detail::BroadcastShared<T>>(capacity);

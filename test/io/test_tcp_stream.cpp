@@ -6,6 +6,7 @@
 // desktop-only ones are in their own sections at the end.
 
 #include <gtest/gtest.h>
+#include "tuple_protocol.h"
 #include <coro/io/tcp_listener.h>
 #include <coro/io/tcp_stream.h>
 #include <coro/runtime/runtime.h>
@@ -56,6 +57,9 @@ static_assert(Future<Coro<TcpStream>>);
 static_assert(Future<Coro<TcpListener>>);
 // read and write are hand-written futures, not coroutines: no frame per transfer.
 static_assert(Future<TcpReadFuture<std::string, false>>);
+// Results bound member by member, not through the tuple protocol (doc/known_issues.md, KI.2).
+static_assert(std::is_same_v<TcpReadFuture<std::string, false>::OutputType, BufResult<std::string>>);
+static_assert(coro_test::kBindsMemberwise<BufResult<std::string>>);
 static_assert(Future<TcpReadFuture<std::string, true>>);
 static_assert(Future<TcpWriteFuture<std::string>>);
 // Leaf futures: safe to drop mid-wait, so they expose no cancel().

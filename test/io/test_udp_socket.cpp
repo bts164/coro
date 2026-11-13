@@ -7,6 +7,7 @@
 // at the end.
 
 #include <gtest/gtest.h>
+#include "tuple_protocol.h"
 #include <coro/io/udp_socket.h>
 #include <coro/io/socket_address.h>
 #include <coro/runtime/runtime.h>
@@ -56,6 +57,11 @@ static_assert(!Cancellable<UdpSendFuture<std::string>>);
 static_assert(!Cancellable<UdpRecvFuture<std::string, true>>);
 static_assert(Future<UdpRecvSegmentsFuture<std::string>>);
 static_assert(!Cancellable<UdpRecvSegmentsFuture<std::string>>);
+// Results bound member by member, not through the tuple protocol (doc/known_issues.md, KI.2).
+static_assert(std::is_same_v<UdpRecvFuture<std::string, true>::OutputType, UdpDatagram<std::string>>);
+static_assert(std::is_same_v<UdpRecvFuture<std::string, false>::OutputType, BufResult<std::string>>);
+static_assert(coro_test::kBindsMemberwise<UdpDatagram<std::string>>);
+static_assert(coro_test::kBindsMemberwise<UdpSegments<std::string>>);
 
 namespace {
 
@@ -502,12 +508,17 @@ TEST(UdpSocketTest, JoinAndLeaveMulticastDoesNotThrow) {
 TEST(UdpSocketTest, MulticastLoopbackDelivery) {
     Runtime rt;
     rt.block_on([]() -> Coro<void> {
+        // All on the loopback interface: the receiver joins there, and a sender bound to
+        // 127.0.0.1 sends its multicast out of the interface that owns that address. Left to
+        // the default route, the looped-back copy would arrive on that route's interface,
+        // where a host firewall (firewalld's public zone, say) drops it and the test hangs.
+        const Ipv4Address loopback{{127, 0, 0, 1}};
         auto receiver = co_await UdpSocket::bind("0.0.0.0", 30061);
-        auto sender   = co_await UdpSocket::bind("0.0.0.0", 30062);
+        auto sender   = co_await UdpSocket::bind("127.0.0.1", 30062);
 
         auto group_addr = SocketAddress::parse("239.255.0.2", 0).value();
         auto group = std::get<Ipv4Address>(group_addr.address);
-        co_await receiver.join_multicast(group, Ipv4Address{});
+        co_await receiver.join_multicast(group, loopback);
 
         auto dest = SocketAddress::parse("239.255.0.2", 30061).value();
         co_await sender.send_to(std::string("multicast-hello"), dest);
@@ -517,7 +528,7 @@ TEST(UdpSocketTest, MulticastLoopbackDelivery) {
         buf.resize(n);
         EXPECT_EQ(buf, "multicast-hello");
 
-        co_await receiver.leave_multicast(group, Ipv4Address{});
+        co_await receiver.leave_multicast(group, loopback);
     }());
 }
 

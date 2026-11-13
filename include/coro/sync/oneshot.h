@@ -4,6 +4,7 @@
 #include <coro/detail/waker.h>
 #include <coro/detail/poll_result.h>
 #include <coro/sync/channel_error.h>
+#include <coro/sync/channel_pair.h>
 
 #include <expected>
 #include <memory>
@@ -168,7 +169,11 @@ public:
             if (!m_shared->receiver_alive) {
                 return std::unexpected<std::decay_t<U>>(std::forward<U>(value));
             }
-            m_shared->slot = std::forward<std::decay_t<U>>(value);
+            // emplace, not assignment: for T = std::optional<X>, `slot = std::nullopt` would leave
+            // the slot empty, and the receiver would see Closed instead of the value (see
+            // CoroPromiseResult::return_value() in coro.h). And forward<U>, not
+            // forward<decay_t<U>>, which would move from a caller's lvalue instead of copying it.
+            m_shared->slot.emplace(std::forward<U>(value));
             waker = std::move(m_shared->receiver_waker);
             m_shared->sender_alive = false; // consumed
         }
@@ -308,10 +313,11 @@ private:
  * @brief Creates a linked (sender, receiver) pair.
  *
  * @tparam T The value type to transport.
- * @return A pair `{OneshotSender<T>, OneshotReceiver<T>}`.
+ * @return A `ChannelPair` `{OneshotSender<T>, OneshotReceiver<T>}`: `first` sends, `second` receives. Not a
+ *         `std::pair`, as GCC 15 leaks a `std::pair` bound in a coroutine (see `ChannelPair`).
  */
 template<typename T>
-[[nodiscard]] std::pair<OneshotSender<T>, OneshotReceiver<T>> oneshot_channel() {
+[[nodiscard]] ChannelPair<OneshotSender<T>, OneshotReceiver<T>> oneshot_channel() {
     auto shared = detail::make_rc<detail::OneshotShared<T>>();
     return { OneshotSender<T>(shared), OneshotReceiver<T>(shared) };
 }

@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <tuple>
+#include <type_traits>
 
 namespace coro {
 
@@ -37,6 +38,13 @@ namespace coro {
  */
 template<typename... Args>
 struct LwipCallbackResult {
+    // lwip_wait() resolves with a std::tuple<Args...>, which callers unpack with a structured
+    // binding. GCC 15 never destroys a binding through the tuple protocol whose hidden object
+    // is in a coroutine frame across a suspension (doc/known_issues.md, KI.2); with only
+    // trivially destructible arguments, as lwIP's callbacks pass, there is nothing to leak.
+    static_assert((std::is_trivially_destructible_v<Args> && ...),
+                  "LwipCallbackResult: arguments must be trivially destructible (see KI.2)");
+
     detail::Rc<detail::Waker>          waker;
     std::optional<std::tuple<Args...>> value;
 

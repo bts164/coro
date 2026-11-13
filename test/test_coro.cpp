@@ -2,6 +2,7 @@
 #include <gmock/gmock.h>
 #include <coro/coro.h>
 #include <coro/future.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -71,6 +72,13 @@ Coro<std::string> chain_two() {
     };
     auto s = co_await StringFuture{};
     co_return s + " world";
+}
+
+// A Coro whose value is itself an optional: `co_return std::nullopt` must be an empty inner
+// optional, not a missing result.
+Coro<std::optional<std::string>> optional_string(bool has) {
+    if (!has) co_return std::nullopt;
+    co_return std::string("present");
 }
 
 // --- Concept checks (compile-time) ---
@@ -148,6 +156,37 @@ TEST(CoroTest, ChainsStringFutures) {
     auto result = c.poll(ctx);
     EXPECT_TRUE(result.isReady());
     EXPECT_EQ(result.value(), "hello world");
+}
+
+// --- co_return of a nested optional ---
+
+// Checks the stored result directly: with assignment, `co_return std::nullopt` left the outer
+// optional empty, and poll() then read an unconstructed value, which is undefined behaviour and
+// so may not fail visibly. The promise's own state fails deterministically.
+TEST(CoroTest, ReturnNulloptStoresEmptyInnerOptional) {
+    Coro<std::optional<int>>::promise_type promise;
+    promise.return_value(std::nullopt);
+    ASSERT_TRUE(promise.m_value.has_value());
+    EXPECT_FALSE(promise.m_value->has_value());
+}
+
+TEST(CoroTest, PollReturnsEmptyInnerOptional) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    auto c = optional_string(false);
+    auto result = c.poll(ctx);
+    ASSERT_TRUE(result.isReady());
+    EXPECT_FALSE(result.value().has_value());
+}
+
+TEST(CoroTest, PollReturnsEngagedInnerOptional) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    auto c = optional_string(true);
+    auto result = c.poll(ctx);
+    ASSERT_TRUE(result.isReady());
+    ASSERT_TRUE(result.value().has_value());
+    EXPECT_EQ(*result.value(), "present");
 }
 
 // --- Exception propagation ---
@@ -531,7 +570,7 @@ Coro<size_t> skynet(size_t my_num, size_t remaining, std::index_sequence<Is...> 
         co_return my_num;
     }
     auto results = co_await join(skynet(my_num + Is*(remaining/10), remaining/10, seq)...);
-    co_return ((std::get<Is>(results)) + ...);
+    co_return ((coro::get<Is>(results)) + ...);
 }
 
 }  // namespace

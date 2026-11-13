@@ -99,8 +99,12 @@ public:
 template<typename T>
 struct CoroPromiseResult : CoroPromiseBase
 {
+    // emplace, not assignment: when T is itself a std::optional, `m_value = std::nullopt`
+    // picks the outer optional's operator=(nullopt_t) and leaves m_value empty, so
+    // `co_return std::nullopt` from a Coro<std::optional<U>> would store no result at all,
+    // and poll()'s *m_value would read an unconstructed T. emplace always constructs a T.
     template<std::convertible_to<T> U> requires (!std::is_void_v<T>)
-    void return_value(U &&value) { m_value = std::forward<U>(value); }
+    void return_value(U &&value) { m_value.emplace(std::forward<U>(value)); }
     std::optional<T> m_value;
 };
 

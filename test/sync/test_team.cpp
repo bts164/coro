@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "executor_traits.h"
+#include "tuple_protocol.h"
 #include <coro/sync/team.h>
 #include <coro/sync/select.h>
 #include <coro/sync/sleep.h>
@@ -34,6 +35,8 @@ static_assert(Future<TeamSyncFuture>);
 static_assert(Cancellable<TeamSyncFuture>);
 static_assert(Cancellable<TeamAllReduceFuture<int, std::plus<>>>);
 static_assert(Cancellable<TeamElementwiseFuture<float, std::plus<>>>);
+// Results bound member by member, not through the tuple protocol (doc/known_issues.md, KI.2).
+static_assert(coro_test::kBindsMemberwise<TeamRange>);
 
 namespace {
 
@@ -901,7 +904,7 @@ TEST(TeamTest, MovedFromHandleAssignedAgainWorks) {
     h.team[1] = std::move(tmp);
     EXPECT_EQ(h.team[1].rank(), 1u);
     EXPECT_EQ(h.team[1].size(), 2u);
-    EXPECT_EQ(h.team[1].range(4), (std::pair<std::size_t, std::size_t>{2, 4}));
+    EXPECT_EQ(h.team[1].range(4), (TeamRange{2, 4}));
     EXPECT_FALSE(h.team[1].is_broken());
     EXPECT_THROW((void)tmp.rank(), TeamUsageError);
 

@@ -156,7 +156,10 @@ struct TaskState : TaskStateBase {
         Weak<Waker> wk;
         {
             std::lock_guard lock(mutex);
-            result = std::forward<U>(value);
+            // emplace, not assignment: for T = std::optional<X>, `result = std::nullopt` would
+            // leave `result` empty (no result at all) rather than hold an empty X. See
+            // CoroPromiseResult::return_value() in coro.h.
+            result.emplace(std::forward<U>(value));
             terminated = true;
             wk = std::move(waker);
         }

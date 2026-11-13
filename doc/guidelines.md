@@ -8,6 +8,8 @@ each rule has a short title, a rationale, and concrete examples.
 
 ## Table of Contents
 
+- [Compiler Defects](#compiler-defects) ⚠️
+    - GCC.1 — Don't let a structured binding through the tuple protocol live across a suspension
 - [Coroutine Scope](#coroutine-scope)
     - CS.1 — Do not drop a `JoinHandle` while the task holds references to local data
     - CS.2 — Use `co_invoke` to place the task handle in a nested scope when referencing local data
@@ -32,6 +34,86 @@ each rule has a short title, a rationale, and concrete examples.
     - IS.1 — Only call `signal_from_isr()` or `send_from_isr()` from an interrupt handler
     - IS.2 — Keep interrupt handlers minimal: write a flag or value and return immediately
     - IS.3 — Declare `IsrEvent` and `IsrChannel<T>` at static or class scope; never as coroutine locals
+
+---
+
+## Compiler Defects
+
+### GCC.1 — Don't let a structured binding through the tuple protocol live across a suspension
+
+!!! danger "WARNING: A silent leak, in correct code, on GCC before 16.2"
+    GCC up to 16.1, at `-O1` and above, never destroys the hidden object of a structured binding
+    that goes through the tuple protocol, when that object lives in a coroutine frame across
+    a real suspension. Whatever the object holds leaks: the ends of a channel, a buffer, a
+    string. There is no diagnostic but a `-Wmaybe-uninitialized` warning, and nothing fails
+    but LeakSanitizer. The code is correct C++; GCC 16.2, Clang and MSVC compile it correctly. See
+    [KI.2](known_issues.md#ki2-gcc-before-162-never-destroys-a-tuple-protocol-structured-binding-in-a-coroutine-frame)
+    for the evidence and the compilers tried.
+
+**Reason:** The tuple protocol is how `auto [a, b] = e;` binds a `std::pair`, a `std::tuple`,
+a `std::array`, a `std::ranges::subrange` (and, in C++26, a `std::complex`), or any other type
+with `std::tuple_size` and `get<I>`, a third-party library's or your own. When the bound names
+are still in scope at a `co_await` or `co_yield` that really suspends, the hidden object holding
+`e` moves into the coroutine frame, and an affected GCC leaves out its destructor. Binding a plain
+aggregate member by member is unaffected, as is a binding that ends before the suspension.
+
+Only a destructor that does something is lost, so a binding of trivially destructible values
+loses nothing: a `subrange` of pointers, `std::array<int, N>`, `map::insert()`'s
+`pair<iterator, bool>`. A `std::string`, a container, a smart pointer or a channel end, as a
+member or an element, leaks.
+
+The easiest one to write by accident is a range-for that binds by value, over a map or any
+range of pairs or tuples: each element is copied into a hidden object, and a `co_await` in the
+body leaks every copy. Bind by reference, as a range-for usually should anyway:
+
+```cpp
+std::map<std::string, Station> stations;
+
+// Leaks on GCC before 16.2: each pair is copied into the frame, across the co_await.
+for (auto [name, station] : stations)
+    co_await report(name, station);
+
+// Safe: the binding refers to the map's own element.
+for (const auto& [name, station] : stations)
+    co_await report(name, station);
+```
+
+Use `auto&&` instead if the body moves from the elements.
+
+Everything coro hands back for a structured binding is a plain aggregate for this reason:
+the channel factories' `ChannelPair`, `join()`'s `JoinOutput`, the reads' and writes'
+`BufResult`, `UdpSocket::recv_from()`'s `UdpDatagram` and `TeamMember::range()`'s
+`TeamRange`. So `auto [tx, rx] = mpsc_channel<T>(n);`, `auto [a, b] = co_await join(f, g);`
+and `auto [n, buf] = co_await stream.read(buf);` are safe anywhere. For anything else that
+returns a `std::pair` or a `std::tuple`, your own functions and the standard library's
+included, bind by reference to a named object instead:
+
+```cpp
+std::pair<std::string, std::vector<int>> load_table();
+
+// Leaks on GCC before 16.2: the hidden pair lives across the co_await and is never destroyed.
+auto [name, rows] = load_table();
+co_await publish(name);
+use(rows);
+
+// Safe: the pair is a named local, destroyed normally; the binding only refers to it.
+auto table = load_table();
+auto& [name, rows] = table;
+co_await publish(name);
+use(rows);
+```
+
+**Keep `-Wmaybe-uninitialized` on in coroutine code, and don't silence it there.** On an affected GCC,
+with `-Wall` and optimization, it warns `'<anonymous>' may be used uninitialized` at the
+closing brace of every coroutine with a leaking binding, and is the only compile-time sign of
+one. It also warns for some bindings that don't leak, whose suspension point happens never to
+suspend. A pragma or `-Wno-maybe-uninitialized` that hides it would hide the leak too: fix the
+binding instead, as above. It doesn't warn at `-O0`, where only a type whose `get<I>` returns
+by value, such as `subrange`, leaks (KI.2).
+
+`test/compiler/structured_binding_leak.cpp` checks a compiler for the defect. Build it with
+the compiler and flags in question and run it: it prints which kinds of binding leak and
+exits non-zero if any does.
 
 ---
 

@@ -1625,7 +1625,9 @@ graph TD
 
 `join()` is the complement of `select()`: it runs a fixed set of futures concurrently and
 waits for **all** of them to complete. The number and types of branches are fixed at compile
-time and results are returned as a `std::tuple` in branch order.
+time (at most ten), and the results come back as a `JoinOutput` in branch order: a plain
+struct with one member per branch (`first`, `second`, ...), which a structured binding
+unpacks. For a pack of branches, `coro::get<I>(results)` reads branch `I`.
 
 ```cpp
 #include <coro/sync/join.h>
@@ -2901,7 +2903,7 @@ the channel's sender count is the signal:
 
 ```cpp
 static Coro<void> run_dsp(uint16_t port) {
-    // std::pair<MpscSender<IqRequest>, MpscReceiver<IqRequest>>
+    // ChannelPair<MpscSender<IqRequest>, MpscReceiver<IqRequest>>
     auto [iq_tx, iq_rx] = mpsc_channel<IqRequest>(IQ_CAPACITY);
 
     auto worker = coro::spawn_blocking(

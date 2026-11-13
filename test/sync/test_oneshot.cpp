@@ -7,6 +7,7 @@
 #include <coro/runtime/runtime.h>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 
 #ifndef CORO_PICO
@@ -92,6 +93,32 @@ TYPED_TEST(OneshotTest, ReceiverGetsValueAfterSend) {
         received = *result;
     }(received));
     EXPECT_EQ(received, 42);
+}
+
+// send(std::nullopt) on a channel of optionals sends a value, an empty optional: with
+// assignment, the slot was left empty, and the receiver saw Closed.
+TYPED_TEST(OneshotTest, SendNulloptOfOptionalIsReceived) {
+    bool received = false;
+    bool inner_engaged = true;
+    this->traits.rt.block_on([](bool& received, bool& inner_engaged) -> Coro<void> {
+        auto [tx, rx] = oneshot_channel<std::optional<int>>();
+        EXPECT_TRUE(tx.send(std::nullopt).has_value());
+        auto result = co_await rx.recv();
+        received = result.has_value();
+        if (received) inner_engaged = result->has_value();
+    }(received, inner_engaged));
+    EXPECT_TRUE(received);
+    EXPECT_FALSE(inner_engaged);
+}
+
+// send() of an lvalue copies it: the caller's value is still there afterwards.
+TYPED_TEST(OneshotTest, SendCopiesLvalue) {
+    auto [tx, rx] = oneshot_channel<std::string>();
+    const std::string sent = "kept";
+    std::string value = sent;
+    EXPECT_TRUE(tx.send(value).has_value());
+    EXPECT_EQ(value, sent);
+    (void)rx;
 }
 
 TYPED_TEST(OneshotTest, ReceiverErrorWhenSenderDropped) {

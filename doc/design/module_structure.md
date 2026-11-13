@@ -39,6 +39,7 @@ include/coro/
 ├── sync/               tokio::sync — synchronization primitives and channels
 │   ├── broadcast.h         broadcast_channel — multi-producer, multi-consumer, lag-detecting
 │   ├── channel_error.h     SendError / RecvError shared by all channel types
+│   ├── channel_pair.h      ChannelPair — the (sender, receiver) aggregate every channel factory returns
 │   ├── event.h             Event — one-shot signal (any-thread set, coroutine wait)
 │   ├── join.h              join() — wait for a fixed heterogeneous set of futures
 │   ├── mpsc.h              mpsc_channel — bounded multi-producer single-consumer

@@ -146,6 +146,26 @@ TEST(JoinHandleTest, PollReturnsReadyAfterSetResult) {
     EXPECT_EQ(r.value(), 42);
 }
 
+// setResult(std::nullopt) for a task whose value is an optional stores an empty optional, not
+// no result: with assignment, the outer optional was left empty and the handle saw nothing.
+TEST(JoinHandleTest, SetResultNulloptStoresEmptyInnerOptional) {
+    auto state = make_rc<detail::TaskState<std::optional<int>>>();
+    state->setResult(std::nullopt);
+    ASSERT_TRUE(state->result.has_value());
+    EXPECT_FALSE(state->result->has_value());
+}
+
+TEST(JoinHandleTest, PollReturnsEmptyInnerOptionalAfterSetResultNullopt) {
+    auto waker = make_rc<MockWaker>();
+    detail::Context ctx(waker);
+    auto state = make_rc<detail::TaskState<std::optional<int>>>();
+    state->setResult(std::nullopt);
+    JoinHandle<std::optional<int>> h(state);
+    auto r = h.poll(ctx);
+    ASSERT_TRUE(r.isReady());
+    EXPECT_FALSE(r.value().has_value());
+}
+
 TEST(JoinHandleTest, VoidPollReturnsReadyAfterSetDone) {
     auto waker = make_rc<MockWaker>();
     detail::Context ctx(waker);

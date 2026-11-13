@@ -27,6 +27,16 @@ class UdpRecvFuture;
 template<ByteBuffer Buf>
 class UdpRecvSegmentsFuture;
 
+/// Result of UdpSocket::recv_from(): buf[0, size) holds the datagram, from sender. A plain
+/// aggregate rather than a std::tuple, as GCC 15 leaks a std::tuple bound in a coroutine
+/// (see BufResult in byte_buffer.h). recv() resolves with a BufResult.
+template<ByteBuffer Buf>
+struct UdpDatagram {
+    std::size_t   size;
+    Buf           buf;
+    SocketAddress sender;
+};
+
 /// Result of UdpSocket::recv_segments_from(): buf[0, size) holds one or more
 /// datagrams from sender, back to back, each segment_size bytes except that the
 /// last may be shorter. segment_size == size when the kernel did not coalesce.

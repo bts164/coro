@@ -129,9 +129,9 @@ js.empty();       // true iff no task is pending or awaiting consumption
 ## join — concurrent fixed fan-out
 
 ```cpp
-// std::tuple<int, std::string>
+// JoinOutput<int, std::string>: members first, second
 auto [a, b] = co_await coro::join(fetch_int(), fetch_string());
-// std::tuple<int, VoidJoinBranch> — void results become VoidJoinBranch{}
+// JoinOutput<int, VoidJoinBranch> — void results become VoidJoinBranch{}
 auto [n, _] = co_await coro::join(fetch_int(), side_effect());
 ```
 

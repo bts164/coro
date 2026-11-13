@@ -168,14 +168,14 @@ static Coro<void> display_loop(Lcd lcd, WatchReceiver<DisplayState> rx) {
 
 static Coro<bool> read_command(TcpStream& stream, Command& out) {
     auto hdr = co_await stream.read_exact(std::array<std::byte, 4>{});
-    if (hdr.first < 4) co_return false;
-    uint32_t len = (uint32_t)hdr.second[0]        | ((uint32_t)hdr.second[1] <<  8) |
-                   ((uint32_t)hdr.second[2] << 16) | ((uint32_t)hdr.second[3] << 24);
+    if (hdr.size < 4) co_return false;
+    uint32_t len = (uint32_t)hdr.buf[0]        | ((uint32_t)hdr.buf[1] <<  8) |
+                   ((uint32_t)hdr.buf[2] << 16) | ((uint32_t)hdr.buf[3] << 24);
     if (len > MAX_PB_MSG) co_return false;
     auto body = co_await stream.read_exact(std::string(len, '\0'));
-    if (body.first < len) co_return false;
+    if (body.size < len) co_return false;
     pb_istream_t is = pb_istream_from_buffer(
-        reinterpret_cast<const pb_byte_t*>(body.second.data()), len);
+        reinterpret_cast<const pb_byte_t*>(body.buf.data()), len);
     out = Command_init_zero;
     co_return pb_decode(&is, Command_fields, &out);
 }

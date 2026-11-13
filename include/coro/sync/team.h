@@ -113,6 +113,16 @@ private:
     std::size_t m_rank;
 };
 
+/// @brief [begin, end) of one member's share of n items, as `TeamMember::range()` returns.
+/// A plain aggregate rather than a `std::pair`, like every result coro hands back that a
+/// structured binding may unpack (doc/known_issues.md, KI.2).
+struct TeamRange {
+    std::size_t begin;
+    std::size_t end;
+
+    bool operator==(const TeamRange&) const = default;
+};
+
 // ---------------------------------------------------------------------------
 // Cheap and expensive ops
 // ---------------------------------------------------------------------------
@@ -277,8 +287,7 @@ inline constexpr std::size_t   kTeamNoRank  = SIZE_MAX;
 inline constexpr std::uint64_t kTeamNoRound = UINT64_MAX;
 
 /// [begin, end) of rank's even share of n items among k; the first n % k get one more.
-inline std::pair<std::size_t, std::size_t> team_range(std::size_t rank, std::size_t k,
-                                                      std::size_t n) noexcept {
+inline TeamRange team_range(std::size_t rank, std::size_t k, std::size_t n) noexcept {
     const std::size_t base  = n / k;
     const std::size_t extra = n % k;
     const std::size_t begin = rank * base + (rank < extra ? rank : extra);
@@ -1448,7 +1457,7 @@ public:
 
     /// @brief [begin, end) of this member's even share of `n` items. The first `n % k`
     /// ranks get one item more; with `n < k` the last ranks get an empty range.
-    std::pair<std::size_t, std::size_t> range(std::size_t n) const {
+    TeamRange range(std::size_t n) const {
         check_held("range() called on a moved-from TeamMember");
         return detail::team_range(m_rank, m_size, n);
     }

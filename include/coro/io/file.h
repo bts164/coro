@@ -98,7 +98,7 @@ class File {
 public:
     using OpenFuture = BlockingHandle<File>;
     template <ByteBuffer Buf>
-    using IoFuture = BlockingHandle<std::pair<std::size_t, Buf>>;
+    using IoFuture = BlockingHandle<BufResult<Buf>>;
 
     File(File&&) noexcept            = default;
     File& operator=(File&&) noexcept = default;

@@ -103,7 +103,7 @@ Coro<size_t> skynet_handles(size_t my_num, size_t remaining, std::index_sequence
         ...
     };
     auto results = co_await coro::join(std::move(handles[Is])...);
-    size_t sum = (std::get<Is>(results) + ...);
+    size_t sum = (coro::get<Is>(results) + ...);
     #ifndef SKYNET_BENCHMARK_ITERATIONS
     size_t exp = SkynetLookup::instance[my_num, remaining];
     CO_ASSERT_EQ(sum, exp)
@@ -282,7 +282,7 @@ template<std::size_t... Is>
 Coro<size_t> skynet_mixed1(size_t my_num, size_t remaining, std::index_sequence<Is...> seq) {
     if (remaining == 1) co_return my_num;
     auto results = co_await join(skynet_mixed1(my_num + Is*(remaining/10), remaining/10, seq)...);
-    size_t sum = (std::get<Is>(results) + ...);
+    size_t sum = (coro::get<Is>(results) + ...);
     #ifndef SKYNET_BENCHMARK_ITERATIONS
     size_t exp = SkynetLookup::instance[my_num, remaining];
     CO_ASSERT_EQ(sum, exp)

@@ -16,31 +16,11 @@ cmake --build --preset conan-release
 ctest --preset conan-release
 ```
 
-## CMakeLists.txt Configuration
+## Running the Tests
 
-Edit `CMakeLists.txt` to enable/disable tests and examples:
-
-```cmake
-# Uncomment to build tests
-enable_testing()
-add_subdirectory(test)
-
-# Uncomment to build examples (including PcieDecoder tests)
-add_subdirectory(examples/io)
-```
-
-## Running Specific Tests
-
-```bash
-# Run all tests
-ctest --preset conan-release
-
-# Run only unit tests
-ctest --preset conan-release --exclude-regex "PcieDecoder"
-
-# Run only PcieDecoder example tests
-ctest --preset conan-release -R PcieDecoder
-```
+The tests are their own Conan project in `test/`, which consumes the coro package like
+any other user. [test/README.md](test/README.md) covers building and running them on the
+development machine and on a Pico, and running one test program or one test.
 
 ## Sanitizer Builds
 

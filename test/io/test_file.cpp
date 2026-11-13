@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "tuple_protocol.h"
 #include <coro/io/file.h>
 #include <coro/runtime/runtime.h>
 #include <coro/runtime/current_thread_executor.h>
@@ -26,6 +27,9 @@ namespace fs = std::filesystem;
 
 static_assert(Future<File::OpenFuture>);
 static_assert(Future<File::IoFuture<std::string>>);
+// Results bound member by member, not through the tuple protocol (doc/known_issues.md, KI.2).
+static_assert(std::is_same_v<File::IoFuture<std::string>::OutputType, BufResult<std::string>>);
+static_assert(coro_test::kBindsMemberwise<BufResult<std::string>>);
 static_assert(Future<BlockingHandle<void>>);
 
 // ---------------------------------------------------------------------------
@@ -65,8 +69,8 @@ TEST(FileTest, BasicOpenWriteReadClose) {
         // Drop file to close, then re-open read-only
         file = co_await File::open(path, FileMode::Read);  // assignment closes previous fd
         auto rr = co_await file.read(std::array<std::byte, 128>{});
-        EXPECT_EQ(rr.first, data.size());
-        std::string read_back(reinterpret_cast<const char*>(rr.second.data()), rr.first);
+        EXPECT_EQ(rr.size, data.size());
+        std::string read_back(reinterpret_cast<const char*>(rr.buf.data()), rr.size);
         EXPECT_EQ(read_back, data);
     }(temp.path_string()));
 }
@@ -84,7 +88,7 @@ TEST(FileTest, ReadEOF) {
     rt.block_on([](std::string path) -> Coro<void> {
         auto file = co_await File::open(path, FileMode::Read);
         auto rr = co_await file.read(std::array<std::byte, 16>{});
-        EXPECT_EQ(rr.first, 0);  // EOF
+        EXPECT_EQ(rr.size, 0);  // EOF
     }(temp.path_string()));
 }
 
@@ -123,8 +127,8 @@ TEST(FileTest, PositionalIO) {
         co_await file.write_at(std::string("BBBB"), 100);
 
         auto rr = co_await file.read_at(std::array<std::byte, 4>{}, 100);
-        EXPECT_EQ(rr.first, 4);
-        std::string read_back(reinterpret_cast<const char*>(rr.second.data()), rr.first);
+        EXPECT_EQ(rr.size, 4);
+        std::string read_back(reinterpret_cast<const char*>(rr.buf.data()), rr.size);
         EXPECT_EQ(read_back, "BBBB");
     }(temp.path_string()));
 }
@@ -147,8 +151,8 @@ TEST(FileTest, MultipleSequentialReads) {
         std::size_t total = 0;
         while (true) {
             auto rr = co_await file.read(std::array<std::byte, 64>{});
-            if (rr.first == 0) break;
-            total += rr.first;
+            if (rr.size == 0) break;
+            total += rr.size;
         }
         EXPECT_EQ(total, 128u);
     }(temp.path_string()));
@@ -176,7 +180,7 @@ TEST(FileTest, MultipleConcurrentFiles) {
         for (int i = 0; i < n; ++i) {
             auto file = co_await File::open(paths[i], FileMode::Read);
             auto rr = co_await file.read(std::array<std::byte, 32>{});
-            std::string got(reinterpret_cast<const char*>(rr.second.data()), rr.first);
+            std::string got(reinterpret_cast<const char*>(rr.buf.data()), rr.size);
             EXPECT_EQ(got, "File" + std::to_string(i));
         }
     }(N, [&] {

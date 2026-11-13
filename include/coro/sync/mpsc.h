@@ -5,6 +5,7 @@
 #include <coro/detail/poll_result.h>
 #include <coro/detail/waker.h>
 #include <coro/sync/channel_error.h>
+#include <coro/sync/channel_pair.h>
 
 #include <cassert>
 #include <deque>
@@ -715,10 +716,11 @@ private:
  *
  * @tparam T       The value type to transport.
  * @param capacity Maximum number of values buffered before senders suspend.
- * @return A pair `{MpscSender<T>, MpscReceiver<T>}`.
+ * @return A `ChannelPair` `{MpscSender<T>, MpscReceiver<T>}`: `first` sends, `second` receives. Not a
+ *         `std::pair`, as GCC 15 leaks a `std::pair` bound in a coroutine (see `ChannelPair`).
  */
 template<typename T>
-[[nodiscard]] std::pair<MpscSender<T>, MpscReceiver<T>> mpsc_channel(size_t capacity) {
+[[nodiscard]] ChannelPair<MpscSender<T>, MpscReceiver<T>> mpsc_channel(size_t capacity) {
     auto shared = detail::make_rc<detail::MpscShared<T>>(capacity);
     return { MpscSender<T>(shared), MpscReceiver<T>(shared) };
 }
