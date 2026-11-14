@@ -12,9 +12,10 @@ Winsock and Win32 versions of the socket, DNS and file seams.
 |---|---|
 | Every executor, `Runtime`, the blocking pool | `Pipe` (no readiness for Windows pipes; needs overlapped I/O; see [Pipes](#pipes)) |
 | `IoDriver` on an IOCP/AFD `sys::Poller` | `signal()`, `signal_stream()` (no POSIX signals; `ctrl_c()`, `shutdown_requested()` and `windows::console_event()` instead) |
-| `TcpStream`, `TcpListener`, `UdpSocket` | `sys/notify.h` (only the Pico ISR primitives use it) |
+| `TcpStream`, `TcpListener`, `UdpSocket` | `sys/notify.h`, and so `ReadinessSource` (see the TODO below) |
 | `sleep_for`, `timeout`, `IntervalTimer`, sub-millisecond | UDP GSO/GRO (Windows USO/URO); reports `ENOTSUP` |
-| `File` (Win32, on the blocking pool) | MinGW, clang-cl, Windows before 10 |
+| `File` (Win32, on the blocking pool) | `AsyncFd` (AFD polls only sockets, as for `Pipe`) |
+| | MinGW, clang-cl, Windows before 10 |
 | `lookup_host` (`GetAddrInfoW`, on the blocking pool) | |
 | `WsStream`, `WsListener` (libwebsockets, level-triggered registrations) | |
 | Fibers (Win32 fibers; see `fiber.md`, "Windows backend") | |
@@ -23,8 +24,11 @@ Winsock and Win32 versions of the socket, DNS and file seams.
 Code above `sys` is shared with the POSIX build. The few places where it accounts for
 Windows are described in [Shared code](#shared-code) and [WebSockets](#websockets).
 
-!!! tip "TODO: notify objects"
-    Nothing on Windows uses `sys/notify.h`. A notify object would be a `Poller`-owned
+!!! tip "TODO: notify objects, for `ReadinessSource`"
+    Windows has no `sys/notify.h`, so `readiness_source.h` is an `#error` there (see
+    [`ReadinessSource`](io_driver.md#readinesssource)). A notify object is all
+    `ReadinessSource` needs: with one, it and its tests (registered `NO_WINDOWS` in
+    `test/tests.cmake`) would work unchanged. A notify object would be a `Poller`-owned
     object signalled with `PostQueuedCompletionStatus()`. `RawFd` would then need to tell
     such objects apart from sockets, for example with a tag bit, because socket handles
     are multiples of 4. A loopback socket can't stand in for one: the notify contract has

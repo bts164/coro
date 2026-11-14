@@ -44,6 +44,7 @@ add_library(coro_pico_core STATIC
     ${CORO_SRC}/detail/sys/lwip/dns_lwip.cpp
     ${CORO_SRC}/io/circular_byte_buffer.cpp
     ${CORO_SRC}/io/lookup_host.cpp
+    ${CORO_SRC}/io/readiness_source.cpp
     ${CORO_SRC}/io/socket_address.cpp
     ${CORO_SRC}/io/tcp_stream.cpp
     ${CORO_SRC}/io/tcp_listener.cpp

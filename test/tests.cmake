@@ -96,6 +96,10 @@ coro_test(io/test_lookup_host.cpp                DESKTOP)
 # needs a failed lookup fakes the resolver (fake_resolver.h).
 coro_test(io/test_system_resolver.cpp            DESKTOP LABELS network)
 coro_test(io/test_pipe.cpp                       DESKTOP NO_WINDOWS)
+# External drivers (doc/design/io_driver.md, "External drivers"). AsyncFd is POSIX
+# only; ReadinessSource is everywhere the notify seam is, the board included.
+coro_test(io/test_async_fd.cpp                   DESKTOP NO_WINDOWS)
+coro_test(io/test_readiness_source.cpp           DESKTOP PICO_STUB ON_TARGET sync NO_WINDOWS)
 coro_test(io/test_circular_byte_buffer.cpp       DESKTOP PICO_STUB ON_TARGET core)
 coro_test(io/test_signal.cpp                     DESKTOP)
 coro_test(io/test_tcp_stream.cpp                 DESKTOP HOST_LINK coro_pico_core ON_TARGET net)

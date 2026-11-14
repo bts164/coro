@@ -17,6 +17,7 @@ queue. Each I/O primitive built on it has its own document (see
 | `sys::Poller`, `sys::PollWaker` (IOCP + AFD) | `src/detail/sys/windows/poller_iocp.cpp`; see [Windows Port](windows_port.md#the-iocpafd-poller) | `test/detail/test_poller.cpp` |
 | `sys::notify_open`, `sys::notify_signal` | `include/coro/detail/sys/notify.h`, `src/detail/sys/posix/notify_posix.cpp`, `src/detail/sys/lwip/notify_lwip.cpp` | `test/detail/test_notify.cpp` |
 | `IoDriver`, `ScheduledIo`, `IoRegistration`, `IoDriverParker` | `include/coro/runtime/io_driver.h`, `src/runtime/io_driver.cpp` | `test/runtime/test_io_driver.cpp`; the waiter list in `test/detail/test_notify.cpp`, on every backend |
+| `AsyncFd`, `ReadinessSource`, `ReadinessFuture` | `include/coro/io/async_fd.h`, `include/coro/io/readiness_source.h`; see [External drivers](#external-drivers) | `test/io/test_async_fd.cpp`, `test/io/test_readiness_source.cpp`, on desktop, host lwIP and the board |
 | `Parker`, `PollingParker` | `include/coro/runtime/parker.h` | `test/runtime/test_current_thread_executor.cpp` |
 | `Clock`, `Instant` | `include/coro/runtime/clock.h` | |
 | `detail::TimerQueue`, `detail::TimerId` | `include/coro/detail/timer_queue.h`, `src/detail/timer_queue.cpp` | `test/detail/test_timer_queue.cpp` |
@@ -51,7 +52,8 @@ The readiness model avoids both:
 
 - Any thread can wait on an fd without a thread hop.
 - Dropping an I/O future is always safe.
-- Readiness waits are first-class, so any non-blocking syscall can be wrapped.
+- Readiness waits are first-class, so any non-blocking syscall can be wrapped, including
+  by code outside coro (see [External drivers](#external-drivers)).
 - Timers with sub-millisecond resolution.
 - One small, explicit platform boundary, so adding an OS means implementing that boundary
   and nothing else. See [Porting to a new platform](#porting-to-a-new-platform).
@@ -75,7 +77,7 @@ Primitives never touch the OS readiness API directly; they go through an
 
 ```mermaid
 flowchart TD
-    P["I/O primitives<br/>UdpSocket, TcpStream, Pipe, signals, ..."]
+    P["I/O primitives<br/>UdpSocket, TcpStream, Pipe, signals, ...<br/>AsyncFd, ReadinessSource (external drivers)"]
     R["IoRegistration<br/>per I/O object: poll_ready / clear_ready / poll_io"]
     D["IoDriver<br/>ScheduledIo registry, event dispatch, timer queue"]
     S["sys:: platform layer (the mio equivalent)<br/>Poller, Event, Interest, PollWaker"]
@@ -89,6 +91,7 @@ flowchart TD
 | `IoDriver` | Yes | Own the `Poller`, map each event to its `ScheduledIo`, update readiness, fire wakers; own the timer queue. |
 | `IoRegistration` | Yes | The readiness handshake a future uses: wait until ready, attempt the syscall, clear readiness on `EAGAIN`. |
 | Primitives | Mostly | Non-blocking syscalls behind a per-primitive backend seam (`detail/sys/udp.h`, `tcp.h`, ...), plus the `IoRegistration` handshake. |
+| `AsyncFd`, `ReadinessSource` | Yes | The public extension point: code outside coro supplies the non-blocking operation, and they supply the handshake. See [External drivers](#external-drivers). |
 
 ### The `sys` layer
 
@@ -223,7 +226,9 @@ A port implements the `sys` layer, and nothing else:
 Everything above `sys` is the same code on every platform: `IoDriver` and its timer
 queue, the `IoRegistration` handshake, `SocketState`, each primitive's futures, buffer
 ownership, cancellation and error mapping, the executors and the `Parker` protocol,
-`Runtime`, and the public API.
+`Runtime`, and the public API. A port that implements `notify.h` also gets
+`ReadinessSource`, and with it every external driver built on it (see
+[External drivers](#external-drivers)).
 
 | Platform | Readiness source | Non-blocking operations |
 |---|---|---|
@@ -677,6 +682,344 @@ IoLevelReady take_ready();                          // {readable, writable, shut
 
 ---
 
+## External drivers
+
+Code outside coro can put its own I/O on the driver. This is the public counterpart of the
+`sys` layer, modelled on tokio's `AsyncFd`: the outside code supplies the non-blocking
+operation, and coro supplies the waiting. There are two public types, one for each kind
+of readiness source:
+
+| Type | Header | Readiness comes from | Platforms |
+|---|---|---|---|
+| `AsyncFd` | `coro/io/async_fd.h` | A real file descriptor that the OS reports through the `Poller`: a character device, a GPIO line-event fd, a serial port, a socket from a C library | POSIX |
+| `ReadinessSource` | `coro/io/readiness_source.h` | The driver code itself, which signals "readable" or "writable" when its own state changes. That code can be an interrupt handler on Pico or another thread on desktop | POSIX, Pico (every `PicoNetwork` mode) |
+
+Both types give the same async API, so code above them is the same whichever one it
+uses. A typical user is a device driver built the way coro builds sockets. A *device*
+does the kernel's job and offers only non-blocking operations, like `try_send()` and
+`try_recv()`. An async layer on top loops "try, would block, wait for readiness, try
+again", using one of these types for the waiting. The device can be a kernel driver
+behind an fd on Linux, an interrupt-driven pump on Pico, or an in-memory fake in tests,
+with the async layer the same on each.
+
+Neither type is a level-triggered registration: they are edge-triggered with the
+handshake from [`ScheduledIo` and the readiness handshake](#scheduledio-and-the-readiness-handshake).
+A library that must be called whenever its socket is ready uses
+[Level-triggered registrations](#level-triggered-registrations) instead, which stay
+internal.
+
+### The readiness API
+
+```cpp
+namespace coro {
+
+/// The future both types return. Hand-written, like the socket futures: an
+/// operation that succeeds on its first poll costs no coroutine frame.
+template<class Op>
+class ReadinessFuture {
+public:
+    using OutputType = T;    // Op returns std::expected<T, int>; T may be void
+    PollResult<T> poll(detail::Context& ctx);
+};
+
+class AsyncFd {            // and ReadinessSource, with the same three members
+public:
+    /// Waits until `op()` succeeds in the read direction. `op` is called on the
+    /// executor's thread, once on the first poll and once after each wake. It must not
+    /// block or suspend, and it returns `std::expected<T, int>`:
+    ///   - a value: the future yields it;
+    ///   - a would-block errno (EAGAIN or EWOULDBLOCK): the future waits for read
+    ///     readiness, then calls `op` again;
+    ///   - any other errno: the future fails with a `std::system_error`.
+    template<class Op> ReadinessFuture<Op> read_io(Op op);
+
+    /// The same, waiting for write readiness.
+    template<class Op> ReadinessFuture<Op> write_io(Op op);
+};
+
+}
+```
+
+A receive on a device then looks like this:
+
+```cpp
+coro::Coro<Packet> Radio::recv() {
+    co_return co_await m_ready.read_io([this]() -> std::expected<Packet, int> {
+        return m_device.try_recv();   // a packet, or std::unexpected(EAGAIN)
+    });
+}
+```
+
+A hand-written future embeds a `ReadinessFuture` as a member and forwards its `poll()`.
+That avoids a coroutine frame per operation, as `FdReadFuture` does for sockets.
+
+**The operation's contract.** `poll_io()` makes the same demands of any operation:
+
+- **Report would-block exactly when it did nothing.** An operation that returns
+  `EAGAIN` must not have consumed anything, because the future goes on to wait and its
+  caller never learns what was consumed. An operation that consumed something returns
+  success.
+- **Express domain errors in `T`.** Only a plain errno can travel in the error channel.
+  An operation that wants to report "CRC failed" or "frame too long" returns success
+  with a `T` that carries the error, such as a `std::expected<Packet, RadioError>`, and
+  leaves the error channel for errno values.
+- **Be idempotent across wakes.** A wake is a hint, not a promise. The operation may be
+  called again after any wake and find nothing (another waiter took it, or the wake was
+  spurious). It then returns `EAGAIN` again.
+
+**Waiters.** Any number of futures may wait in each direction at once, through the
+[waiter list](#more-than-one-waiter). A wake wakes every waiter in that direction. Each
+calls its operation, and the losers get `EAGAIN` and wait again. A device whose
+operations are each atomic (one whole packet per `try_recv()`) needs no lock of its own
+against several receivers. A byte stream, whose reads split the stream, permits one
+reader by its own contract, as `TcpStream` does.
+
+**Pinning.** Each future embeds its `IoWaiter`, so it is pinned from its first poll, like
+the ISR wait futures (see [Future and Stream](future_and_stream.md#movable-until-the-first-poll-pinned-after)).
+Its move operations only assert that the future has not started.
+
+**Cancellation.** Dropping a future unlinks its waiter. This is always safe, because an
+operation either completes inside a single `poll()` or reports that it did nothing.
+
+**Shutdown.** Once the driver has been shut down, a pending future fails with a
+`std::system_error` carrying `sys::kDriverShutDown` (`ECANCELED`), as every I/O future
+does. The operation is not called again.
+
+**Lifetime.** A future refers to its `AsyncFd` or `ReadinessSource`, which must outlive
+it, as an ISR primitive outlives its wait futures. Destroying either type while a future
+of it exists is a precondition violation. Debug builds assert it.
+
+### `AsyncFd`
+
+```cpp
+namespace coro {
+
+class AsyncFd {
+public:
+    /// Takes ownership of `fd`, sets O_NONBLOCK on it, and registers it,
+    /// edge-triggered, with the current runtime's driver for `interest`.
+    /// @throws std::logic_error outside a runtime, or if the runtime's executor does
+    ///         not turn its driver; std::system_error if the OS rejects the fd (a
+    ///         regular file, for instance, which epoll refuses with EPERM).
+    explicit AsyncFd(int fd, Interest interest = Interest::read_write());
+
+    /// Deregisters, then closes the fd.
+    ~AsyncFd();
+
+    AsyncFd(AsyncFd&&) noexcept;   // only while no future of it exists
+    AsyncFd& operator=(AsyncFd&&) noexcept;
+
+    int fd() const noexcept;       // for the operation to call read(), ioctl(), ...
+
+    /// Deregisters and gives the fd back, open. The AsyncFd is empty afterwards.
+    int release() noexcept;
+
+    template<class Op> ReadinessFuture<Op> read_io(Op op);
+    template<class Op> ReadinessFuture<Op> write_io(Op op);
+};
+
+}
+```
+
+`Interest` is `coro::Interest`, a public alias of `sys::Interest`.
+
+- **It owns the fd.** The danger in
+  [Registration lifetime and stale events](#registration-lifetime-and-stale-events),
+  closing an fd before deregistering it, cannot happen. The destructor deregisters
+  first, and `release()` returns the fd only after deregistering. Code that needs to
+  keep the fd uses `release()`.
+- **It sets `O_NONBLOCK`.** A blocking read in an operation would block the executor
+  thread, and with it every task on it. `O_NONBLOCK` is a flag of the open file
+  description, so it also applies to any `dup()` of the fd.
+- **It registers at construction**, for the life of the object, as a socket does. On
+  epoll each registration costs a syscall, and registering per wait would add two to
+  every wait. The object therefore belongs to a runtime: it must be destroyed before
+  that runtime, and it is not a global.
+- **Errors and hang-ups.** `EPOLLERR` and `EPOLLHUP` mark both directions ready (see
+  [The handshake](#scheduledio-and-the-readiness-handshake)), so every waiter calls its
+  operation, and the operation's syscall reports the error or end of file.
+- **Not on Pico or Windows.** Pico has no file descriptors. The Windows `Poller` polls
+  sockets through AFD, which cannot poll arbitrary handles, so on Windows the header is
+  an `#error`, as `pipe.h` is.
+
+### `ReadinessSource`
+
+```cpp
+namespace coro {
+
+class ReadinessSource {
+public:
+    /// Opens its two notify objects. Needs no runtime, so it may be a global.
+    /// @throws std::system_error or std::bad_alloc.
+    ReadinessSource();
+
+    /// Closes them. Precondition: no future of it exists.
+    ~ReadinessSource();
+
+    ReadinessSource(const ReadinessSource&)            = delete;
+    ReadinessSource& operator=(const ReadinessSource&) = delete;
+
+    /// Reports that an operation in that direction may now succeed. Safe from any
+    /// thread, and on Pico from an interrupt handler on either core.
+    void signal_readable() noexcept;
+    void signal_writable() noexcept;
+    /// Both directions: an error, or the device closing, which every waiter must see.
+    void signal() noexcept;
+
+    template<class Op> ReadinessFuture<Op> read_io(Op op);
+    template<class Op> ReadinessFuture<Op> write_io(Op op);
+};
+
+}
+```
+
+The readiness here comes from the device's code itself, not from an OS. Its state lives
+in the device: a packet queue, a status register, a flag. The `ReadinessSource` only
+tells a sleeping driver to look.
+
+**One notify object per direction.** A `ReadinessSource` is a pair of notify fds from
+the `sys/notify.h` seam, one for read waiters and one for write waiters, each with its
+own registration. `signal_readable()` is `notify_signal()` on the first fd,
+`signal_writable()` on the second, and `signal()` on both. A notify fd already has the
+properties a readiness source needs, on every backend that has the seam:
+
+| Property | How the notify seam provides it |
+|---|---|
+| Safe from an interrupt, on either core | `notify_signal()` on lwIP is `async_context_set_work_pending()`; see [Pico Port](pico_port.md#notify-objects) |
+| Safe from another thread | `notify_signal()` on POSIX writes to an eventfd |
+| Ends a sleeping turn | Both are wake sources of their `Poller` |
+| Edge semantics, with nothing to read back | Each signal is reported once; see [The `sys` layer](#the-sys-layer) |
+
+The directions stay independent. A packet arriving wakes only receivers, and room in a
+transmit queue wakes only senders. Building a readiness source this way takes no new
+`sys` object and no new code in any backend.
+
+**The registration lives while a direction has waiters.** This is the rule the ISR
+primitives follow (see [ISR Safety](isr_safety.md#the-wait)), for the same reason. A
+device driver is often a global or a member of a long-lived object, and a registration
+must never outlive its driver. Per direction:
+
+1. A future calls its operation first. If that succeeds, the future is done with no
+   registration at all.
+2. Otherwise the future takes a share of the direction's registration: the existing one
+   if another waiter holds it, or a new one on the current runtime's driver. The source
+   keeps only a weak reference.
+3. The future waits through `poll_io()` with its own `IoWaiter`. The last future to
+   leave the direction drops the registration, which deregisters the notify fd.
+
+The waiting half is the ISR primitives' `detail::IsrWaitCore`: call the operation,
+take a share of the registration, and wait through the waiter list. It is implemented
+once, with the operation pluggable, and both `ReadinessSource` and the ISR primitives
+are built on it. They differ only in where the notify fd comes from. An ISR primitive
+opens its fd on the first wait, under its spin lock. A `ReadinessSource` opens both fds
+in its constructor, and they never change afterwards, so a signal reads them without a
+lock. On desktop, where waiters can
+be on several executor threads, step 2 runs under a `detail::Mutex` in the source, so
+that two first waiters cannot register the same eventfd twice. On Pico that mutex is a
+no-op, as everywhere else.
+
+Registering per wait cycle costs one worker attach and detach on lwIP, which is cheap,
+and two `epoll_ctl()` calls on POSIX. On POSIX, a `ReadinessSource` serves in-process
+devices (fakes in tests, a device pumped by a thread of its own). A device with a real
+fd uses `AsyncFd`, which registers once.
+
+**No signal is lost.** This is the readiness handshake plus the ordering below:
+
+- A signal before any future waits only changes the device's state. The first future
+  calls its operation before it waits, and finds the state.
+- A signal between the operation returning `EAGAIN` and `clear_ready()` makes the notify
+  fd readable. That bumps the registration's tick, so `clear_ready()` leaves the
+  direction ready, and `poll_io()` calls the operation again.
+- A signal while the direction is unregistered is dropped by the lwIP backend, and
+  needs nothing: no one waits, and the next waiter calls the operation first.
+
+**The device's rules.** These are the rules an ISR primitive follows, applied to code
+coro does not own:
+
+1. **Change the state, then signal.** The device updates the state its operations read,
+   then calls `signal_readable()` / `signal_writable()`. A signal before the change can
+   wake a waiter whose operation does not see the change yet. It returns `EAGAIN` and
+   waits for a signal that already came.
+2. **Signal after every change that can turn `EAGAIN` into success.** Signal on every
+   change, not only when the queue goes from empty to non-empty. Extra signals cost an
+   extra call of the operation. A missing one strands a waiter.
+3. **Guard the state with the device's own lock**, taken by both the signalling side
+   and the operations. On Pico that is a hardware spin lock, since the interrupt can run
+   on either core (see [ISR Safety](isr_safety.md#cross-core-isr-delivery)). On desktop
+   it is a mutex. Coro orders nothing about the device's state: the lock is the only
+   thing that makes the waiter see what the signaller wrote.
+4. **Signal after releasing that lock.** On Pico, `notify_signal()` takes a striped
+   spin lock, which can be the same hardware lock as the device's own. Hardware spin
+   locks are not recursive (see [ISR Safety](isr_safety.md#the-signal)).
+
+```cpp
+// Pico: the radio's receive interrupt
+void Radio::on_packet_end_irq() {
+    uint32_t save = spin_lock_blocking(m_lock);
+    m_rx_queue.commit(m_current_slot);     // 1. change the state
+    spin_unlock(m_lock, save);             // 4. release before signalling
+    m_ready.signal_readable();             // 2. every time
+}
+
+// The operation, on the executor's thread
+std::expected<Packet, int> Radio::Device::try_recv() {
+    uint32_t save = spin_lock_blocking(m_lock);   // 3. the same lock
+    auto packet = m_rx_queue.pop();
+    spin_unlock(m_lock, save);
+    if (!packet) return std::unexpected(EAGAIN);
+    return *packet;
+}
+```
+
+**Availability.** A `ReadinessSource` needs only the notify seam. It works on POSIX, and
+on Pico in every `PicoNetwork` mode, `None` included, since notify fds need no network
+(see [Pico Port](pico_port.md#runtime-on-pico)). It is not available on Windows, whose
+backend has no notify seam: the header is an `#error` there. A Windows notify object
+would bring it (see the TODO in [Windows Port](windows_port.md#scope)), as would any
+future port that implements `notify.h`. A port must
+implement the seam for its ISR primitives anyway.
+
+!!! warning "WARNING: an interrupt on the other core can race the last waiter leaving"
+    This is the race described for the ISR primitives in
+    [ISR Safety](isr_safety.md#the-wait). On Pico, the last waiter in a direction
+    deregisters its notify fd, which detaches the fd's worker. An interrupt on core 1
+    that is partway through `signal_readable()` at that moment marks a detached worker
+    pending, which does nothing. If the `Runtime` is destroyed in the same instant, it
+    touches a destroyed context. The window and the reason it is left open are the same
+    as for the ISR primitives.
+
+### Driver code above both
+
+A device driver that runs on more than one platform keeps its async layer independent of
+where the readiness comes from:
+
+```mermaid
+flowchart TD
+    A["Driver's async layer<br/>send(), recv(): read_io / write_io around try_send / try_recv"]
+    subgraph linux["Linux"]
+        L1["/dev node from a kernel driver"]
+        L2["AsyncFd"]
+    end
+    subgraph pico["Pico"]
+        P1["Interrupt-driven device<br/>packet queues in RAM"]
+        P2["ReadinessSource"]
+    end
+    subgraph test["Tests (desktop)"]
+        T1["In-memory fake device"]
+        T2["ReadinessSource"]
+    end
+    A --> L2 --> L1
+    A --> P2 --> P1
+    A --> T2 --> T1
+```
+
+The async layer needs only `read_io()` and `write_io()`, which both types provide with
+the same signatures. Whether the layer is a template over the readiness type or holds
+one chosen at compile time is the driver's own decision. Coro defines no common base
+class, because a virtual `read_io()` cannot be a template.
+
+---
+
 ## Timers
 
 The driver owns the runtime's timer queue. The earliest deadline bounds every blocking
@@ -928,6 +1271,8 @@ never early: `SleepFuture` checks the clock itself.
 | `File` | Not on the driver: a regular file is always "ready", so each operation runs on the blocking pool | [File I/O](file_io.md) |
 | `lookup_host()` | POSIX: `getaddrinfo()` blocks, so it runs on the blocking pool. lwIP: each query is an object registered with the driver, made readable by lwIP's DNS callback | [File I/O](file_io.md#lookup_host), [Pico Port](pico_port.md#name-resolution) |
 | `IsrEvent`, `IsrChannel<T>`, `IsrSemaphore` (Pico) | A notify fd per primitive, signalled by the ISR and registered while the primitive has waiters; its waiters use the [waiter list](#more-than-one-waiter) | [ISR Safety](isr_safety.md#waiting-on-the-driver) |
+| `AsyncFd` (POSIX) | `IoRegistration` per fd, for the object's life; the operation is the caller's; the [waiter list](#more-than-one-waiter) | [External drivers](#asyncfd) |
+| `ReadinessSource` (POSIX, Pico) | Two notify fds, one per direction, each registered while it has waiters; the operation is the caller's; the waiter list | [External drivers](#readinesssource) |
 | `WsStream`, `WsListener` | A [level-triggered registration](#level-triggered-registrations) per libwebsockets socket, whose waker calls lws inside the turn; lws's timers on the timer queue | [WebSocket Stream](websocket_stream.md) |
 
 ---
@@ -960,6 +1305,11 @@ never early: `SleepFuture` checks the clock itself.
 | `IoDriver.WakerMayDeregisterItselfDuringWake`, `ShutdownWakesLevelWakerAndReportsIt`, `ShutdownWakesWithTheTurnHeld` | A waker that drops its own registration from `wake()`; shutdown wakes a level-triggered waker, which then reads `shutdown`; a shutdown wake can't overlap a turn on another thread. |
 | `IoWaiter.EveryListedWaiterIsWoken`, `LateWaiterClearingReadinessLosesNoWake`, `DroppedWaiterIsUnlinked`, `MoreThan32WaitersAreAllWoken`, `ShutdownWakesListedWaiters` | The waiter list: one event wakes every waiter of its direction; a waiter that arrives after the event and clears readiness doesn't strand those already woken; a dropped waiter is unlinked; wakes in batches lose no one; shutdown reaches the list. |
 | `Notify.SignalMakesReadable`, `SignalsAreEdges` | `sys/notify.h`: a signal from another thread wakes a waiting future; each signal is reported without reading the notify back. |
+| `AsyncFd.ReadIoWaitsForReadable`, `WriteIoWaitsForWritable`, `OtherErrnoFails`, `HangUpWakesBothDirections` | On a pipe: the handshake around a caller's operation; an errno other than would-block fails the future; closing the far end wakes readers and writers. |
+| `AsyncFd.ConstructorSetsNonBlocking`, `DestructorDeregistersThenCloses`, `ReleaseReturnsOpenFd`, `RegularFileIsRefused`, `ShutdownFailsPendingFuture` | Ownership of the fd, the deregister-before-close order, and shutdown. |
+| `ReadinessSource.OpSucceedsWithoutRegistering`, `SignalBeforeWaitIsSeen`, `SignalBetweenEagainAndClearIsNotLost`, `DirectionsAreIndependent` | The handshake: a ready device costs no registration; no signal is lost; a read signal wakes no writer. |
+| `ReadinessSource.EveryWaiterIsWokenAndOneClaims`, `DroppedFutureUnlinks`, `LastWaiterDeregisters`, `ConcurrentFirstWaitersRegisterOnce` | The waiter list, and the registration living only while a direction has waiters (the last on desktop with two executor threads). |
+| `ReadinessSource.SignalFromOtherThread`, `SignalFromIsrEndsASleepingTurn`, `WorksWithoutNetwork`, `ShutdownFailsPendingFuture` | A signal from a foreign thread (desktop) and from a timer interrupt (board) wakes a sleeping turn; a `PicoNetwork::None` runtime; shutdown. |
 | `Notify.SignalFromIsrEndsASleepingTurn`, `TurnTimesOutWhenIdle`, `SignalWhileDeregisteredLeavesAtMostOneEvent` | On every backend, the board's included: an interrupt's signal ends a sleeping turn; an idle turn sleeps out its timeout; a signal while the notify object is deregistered is reported at most once by its next registration, and the next signal still wakes it. |
 
 ---

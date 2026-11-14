@@ -4,8 +4,9 @@ The policy is a whitelist: **nothing is ISR-safe unless explicitly listed in thi
 document**. Everything else is undefined behavior from ISR context, regardless of
 whether it appears to work on a specific hardware configuration.
 
-At present the only ISR-safe API is `IsrEvent::signal_from_isr()`,
-`IsrChannel<T>::send_from_isr()`, and `IsrSemaphore::release_from_isr()`.
+The ISR-safe API is `IsrEvent::signal_from_isr()`, `IsrChannel<T>::send_from_isr()`,
+`IsrSemaphore::release_from_isr()`, and `ReadinessSource::signal_readable()`,
+`signal_writable()` and `signal()` (see [Device drivers](#device-drivers-readinesssource)).
 
 ---
 
@@ -320,6 +321,35 @@ which `op` takes.
     the same instant, touches a destroyed context. This is the same narrow window as
     the DMA dispatch table's (see [GPIO Pin](gpio_pin.md)), and is left open for the
     same reason.
+
+---
+
+## Device drivers: `ReadinessSource`
+
+The ISR primitives carry their own state: an epoch, a value, a count. A device driver
+already has state of its own (packet queues, a status register), and wants to wake its
+readers and writers separately. `ReadinessSource` serves that case. It is the waiting
+half of an ISR primitive with the state left out: two notify fds, one per direction,
+and futures that call the driver's own non-blocking operation where an ISR primitive
+calls its claim. Its design is in [I/O Driver](io_driver.md#readinesssource).
+
+The interrupt side follows the rules of [The signal](#the-signal), with the driver's
+state in place of the primitive's:
+
+- The handler updates the driver's state under the driver's own hardware spin lock,
+  which the operations also take. That lock is what orders the state for a waiter on
+  the other core.
+- It releases that lock, then calls `signal_readable()`, `signal_writable()` or
+  `signal()`. These are `notify_signal()` on the matching fd, which takes a striped
+  spin lock of its own.
+- It signals after every change that can let an operation succeed, not only on the
+  first. An extra signal costs one extra call of the operation, and a missing one
+  strands a waiter.
+
+The wait is [The wait](#the-wait), unchanged. The operation runs before any registration,
+each direction's registration lives while that direction has waiters, and every wake
+calls the operation again. The race warned about there, an interrupt on the other core
+signalling as the last waiter leaves, applies to each direction in the same way.
 
 ---
 

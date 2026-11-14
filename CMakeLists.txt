@@ -154,6 +154,7 @@ else()
         set(CORO_PLATFORM_SOURCES
             src/detail/fiber_context_posix.cpp
             src/detail/sys/posix/dns_posix.cpp
+            src/detail/sys/posix/fd_posix.cpp
             src/detail/sys/posix/file_posix.cpp
             src/detail/sys/posix/notify_posix.cpp
             src/detail/sys/posix/pipe_posix.cpp
@@ -162,7 +163,9 @@ else()
             src/detail/sys/posix/socket_posix.cpp
             src/detail/sys/posix/tcp_posix.cpp
             src/detail/sys/posix/udp_posix.cpp
+            src/io/async_fd.cpp
             src/io/pipe.cpp
+            src/io/readiness_source.cpp
             src/io/signal.cpp
         )
     endif()

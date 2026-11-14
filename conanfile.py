@@ -1,5 +1,6 @@
-import os, re, sys
+import hashlib, os, re, sys
 from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.files import copy, load, update_conandata
 
@@ -52,6 +53,13 @@ class CoroRecipe(ConanFile):
         # other option, so an app needing MQTT gets a distinctly-cached
         # binary from one that doesn't.
         "with_mqtt": [True, False],
+        # Pico-only. Absolute path of a directory holding a complete,
+        # hand-written lwipopts.h, used instead of the bundled default (also
+        # settable through CORO_PICO_LWIPOPTS_DIR in the environment). In the
+        # package ID it is replaced by a hash of the file's contents (see
+        # package_id()), so the same file shares a binary wherever it lives
+        # and a different file gets its own. See doc/design/lwip_config.md.
+        "lwipopts_dir": [None, "ANY"],
     }
     default_options = {
         "shared": True,
@@ -60,6 +68,7 @@ class CoroRecipe(ConanFile):
         "with_local_run_queue": True,
         "tracing": "none",
         "with_mqtt": False,
+        "lwipopts_dir": None,
     }
     exports_sources = (
         "include/**.h", "include/**.hpp",
@@ -136,8 +145,13 @@ class CoroRecipe(ConanFile):
             self.options.rm_safe("fPIC")
             self.options.rm_safe("with_gperftools")
             self.options.rm_safe("tracing")
+            if self.options.lwipopts_dir == None:
+                env_dir = os.environ.get("CORO_PICO_LWIPOPTS_DIR")
+                if env_dir:
+                    self.options.lwipopts_dir = env_dir
         else:
             self.options.rm_safe("with_mqtt")
+            self.options.rm_safe("lwipopts_dir")
             if self.options.get_safe("shared") is not None:
                 self.options.shared = self._env_bool("CORO_SHARED", self.options.shared)
             if self.options.get_safe("with_gperftools") is not None:
@@ -149,6 +163,35 @@ class CoroRecipe(ConanFile):
     def configure(self):
         if self.settings.os != "baremetal" and self.options.get_safe("shared"):
             self.options.rm_safe("fPIC")
+
+    def _lwipopts_file(self, options):
+        """The custom lwipopts.h named by the lwipopts_dir option, or None."""
+        lwipopts_dir = options.get_safe("lwipopts_dir")
+        if lwipopts_dir is None or str(lwipopts_dir) == "None":
+            return None
+        return os.path.join(str(lwipopts_dir), "lwipopts.h")
+
+    def validate(self):
+        lwipopts = self._lwipopts_file(self.options)
+        if lwipopts is None:
+            return
+        if not os.path.isabs(lwipopts):
+            raise ConanInvalidConfiguration(
+                f"coro: lwipopts_dir must be an absolute path, got '{self.options.lwipopts_dir}'")
+        if not os.path.isfile(lwipopts):
+            raise ConanInvalidConfiguration(f"coro: lwipopts_dir has no lwipopts.h ({lwipopts})")
+
+    # A custom lwipopts.h changes the ABI of coro_pico (and of everything
+    # including lwIP headers through it), so its *contents* must be part of
+    # the package ID; its path must not be, or the same file in two checkouts
+    # would build twice. validate() has already rejected a missing file by the
+    # time a binary is looked up, so a missing file here just leaves the path.
+    def package_id(self):
+        lwipopts = self._lwipopts_file(self.info.options)
+        if lwipopts is not None and os.path.isfile(lwipopts):
+            with open(lwipopts, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            self.info.options.lwipopts_dir = f"sha256:{digest}"
 
     def requirements(self):
         if self.settings.os == "baremetal":
@@ -201,7 +244,11 @@ class CoroRecipe(ConanFile):
             # layout()'s cpp.build/cpp.source rather than from coro_pico's
             # real CMake target properties, so it needs its own includedirs
             # entry pointing at the build-folder path.
-            self.cpp.build.components["pico"].includedirs = ["coro_pico_lwipopts"]
+            # A custom lwipopts_dir is used in place, so point at it instead
+            # (an absolute path, which cpp.build leaves as is).
+            lwipopts = self._lwipopts_file(self.options)
+            self.cpp.build.components["pico"].includedirs = [
+                os.path.dirname(lwipopts) if lwipopts else "coro_pico_lwipopts"]
             # cpp.build.includedirs resolves against the build folder;
             # include/ lives in the source tree, so it belongs on cpp.source
             # instead. Must be set explicitly -- same gotcha package_info()
@@ -243,6 +290,9 @@ class CoroRecipe(ConanFile):
         if self.settings.os == "baremetal":
             tc.cache_variables["CORO_PLATFORM"] = "pico"
             tc.cache_variables["CORO_PICO_WITH_MQTT"] = bool(self.options.with_mqtt)
+            lwipopts = self._lwipopts_file(self.options)
+            if lwipopts is not None:
+                tc.cache_variables["CORO_PICO_LWIPOPTS_DIR"] = os.path.dirname(lwipopts)
         else:
             tc.cache_variables["WITH_GPERFTOOLS"] = bool(self.options.get_safe("with_gperftools"))
             tc.cache_variables["CORO_USE_LOCAL_RUN_QUEUE"] = self.options.with_local_run_queue

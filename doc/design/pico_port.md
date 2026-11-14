@@ -144,7 +144,8 @@ the backend's "lwIP is running" flag, which the `Poller` sets only for `Cyw43` a
 `Lwip`, and fails with `ENETDOWN` before it touches lwIP. Like any other setup failure,
 that reaches the caller as a `std::system_error` thrown at the `co_await` of
 `TcpStream::connect()`, `TcpListener::bind()`, `UdpSocket::bind()` or `lookup_host()`.
-Notify fds need no network, so the ISR primitives work in every mode.
+Notify fds need no network, so the ISR primitives and `ReadinessSource` work in every
+mode.
 
 **`Runtime::poll()`** is for firmware that keeps its own main loop instead of calling
 `block_on()`. It runs one batch of ready tasks and then turns the driver with a zero
@@ -322,13 +323,14 @@ happens.** The set of such things is small and closed:
 | lwIP's timers: retransmits, DNS retries, MQTT keep-alive | At-time workers on the context bound the sleep |
 | coro's timers (`sleep_for`, `timeout`) | The driver passes the earliest deadline as the sleep's limit |
 | ISR primitives (`IsrEvent`, `IsrChannel<T>`, `IsrSemaphore`), and through them the HAL (DMA, GPIO) | Each signal function signals the primitive's notify fd, whose worker is marked pending; see [Notify objects](#notify-objects) |
+| Device drivers outside coro, through `ReadinessSource` | `signal_readable()` / `signal_writable()` signal one of its two notify fds; see [I/O Driver](io_driver.md#readinesssource) |
 | `IoDriver::unpark()` | `PollWaker::wake()` marks its worker pending |
 | Packets to the device's own address | Not a wake source: the `Poller` drains the loopback queue before it sleeps |
 
 lwIP applications such as MQTT need nothing of their own: they run inside lwIP, so
 everything that drives them is already on the list. A user ISR reaches a task only
-through an ISR primitive, which [ISR Safety](isr_safety.md) already requires, so it is
-covered too.
+through an ISR primitive or a `ReadinessSource`, which [ISR Safety](isr_safety.md)
+already requires, so it is covered too.
 
 The context's semaphore is binary and latched (`sem_init(&sem, 1, 1)`). A release made
 while the executor is awake leaves a permit, so the next wait returns at once: a wake
@@ -502,8 +504,10 @@ receive ring.
 ### Notify objects
 
 `sys/notify.h` is the driver's eventfd seam (see
-[I/O Driver](io_driver.md#the-sys-layer)), and the ISR primitives are built on it (see
-[ISR Safety](isr_safety.md#waiting-on-the-driver)). On lwIP a notify fd is an
+[I/O Driver](io_driver.md#the-sys-layer)). The ISR primitives are built on it (see
+[ISR Safety](isr_safety.md#waiting-on-the-driver)), and so is `ReadinessSource`, the
+public readiness source for device drivers, with one notify fd per direction (see
+[I/O Driver](io_driver.md#readinesssource)). On lwIP a notify fd is an
 `LwipNotify`: an `IoObject` that embeds its own `async_when_pending_worker_t` and the
 context it is attached to.
 
@@ -713,14 +717,18 @@ stays exercised.
 ### ISR → coroutine communication: `IsrEvent`, `IsrChannel<T>`, `IsrSemaphore`
 
 The **only supported** way to signal a coroutine from an ISR is through `IsrEvent`,
-`IsrChannel<T>` or `IsrSemaphore` (declared in `include/coro/sync/isr_event.h`).
+`IsrChannel<T>` or `IsrSemaphore` (declared in `include/coro/sync/isr_event.h`), or,
+for a device driver with state of its own, a `ReadinessSource`
+(`include/coro/io/readiness_source.h`; see
+[ISR Safety](isr_safety.md#device-drivers-readinesssource)).
 
 !!! danger "WARNING: All other coro APIs are undefined behavior from ISR"
     Calling `oneshot::send()`, `mpsc::send()`, `watch::send()`, `event::set()`,
     `CancellationToken::cancel()`, or any other coro sync primitive from an ISR is
     **undefined behavior**, even if it appears to work on single-core RP2040. These APIs
     call `waker->wake()`, which calls `shared_from_this()` and `Executor::enqueue()`. The
-    library makes no ISR-safety guarantee for any API other than the ISR primitives. A
+    library makes no ISR-safety guarantee for any API other than the ISR primitives and
+    `ReadinessSource`'s signal functions. A
     different executor, a dual-core configuration, or a port to another MCU can silently
     break code that relies on it. See [ISR Safety](isr_safety.md) for the full analysis.
 
@@ -1274,9 +1282,11 @@ The HAL (`GpioPin`, `AsyncDmaTransfer`) stays on the public ISR primitives rathe
 using `sys` directly. The primitives hold the state that makes a wait lossless (the
 epoch a DMA transfer's `start()` captures, the edge count `GpioPin::edges()` needs), and
 the driver's registration, waiter and pinning rules are implemented once inside them.
-If a driver ever wants to supply its own state, such as a peripheral's status register,
-factor the primitives' common core (notify fd, registration share, `IoWaiter`) into an
-internal helper with a pluggable check, and build the driver on that.
+A driver that supplies its own state, such as a peripheral's status register or a packet
+queue its interrupt handler fills, uses `ReadinessSource` instead. It is the primitives'
+common core (notify fd, registration share, `IoWaiter`) with the driver's own
+non-blocking operation in place of the claim. See
+[I/O Driver](io_driver.md#external-drivers).
 
 ### Potential future primitives
 

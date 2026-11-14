@@ -52,14 +52,34 @@ that would be solving tuning needs nobody has hit yet. `LWIP_MQTT` earned
 its own toggle because a real, existing consumer (`coro_pico_mqtt`) needs
 it; nothing else has.
 
-**The full-file override remains for genuinely custom tuning.** Setting
-`CORO_PICO_LWIPOPTS_DIR` to a directory containing a complete, hand-written
-`lwipopts.h` bypasses generation entirely — for tuning beyond what coro's
-own options cover (e.g. non-default `MEM_SIZE`/`TCP_WND` for a
-memory-constrained board). `pico.cmake` and `pico_mqtt.cmake` both consume
-the same resolved directory (`CORO_PICO_LWIPOPTS_INCLUDE_DIR`), so an
-override always applies consistently across every coro-provided lwIP
-target in one build — never just one of them.
+**The full-file override remains for genuinely custom tuning.** A
+directory containing a complete, hand-written `lwipopts.h` can replace the
+generated one entirely. This is for tuning beyond what coro's own options
+cover, such as a non-default `MEM_SIZE` or `TCP_WND` for a memory-constrained
+board. How the directory is given depends on the build:
+
+- **Conan:** the `lwipopts_dir` option, for example
+  `-o coro/*:lwipopts_dir=/abs/path/to/dir`. If the option isn't set, the
+  `CORO_PICO_LWIPOPTS_DIR` environment variable supplies it, for example from an
+  application's `.envrc`. The path must be absolute and must contain
+  `lwipopts.h`; otherwise `validate()` rejects the configuration.
+- **Source builds:** the CMake variable `CORO_PICO_LWIPOPTS_DIR`, set before
+  `pico.cmake` is included. The Conan option sets the same variable.
+
+`pico.cmake` and `pico_mqtt.cmake` both use the same resolved directory
+(`CORO_PICO_LWIPOPTS_INCLUDE_DIR`). An override therefore applies to every
+coro-provided lwIP target in a build, never to just one of them. A custom
+file used with `with_mqtt=True` must define `LWIP_MQTT 1` itself.
+
+**A custom file's contents are part of the package ID.** `package_id()`
+replaces the option's path with a SHA-256 hash of the `lwipopts.h` it names.
+Two applications with different files therefore get different `coro`
+binaries, while the same file in two checkouts at different paths shares one.
+Editing the file changes the hash, so the next build makes a new binary
+rather than reusing one compiled against the old config. The installed
+package carries its own copy of the file (`include/coro_pico_lwipopts/`),
+and an editable package points `coro::pico` at the custom directory in
+place.
 
 ## Loopback
 

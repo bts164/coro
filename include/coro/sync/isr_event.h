@@ -3,6 +3,7 @@
 #include <coro/coro.h>
 #include <coro/detail/poll_result.h>
 #include <coro/detail/context.h>
+#include <coro/detail/isr_wait_core.h>
 #include <coro/detail/rc.h>
 #include <coro/detail/sys/notify.h>
 #include <coro/detail/sys/socket.h>
@@ -13,6 +14,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <exception>
+#include <expected>
+#include <optional>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -37,15 +40,6 @@
 namespace coro {
 
 namespace detail {
-
-/// A notify fd's registration with the driver, shared by every waiter of one ISR
-/// primitive while it has any. See doc/design/isr_safety.md, "The wait".
-struct NotifyRegistration {
-    NotifyRegistration(IoDriver& driver, sys::RawFd fd)
-        : reg(driver, fd, sys::Interest::read()) {}
-
-    IoRegistration reg;
-};
 
 /**
  * @brief The notify fd an ISR primitive signals, and its registration while the
@@ -108,74 +102,35 @@ inline void isr_signal(sys::RawFd fd) noexcept {
 }
 
 /**
- * @brief The waiting half every ISR wait future shares: a share of the primitive's
- * registration and the future's own IoWaiter.
+ * @brief One poll of an ISR primitive's wait. `claim()` takes the primitive's spin
+ * lock and returns true if this waiter's wait is over (it compared the epoch, or
+ * claimed a value or a count).
  *
- * WARNING: the future is pinned from its first poll (doc/design/future_and_stream.md):
- * its IoWaiter is linked into the driver's list by address. The move operations only
- * assert that it has not started; they never re-link.
+ * `claim()` runs first, so a signal that arrived before the wait started is seen
+ * without registering. Otherwise the waiter waits on the notify fd through the
+ * driver's waiter list, and every wake runs `claim()` again. The waiting itself is
+ * detail::IsrWaitCore (coro/detail/isr_wait_core.h), which ReadinessSource shares.
  */
-class IsrWaitCore {
-public:
-    IsrWaitCore() = default;
-    IsrWaitCore([[maybe_unused]] IsrWaitCore&& other) noexcept {
-        assert(!other.m_registration && "ISR wait future moved after its first poll()");
+template<typename Claim>
+PollResult<void> isr_wait_poll(IsrWaitCore& core, detail::Context& ctx, IsrNotifier& notifier,
+                               spin_lock_t* lock, Claim&& claim, const char* what) {
+    auto op = [&]() -> std::expected<void, int> {
+        if (claim()) return {};
+        return std::unexpected(EAGAIN);
+    };
+    std::optional<std::expected<void, int>> result;
+    try {
+        result = core.poll_io(ctx, IoDirection::Read,
+                              [&] { return notifier.acquire(lock); }, op);
+    } catch (...) {
+        return PollError(std::current_exception());
     }
-    IsrWaitCore& operator=([[maybe_unused]] IsrWaitCore&& other) noexcept {
-        assert(!m_registration && "ISR wait future assigned to after its first poll()");
-        assert(!other.m_registration && "ISR wait future moved after its first poll()");
-        return *this;
-    }
-    IsrWaitCore(const IsrWaitCore&)            = delete;
-    IsrWaitCore& operator=(const IsrWaitCore&) = delete;
-
-    ~IsrWaitCore() {
-        if (m_registration) m_registration->reg.cancel_wait(m_waiter);
-    }
-
-    /**
-     * @brief One poll of a wait. `claim()` takes the primitive's spin lock and
-     * returns true if this waiter's wait is over (it compared the epoch, or claimed a
-     * value or a count).
-     *
-     * `claim()` runs first, so a signal that arrived before the wait started is seen
-     * without registering. Otherwise the waiter waits on the notify fd through the
-     * driver's waiter list, and every wake runs `claim()` again.
-     */
-    template<typename Claim>
-    PollResult<void> poll(detail::Context& ctx, IsrNotifier& notifier, spin_lock_t* lock,
-                          Claim&& claim, const char* what) {
-        if (!m_registration) {
-            if (claim()) return PollReady;
-            try {
-                m_registration = notifier.acquire(lock);
-            } catch (...) {
-                return PollError(std::current_exception());
-            }
-        }
-        // Race (handled): a signal between claim() above and the waiter being linked
-        // cannot be dispatched in between (dispatch runs in the driver's turn, not in
-        // a task poll), so its event finds the waiter linked. One that arrived before
-        // the registration existed left a new registration ready, so poll_io() runs
-        // claim() again before waiting.
-        auto result = m_registration->reg.poll_io(IoDirection::Read, ctx, m_waiter,
-            [&]() -> sys::IoResult {
-                if (claim()) return std::size_t{0};
-                return std::unexpected(EAGAIN);
-            });
-        if (!result) return PollPending;
-        if (!*result)
-            return PollError(std::make_exception_ptr(
-                std::system_error(result->error(), std::generic_category(), what)));
-        return PollReady;
-    }
-
-private:
-    // Declared before m_waiter, so m_waiter (unlinked by the destructor above) is
-    // destroyed first.
-    Rc<NotifyRegistration> m_registration;
-    IoWaiter               m_waiter;
-};
+    if (!result) return PollPending;
+    if (!*result)
+        return PollError(std::make_exception_ptr(
+            std::system_error(result->error(), std::generic_category(), what)));
+    return PollReady;
+}
 
 } // namespace detail
 
@@ -321,7 +276,7 @@ public:
     IsrWaitFuture& operator=(const IsrWaitFuture&) = delete;
 
     PollResult<void> poll(detail::Context& ctx) {
-        return m_core.poll(ctx, m_event->m_notifier, m_event->m_lock, [this] {
+        return detail::isr_wait_poll(m_core, ctx, m_event->m_notifier, m_event->m_lock, [this] {
             uint32_t save = spin_lock_blocking(m_event->m_lock);
             const bool ready = m_event->m_epoch != m_baseline;
             spin_unlock(m_event->m_lock, save);
@@ -427,7 +382,7 @@ public:
 
     PollResult<T> poll(detail::Context& ctx) {
         T value{};
-        auto result = m_core.poll(ctx, m_channel->m_notifier, m_channel->m_lock, [&] {
+        auto result = detail::isr_wait_poll(m_core, ctx, m_channel->m_notifier, m_channel->m_lock, [&] {
             uint32_t save = spin_lock_blocking(m_channel->m_lock);
             const bool set = std::exchange(m_channel->m_flag, false);
             if (set) value = m_channel->m_value;
@@ -518,7 +473,7 @@ public:
     IsrSemaphoreWaitFuture& operator=(const IsrSemaphoreWaitFuture&) = delete;
 
     PollResult<void> poll(detail::Context& ctx) {
-        return m_core.poll(ctx, m_sem->m_notifier, m_sem->m_lock, [this] {
+        return detail::isr_wait_poll(m_core, ctx, m_sem->m_notifier, m_sem->m_lock, [this] {
             uint32_t save = spin_lock_blocking(m_sem->m_lock);
             const bool set = m_sem->m_count != 0;
             if (set) --(m_sem->m_count);
