@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -159,8 +160,11 @@ TYPED_TEST(AsyncFdTest, WriteIoWaitsForWritable) {
     this->traits.rt.block_on([](StreamPair& s) -> Coro<void> {
         AsyncFd afd(s.give_a());
         fill(afd.fd());
-        bool sent = false;
-        auto writer = spawn([](AsyncFd& afd, bool& sent) -> Coro<void> {
+        // Atomic: on a multi-threaded executor the writer can run on another worker,
+        // and the only ordering between its write and the reads here is the socket
+        // (drain() -> epoll), which isn't a happens-before edge.
+        std::atomic<bool> sent{false};
+        auto writer = spawn([](AsyncFd& afd, std::atomic<bool>& sent) -> Coro<void> {
             co_await send_one(afd);
             sent = true;
         }(afd, sent));
@@ -170,6 +174,7 @@ TYPED_TEST(AsyncFdTest, WriteIoWaitsForWritable) {
         drain(s.b);
         auto r = co_await timeout(5s, std::move(writer));
         EXPECT_EQ(r.index(), 0u);
+        EXPECT_TRUE(sent);
     }(s));
 }
 
