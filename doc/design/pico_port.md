@@ -903,6 +903,10 @@ like a wake from `dispatch()`, only enqueues it.
   optional `username`/`password` parameters, forwarded to `client_user`/`client_pass`;
   an empty `username` (the default) omits both fields (lwIP only sends a password
   alongside a user name, so a non-empty `password` with an empty `username` is ignored).
+  A non-zero `keep_alive_s` sets the CONNECT packet's Keep Alive: lwIP then pings an
+  idle broker and drops a silent one, and the broker drops a silent client and
+  publishes its Last Will. 0 (the default) turns keep-alive off, and with it any
+  notice of a client that loses power.
 - **Publish acknowledgement** (`mqtt_publish()`'s per-call request callback, used for
   QoS 1/2) is also one-shot per call, with the same `LwipCallbackResult` pattern.
 - **Incoming messages** are different: `mqtt_set_inpub_callback()` registers a single
@@ -921,6 +925,17 @@ like a wake from `dispatch()`, only enqueues it.
   only sender clone, so the channel stays valid for a later `subscribe()` on the same
   topic to reattach to without re-sending a wire-level SUBSCRIBE. Topic matching is
   exact string match only, with no MQTT wildcard (`+`/`#`) filters.
+- **Disconnection:** lwIP's `mqtt_close()` deletes its pending requests without calling
+  them back, and stops the timer that would time them out. So each `publish()` and
+  `subscribe()` waiting on lwIP is listed in `MqttCtx::pending` (an `MqttRequest` on
+  its frame, holding the `LwipCallbackResult<err_t>`), and leaves the list when its
+  callback fires. When the connection drops, the connection callback fires a second
+  time, and `MqttCtx::lost()` completes every listed request with `ERR_CONN` (each
+  throws), clears `connected`, and clears the channel map: dropping each channel's
+  only sender closes it, so every receiver gets `Closed` after what it had already
+  been sent. `~MqttClient()` calls `lost()` too, since `mqtt_disconnect()` doesn't
+  call the connection callback. A client never reconnects; the application connects
+  a new one.
 
 ```cpp
 // include/coro/pico/mqtt.h
@@ -938,7 +953,8 @@ public:
         std::string_view host, uint16_t port, std::string_view client_id,
         std::string_view will_topic = {}, std::string_view will_payload = {},
         uint8_t will_qos = 0, bool will_retain = false,
-        std::string_view username = {}, std::string_view password = {});
+        std::string_view username = {}, std::string_view password = {},
+        uint16_t keep_alive_s = 0);
 
     // Publishes a message. Suspends until the broker PUBACK for QoS 1/2; returns
     // immediately after the write completes for QoS 0.
@@ -952,6 +968,9 @@ public:
     // channel map above.
     [[nodiscard]] coro::Coro<coro::BroadcastReceiver<MqttMessage>> subscribe(
         std::string_view topic, uint8_t qos = 0, size_t capacity = 8);
+
+    // False once the connection has dropped; never true again.
+    [[nodiscard]] bool connected() const;
 
 private:
     mqtt_client_t* m_client;

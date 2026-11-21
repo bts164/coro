@@ -18,12 +18,38 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // MqttCtx callbacks  (coro::detail namespace)
 // ---------------------------------------------------------------------------
 
 namespace coro::detail {
+
+MqttRequest::MqttRequest(MqttCtx* c) : ctx(c) {
+    ctx->pending.push_back(this);
+}
+
+MqttRequest::~MqttRequest() {
+    ctx->pending.remove(this);   // a no-op once on_done() or lost() has unlinked it
+}
+
+void MqttRequest::on_done(void* arg, err_t err) {
+    auto* r = static_cast<MqttRequest*>(arg);
+    r->ctx->pending.remove(r);
+    r->result.complete(err);
+}
+
+void MqttCtx::lost() {
+    connected = false;
+    // Completing only wakes each waiter, which resumes later, so none of them
+    // touches `pending` while this runs.
+    while (MqttRequest* r = pending.pop_front())
+        r->result.complete(ERR_CONN);
+    // Dropping each channel's only sender closes it.
+    channels.clear();
+}
 
 void MqttCtx::on_connect(mqtt_client_t*, void* arg, mqtt_connection_status_t status) {
     auto* ctx = static_cast<MqttCtx*>(arg);
@@ -39,10 +65,11 @@ void MqttCtx::on_connect(mqtt_client_t*, void* arg, mqtt_connection_status_t sta
         return;
     }
 
-    // Later firing — server-initiated disconnect or keep-alive timeout.
+    // Later firing — server-initiated disconnect, TCP failure or keep-alive timeout.
+    // lwIP has already deleted every pending request without calling it back.
     // RACE CONDITION NOTE: safe — this callback and every coro caller run on
     // the same executor thread, never concurrently.
-    ctx->connected = false;
+    ctx->lost();
 }
 
 void MqttCtx::on_incoming_publish(void* arg, const char* topic, uint32_t /*tot_len*/) {
@@ -86,16 +113,24 @@ MqttClient::MqttClient(MqttClient&&) noexcept            = default;
 MqttClient& MqttClient::operator=(MqttClient&&) noexcept = default;
 
 MqttClient::~MqttClient() {
-    if (!m_impl || !m_impl->client) return;
-    mqtt_disconnect(m_impl->client);
-    mqtt_client_free(m_impl->client);
-    m_impl->client = nullptr;
+    if (!m_impl) return;
+    if (m_impl->client) {
+        // Deletes lwIP's pending requests but, unlike a drop, doesn't call on_connect.
+        mqtt_disconnect(m_impl->client);
+        mqtt_client_free(m_impl->client);
+        m_impl->client = nullptr;
+    }
+    m_impl->lost();
+}
+
+bool MqttClient::connected() const {
+    return m_impl && m_impl->connected;
 }
 
 Coro<MqttClient> MqttClient::connect(
     std::string host, uint16_t port, std::string client_id,
     std::string will_topic, std::string will_payload, uint8_t will_qos, bool will_retain,
-    std::string username, std::string password) {
+    std::string username, std::string password, uint16_t keep_alive_s) {
     // ---- Step 1: DNS resolution (same pattern as TcpStream::connect) ----
     LwipCallbackResult<ip_addr_t, bool> dns_cb;
     ip_addr_t addr{};
@@ -110,9 +145,9 @@ Coro<MqttClient> MqttClient::connect(
         &dns_cb);
 
     if (dns_err == ERR_INPROGRESS) {
-        auto [resolved, ok] = co_await lwip_wait(dns_cb);
-        if (!ok) throw std::runtime_error("MqttClient::connect: DNS lookup failed");
-        addr = resolved;
+        const std::tuple<ip_addr_t, bool> dns = co_await lwip_wait(dns_cb);
+        if (!std::get<1>(dns)) throw std::runtime_error("MqttClient::connect: DNS lookup failed");
+        addr = std::get<0>(dns);
     } else if (dns_err != ERR_OK) {
         throw std::runtime_error("MqttClient::connect: dns_gethostbyname failed");
     }
@@ -123,7 +158,8 @@ Coro<MqttClient> MqttClient::connect(
     if (!ctx->client) throw std::runtime_error("MqttClient::connect: mqtt_client_new failed");
 
     mqtt_connect_client_info_t info{};
-    info.client_id = client_id.c_str();
+    info.client_id  = client_id.c_str();
+    info.keep_alive = keep_alive_s;
     if (!will_topic.empty()) {
         info.will_topic = will_topic.c_str();
         info.will_msg   = will_payload.c_str();
@@ -185,19 +221,19 @@ Coro<void> MqttClient::publish(
     if (!ctx_ptr->connected)
         throw std::runtime_error("MqttClient::publish: not connected");
 
-    LwipCallbackResult<err_t> result;
+    // Listed before mqtt_publish(), which may drop the connection itself: lost() then
+    // completes it, and the wait below ends at once.
+    detail::MqttRequest req(ctx_ptr.get());
     err_t err = mqtt_publish(
         ctx_ptr->client, topic.c_str(), payload.data(), static_cast<uint16_t>(payload.size()),
-        qos, retain ? 1 : 0,
-        +[](void* arg, err_t e) {
-            static_cast<LwipCallbackResult<err_t>*>(arg)->complete(e);
-        },
-        &result);
+        qos, retain ? 1 : 0, &detail::MqttRequest::on_done, &req);
 
     if (err != ERR_OK)
         throw std::runtime_error("MqttClient::publish: mqtt_publish failed");
 
-    auto [ack] = co_await lwip_wait(result);
+    const err_t ack = std::get<0>(co_await lwip_wait(req.result));
+    if (ack == ERR_CONN)
+        throw std::runtime_error("MqttClient::publish: disconnected");
     if (ack != ERR_OK)
         throw std::runtime_error("MqttClient::publish: broker did not acknowledge");
 }
@@ -211,13 +247,10 @@ Coro<BroadcastReceiver<MqttMessage>> MqttClient::subscribe(
     if (!ctx_ptr->connected)
         throw std::runtime_error("MqttClient::subscribe: not connected");
 
-    LwipCallbackResult<err_t> result;
+    // Listed before mqtt_subscribe(), as in publish().
+    detail::MqttRequest req(ctx_ptr.get());
     err_t err = mqtt_subscribe(
-        ctx_ptr->client, topic.c_str(), qos,
-        +[](void* arg, err_t e) {
-            static_cast<LwipCallbackResult<err_t>*>(arg)->complete(e);
-        },
-        &result);
+        ctx_ptr->client, topic.c_str(), qos, &detail::MqttRequest::on_done, &req);
 
     if (err != ERR_OK)
         throw std::runtime_error("MqttClient::subscribe: mqtt_subscribe failed");
@@ -237,7 +270,9 @@ Coro<BroadcastReceiver<MqttMessage>> MqttClient::subscribe(
         ctx_ptr->channels.emplace(topic, std::move(chan.first));
     }
 
-    auto [ack] = co_await lwip_wait(result);
+    const err_t ack = std::get<0>(co_await lwip_wait(req.result));
+    if (ack == ERR_CONN)
+        throw std::runtime_error("MqttClient::subscribe: disconnected");
     if (ack != ERR_OK)
         throw std::runtime_error("MqttClient::subscribe: broker refused subscription");
 

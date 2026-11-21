@@ -38,10 +38,10 @@ namespace coro {
  */
 template<typename... Args>
 struct LwipCallbackResult {
-    // lwip_wait() resolves with a std::tuple<Args...>, which callers unpack with a structured
-    // binding. GCC 15 never destroys a binding through the tuple protocol whose hidden object
-    // is in a coroutine frame across a suspension (doc/known_issues.md, KI.2); with only
-    // trivially destructible arguments, as lwIP's callbacks pass, there is nothing to leak.
+    // lwip_wait() resolves with a std::tuple<Args...>: read it with std::get, or bind it to a
+    // named local first, never with a structured binding straight from the co_await (see
+    // lwip_wait()). The arguments must also be trivially destructible, as lwIP's callbacks
+    // pass them, so that a binding that slips through has nothing to leak.
     static_assert((std::is_trivially_destructible_v<Args> && ...),
                   "LwipCallbackResult: arguments must be trivially destructible (see KI.2)");
 
@@ -89,6 +89,26 @@ private:
     LwipCallbackResult<Args...>* m_result = nullptr;
 };
 
+/**
+ * @brief Awaits `result`'s callback, resolving with its arguments as a std::tuple<Args...>.
+ *
+ * Don't unpack the tuple with a structured binding. On GCC before 16.2, a binding through
+ * the tuple protocol whose hidden object stays in the coroutine frame across a suspension
+ * is never destroyed (doc/known_issues.md, KI.2; guideline GCC.1). Read it with std::get,
+ * or keep it in a named local:
+ *
+ * @code
+ * const err_t ack = std::get<0>(co_await lwip_wait(req.result));
+ *
+ * const std::tuple<ip_addr_t, bool> dns = co_await lwip_wait(dns_cb);
+ * if (std::get<1>(dns)) use(std::get<0>(dns));
+ *
+ * auto [addr, ok] = co_await lwip_wait(dns_cb);   // no: KI.2
+ * @endcode
+ *
+ * LwipCallbackResult's static_assert keeps the arguments trivially destructible, so a
+ * binding that slips through leaks nothing today. Don't rely on that.
+ */
 template<typename... Args>
 LwipFuture<Args...> lwip_wait(LwipCallbackResult<Args...>& result) {
     return LwipFuture<Args...>(result);

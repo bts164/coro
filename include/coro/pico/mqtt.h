@@ -45,9 +45,19 @@ struct MqttMessage {
  * receiver on the same underlying channel (both see every message on that topic from
  * the point they subscribed onward) — it does not displace anything.
  *
- * **Destruction:** destroying an `MqttClient` while `publish()` is in flight is UB,
- * same as `TcpStream`. Outstanding `BroadcastReceiver`s from `subscribe()` may safely
- * outlive or be dropped independently of the `MqttClient` and of each other.
+ * **Disconnection:** once the connection drops (the broker closes it, the TCP
+ * connection fails, or the keep-alive finds the broker unresponsive), `connected()`
+ * is false, every `publish()` and `subscribe()` still waiting throws, later ones throw
+ * at once, and every receiver from `subscribe()` gets `BroadcastRecvError::Closed` once
+ * it has read what was already delivered. There is no reconnect: connect a new client.
+ * A task reading a subscription is therefore told about the disconnect too.
+ *
+ * **Destruction:** destroying an `MqttClient` disconnects it, with the same effects as
+ * above. lwIP closes the TCP connection without sending DISCONNECT, so the broker
+ * publishes the Last Will, if there is one. A `publish()` or `subscribe()` must not be cancelled (its
+ * coroutine dropped) while waiting, same as `TcpStream`: lwIP still holds its
+ * callback. Outstanding `BroadcastReceiver`s from `subscribe()` may safely outlive or
+ * be dropped independently of the `MqttClient` and of each other.
  */
 class MqttClient {
 public:
@@ -72,13 +82,22 @@ public:
      *                    (the default) omits it — the Password Flag is left clear. Ignored
      *                    if `username` is empty, since lwIP's MQTT client only sends a
      *                    password alongside a user name.
+     * @param keep_alive_s The CONNECT packet's Keep Alive, in seconds; 0 (the default)
+     *                    turns keep-alive off. Non-zero, lwIP sends PINGREQ whenever it has
+     *                    sent nothing for that long, and drops the connection if it hears
+     *                    nothing from the broker for 1.5 times that; the broker likewise
+     *                    drops a client it hasn't heard from for 1.5 times that, and
+     *                    publishes its Last Will. Without it, a client that loses power
+     *                    or its network is never noticed by the broker, and its Last Will
+     *                    never fires.
      * @throws std::runtime_error on DNS failure, connection failure, or a non-accepted CONNACK.
      */
     [[nodiscard]] static Coro<MqttClient> connect(
         std::string host, uint16_t port, std::string client_id,
         std::string will_topic = {}, std::string will_payload = {},
         uint8_t will_qos = 0, bool will_retain = false,
-        std::string username = {}, std::string password = {});
+        std::string username = {}, std::string password = {},
+        uint16_t keep_alive_s = 0);
 
     /**
      * @brief Publishes `payload` to `topic`.
@@ -87,7 +106,8 @@ public:
      * as soon as the write is queued (lwIP still invokes the completion callback, but
      * synchronously, so this never actually blocks the caller).
      *
-     * @throws std::runtime_error if the client is disconnected, or on publish failure.
+     * @throws std::runtime_error if the client is disconnected or disconnects before the
+     *         publish completes, or on publish failure.
      */
     [[nodiscard]] Coro<void> publish(
         std::string topic, std::span<const std::byte> payload,
@@ -104,10 +124,15 @@ public:
      * concurrency note — multiple topics, and multiple receivers on the same topic, may
      * all be live at once.
      *
-     * @throws std::runtime_error on subscribe failure (e.g. broker refusal).
+     * @throws std::runtime_error if the client is disconnected or disconnects before the
+     *         SUBACK, or on subscribe failure (e.g. broker refusal).
      */
     [[nodiscard]] Coro<BroadcastReceiver<MqttMessage>> subscribe(
         std::string topic, uint8_t qos = 0, size_t capacity = 8);
+
+    /// @brief False once the connection has dropped (see **Disconnection** above), or
+    /// for a moved-from client. Never true again: connect a new client.
+    [[nodiscard]] bool connected() const;
 
 private:
     explicit MqttClient(detail::Rc<detail::MqttCtx> impl);

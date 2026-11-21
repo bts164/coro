@@ -93,6 +93,7 @@ std::string build_puback(uint16_t pkt_id) {
 // CONNECT built by MqttClient::connect() in these tests.
 struct ParsedConnect {
     uint8_t                    flags = 0;
+    uint16_t                   keep_alive = 0;
     std::optional<std::string> will_topic;
     std::optional<std::string> will_message;
     std::optional<std::string> username;
@@ -106,12 +107,14 @@ ParsedConnect parse_connect(const std::string& packet) {
     idx += 1;                   // protocol level
     out.flags = static_cast<uint8_t>(packet[idx]);
     idx += 1;
-    idx += 2;                   // keep alive
 
     auto read_u16 = [&packet](std::size_t i) {
         return static_cast<uint16_t>(static_cast<uint8_t>(packet[i]) << 8) |
                static_cast<uint8_t>(packet[i + 1]);
     };
+
+    out.keep_alive = read_u16(idx);
+    idx += 2;
 
     uint16_t cid_len = read_u16(idx);
     idx += 2 + cid_len;          // skip client id
@@ -734,6 +737,7 @@ TEST_F(MqttLoopback, ConnectWithoutLastWillLeavesWillFlagClear) {
     EXPECT_EQ(caught, nullptr) << "MqttClient::connect threw unexpectedly";
     EXPECT_FALSE(parsed.flags & 0x04) << "will flag should be clear when no LWT is given";
     EXPECT_FALSE(parsed.will_topic.has_value());
+    EXPECT_EQ(parsed.keep_alive, 0) << "keep-alive should default to off";
 }
 
 TEST_F(MqttLoopback, ConnectWithCredentialsSetsUsernameAndPasswordFields) {
@@ -811,4 +815,176 @@ TEST_F(MqttLoopback, ConnectWithoutCredentialsLeavesUsernameFlagsClear) {
     EXPECT_FALSE(parsed.flags & 0x40) << "password flag should be clear when no password is given";
     EXPECT_FALSE(parsed.username.has_value());
     EXPECT_FALSE(parsed.password.has_value());
+}
+
+TEST_F(MqttLoopback, ConnectWithKeepAliveSetsKeepAliveField) {
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
+    bool done = false;
+    std::exception_ptr caught;
+    ParsedConnect parsed;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                ParsedConnect& parsed) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19904);
+
+        rt.spawn([](coro::TcpListener l, ParsedConnect& parsed) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n, buf] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            buf.resize(n);
+            parsed = parse_connect(buf);
+            co_await stream.write(build_connack());
+        }(std::move(listener), parsed)).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect(
+                "127.0.0.1", 19904, "test-client", {}, {}, 0, false, {}, {},
+                /*keep_alive_s=*/30);
+            (void)client;
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, parsed)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "test timed out";
+    EXPECT_EQ(caught, nullptr) << "MqttClient::connect with keep-alive threw unexpectedly";
+    EXPECT_EQ(parsed.keep_alive, 30);
+}
+
+// lwIP's mqtt_close() deletes a pending QoS 1 request without calling it back; the
+// publish must still end, with an exception, rather than wait forever.
+TEST_F(MqttLoopback, PublishQos1ThrowsWhenBrokerDropsBeforePuback) {
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
+    bool done = false;
+    std::exception_ptr caught;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19905);
+
+        rt.spawn([](coro::TcpListener l) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n1, conn_pkt] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            (void)n1;
+            co_await stream.write(build_connack());
+            auto [n2, pub_pkt] = co_await stream.read(std::string(256, '\0')); // PUBLISH QoS1
+            (void)n2;
+            // No PUBACK: `stream` closes the connection on destruction here.
+        }(std::move(listener))).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect("127.0.0.1", 19905, "test-client");
+            std::string payload = "never acked";
+            co_await client.publish(
+                "test/topic",
+                std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(payload.data()), payload.size()),
+                /*qos=*/1);
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "publish() still waiting after the broker dropped the connection";
+    ASSERT_NE(caught, nullptr) << "publish() should throw when the connection drops before PUBACK";
+    EXPECT_THROW(std::rethrow_exception(caught), std::runtime_error);
+}
+
+TEST_F(MqttLoopback, SubscriptionClosesWhenBrokerDisconnects) {
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
+    bool done = false;
+    std::exception_ptr caught;
+    bool connected_after_connect = false;
+    bool connected_at_end = true;
+    std::optional<coro::BroadcastRecvError::Kind> error;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                bool& connected_after_connect, bool& connected_at_end,
+                std::optional<coro::BroadcastRecvError::Kind>& error) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19906);
+
+        rt.spawn([](coro::TcpListener l) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n1, conn_pkt] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            (void)n1;
+            co_await stream.write(build_connack());
+            auto [n2, sub_pkt] = co_await stream.read(std::string(256, '\0')); // SUBSCRIBE
+            sub_pkt.resize(n2);
+            co_await stream.write(build_suback(extract_subscribe_pkt_id(sub_pkt), 0));
+            // Then `stream` closes the connection on destruction.
+        }(std::move(listener))).detach();
+
+        try {
+            auto client = co_await coro::MqttClient::connect("127.0.0.1", 19906, "test-client");
+            connected_after_connect = client.connected();
+            auto rx = co_await client.subscribe("test/topic");
+            auto msg = co_await rx.recv();
+            if (!msg)
+                error = msg.error().kind;
+            connected_at_end = client.connected();
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, connected_after_connect, connected_at_end, error)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "the receiver still waiting after the broker dropped the connection";
+    EXPECT_EQ(caught, nullptr) << "subscription path threw unexpectedly";
+    EXPECT_TRUE(connected_after_connect);
+    ASSERT_TRUE(error.has_value()) << "recv() should fail once the connection drops";
+    EXPECT_EQ(*error, coro::BroadcastRecvError::Kind::Closed);
+    EXPECT_FALSE(connected_at_end);
+}
+
+TEST_F(MqttLoopback, DestroyingClientClosesSubscriptions) {
+    coro::Runtime rt{coro::PicoNetwork::Lwip};
+    bool done = false;
+    std::exception_ptr caught;
+    std::optional<coro::BroadcastRecvError::Kind> error;
+
+    rt.spawn([](coro::Runtime& rt, bool& done, std::exception_ptr& caught,
+                std::optional<coro::BroadcastRecvError::Kind>& error) -> coro::Coro<void> {
+        auto listener = co_await coro::TcpListener::bind("127.0.0.1", 19907);
+
+        rt.spawn([](coro::TcpListener l) -> coro::Coro<void> {
+            auto stream = co_await l.accept();
+            auto [n1, conn_pkt] = co_await stream.read(std::string(256, '\0')); // CONNECT
+            (void)n1;
+            co_await stream.write(build_connack());
+            auto [n2, sub_pkt] = co_await stream.read(std::string(256, '\0')); // SUBSCRIBE
+            sub_pkt.resize(n2);
+            co_await stream.write(build_suback(extract_subscribe_pkt_id(sub_pkt), 0));
+            // Stay connected until the client goes (a clean close, or a reset).
+            try {
+                for (;;) {
+                    auto r = co_await stream.read(std::string(256, '\0'));
+                    if (r.size == 0)
+                        break;
+                }
+            } catch (const std::exception&) {
+            }
+        }(std::move(listener))).detach();
+
+        try {
+            std::optional<coro::MqttClient> client =
+                co_await coro::MqttClient::connect("127.0.0.1", 19907, "test-client");
+            auto rx = co_await client->subscribe("test/topic");
+            client.reset();
+            auto msg = co_await rx.recv();
+            if (!msg)
+                error = msg.error().kind;
+        } catch (...) {
+            caught = std::current_exception();
+        }
+        done = true;
+    }(rt, done, caught, error)).detach();
+
+    poll_until(rt, done);
+    ASSERT_TRUE(done) << "the receiver still waiting after its client was destroyed";
+    EXPECT_EQ(caught, nullptr) << "subscription path threw unexpectedly";
+    ASSERT_TRUE(error.has_value()) << "recv() should fail once the client is destroyed";
+    EXPECT_EQ(*error, coro::BroadcastRecvError::Kind::Closed);
 }
