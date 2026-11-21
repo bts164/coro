@@ -365,3 +365,70 @@ TYPED_TEST(WatchTest, LastWriteWins) {
         EXPECT_EQ(*rx.borrow(), 3);
     }());
 }
+
+// --- Sender reads and subscribe ---
+
+TYPED_TEST(WatchTest, SenderGetReadsCurrentValue) {
+    auto [tx, rx] = watch_channel<int>(4);
+    EXPECT_EQ(tx.get(), 4);
+    (void)tx.send(9);
+    EXPECT_EQ(tx.get(), 9);
+    (void)rx;
+}
+
+TYPED_TEST(WatchTest, SenderBorrowReadsCurrentValue) {
+    struct Point { int x, y; };
+    auto [tx, rx] = watch_channel<Point>({1, 2});
+    {
+        auto g = tx.borrow();
+        EXPECT_EQ(g->x, 1);
+        EXPECT_EQ((*g).y, 2);
+    }
+    { auto guard = tx.borrow_mut(); guard->x = 5; }
+    EXPECT_EQ(tx.borrow()->x, 5);
+    (void)rx;
+}
+
+TYPED_TEST(WatchTest, SenderKeepsValueWithNoReceivers) {
+    auto tx = std::move(watch_channel<int>(0).first);
+    EXPECT_TRUE(tx.all_receivers_dropped());
+    EXPECT_TRUE(tx.send_if_modified([](int& v) { v = 7; return true; }));
+    EXPECT_EQ(tx.get(), 7);
+    { auto guard = tx.borrow_mut(); *guard = 8; }
+    EXPECT_EQ(*tx.borrow(), 8);
+}
+
+TYPED_TEST(WatchTest, SubscribeWithNoReceiversReadsCurrentValue) {
+    auto tx = std::move(watch_channel<int>(0).first);
+    { auto guard = tx.borrow_mut(); *guard = 3; }
+    auto rx = tx.subscribe();
+    EXPECT_FALSE(tx.all_receivers_dropped());
+    EXPECT_EQ(rx.get(), 3);
+    EXPECT_TRUE(tx.send(4).has_value());   // a receiver again, so send() succeeds
+    EXPECT_EQ(rx.get(), 4);
+}
+
+TYPED_TEST(WatchTest, SubscribedReceiverHasSeenCurrentValue) {
+    this->traits.rt.block_on([]() -> Coro<void> {
+        auto tx = std::move(watch_channel<int>(0).first);
+        (void)tx.send_if_modified([](int& v) { v = 1; return true; });
+        auto rx = tx.subscribe();
+        // Not woken by the change made before subscribe(): only by the next one.
+        spawn(co_invoke([&tx]() -> Coro<void> {
+            (void)tx.send(2);
+            co_return;
+        })).detach();
+        auto r = co_await rx.changed();
+        EXPECT_TRUE(r.has_value());
+        EXPECT_EQ(rx.get(), 2);
+    }());
+}
+
+TYPED_TEST(WatchTest, SubscribeMarksCurrentVersionSeen) {
+    auto [tx, rx] = watch_channel<int>(0);
+    (void)tx.send(1);
+    (void)tx.send(2);
+    auto sub = tx.subscribe();
+    EXPECT_EQ(rx.last_seen(), 0u);    // the factory's receiver hasn't seen either send
+    EXPECT_EQ(sub.last_seen(), 2u);   // the subscriber starts at the current version
+}

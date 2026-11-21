@@ -236,6 +236,11 @@ if (!r) co_return;  // sender dropped
 { WatchBorrowGuard<int> g = rx.borrow(); use(*g); }
 // write in place; version++ and receivers notified on drop
 { WatchBorrowMutGuard<int> g = tx.borrow_mut(); *g = 99; }
+// the sender reads too, and needs no receiver alive to keep the value
+int now = tx.get();
+{ WatchBorrowGuard<int> g = tx.borrow(); use(*g); }
+// a receiver from the sender, having seen the current value: changed() waits for the next
+WatchReceiver<int> rx3 = tx.subscribe();
 ```
 
 ## broadcast — every receiver sees every message, lag-detecting

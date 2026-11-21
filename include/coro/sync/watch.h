@@ -64,7 +64,8 @@ struct WatchShared {
 template<typename T> class WatchReceiver;
 
 /**
- * @brief RAII read-lock guard returned by `WatchReceiver<T>::borrow()`.
+ * @brief RAII read-lock guard returned by `WatchReceiver<T>::borrow()` and
+ *        `WatchSender<T>::borrow()`.
  *
  * Holds a shared lock on the channel's value for its lifetime. Provides
  * read-only access via `operator*` and `operator->`.
@@ -222,6 +223,10 @@ private:
  * `send()` synchronously overwrites the watched value. Multiple senders may
  * exist simultaneously — the channel closes only when the last sender is dropped.
  *
+ * A sender needs no receiver to keep the value: `send_if_modified()` and
+ * `borrow_mut()` update it with none alive (only `send()` refuses), `get()` and
+ * `borrow()` read it, and `subscribe()` makes a receiver whenever one is wanted.
+ *
  * **Thread safety:** each instance must be used by at most one thread at a time.
  * Give each thread its own clone.
  *
@@ -300,6 +305,36 @@ public:
      */
     [[nodiscard]] WatchSender<T> clone() const {
         return WatchSender<T>(m_shared);
+    }
+
+    /**
+     * @brief Creates a receiver that has already seen the current value.
+     *
+     * Its `changed()` resolves only for a change made after this call. Works with
+     * no receiver alive: a sender can hand out receivers as they are needed.
+     */
+    [[nodiscard]] WatchReceiver<T> subscribe() const;
+
+    /**
+     * @brief Returns a copy of the current value, taken under a read lock.
+     *
+     * For small values that are cheaper to copy than to hold a guard for.
+     */
+    [[nodiscard]] T get() const {
+        std::shared_lock lock(m_shared->value_mutex);
+        return m_shared->value;
+    }
+
+    /**
+     * @brief Acquires a read lock and returns a guard providing access to the current value.
+     *
+     * @warning Do not hold the returned guard across a `co_await` point, nor call
+     *          `send()`, `send_if_modified()` or `borrow_mut()` while holding it:
+     *          they wait for the read lock to be released.
+     */
+    [[nodiscard]] WatchBorrowGuard<T> borrow() const {
+        return WatchBorrowGuard<T>(m_shared,
+            std::shared_lock<detail::SharedMutex>(m_shared->value_mutex));
     }
 
     /**
@@ -389,6 +424,7 @@ private:
  * @brief Receiver half of a watch channel. Cloneable; each clone tracks its own version.
  *
  * - `changed()` — suspends until a new value is sent after `last_seen`.
+ * - `get()`     — returns a copy of the current value.
  * - `borrow()`  — returns a `WatchBorrowGuard<T>` for read-only access under a shared lock.
  * - `clone()`   — creates an independent receiver starting at version 0.
  *
@@ -533,6 +569,16 @@ private:
 
     friend class WatchChangedFuture<T>;
 };
+
+// --- WatchSender::subscribe definition (needs WatchReceiver to be complete) ---
+
+template<typename T>
+WatchReceiver<T> WatchSender<T>::subscribe() const {
+    WatchReceiver<T> rx(m_shared);
+    std::shared_lock lock(m_shared->value_mutex);
+    rx.mark_seen(m_shared->version);
+    return rx;
+}
 
 // --- WatchChangedFuture::poll definition (needs WatchReceiver to be complete) ---
 
